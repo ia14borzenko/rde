@@ -1,0 +1,83 @@
+From f85cb9c9ecaf6d4193a8b06d32eefe9671338733 Mon Sep 17 00:00:00 2001
+From: ilya <ilunix@pc.ubuntu>
+Date: Sat, 24 Oct 2026 22:05:56 +0300
+Subject: [PATCH] RDE: ui-egui: chrome-less DocView for embedding (feature
+ rde-docview)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds WordApp::doc_view_ui(): the document editing surface without WordCraft's own title bar, ribbon, panes or status bar — canvas + the dialogs/popups/shortcuts it needs. Feature-gated (rde-docview, off by default), so upstream behaviour and the full test suite are unchanged.
+
+Why: RDE embeds the editor into its own dock and supplies its own toolbar/status bar; this is the first fork change and the upstream-candidate 'DocView widget split'. Verified on the RDE side: RDE builds with the feature and renders the embedded editor headlessly.
+---
+ crates/ui-egui/Cargo.toml |  6 ++++++
+ crates/ui-egui/src/lib.rs | 41 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 47 insertions(+)
+
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index 48ed4121..e6140797 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -46,3 +46,9 @@ zip = { workspace = true }
+ [build-dependencies]
+ serde_json = { workspace = true }
+ toml = "1"
++
++[features]
++# RDE fork addition: expose a chrome-less document view (`WordApp::doc_view_ui`)
++# so a host application can embed the editor in its own dock/toolbar.
++# Off by default: upstream behaviour and tests are unchanged.
++rde-docview = []
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 5dede361..e79680ae 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -8905,3 +8905,44 @@ mod tests {
+         assert!(h.state().session.view.read_mode && shown(&h, "Focus"), "Immersive Reader keeps the status bar");
+     }
+ }
++
++// ─────────────────────────────────────────────────────────────────────────────
++// RDE fork addition: chrome-less document view (feature `rde-docview`)
++//
++// The host application (RDE) embeds the editor in its own dock and supplies its
++// own toolbar, status bar and menus. `doc_view_ui` draws only the editing
++// surface: the page canvas plus the dialogs, popups and shortcuts the canvas
++// needs — no WordCraft title bar, ribbon, panes or status bar.
++// ─────────────────────────────────────────────────────────────────────────────
++#[cfg(feature = "rde-docview")]
++impl WordApp {
++    /// RDE: draw just the document editing surface into `ui`.
++    ///
++    /// Call [`WordApp::logic`] once per frame before this, as the desktop app does.
++    /// The canvas takes the keyboard after a click, exactly as in the full app.
++    pub fn doc_view_ui(&mut self, ui: &mut egui::Ui) {
++        let ctx = ui.ctx().clone();
++        i18n::set_current(i18n::Lang::from_pref(&self.ui.language));
++        // Fonts installed by `logic` take effect on the next frame.
++        if self.fonts_frames < 2 {
++            self.fonts_frames += 1;
++            ctx.request_repaint();
++            return;
++        }
++        self.escape_free = self.dialog.is_none() && !egui::Popup::is_any_open(&ctx);
++        let fill = theme::Tokens::get(&ctx).canvas;
++        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(fill)).show(ui, |ui| {
++            if self.has_document() {
++                canvas::show(self, ui);
++            }
++        });
++        content_controls::popup(self, &ctx);
++        dialogs::show(self, &ctx);
++        #[cfg(not(target_arch = "wasm32"))]
++        file_browser::show(self, &ctx);
++        colors::show(self, &ctx);
++        keys::global_shortcuts(self, &ctx);
++        self.refocus_after_chrome_click(&ctx);
++        self.report_dirty();
++    }
++}
+-- 
+2.53.0
+
