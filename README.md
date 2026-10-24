@@ -35,10 +35,12 @@ v0.10.0 (git-субмодуль).
 Требования: Rust 1.99.x (пин в `rust-toolchain.toml`), Linux с X11/Wayland и GPU (wgpu).
 
 ```bash
-git submodule update --init --recursive   # WordCraft v0.10.0
+git submodule update --init --recursive   # WordCraft v0.10.0 + форк-патч DocView (ветка rde/main)
 cargo build --release -p rde              # приложение
 cargo run -p rde                          # окно RDE (демо-проект)
 ```
+
+Форк-ветка WordCraft: <https://github.com/ia14borzenko/wordcraft-rde> (ветка `rde/main`).
 
 ### Концепт-скриншот без видимого окна (headless)
 
@@ -56,7 +58,7 @@ rde/
   crates/rde-core/     # модель проекта (пока демо-данные)
   crates/rde-ui/       # каркас UI + реальный предпросмотр документа
   fixtures/            # demo-report.docx (собран командами WordCraft)
-  vendor/wordcraft/    # git-субмодуль; ветка rde/main форка (патч DocView), журнал — docs/wordcraft-fork.md
+  vendor/wordcraft/    # git-субмодуль форка ia14borzenko/wordcraft-rde, ветка rde/main (DocView); журнал — docs/wordcraft-fork.md
   patches/wordcraft/   # экспорт патчей форка (для bootstrap до публикации GitHub-форка)
   docs/adr/            # архитектурные решения
   docs/wordcraft-fork.md  # журнал любых изменений исходников WordCraft

@@ -15,19 +15,18 @@
 | — | 2026-10-24 | — | — | Итерация 1.1: встроен полный `WordApp` через публичный `WordApp::ui` в панель RDE — исходники не менялись, форк-ветка не создавалась | — | headless-скриншот `concept-v0.2.png`, `cargo build -p rde` |
 | 1 | 2026-10-24 | `crates/ui-egui` | `f85cb9c9ecaf6d4193a8b06d32eefe9671338733` (ветка `rde/main`) | S5: `WordApp::doc_view_ui()` — canvas документа без WordCraft titlebar/ribbon/panes/statusbar; feature `rde-docview` (выключен по умолчанию). RDE получает нативный редактор в своей панели | да, кандидат: выделение `DocView`-виджета в upstream | `cargo check` ui-egui с feature и без; `cargo build -p rde`; headless-скриншот `concept-v0.3.png`; полный тест-сьют upstream — feature off, поведение не меняется |
 
-## Как устроена форк-ветка и как её опубликовать
+## Форк опубликован (2026-10-24)
 
-- Ветка: `vendor/wordcraft`, ветка `rde/main` (один коммит `f85cb9c9` на этой итерации).
-- Родительский репозиторий RDE пинит субмодуль на этот коммит, поэтому **свежий клон RDE
-  соберётся только после публикации форка** (коммита нет в upstream `storytold/wordcraft`).
-- До публикации: экспорт патча `patches/wordcraft/0001-rde-docview.patch` (сгенерирован из коммита).
-  Bootstrap без форка: `git submodule update --init` → `git -C vendor/wordcraft checkout v0.10.0` →
-  `git -C vendor/wordcraft apply ../../../patches/wordcraft/0001-rde-docview.patch`.
-- Публикация форка (владелец):
-  1. создать форк `storytold/wordcraft` на GitHub;
-  2. `cd vendor/wordcraft && git remote add fork git@github.com:<user>/wordcraft.git && git push -u fork rde/main`;
-  3. в RDE: заменить URL в `.gitmodules` на форк, `git submodule sync vendor/wordcraft`, закоммитить;
-  4. после этого `patches/wordcraft/` можно оставить как архив.
+- **URL:** <https://github.com/ia14borzenko/wordcraft-rde> (публичный, parent `storytold/wordcraft`).
+- **Ветка:** `rde/main`; коммит `f85cb9c9ecaf6d4193a8b06d32eefe9671338733` (проверено публичным
+  клоном и `git ls-remote`).
+- **`.gitmodules`** в RDE указывает на форк: `https://github.com/ia14borzenko/wordcraft-rde.git`;
+  `git submodule sync` выполнен, пин субмодуля — тот же коммит.
+- **Проверена воспроизводимость:** `git clone` RDE + `git submodule update --init --recursive`
+  скачивает форк-коммит с GitHub (без локальных веток).
+- Синхронизация с upstream: по релизам WordCraft (1–3 мес.) — bump пина, ребейз `rde/main`,
+  прогон регрессии; «живой merge» main не практикуется (см. tz-02 §8.1).
+- `patches/wordcraft/0001-rde-docview.patch` остаётся как архив/ревью-артефакт (не нужен для обычного клона).
 
 ## Планируемые изменения (не начаты)
 
