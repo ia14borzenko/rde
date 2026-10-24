@@ -190,10 +190,18 @@ impl RdeApp {
             return;
         }
         let region = wordcraft_engine::Region::from_tag("ru-RU");
-        match wordcraft_engine::io::open_path_in(&self.doc.path, None, &region) {
+        // Встроенный WordApp умеет сам сохранять документ (autosave/сохранение при выходе).
+        // Пока у RDE нет своего слоя сохранения проекта (rde:doc/транзакции — следующая веха),
+        // открываем временную копию: правки редактора не могут испортить файлы проекта.
+        let copy = std::env::temp_dir().join("rde-embedded-doc.docx");
+        if let Ok(bytes) = std::fs::read(&self.doc.path) {
+            let _ = std::fs::write(&copy, bytes);
+        }
+        let edit_path = if copy.is_file() { copy } else { self.doc.path.clone() };
+        match wordcraft_engine::io::open_path_in(&edit_path, None, &region) {
             Ok((doc, _encrypted)) => {
                 let mut session = wordcraft_engine::Session::new(doc);
-                session.path = Some(self.doc.path.clone());
+                session.path = Some(edit_path.clone());
                 let mut app = wordcraft_ui_egui::WordApp::new(session, wordcraft_ui_egui::Services::default());
                 app.integrated_titlebar = false;
                 app.ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
