@@ -1,0 +1,20 @@
+RDE — Research Development Environment
+Copyright 2026 RDE contributors
+
+This product is dual-licensed under MIT OR Apache-2.0 (see LICENSE-MIT, LICENSE-APACHE).
+
+Third-party components referenced or used as dependencies (attribution):
+
+- WordCraft (https://github.com/storytold/wordcraft) — MIT OR Apache-2.0.
+  RDE embeds WordCraft's document engine and, via the fork branch `rde/main`
+  (https://github.com/ia14borzenko/wordcraft-rde), a feature-gated chrome-less
+  document view. See docs/wordcraft-fork.md for the change log.
+- egui / eframe / egui_dock — MIT OR Apache-2.0.
+- xtask tooling and Cargo dependencies are attributed in Cargo.lock and their own licenses.
+- pdfium (https://github.com/chromium/pdfium) — BSD-3-Clause; pdfium-render — MIT/Apache-2.0.
+- monolith (https://github.com/Y2Z/monolith) — CC0-1.0.
+- Liberation fonts — SIL Open Font License 1.1 (not bundled in this prototype).
+- ГОСТ standards texts are NOT distributed with this project; formatting rules are implemented
+  as data/own wording with standard designations only.
+
+This list is maintained before release; keep it up to date when adding dependencies/assets.
