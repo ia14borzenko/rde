@@ -1,0 +1,12 @@
+[package]
+name = "rde"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDE desktop app (prototype)"
+
+[dependencies]
+egui = { workspace = true }
+eframe = { workspace = true }
+rde-core = { workspace = true }
+rde-ui = { workspace = true }
