@@ -1,0 +1,14 @@
+[package]
+name = "rde-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDE prototype UI shell: project tree, tabs, document preview (real WordCraft rendering), agent panel"
+
+[dependencies]
+egui = { workspace = true }
+rde-core = { workspace = true }
+wordcraft-engine = { workspace = true }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu"] }
