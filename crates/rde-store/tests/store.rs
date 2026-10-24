@@ -86,6 +86,24 @@ fn tx_journal_commit_and_crash_recovery_report() {
 }
 
 #[test]
+fn tx_payload_survives_reopen_and_rebuild() {
+    let root = tmp("tx-payload");
+    let mut store = Store::open(&root).unwrap();
+    let payload = serde_json::json!({"artifacts": [{"id": "a1", "act_key": "abc"}]});
+    let tx = store.begin_tx_with("ledger", Some(payload.clone())).unwrap();
+    store.commit_tx(&tx).unwrap();
+    drop(store);
+
+    // payload читается из файла журнала и переживает пересборку индекса.
+    let mut store = Store::open(&root).unwrap();
+    store.rebuild_index().unwrap();
+    let record = store.read_tx(&tx).unwrap().unwrap();
+    assert_eq!(record.status, TxStatus::Committed);
+    assert_eq!(record.data, Some(payload));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn index_recovers_from_files_and_detects_corruption() {
     let root = tmp("index");
     {

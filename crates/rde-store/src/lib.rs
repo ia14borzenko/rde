@@ -88,6 +88,9 @@ pub struct TxRecord {
     pub started_unix: u64,
     #[serde(default)]
     pub updated_unix: Option<u64>,
+    /// Произвольный payload транзакции (например, ledger состояний артефактов для rde-dag).
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
 }
 
 /// Сводка восстановления при открытии проекта.
@@ -260,6 +263,11 @@ impl Store {
 
     /// Начать транзакцию: запись в журнал со статусом `prepared`.
     pub fn begin_tx(&mut self, note: &str) -> Result<String> {
+        self.begin_tx_with(note, None)
+    }
+
+    /// Начать транзакцию с payload (например, ledger состояний артефактов).
+    pub fn begin_tx_with(&mut self, note: &str, data: Option<serde_json::Value>) -> Result<String> {
         let id = ulid::Ulid::generate().to_string();
         let record = TxRecord {
             id: id.clone(),
@@ -267,6 +275,7 @@ impl Store {
             note: note.to_owned(),
             started_unix: now_unix(),
             updated_unix: None,
+            data,
         };
         self.write_tx(&record)?;
         Ok(id)
