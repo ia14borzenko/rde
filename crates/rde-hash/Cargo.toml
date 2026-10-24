@@ -1,0 +1,11 @@
+[package]
+name = "rde-hash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDE content hashing (M2.2): canonical JSON, Merkle trees, act_key formulas (tz-02 §7)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
