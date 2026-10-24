@@ -97,6 +97,7 @@ pub struct ArtifactStatus {
     pub kind: String,
     pub status: LiveStatus,
     pub act_key: Option<String>,
+    pub out_hash: Option<String>,
     pub updated_unix: Option<u64>,
     pub outputs: usize,
     pub run_id: Option<String>,
@@ -285,19 +286,20 @@ pub fn evaluate(project: &Project, store: &Store) -> Result<BTreeMap<String, Art
     let mut result = BTreeMap::new();
     for artifact_object in project.objects.iter().filter(|o| matches!(o.data, ObjectData::Artifact(_))) {
         let ObjectData::Artifact(artifact) = &artifact_object.data else { continue };
-        let (status, act_key, updated, run_id) = if artifact.kind != "compute" {
-            (LiveStatus::Fresh, None, None, None)
+        let (status, act_key, out_hash, updated, run_id) = if artifact.kind != "compute" {
+            (LiveStatus::Fresh, None, None, None, None)
         } else {
             match activation(project, artifact, &ledger) {
-                Err(error) => (LiveStatus::NotComputable(error), None, None, None),
+                Err(error) => (LiveStatus::NotComputable(error), None, None, None, None),
                 Ok(activation) => {
                     let state = ledger.get(&artifact.id);
                     let updated = state.map(|state| state.updated_unix);
+                    let out_hash = state.and_then(|state| state.out_hash.clone());
                     let run_id = state.and_then(|state| state.run_id.clone());
                     match is_fresh(&artifact_object.dir, state, activation.act_key) {
-                        Ok(()) => (LiveStatus::Fresh, Some(activation.act_key.hex()), updated, run_id),
-                        Err(reason) if reason == "не запускался" => (LiveStatus::NeverRun, Some(activation.act_key.hex()), None, None),
-                        Err(reason) => (LiveStatus::Stale(reason), Some(activation.act_key.hex()), updated, run_id),
+                        Ok(()) => (LiveStatus::Fresh, Some(activation.act_key.hex()), out_hash, updated, run_id),
+                        Err(reason) if reason == "не запускался" => (LiveStatus::NeverRun, Some(activation.act_key.hex()), None, None, None),
+                        Err(reason) => (LiveStatus::Stale(reason), Some(activation.act_key.hex()), out_hash, updated, run_id),
                     }
                 }
             }
@@ -310,6 +312,7 @@ pub fn evaluate(project: &Project, store: &Store) -> Result<BTreeMap<String, Art
                 kind: artifact.kind.clone(),
                 status,
                 act_key,
+                out_hash,
                 updated_unix: updated,
                 outputs: artifact.outputs.len(),
                 run_id,
