@@ -78,6 +78,41 @@ schema-валидация, несовместимая schema) + тест вво�
 «Обновить связанные»/запуск скриптов — mock до M2.2/M2.3; `rde.toml` только читается (редактирование
 в UI — позже); `rde-store`/CAS/атомарность — следующий шаг.
 
+### Как запустить (M2.1)
+
+```bash
+cd /home/admin-pc/proj/rde-dev/rde
+export PATH="$HOME/.cargo/bin:$PATH"   # если cargo не найден
+
+# 1) окно RDE с демо-проектом (быстрый путь — готовый debug-бинарь):
+/home/admin-pc/proj/rde-dev/.build/rde-target/debug/rde
+#    или из исходников (инкрементально):
+CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target cargo run -p rde
+
+# 2) другой проект RDE:
+CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target \
+  cargo run -p rde -- --project /путь/к/проекту
+#    либо: RDE_PROJECT=/путь/к/проекту ... cargo run -p rde
+
+# 3) тесты (модель/схемы/загрузка + ввод и сохранение DocView):
+CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target cargo test -p rde-core -p rde-ui
+
+# 4) headless-скриншоты без окон (вкладка: document|artifacts|source|structure|code):
+CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target \
+  cargo run -p rde-ui --example screenshot -- /tmp/rde-m21.png artifacts
+
+# 5) выгрузить JSON Schema манифестов:
+CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target \
+  cargo run -p rde-core --example dump-schemas -- docs/schema
+```
+
+**Что проверить руками:**
+1. Дерево: 9 объектов из `demo-project/`, у `stats`/`plot` — «устарел» с причиной (нет `out/`).
+2. Вкладка «Артефакты»: DAG из 3 compute/data-узлов, 2 устаревших, причины внизу.
+3. Переименуй `demo-project/objects/artifacts/<stats-id>/artifact.toml` → перезапусти: объект исчез,
+   в журнале предупреждение; верни файл — всё восстановится.
+4. «Сохранить .docx» в панели документа → файл появится в `demo-project/exports/`.
+
 ---
 
 ## S5 — «Чистый DocView» — ✅ первая версия 2026-10-24 (ветка форка `rde/main`, коммит `f85cb9c9`)
