@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
-use rde_core::{Freshness, Level, ObjectData, Project};
+use rde_core::{Freshness, Level, ObjectData, ObjectKind, Project};
 
 pub const APP_TITLE: &str = "RDE — Research Development Environment";
 
@@ -244,7 +244,7 @@ impl RdeApp {
                 Ok(()) => {
                     let path = dir.join("demo-report-edited.docx");
                     match wordcraft_engine::io::save_path(&path, &ed.app.session.doc) {
-                        Ok(()) => (Level::Ok, format!("Документ сохранён RDE: {}", path.display())),
+                        Ok(()) => (Level::Ok, format!("Экспорт .docx (RDE): {} (шрифты/оформление — дальше с шаблонами)", path.display())),
                         Err(e) => (Level::Warn, format!("Не удалось сохранить документ: {e}")),
                     }
                 }
@@ -407,7 +407,8 @@ impl RdeApp {
             self.push_log(Level::Ok, "Запрошено обновление всех артефактов (mock: транзакция В2–В4 не реализована)");
         }
         if export {
-            self.push_log(Level::Info, "Экспорт .docx: пайплайн WordCraft готов, RDE-гейты — следующая итерация");
+            self.ensure_editor();
+            self.save_editor_copy();
         }
         if new_object {
             self.push_log(Level::Info, "Создание объекта: мастер появится вместе с rde-core");
@@ -559,6 +560,14 @@ impl RdeApp {
             self.show_tree = false;
         }
         if let Some(id) = clicked {
+            if let Some(object) = self.project.object(&id) {
+                self.tab = match object.kind {
+                    ObjectKind::Document => Tab::Document,
+                    ObjectKind::Artifact | ObjectKind::Constants => Tab::Artifacts,
+                    ObjectKind::Source | ObjectKind::Note => Tab::Source,
+                    ObjectKind::Repository => Tab::Artifacts,
+                };
+            }
             self.selected = Some(id);
         }
         if new_object {
@@ -682,7 +691,6 @@ impl RdeApp {
         let mut mode = self.doc_mode;
         let mut update_inserts = false;
         let mut zoom_action: Option<&'static str> = None;
-        let mut save_action = false;
         if mode != DocMode::Preview {
             self.ensure_editor();
         }
@@ -713,10 +721,6 @@ impl RdeApp {
                             zoom_action = Some("view.pageWidth");
                         }
                         ui.separator();
-                        if ui.button(RichText::new("Сохранить .docx").size(12.0)).clicked() {
-                            save_action = true;
-                        }
-                        ui.separator();
                     }
                 }
                 DocMode::Preview => {
@@ -735,9 +739,6 @@ impl RdeApp {
         self.doc_mode = mode;
         if let (Some(id), Some(ed)) = (zoom_action, &mut self.editor) {
             let _ = ed.app.run(id, serde_json::json!({}));
-        }
-        if save_action {
-            self.save_editor_copy();
         }
         match mode {
             DocMode::DocView => {
@@ -911,9 +912,11 @@ impl RdeApp {
             .map(|i| Rect::from_min_size(pos2(rect.left() + margin + step * i as f32, y), vec2(nw, nh)))
             .collect();
         let index_of = |id: &str| artifacts.iter().position(|o| o.id == id);
+        let selected_id = self.selected.clone();
         for (i, object) in artifacts.iter().take(n).enumerate() {
             let color = freshness_color(object.freshness);
-            draw_node(&painter, nodes[i], &object.title, &object.detail, color, object.freshness.label_ru());
+            let selected = selected_id.as_deref() == Some(object.id.as_str());
+            draw_node(&painter, nodes[i], &object.title, &object.detail, color, object.freshness.label_ru(), selected);
         }
         for (from, to) in &edges {
             if let (Some(a), Some(b)) = (index_of(from), index_of(to)) {
@@ -948,11 +951,14 @@ impl RdeApp {
     }
 
     fn source_tab(&mut self, ui: &mut egui::Ui) {
+        let selected = self.selected.clone();
+        let is_source = |o: &&rde_core::Object| matches!(o.data, ObjectData::Source(_));
         let source = self
             .project
             .objects
             .iter()
-            .find(|o| matches!(o.data, ObjectData::Source(_)))
+            .find(|o| is_source(o) && selected.as_deref() == Some(o.id.as_str()))
+            .or_else(|| self.project.objects.iter().find(is_source))
             .cloned();
         ui.add_space(10.0);
         let Some(obj) = source else {
@@ -1160,9 +1166,18 @@ fn suggestion_card(ui: &mut egui::Ui, accept: &mut bool, reject: &mut bool) {
         });
 }
 
-fn draw_node(painter: &egui::Painter, rect: Rect, title: &str, sub: &str, color: Color32, status: &str) {
+fn draw_node(
+    painter: &egui::Painter,
+    rect: Rect,
+    title: &str,
+    sub: &str,
+    color: Color32,
+    status: &str,
+    selected: bool,
+) {
     painter.rect_filled(rect, CornerRadius::same(8), PANEL_HI);
-    painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+    let border = if selected { ACCENT } else { BORDER };
+    painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(if selected { 1.6 } else { 1.0 }, border), egui::StrokeKind::Inside);
     painter.circle_filled(rect.left_top() + vec2(12.0, 14.0), 4.0, color);
     painter.text(
         rect.left_top() + vec2(24.0, 7.0),
