@@ -3507,12 +3507,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "rde-dag"
+version = "0.1.0"
+dependencies = [
+ "rde-core",
+ "rde-hash",
+ "rde-run",
+ "rde-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rde-hash"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "rde-run"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "ulid",
 ]
 
 [[package]]

@@ -1,0 +1,14 @@
+[package]
+name = "rde-dag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDE DAG execution (M2.3): act_key/out_hash ledger, statuses, topological update with transactions"
+
+[dependencies]
+rde-core = { workspace = true }
+rde-hash = { workspace = true }
+rde-run = { workspace = true }
+rde-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name = "rde-run"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDE artifact runtime execution (M2.3): isolated workdir, logs, timeout/cancel, declared outputs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ulid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
