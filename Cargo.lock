@@ -3555,6 +3555,8 @@ dependencies = [
  "egui",
  "egui_kittest",
  "rde-core",
+ "rde-dag",
+ "rde-store",
  "serde_json",
  "wordcraft-engine",
  "wordcraft-ui-egui",

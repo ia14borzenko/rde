@@ -12,9 +12,11 @@ v0.10.0 (git-субмодуль).
 
 ## Вехи
 
-Текущая: **M2.1 «Модель проекта и схемы»** — проект на диске (`rde.toml` + `objects/**`),
-типизированные TOML-манифесты с JSON Schema, реальное дерево/статусы/DAG/журнал в UI.
-Предыдущие: M1 «Концепт и интеграция WordCraft» (тег `m1-concept`), S5 «Чистый DocView» (тег `s5-docview`).
+Текущая: **M2.3 «Запуск и обновление»** — артефакты реально запускаются (`rde-run`), статусы
+считаются из `act_key`/`out_hash` (`rde-dag`), обновление цепочки фиксируется транзакциями в CAS;
+кнопка «Обновить всё» работает, а не mock.
+Предыдущие: M1 «Концепт и интеграция WordCraft» (`m1-concept`), S5 «Чистый DocView» (`s5-docview`),
+M2.1 «Модель проекта и схемы» (`m2.1-project-model`), M2.2 «Хранилище и хеши» (`m2.2-store`).
 История и критерии вех: [`docs/milestones.md`](docs/milestones.md).
 
 ## Что уже есть в прототипе
@@ -25,10 +27,10 @@ v0.10.0 (git-субмодуль).
 | Центральные вкладки: Документ / Структура / Артефакты (DAG) / Источник / Код документа | UI готов |
 | **Документ** | три режима: **«Редактор RDE (DocView)»** — canvas WordCraft без его ribbon/titlebar (форк-патч `rde-docview`, feature-gate), ввод/вёрстка/undo как в WordCraft; **«Полный WordCraft»** — весь WordApp в панели (для сравнения); **«Предпросмотр страниц»** — растровые страницы |
 | Сохранение | **одна кнопка «Экспорт .docx»** в верхней панели: RDE сохраняет текущий документ в `demo-project/exports/`; WordCraft-autosave отключён — решения о сохранении принимает RDE. Пока это экспорт; «Сохранить проект» (`.doc.rde`, транзакции) — M3 |
-| DAG артефактов | **реальный**: узлы/статусы из манифестов, рёбра — из `hashed`-групп; причины устаревания показаны |
+| DAG артефактов | **реальный**: узлы/рёбра/статусы из `act_key`/`out_hash` (`rde-dag`); причины устаревания — из хешей, а не эвристик |
 | Панель агента (ACP/DSH), предложения, tool-calls; вкладки «Структура»/«Код документа» | mock (следующие вехи) |
 | Панели (дерево, агент, журнал) | скрываются: × в заголовке панели или меню «Вид» |
-| Журнал | **реальный** журнал загрузки проекта (сводка + предупреждения по объектам) |
+| Журнал | **реальный** журнал загрузки проекта + строки запусков артефактов с act_key |
 | Экспорт `.docx`, обновление вставок, CAS/транзакции, шаблоны ГОСТ, MCP-сервер | **следующие итерации** (см. `.agent/plan-v01.md`) |
 | S5 (чистый DocView) | ✅ первая версия: feature `rde-docview` в форк-ветке WordCraft; см. `docs/wordcraft-fork.md` |
 
@@ -39,7 +41,7 @@ v0.10.0 (git-субмодуль).
 Тесты (включая автотест клавиатурного ввода в DocView и RDE-сохранения):
 
 ```bash
-cargo test -p rde-core -p rde-hash -p rde-store -p rde-ui   # модель, хеши, хранилище (kill -9), DocView
+cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-ui   # модель, хеши, store (kill -9), запуск, DAG, DocView
 ```
 
 ```bash
@@ -51,11 +53,12 @@ cargo run -p rde -- --project <каталог>   # открыть другой �
 
 Форк-ветка WordCraft: <https://github.com/ia14borzenko/wordcraft-rde> (ветка `rde/main`).
 
-Хранилище проекта (CAS/журнал) — можно посмотреть без окна:
+Хранилище проекта (CAS/журнал) и реальное обновление артефактов — можно посмотреть без окна:
 
 ```bash
 CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target cargo run -p rde-store --example demo
-# создаст demo-project/.rde/{cas,trees,index.db} и напечатает статистику
+CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target cargo run -p rde-dag --example update-demo
+# второй запуск update-demo: «выполнено 0, пропущено 2» — act_key/out_hash совпали
 ```
 
 ### Концепт-скриншот без видимого окна (headless)
@@ -74,6 +77,8 @@ rde/
   crates/rde-core/     # модель проекта: манифесты, JSON Schema, загрузчик, статусы
   crates/rde-hash/     # канонизация, Merkle-деревья, group/in/script/params/env → act_key (M2.2)
   crates/rde-store/    # CAS, атомарная запись, журнал транзакций, пересборка индекса (M2.2)
+  crates/rde-run/      # исполнение скриптов артефактов: workdir, логи, timeout/cancel (M2.3)
+  crates/rde-dag/      # act_key/out_hash ledger, статусы, топологическое обновление (M2.3)
   crates/rde-ui/       # каркас UI + DocView WordCraft + панели на модели проекта
   demo-project/        # демо-проект: rde.toml, objects/{artifacts,documents,sources,notes,repos}
   docs/schema/         # сгенерированные JSON Schema манифестов (rde-core examples/dump-schemas)

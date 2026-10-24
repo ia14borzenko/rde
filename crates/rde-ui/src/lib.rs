@@ -13,12 +13,15 @@
 //! - mock: чат агента, вкладки «Структура»/«Код документа», «Обновить связанные» —
 //!   заменяются в M2.2/M2.3 (store/CAS, hash/DAG, run).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 use rde_core::{Freshness, Level, ObjectData, ObjectKind, Project};
+use rde_dag::{LiveStatus, UpdateAction};
+use rde_store::Store;
 
 pub const APP_TITLE: &str = "RDE — Research Development Environment";
 
@@ -182,13 +185,17 @@ pub struct RdeApp {
     editor_error: Option<String>,
     /// Куда RDE сохраняет явные экспорты (редактор пока работает с временной копией).
     export_dir: PathBuf,
+    /// Хранилище проекта (CAS/журнал транзакций; открывается при старте).
+    store: Option<Store>,
+    /// Статусы артефактов из DAG (act_key/out_hash/выходы), наложенные на модель проекта.
+    dag_statuses: BTreeMap<String, rde_dag::ArtifactStatus>,
 }
 
 impl RdeApp {
     pub fn new(project: Project) -> Self {
         let doc = DocPreview::new(project.document_path());
         let export_dir = project.root.join("exports");
-        Self {
+        let mut app = Self {
             project,
             tab: Tab::Document,
             tree_filter: String::new(),
@@ -206,7 +213,106 @@ impl RdeApp {
             editor: None,
             editor_error: None,
             export_dir,
+            store: None,
+            dag_statuses: BTreeMap::new(),
+        };
+        match Store::open(&app.project.root) {
+            Ok(store) => {
+                app.store = Some(store);
+                app.refresh_dag_statuses();
+            }
+            Err(error) => app.push_log(Level::Warn, format!("Хранилище проекта недоступно: {error}")),
         }
+        app
+    }
+
+    /// Пересчитать статусы артефактов из фактов (act_key/out_hash/выходы) и наложить на модель.
+    pub fn refresh_dag_statuses(&mut self) {
+        let Some(store) = self.store.as_ref() else { return };
+        let statuses = match rde_dag::evaluate(&self.project, store) {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                self.push_log(Level::Warn, format!("DAG-статусы: {error}"));
+                return;
+            }
+        };
+        let mut overlays: Vec<(String, Freshness, String)> = Vec::new();
+        for object in &self.project.objects {
+            let ObjectData::Artifact(artifact) = &object.data else { continue };
+            let Some(status) = statuses.get(&artifact.id) else { continue };
+            let freshness = match status.status {
+                LiveStatus::Fresh => Freshness::UpToDate,
+                LiveStatus::Stale(_) | LiveStatus::NeverRun => Freshness::Stale,
+                LiveStatus::NotComputable(_) => Freshness::Failed,
+            };
+            let detail = match &status.status {
+                LiveStatus::Fresh => object.detail.clone(),
+                live => format!("{} · {}", artifact.kind, live.reason().unwrap_or_else(|| live.label_ru())),
+            };
+            overlays.push((artifact.id.clone(), freshness, detail));
+        }
+        for (id, freshness, detail) in overlays {
+            if let Some(object) = self.project.objects.iter_mut().find(|o| o.id == id) {
+                object.freshness = freshness;
+                object.detail = detail;
+            }
+        }
+        self.dag_statuses = statuses;
+    }
+
+    /// Перезагрузить проект с диска и обновить статусы/документ.
+    fn reload_project(&mut self) {
+        match rde_core::load_project(&self.project.root) {
+            Ok(project) => {
+                let new_path = project.document_path();
+                let path_changed = new_path != self.doc.path;
+                self.project = project;
+                if path_changed {
+                    self.doc = DocPreview::new(new_path);
+                }
+                self.refresh_dag_statuses();
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Не удалось перезагрузить проект: {error}")),
+        }
+    }
+
+    /// Реальное обновление артефактов через DAG/транзакции (`targets=None` — все устаревшие).
+    pub fn update_dependencies(&mut self, targets: Option<Vec<String>>) -> Option<rde_dag::UpdateReport> {
+        if self.store.is_none() {
+            self.push_log(Level::Warn, "Обновление невозможно: хранилище проекта не открыто");
+            return None;
+        }
+        let options = rde_dag::UpdateOptions { targets, continue_on_error: false };
+        let result = {
+            let store = self.store.as_mut().expect("store проверен выше");
+            rde_dag::update(&self.project, store, &options)
+        };
+        let report = match result {
+            Ok(report) => report,
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Обновление не удалось: {error}"));
+                return None;
+            }
+        };
+        self.reload_project();
+        for artifact in &report.artifacts {
+            let text = match artifact.action {
+                UpdateAction::Ran => format!("Артефакт «{}»: {} (act_key {})", artifact.title, artifact.message, artifact.act_key.as_deref().map(|key| &key[..12.min(key.len())]).unwrap_or("—")),
+                UpdateAction::Skipped => format!("Артефакт «{}»: актуален, запуск не нужен", artifact.title),
+                UpdateAction::Failed => format!("Артефакт «{}»: ошибка — {}", artifact.title, artifact.message),
+            };
+            let level = match artifact.action {
+                UpdateAction::Ran => Level::Ok,
+                UpdateAction::Skipped => Level::Info,
+                UpdateAction::Failed => Level::Warn,
+            };
+            self.push_log(level, text);
+        }
+        self.push_log(
+            if report.failed() > 0 { Level::Warn } else { Level::Ok },
+            format!("Обновление связанных: выполнено {}, пропущено {}, ошибок {}", report.ran(), report.skipped(), report.failed()),
+        );
+        Some(report)
     }
 
     /// Для демо/скриншотов: переключить центральную вкладку по имени
@@ -379,7 +485,7 @@ impl RdeApp {
                 ui.horizontal(|ui| {
                     if ui
                         .add(egui::Button::new(RichText::new("Обновить всё").color(Color32::WHITE)).fill(ACCENT))
-                        .on_hover_text("Пересчитать устаревшие артефакты и обновить вставки документа")
+                        .on_hover_text("Реально пересчитать устаревшие артефакты (rde-dag: act_key/out_hash, транзакции)")
                         .clicked()
                     {
                         update_all = true;
@@ -404,7 +510,7 @@ impl RdeApp {
                 });
             });
         if update_all {
-            self.push_log(Level::Ok, "Запрошено обновление всех артефактов (mock: транзакция В2–В4 не реализована)");
+            self.update_dependencies(None);
         }
         if export {
             self.ensure_editor();
@@ -946,7 +1052,13 @@ impl RdeApp {
             );
         }
         if refresh {
-            self.push_log(Level::Info, "Обновление связанных: DAG-транзакция появится в M2.3 (сейчас mock)");
+            let targets = self.selected.as_ref().and_then(|id| {
+                self.project
+                    .artifact_object(id)
+                    .filter(|object| matches!(&object.data, ObjectData::Artifact(artifact) if artifact.kind == "compute"))
+                    .map(|object| vec![object.id.clone()])
+            });
+            self.update_dependencies(targets);
         }
     }
 
@@ -1321,5 +1433,80 @@ mod docview_tests {
         let out = harness.state().export_dir.join("demo-report-edited.docx");
         assert!(out.is_file(), "RDE-сохранение не создало {}", out.display());
         let _ = std::fs::remove_dir_all(&harness.state().export_dir);
+    }
+
+    // ── M2.3: статусы из хешей и реальное обновление связанных артефактов ─────
+    const STATS: &str = "01M5VJ1JG039MMV97SZGY6V9EQ";
+    const REALIZATIONS: &str = "01M5VJ1JG0HD99FDTGJ8YEPFZX";
+
+    fn python_available() -> bool {
+        std::process::Command::new("python3").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(&*name, ".rde" | "exports" | "__pycache__" | "out") {
+                continue;
+            }
+            let path = entry.path();
+            let target = dst.join(&*name);
+            if path.is_dir() {
+                copy_tree(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    fn temp_demo_copy(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rde-ui-dag-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        copy_tree(&rde_core::demo_project_dir(), &root);
+        root
+    }
+
+    /// UI-слой: статусы артефактов берутся из DAG (никогда не запускался), «Обновить всё»
+    /// действительно запускает скрипты и меняет статусы на «актуален»; повтор — без запусков.
+    #[test]
+    fn dag_update_from_ui_runs_real_artifacts() {
+        if !python_available() {
+            return;
+        }
+        let root = temp_demo_copy("update");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        let stats = app.project.artifact_object(STATS).unwrap();
+        assert_eq!(stats.freshness, super::Freshness::Stale, "до запуска артефакт должен быть устаревшим");
+        assert!(stats.detail.contains("не запускался"), "detail: {}", stats.detail);
+
+        let report = app.update_dependencies(None).expect("DAG-обновление");
+        assert_eq!(report.failed(), 0, "{:?}", report.errors);
+        assert_eq!(report.ran(), 2, "stats и plot должны выполниться: {:?}", report.artifacts);
+        let stats = app.project.artifact_object(STATS).unwrap();
+        assert_eq!(stats.freshness, super::Freshness::UpToDate, "после запуска актуален: {}", stats.detail);
+        assert!(app.project.root.join("exports").exists() || root.join(".rde/updates").is_dir());
+
+        let second = app.update_dependencies(None).expect("повторное обновление");
+        assert_eq!(second.ran(), 0, "повторный запуск не нужен: {:?}", second.artifacts);
+        assert_eq!(second.skipped(), 2);
+
+        // Изменяем вход data-артефакта → статус из хешей становится «устарел» с причиной.
+        let input = app.project.artifact_object(REALIZATIONS).unwrap().dir.join("inputs/experiment.csv");
+        let mut text = std::fs::read_to_string(&input).unwrap();
+        text.push_str("50,50.0,50.0\n");
+        std::fs::write(&input, text).unwrap();
+        app.reload_project();
+        let stats = app.project.artifact_object(STATS).unwrap();
+        assert_eq!(stats.freshness, super::Freshness::Stale);
+        assert!(stats.detail.contains("изменились"), "detail: {}", stats.detail);
+
+        let third = app.update_dependencies(None).expect("обновление после правки входа");
+        assert_eq!(third.ran(), 2, "stats и plot пересчитываются: {:?}", third.artifacts);
+        assert_eq!(app.project.artifact_object(STATS).unwrap().freshness, super::Freshness::UpToDate);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

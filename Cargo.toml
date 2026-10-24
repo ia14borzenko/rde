@@ -32,6 +32,7 @@ eframe = { version = "0.36.2", default-features = false, features = [
     "accesskit",
 ] }
 rde-core = { path = "crates/rde-core" }
+rde-dag = { path = "crates/rde-dag" }
 rde-hash = { path = "crates/rde-hash" }
 rde-run = { path = "crates/rde-run" }
 rde-store = { path = "crates/rde-store" }
