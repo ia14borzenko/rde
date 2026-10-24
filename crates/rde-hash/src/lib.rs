@@ -38,6 +38,20 @@ impl Hash {
         out
     }
 
+    /// Восстановить хеш из 64-символьной hex-строки (для чтения сохранённых деревьев).
+    pub fn from_hex(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if text.len() != HASH_LEN * 2 {
+            return Err(format!("hex-хеш должен быть {} символов, получено {}", HASH_LEN * 2, text.len()));
+        }
+        let mut bytes = [0u8; HASH_LEN];
+        for (i, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+            let pair = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+            bytes[i] = u8::from_str_radix(pair, 16).map_err(|e| format!("hex `{pair}`: {e}"))?;
+        }
+        Ok(Self(bytes))
+    }
+
     /// Первые `n` hex-символов (для подписей/логов; не для сравнения).
     pub fn short(&self, n: usize) -> String {
         self.hex().chars().take(n).collect()
