@@ -126,6 +126,20 @@ fn load_and_render(path: &Path, ctx: &egui::Context) -> Result<(Vec<egui::Textur
     Ok((pages, page_pt, layout.pages.len()))
 }
 
+/// Режим области документа.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DocMode {
+    /// Полноценный редактор WordCraft, встроенный как панель без изменений исходников.
+    Editor,
+    /// Растеризованный предпросмотр страниц (лёгкий, работает без UI-стека WordCraft).
+    Preview,
+}
+
+/// Встроенный редактор WordCraft: полноценный `WordApp` (ribbon + canvas + ввод).
+struct EmbeddedEditor {
+    app: wordcraft_ui_egui::WordApp,
+}
+
 /// Приложение прототипа RDE.
 pub struct RdeApp {
     pub project: Project,
@@ -138,6 +152,13 @@ pub struct RdeApp {
     suggestion_open: bool,
     logs_tab: usize,
     fonts_installed: bool,
+    // видимость панелей (скрываются через меню «Вид» или кнопкой × в заголовке)
+    show_tree: bool,
+    show_agent: bool,
+    show_logs: bool,
+    doc_mode: DocMode,
+    editor: Option<EmbeddedEditor>,
+    editor_error: Option<String>,
 }
 
 impl RdeApp {
@@ -154,6 +175,31 @@ impl RdeApp {
             suggestion_open: true,
             logs_tab: 0,
             fonts_installed: false,
+            show_tree: true,
+            show_agent: true,
+            show_logs: true,
+            doc_mode: DocMode::Editor,
+            editor: None,
+            editor_error: None,
+        }
+    }
+
+    /// Лениво создать встроенный редактор WordCraft с тем же документом, что и предпросмотр.
+    fn ensure_editor(&mut self) {
+        if self.editor.is_some() || self.editor_error.is_some() {
+            return;
+        }
+        let region = wordcraft_engine::Region::from_tag("ru-RU");
+        match wordcraft_engine::io::open_path_in(&self.doc.path, None, &region) {
+            Ok((doc, _encrypted)) => {
+                let mut session = wordcraft_engine::Session::new(doc);
+                session.path = Some(self.doc.path.clone());
+                let mut app = wordcraft_ui_egui::WordApp::new(session, wordcraft_ui_egui::Services::default());
+                app.integrated_titlebar = false;
+                app.ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
+                self.editor = Some(EmbeddedEditor { app });
+            }
+            Err(e) => self.editor_error = Some(e),
         }
     }
 
@@ -164,12 +210,24 @@ impl RdeApp {
             install_style(ui.ctx());
             self.fonts_installed = true;
         }
+        if self.editor.is_some() {
+            // WordCraft's own UI applies its theme/fonts globally in `logic`; restore the
+            // RDE shell visuals each frame so the environment keeps a stable look. WordCraft
+            // draws itself from the effective dark palette (`Tokens::get`), so both match.
+            install_style(ui.ctx());
+        }
         self.menu_bar(ui);
         self.toolbar(ui);
         self.status_bar(ui);
-        self.logs_panel(ui);
-        self.tree_panel(ui);
-        self.agent_panel(ui);
+        if self.show_logs {
+            self.logs_panel(ui);
+        }
+        if self.show_tree {
+            self.tree_panel(ui);
+        }
+        if self.show_agent {
+            self.agent_panel(ui);
+        }
         self.central(ui);
     }
 
@@ -203,9 +261,9 @@ impl RdeApp {
                         let _ = ui.button("Настройки проекта…");
                     });
                     ui.menu_button("Вид", |ui| {
-                        let _ = ui.button("Дерево проекта");
-                        let _ = ui.button("Журнал");
-                        let _ = ui.button("Панель агента");
+                        ui.checkbox(&mut self.show_tree, "Дерево проекта");
+                        ui.checkbox(&mut self.show_agent, "Панель агента");
+                        ui.checkbox(&mut self.show_logs, "Журнал и задачи");
                     });
                     ui.menu_button("Агент", |ui| {
                         let _ = ui.button("Новая сессия");
@@ -300,6 +358,7 @@ impl RdeApp {
     // ── журнал / задачи ─────────────────────────────────────────────────────
     fn logs_panel(&mut self, ui: &mut egui::Ui) {
         let mut tab = self.logs_tab;
+        let mut hide_logs = false;
         let log = &self.project.log;
         egui::Panel::bottom("rde_logs")
             .resizable(true)
@@ -316,7 +375,10 @@ impl RdeApp {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new("очистить").small().color(MUTED));
+                        if ui.small_button("×").on_hover_text("Скрыть панель (вернуть — меню «Вид»)").clicked() {
+                            hide_logs = true;
+                        }
+                        let _ = ui.small_button("очистить");
                     });
                 });
                 ui.separator();
@@ -340,6 +402,9 @@ impl RdeApp {
                     });
             });
         self.logs_tab = tab;
+        if hide_logs {
+            self.show_logs = false;
+        }
     }
 
     // ── дерево проекта ──────────────────────────────────────────────────────
@@ -350,6 +415,7 @@ impl RdeApp {
         let selected = self.selected.clone();
         let mut clicked: Option<String> = None;
         let mut new_object = false;
+        let mut hide_tree = false;
         egui::Panel::left("rde_tree")
             .resizable(true)
             .default_size(268.0)
@@ -358,6 +424,9 @@ impl RdeApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("ПРОЕКТ").small().strong().color(MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Скрыть панель (вернуть — меню «Вид»)").clicked() {
+                            hide_tree = true;
+                        }
                         ui.label(RichText::new(format!("{object_count} объектов")).small().color(MUTED));
                     });
                 });
@@ -398,6 +467,9 @@ impl RdeApp {
                     }
                 });
             });
+        if hide_tree {
+            self.show_tree = false;
+        }
         if let Some(id) = clicked {
             self.selected = Some(id);
         }
@@ -411,6 +483,7 @@ impl RdeApp {
         let mut send = false;
         let mut accept = false;
         let mut reject = false;
+        let mut hide_agent = false;
         egui::Panel::right("rde_agent")
             .resizable(true)
             .default_size(316.0)
@@ -421,6 +494,9 @@ impl RdeApp {
                     ui.label(RichText::new("АГЕНТ").small().strong().color(MUTED));
                     ui.label(RichText::new("• DSH · deepseek-v4-flash").small().color(GREEN));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Скрыть панель (вернуть — меню «Вид»)").clicked() {
+                            hide_agent = true;
+                        }
                         let _ = ui.small_button("…");
                         ui.label(RichText::new("ACP").small().color(MUTED));
                     });
@@ -459,6 +535,9 @@ impl RdeApp {
                     }
                 });
             });
+        if hide_agent {
+            self.show_agent = false;
+        }
         if send {
             let text = std::mem::take(&mut self.agent_input);
             let text = if text.trim().is_empty() { "Продолжай".to_owned() } else { text };
@@ -510,51 +589,93 @@ impl RdeApp {
 
     fn doc_tab(&mut self, ui: &mut egui::Ui) {
         let mut update_inserts = false;
+        let mut mode = self.doc_mode;
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            if ui.button(RichText::new("Обновить вставки").size(12.0)).clicked() {
-                update_inserts = true;
+            if ui.selectable_label(mode == DocMode::Editor, RichText::new("Редактор WordCraft").size(12.0)).clicked() {
+                mode = DocMode::Editor;
+            }
+            if ui.selectable_label(mode == DocMode::Preview, RichText::new("Предпросмотр страниц").size(12.0)).clicked() {
+                mode = DocMode::Preview;
             }
             ui.separator();
-            ui.label(RichText::new("Масштаб").small().color(MUTED));
-            ui.add(egui::Slider::new(&mut self.zoom, 0.35..=1.5).show_value(false));
-            ui.separator();
-            let _ = ui.button(RichText::new("Открыть копию в Word").size(12.0));
+            match mode {
+                DocMode::Editor => {
+                    ui.label(
+                        RichText::new("полноценный WordApp встроен в панель, исходники не изменялись")
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+                DocMode::Preview => {
+                    if ui.button(RichText::new("Обновить вставки").size(12.0)).clicked() {
+                        update_inserts = true;
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Масштаб").small().color(MUTED));
+                    ui.add(egui::Slider::new(&mut self.zoom, 0.35..=1.5).show_value(false));
+                    ui.separator();
+                    let _ = ui.button(RichText::new("Открыть копию в Word").size(12.0));
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("Предпросмотр: настоящий .docx (WordCraft layout)").small().color(MUTED));
+                ui.label(RichText::new("Документ: демо-отчёт · 2 страницы").small().color(MUTED));
             });
         });
         ui.separator();
-        self.doc.ensure(ui.ctx());
-        let zoom = self.zoom;
-        match &self.doc.state {
-            DocState::Pending => {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(60.0);
-                    ui.spinner();
-                    ui.label(RichText::new("Рендеринг документа движком WordCraft…").color(MUTED));
-                });
+        self.doc_mode = mode;
+        match mode {
+            DocMode::Editor => {
+                self.ensure_editor();
+                if self.editor.is_none() {
+                    if let Some(err) = &self.editor_error {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(50.0);
+                            ui.label(RichText::new("Не удалось открыть редактор WordCraft").color(RED).strong());
+                            ui.label(RichText::new(err).color(MUTED));
+                        });
+                    }
+                    return;
+                }
+                if let Some(ed) = &mut self.editor {
+                    let ctx = ui.ctx().clone();
+                    ed.app.logic(&ctx);
+                    ed.app.ui(ui);
+                }
             }
-            DocState::Failed(e) => {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(60.0);
-                    ui.label(RichText::new("Не удалось открыть документ").color(RED).strong());
-                    ui.label(RichText::new(e).color(MUTED));
-                });
-            }
-            DocState::Ready(doc) => {
-                egui::ScrollArea::both().id_salt("rde_doc_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                    ui.add_space(14.0);
-                    ui.vertical_centered(|ui| {
-                        for (i, tex) in doc.pages.iter().enumerate() {
-                            let size = doc.page_pt * zoom;
-                            ui.image((tex.id(), size));
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(format!("Страница {} из {}", i + 1, doc.count)).small().color(MUTED));
-                            ui.add_space(12.0);
-                        }
-                    });
-                });
+            DocMode::Preview => {
+                self.doc.ensure(ui.ctx());
+                let zoom = self.zoom;
+                match &self.doc.state {
+                    DocState::Pending => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(60.0);
+                            ui.spinner();
+                            ui.label(RichText::new("Рендеринг документа движком WordCraft…").color(MUTED));
+                        });
+                    }
+                    DocState::Failed(e) => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(60.0);
+                            ui.label(RichText::new("Не удалось открыть документ").color(RED).strong());
+                            ui.label(RichText::new(e).color(MUTED));
+                        });
+                    }
+                    DocState::Ready(doc) => {
+                        egui::ScrollArea::both().id_salt("rde_doc_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                            ui.add_space(14.0);
+                            ui.vertical_centered(|ui| {
+                                for (i, tex) in doc.pages.iter().enumerate() {
+                                    let size = doc.page_pt * zoom;
+                                    ui.image((tex.id(), size));
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new(format!("Страница {} из {}", i + 1, doc.count)).small().color(MUTED));
+                                    ui.add_space(12.0);
+                                }
+                            });
+                        });
+                    }
+                }
             }
         }
         if update_inserts {

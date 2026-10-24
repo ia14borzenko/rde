@@ -9,6 +9,7 @@ description = "RDE prototype UI shell: project tree, tabs, document preview (rea
 egui = { workspace = true }
 rde-core = { workspace = true }
 wordcraft-engine = { workspace = true }
+wordcraft-ui-egui = { path = "../../vendor/wordcraft/crates/ui-egui" }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu"] }
