@@ -1,0 +1,19 @@
+# RDE — Research Development Environment (прототип)
+#
+# Сборка
+/target/
+**/target/
+Cargo.lock.bak
+
+# Локальное состояние RDE-проектов
+/.rde/
+/exports/
+
+# Референсы и артефакты сборки живут вне репозитория продукта
+/refs/
+/.build/
+
+# ОС/редакторы
+.DS_Store
+*.swp
+*~

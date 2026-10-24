@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["apps/rde", "crates/rde-core", "crates/rde-ui"]
+# WordCraft vendored as a submodule keeps its own Cargo workspace (workspace-inherited
+# dependencies like `chrono = { workspace = true }`); the outer workspace must not
+# claim it, or those fields would inherit from RDE's manifest.
+exclude = ["vendor/wordcraft", "vendor/craft-libs"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+egui = "0.36.2"
+eframe = { version = "0.36.2", default-features = false, features = [
+    "wgpu",
+    "x11",
+    "wayland",
+    "default_fonts",
+    "accesskit",
+] }
+rde-core = { path = "crates/rde-core" }
+rde-ui = { path = "crates/rde-ui" }
+wordcraft-engine = { path = "vendor/wordcraft/crates/engine" }
+
+# WordCraft pins krilla itself in its own workspace; patches of a dependency's
+# workspace do not apply when it is built as a path dependency, so RDE mirrors it.
+[patch.crates-io]
+krilla = { git = "https://github.com/storytold/craft-libs", rev = "c3487320b2d1de657b860b3c8abb44e1f2b32bd8" }

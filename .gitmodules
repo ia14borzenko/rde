@@ -1,0 +1,3 @@
+[submodule "vendor/wordcraft"]
+	path = vendor/wordcraft
+	url = https://github.com/storytold/wordcraft
