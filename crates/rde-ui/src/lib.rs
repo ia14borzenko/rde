@@ -129,10 +129,24 @@ fn load_and_render(path: &Path, ctx: &egui::Context) -> Result<(Vec<egui::Textur
 /// Режим области документа.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DocMode {
-    /// Полноценный редактор WordCraft, встроенный как панель без изменений исходников.
-    Editor,
-    /// Растеризованный предпросмотр страниц (лёгкий, работает без UI-стека WordCraft).
+    /// Чистый редактор: canvas WordCraft без его ribbon/titlebar (RDE-патч `rde-docview`).
+    DocView,
+    /// Полный интерфейс WordCraft, встроенный как панель (для сравнения/отладки).
+    Full,
+    /// Растеризованный предпросмотр страниц (лёгкий, без UI-стека WordCraft).
     Preview,
+}
+
+impl DocMode {
+    const ALL: [DocMode; 3] = [DocMode::DocView, DocMode::Full, DocMode::Preview];
+
+    fn label(self) -> &'static str {
+        match self {
+            DocMode::DocView => "Редактор RDE (DocView)",
+            DocMode::Full => "Полный WordCraft",
+            DocMode::Preview => "Предпросмотр страниц",
+        }
+    }
 }
 
 /// Встроенный редактор WordCraft: полноценный `WordApp` (ribbon + canvas + ввод).
@@ -178,7 +192,7 @@ impl RdeApp {
             show_tree: true,
             show_agent: true,
             show_logs: true,
-            doc_mode: DocMode::Editor,
+            doc_mode: DocMode::DocView,
             editor: None,
             editor_error: None,
         }
@@ -596,24 +610,40 @@ impl RdeApp {
     }
 
     fn doc_tab(&mut self, ui: &mut egui::Ui) {
-        let mut update_inserts = false;
         let mut mode = self.doc_mode;
+        let mut update_inserts = false;
+        let mut zoom_action: Option<&'static str> = None;
+        if mode != DocMode::Preview {
+            self.ensure_editor();
+        }
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            if ui.selectable_label(mode == DocMode::Editor, RichText::new("Редактор WordCraft").size(12.0)).clicked() {
-                mode = DocMode::Editor;
-            }
-            if ui.selectable_label(mode == DocMode::Preview, RichText::new("Предпросмотр страниц").size(12.0)).clicked() {
-                mode = DocMode::Preview;
+            for m in DocMode::ALL {
+                if ui.selectable_label(mode == m, RichText::new(m.label()).size(12.0)).clicked() {
+                    mode = m;
+                }
             }
             ui.separator();
             match mode {
-                DocMode::Editor => {
-                    ui.label(
-                        RichText::new("полноценный WordApp встроен в панель, исходники не изменялись")
-                            .small()
-                            .color(MUTED),
-                    );
+                DocMode::DocView | DocMode::Full => {
+                    if let Some(ed) = &mut self.editor {
+                        if ui.small_button("-").on_hover_text("Уменьшить масштаб").clicked() {
+                            zoom_action = Some("view.zoomOut");
+                        }
+                        ui.label(
+                            RichText::new(format!("{:.0}%", ed.app.session.view.zoom * 100.0)).monospace().size(11.5).color(MUTED),
+                        );
+                        if ui.small_button("+").on_hover_text("Увеличить масштаб").clicked() {
+                            zoom_action = Some("view.zoomIn");
+                        }
+                        if ui.small_button("Сброс").on_hover_text("Масштаб 100%").clicked() {
+                            zoom_action = Some("view.zoom100");
+                        }
+                        if ui.small_button("По ширине").clicked() {
+                            zoom_action = Some("view.pageWidth");
+                        }
+                        ui.separator();
+                    }
                 }
                 DocMode::Preview => {
                     if ui.button(RichText::new("Обновить вставки").size(12.0)).clicked() {
@@ -632,23 +662,33 @@ impl RdeApp {
         });
         ui.separator();
         self.doc_mode = mode;
+        if let (Some(id), Some(ed)) = (zoom_action, &mut self.editor) {
+            let _ = ed.app.run(id, serde_json::json!({}));
+        }
         match mode {
-            DocMode::Editor => {
-                self.ensure_editor();
-                if self.editor.is_none() {
-                    if let Some(err) = &self.editor_error {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(50.0);
-                            ui.label(RichText::new("Не удалось открыть редактор WordCraft").color(RED).strong());
-                            ui.label(RichText::new(err).color(MUTED));
-                        });
-                    }
-                    return;
+            DocMode::DocView => {
+                if let Some(ed) = &mut self.editor {
+                    let ctx = ui.ctx().clone();
+                    ed.app.logic(&ctx);
+                    // The WordCraft canvas paints across its whole area; give it a clipped
+                    // child Ui so it can never draw over the RDE side panels.
+                    let rect = ui.available_rect_before_wrap();
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    child.set_clip_rect(rect);
+                    ed.app.doc_view_ui(&mut child);
+                } else {
+                    self.editor_error_ui(ui);
                 }
+            }
+            DocMode::Full => {
                 if let Some(ed) = &mut self.editor {
                     let ctx = ui.ctx().clone();
                     ed.app.logic(&ctx);
                     ed.app.ui(ui);
+                } else {
+                    self.editor_error_ui(ui);
                 }
             }
             DocMode::Preview => {
@@ -688,6 +728,17 @@ impl RdeApp {
         }
         if update_inserts {
             self.push_log(Level::Info, "Обновление вставок документа: транзакция появится в следующей итерации (сейчас mock)");
+        }
+    }
+
+    /// Сообщение, если встроенный редактор не удалось открыть.
+    fn editor_error_ui(&self, ui: &mut egui::Ui) {
+        if let Some(err) = &self.editor_error {
+            ui.vertical_centered(|ui| {
+                ui.add_space(50.0);
+                ui.label(RichText::new("Не удалось открыть редактор WordCraft").color(RED).strong());
+                ui.label(RichText::new(err).color(MUTED));
+            });
         }
     }
 
