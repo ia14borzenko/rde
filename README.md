@@ -24,7 +24,7 @@ v0.10.0 (git-субмодуль).
 | Дерево проекта (документы, артефакты, константы, источники, заметки, репозитории) | **реальные объекты** из `demo-project/` (`rde.toml` + `objects/**`), статусы вычисляются из фактов на диске |
 | Центральные вкладки: Документ / Структура / Артефакты (DAG) / Источник / Код документа | UI готов |
 | **Документ** | три режима: **«Редактор RDE (DocView)»** — canvas WordCraft без его ribbon/titlebar (форк-патч `rde-docview`, feature-gate), ввод/вёрстка/undo как в WordCraft; **«Полный WordCraft»** — весь WordApp в панели (для сравнения); **«Предпросмотр страниц»** — растровые страницы |
-| Сохранение | кнопка **«Сохранить .docx»** в панели документа: сохраняет средствами RDE в `exports/` (WordCraft-autosave отключён — решения о сохранении принимает RDE). Пока это экспорт, а не `.doc.rde`-проект |
+| Сохранение | **одна кнопка «Экспорт .docx»** в верхней панели: RDE сохраняет текущий документ в `demo-project/exports/`; WordCraft-autosave отключён — решения о сохранении принимает RDE. Пока это экспорт; «Сохранить проект» (`.doc.rde`, транзакции) — M3 |
 | DAG артефактов | **реальный**: узлы/статусы из манифестов, рёбра — из `hashed`-групп; причины устаревания показаны |
 | Панель агента (ACP/DSH), предложения, tool-calls; вкладки «Структура»/«Код документа» | mock (следующие вехи) |
 | Панели (дерево, агент, журнал) | скрываются: × в заголовке панели или меню «Вид» |
@@ -65,6 +65,7 @@ cargo run -p rde-ui --example screenshot -- /tmp/rde-concept.png [document|artif
 rde/
   apps/rde/            # eframe-приложение (окно)
   crates/rde-core/     # модель проекта: манифесты, JSON Schema, загрузчик, статусы
+  crates/rde-hash/     # канонизация, Merkle-деревья, group/in/script/params/env → act_key (M2.2)
   crates/rde-ui/       # каркас UI + DocView WordCraft + панели на модели проекта
   demo-project/        # демо-проект: rde.toml, objects/{artifacts,documents,sources,notes,repos}
   docs/schema/         # сгенерированные JSON Schema манифестов (rde-core examples/dump-schemas)
