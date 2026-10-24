@@ -1,0 +1,5 @@
+schema = "rde/repo@1"
+id = "01M5VJ1JG0HX6XV8A99HSWY9BD"
+title = "sim-data"
+kind = "external"
+path = "~/src/sim-data"

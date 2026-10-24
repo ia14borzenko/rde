@@ -1,0 +1,26 @@
+schema = "rde/artifact@1"
+id = "01M5VJ1JG039MMV97SZGY6V9EQ"
+title = "Статистики реализаций"
+type = "compute"
+rebuild = "manual"
+timeout_s = 120
+network_allow = false
+
+outputs = ["out/stats.json"]
+
+[runtime]
+kind = "python"
+env = "project"
+entry = "script.py"
+
+[params]
+window = 128
+method = "welch"
+
+
+[[groups]]
+name = "realizations"
+mode = "hashed"
+inputs = [
+  { artifact = "01M5VJ1JG0HD99FDTGJ8YEPFZX", selector = "inputs/experiment.csv" },
+]

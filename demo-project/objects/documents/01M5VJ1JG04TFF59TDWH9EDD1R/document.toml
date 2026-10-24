@@ -1,0 +1,5 @@
+schema = "rde/document@1"
+id = "01M5VJ1JG04TFF59TDWH9EDD1R"
+title = "Отчёт по НИР (демо)"
+template = "free"
+file = "report.docx"

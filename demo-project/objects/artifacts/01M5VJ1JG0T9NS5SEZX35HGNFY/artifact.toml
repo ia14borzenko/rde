@@ -1,0 +1,16 @@
+schema = "rde/artifact@1"
+id = "01M5VJ1JG0T9NS5SEZX35HGNFY"
+title = "Константы проекта"
+type = "constants"
+
+[values.R_n]
+value = 12.4
+unit = "Ом"
+display = "R_н"
+style = "italic-subscript"
+
+[values.f_s]
+value = 1000.0
+unit = "Гц"
+display = "f_с"
+style = "italic-subscript"

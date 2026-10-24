@@ -1,0 +1,5 @@
+# локальное состояние проекта
+/.rde/
+/exports/
+objects/*/*/out/
+__pycache__/

@@ -1,0 +1,11 @@
+schema = "rde/source@1"
+id = "01M5VJ1JG0YSC5XMTFWMX0JS9K"
+title = "ГОСТ 7.32-2017 — реестр Росстандарта"
+kind = "url"
+url = "https://protect.gost.ru/gost/details/7d280e43-7036-4a69-8e6e-d15867028343"
+retrieved_at = "2026-10-24"
+
+[reference]
+designation = "ГОСТ 7.32-2017"
+year = 2017
+kind = "standard"

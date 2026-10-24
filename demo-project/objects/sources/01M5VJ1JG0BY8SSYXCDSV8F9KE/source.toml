@@ -1,0 +1,11 @@
+schema = "rde/source@1"
+id = "01M5VJ1JG0BY8SSYXCDSV8F9KE"
+title = "Cumming & Wong, гл. 7 — конспект"
+kind = "file"
+file = "files/cumming-wong-ch7-notes.md"
+
+[reference]
+authors = ["Cumming, I. G.", "Wong, F. H."]
+title = "Digital Processing of Synthetic Aperture Radar Data"
+year = 2005
+kind = "book"

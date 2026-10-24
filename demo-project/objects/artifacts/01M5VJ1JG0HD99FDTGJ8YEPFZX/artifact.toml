@@ -1,0 +1,11 @@
+schema = "rde/artifact@1"
+id = "01M5VJ1JG0HD99FDTGJ8YEPFZX"
+title = "Реализации случайного процесса"
+type = "data"
+
+[[groups]]
+name = "data"
+mode = "hashed"
+inputs = [
+  { file = "inputs/experiment.csv" },
+]

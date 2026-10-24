@@ -1,0 +1,21 @@
+schema = "rde/artifact@1"
+id = "01M5VJ1JG0QQJM2S6R76FQCZ25"
+title = "График статистик"
+type = "compute"
+rebuild = "manual"
+timeout_s = 120
+
+outputs = ["out/plot.svg"]
+
+[runtime]
+kind = "python"
+env = "project"
+entry = "script.py"
+
+
+[[groups]]
+name = "stats"
+mode = "hashed"
+inputs = [
+  { artifact = "01M5VJ1JG039MMV97SZGY6V9EQ", selector = "out/stats.json" },
+]
