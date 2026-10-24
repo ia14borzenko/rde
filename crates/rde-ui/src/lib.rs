@@ -13,7 +13,7 @@
 //! (см. `.agent/plan-v01.md`).
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
@@ -173,6 +173,8 @@ pub struct RdeApp {
     doc_mode: DocMode,
     editor: Option<EmbeddedEditor>,
     editor_error: Option<String>,
+    /// Куда RDE сохраняет явные экспорты (редактор пока работает с временной копией).
+    export_dir: PathBuf,
 }
 
 impl RdeApp {
@@ -195,7 +197,30 @@ impl RdeApp {
             doc_mode: DocMode::DocView,
             editor: None,
             editor_error: None,
+            export_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("exports"),
         }
+    }
+
+    /// Сохранить текущее содержимое встроенного редактора средствами RDE (владелец сохранения — RDE).
+    /// Пока это .docx-экспорт в `exports/`; сохранение в `.doc.rde`/проект появится с `rde:doc`.
+    pub fn save_editor_copy(&mut self) {
+        let msg = {
+            let Some(ed) = &self.editor else {
+                return;
+            };
+            let dir = self.export_dir.clone();
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    let path = dir.join("demo-report-edited.docx");
+                    match wordcraft_engine::io::save_path(&path, &ed.app.session.doc) {
+                        Ok(()) => (Level::Ok, format!("Документ сохранён RDE: {}", path.display())),
+                        Err(e) => (Level::Warn, format!("Не удалось сохранить документ: {e}")),
+                    }
+                }
+                Err(e) => (Level::Warn, format!("Не удалось создать каталог {}: {e}", dir.display())),
+            }
+        };
+        self.push_log(msg.0, msg.1);
     }
 
     /// Лениво создать встроенный редактор WordCraft с тем же документом, что и предпросмотр.
@@ -219,6 +244,8 @@ impl RdeApp {
                 let mut app = wordcraft_ui_egui::WordApp::new(session, wordcraft_ui_egui::Services::default());
                 app.integrated_titlebar = false;
                 app.ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
+                // RDE owns saving: no WordCraft autosave recovery writes behind its back.
+                app.autosave = false;
                 self.editor = Some(EmbeddedEditor { app });
             }
             Err(e) => self.editor_error = Some(e),
@@ -613,6 +640,7 @@ impl RdeApp {
         let mut mode = self.doc_mode;
         let mut update_inserts = false;
         let mut zoom_action: Option<&'static str> = None;
+        let mut save_action = false;
         if mode != DocMode::Preview {
             self.ensure_editor();
         }
@@ -643,6 +671,10 @@ impl RdeApp {
                             zoom_action = Some("view.pageWidth");
                         }
                         ui.separator();
+                        if ui.button(RichText::new("Сохранить .docx").size(12.0)).clicked() {
+                            save_action = true;
+                        }
+                        ui.separator();
                     }
                 }
                 DocMode::Preview => {
@@ -664,6 +696,9 @@ impl RdeApp {
         self.doc_mode = mode;
         if let (Some(id), Some(ed)) = (zoom_action, &mut self.editor) {
             let _ = ed.app.run(id, serde_json::json!({}));
+        }
+        if save_action {
+            self.save_editor_copy();
         }
         match mode {
             DocMode::DocView => {
@@ -1071,4 +1106,67 @@ fn install_style(ctx: &egui::Context) {
         style.spacing.button_padding = vec2(9.0, 3.0);
         style.spacing.interact_size.y = 24.0;
     });
+}
+
+#[cfg(test)]
+mod docview_tests {
+    use super::{DocMode, RdeApp};
+
+    /// S5-полировка: клавиатурный ввод доходит до встроенного DocView, а сохраняет документ RDE.
+    #[test]
+    fn docview_receives_keyboard_input_and_rde_saves() {
+        let mut app = RdeApp::new(rde_core::demo());
+        app.doc_mode = DocMode::DocView;
+        app.export_dir = std::env::temp_dir().join(format!("rde-ui-test-{}", std::process::id()));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(
+                |ui, app: &mut RdeApp| {
+                    app.ui(ui);
+                },
+                app,
+            );
+        for _ in 0..8 {
+            harness.step();
+        }
+        // Клик по странице: canvas получает клавиатурный фокус.
+        let pos = egui::pos2(800.0, 500.0);
+        harness.event(egui::Event::PointerMoved(pos));
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness.event(egui::Event::Text("RDE".to_owned()));
+        for _ in 0..4 {
+            harness.step();
+        }
+        let text = harness
+            .state()
+            .editor
+            .as_ref()
+            .expect("встроенный редактор должен открыться")
+            .app
+            .session
+            .doc
+            .plain_text(wordcraft_engine::doc::StoryRef::Body);
+        assert!(text.contains("RDE"), "набранный текст не дошёл до документа: {text:.120}");
+
+        // Сохранение под контролем RDE: явный .docx-экспорт в export_dir.
+        harness.state_mut().save_editor_copy();
+        let out = harness.state().export_dir.join("demo-report-edited.docx");
+        assert!(out.is_file(), "RDE-сохранение не создало {}", out.display());
+        let _ = std::fs::remove_dir_all(&harness.state().export_dir);
+    }
 }
