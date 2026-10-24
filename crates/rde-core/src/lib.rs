@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 pub mod manifest;
+pub mod ops;
 pub mod project;
 
 pub use manifest::{
@@ -19,6 +20,7 @@ pub use manifest::{
     ManifestKind, NoteManifest, ProjectManifest, ReferenceManifest, RepositoryManifest,
     RuntimeManifest, SourceManifest,
 };
+pub use ops::{CreateRequest, NewObjectKind, create_object, delete_object, rename_object};
 pub use project::{
     Freshness, Group, Issue, Level, LogLine, Object, ObjectData, ObjectKind, Project, load_project,
 };
@@ -65,9 +67,33 @@ mod tests {
         dir
     }
 
+    fn copy_demo_without_generated_state(target: &std::path::Path) {
+        fn copy(src: &std::path::Path, dst: &std::path::Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for entry in std::fs::read_dir(src).unwrap().flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if matches!(&*name, ".rde" | "exports" | "__pycache__" | "out") {
+                    continue;
+                }
+                let path = entry.path();
+                let to = dst.join(&*name);
+                if path.is_dir() {
+                    copy(&path, &to);
+                } else {
+                    std::fs::copy(&path, &to).unwrap();
+                }
+            }
+        }
+        copy(&demo_project_dir(), target);
+    }
+
     #[test]
     fn demo_project_loads_and_has_expected_objects() {
-        let project = demo();
+        // Копия без .rde/out: тест не зависит от того, запускал ли кто-то артефакты в рабочем demo-project.
+        let dir = unique_tmp("demo-copy");
+        copy_demo_without_generated_state(&dir);
+        let project = load_project(&dir).unwrap();
         assert!(project.issues.is_empty(), "issues: {:?}", project.issues);
         assert_eq!(
             project.object_count(),
