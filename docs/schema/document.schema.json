@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`document.toml` — манифест документа.",
+  "properties": {
+    "file": {
+      "description": "Рабочий файл документа (в M3 — `.doc.rde`, пока `.docx`).",
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "template": {
+      "default": "",
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "id",
+    "title",
+    "file"
+  ],
+  "title": "DocumentManifest",
+  "type": "object"
+}

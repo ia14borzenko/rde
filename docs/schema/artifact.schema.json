@@ -1,0 +1,210 @@
+{
+  "$defs": {
+    "ConstantValue": {
+      "description": "Значение константы проекта (тип `constants`).",
+      "properties": {
+        "display": {
+          "default": "",
+          "type": "string"
+        },
+        "style": {
+          "default": "",
+          "description": "Подсказка форматирования (например, `italic-subscript` для `R_н`).",
+          "type": "string"
+        },
+        "unit": {
+          "default": "",
+          "type": "string"
+        },
+        "value": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "type": "object"
+    },
+    "GroupManifest": {
+      "description": "Группа зависимостей артефакта (`hashed` — влияет на хеш/каскад, `ref` — только provenance).",
+      "properties": {
+        "inputs": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/InputSpec"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "default": "hashed",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "InputSpec": {
+      "anyOf": [
+        {
+          "properties": {
+            "artifact": {
+              "type": "string"
+            },
+            "selector": {
+              "default": "",
+              "type": "string"
+            }
+          },
+          "required": [
+            "artifact"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "file": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "file"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "note": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "note"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "Вход артефакта: ссылка на выход другого артефакта, файл, заметка или источник."
+    },
+    "RuntimeManifest": {
+      "description": "Окружение исполнения скрипта артефакта.",
+      "properties": {
+        "entry": {
+          "description": "Относительный путь к исполняемому файлу артефакта.",
+          "type": "string"
+        },
+        "env": {
+          "default": "project",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`python` | `shell` | `node` | `r`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "entry"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`artifact.toml` — манифест артефакта (`compute`, `data` или `constants`).",
+  "properties": {
+    "groups": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/GroupManifest"
+      },
+      "type": "array"
+    },
+    "id": {
+      "type": "string"
+    },
+    "network_allow": {
+      "default": null,
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "outputs": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "params": {
+      "default": null,
+      "description": "Произвольные параметры запуска (входят в `params_hash` в M2.3)."
+    },
+    "rebuild": {
+      "default": "",
+      "type": "string"
+    },
+    "runtime": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RuntimeManifest"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "schema": {
+      "type": "string"
+    },
+    "timeout_s": {
+      "default": null,
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "type": {
+      "description": "`compute` | `data` | `constants`.",
+      "type": "string"
+    },
+    "values": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ConstantValue"
+      },
+      "default": {},
+      "description": "Для `type = \"constants\"`: типизированные значения проекта.",
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "id",
+    "title",
+    "type"
+  ],
+  "title": "ArtifactManifest",
+  "type": "object"
+}

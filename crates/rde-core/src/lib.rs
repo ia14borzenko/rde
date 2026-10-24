@@ -1,229 +1,173 @@
-//! RDE project model — prototype scope.
+//! RDE project model (M2.1): типизированные TOML-манифесты, JSON Schema, загрузка проекта.
 //!
-//! Сейчас это статическая модель демонстрационного проекта: дерево объектов,
-//! статусы свежести и журнал. Настоящие `rde.toml`/`artifact.toml`, CAS, DAG и
-//! транзакции появятся в следующих итерациях (см. `.agent/plan-v01.md`, В2–В4);
-//! интерфейс этого крейта намеренно беден, чтобы UI не зависел от деталей.
+//! Канон формата — `tz-02` §8.3; реализовано подмножество v0.1. Модель всегда пересоздаётся из
+//! файлов проекта (source of truth — файлы, как требует ТЗ §8.4), поэтому здесь нет состояния
+//! редактирования: только чтение/валидация/факты и статусы.
+//!
+//! ```
+//! let project = rde_core::demo();
+//! assert!(!project.groups.is_empty());
+//! ```
 
 use std::path::PathBuf;
 
-/// Тип объекта дерева проекта (фиксированный набор v0.x, см. tz-02 R-TREE-01).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ObjectKind {
-    Document,
-    Artifact,
-    Constants,
-    Source,
-    Note,
-    Repository,
-}
+pub mod manifest;
+pub mod project;
 
-impl ObjectKind {
-    pub fn label_ru(self) -> &'static str {
-        match self {
-            ObjectKind::Document => "Документы",
-            ObjectKind::Artifact => "Артефакты",
-            ObjectKind::Constants => "Константы",
-            ObjectKind::Source => "Источники",
-            ObjectKind::Note => "Заметки",
-            ObjectKind::Repository => "Репозитории",
+pub use manifest::{
+    ArtifactManifest, AuthorManifest, ConstantValue, DocumentManifest, GroupManifest, InputSpec,
+    ManifestKind, NoteManifest, ProjectManifest, ReferenceManifest, RepositoryManifest,
+    RuntimeManifest, SourceManifest,
+};
+pub use project::{
+    Freshness, Group, Issue, Level, LogLine, Object, ObjectData, ObjectKind, Project, load_project,
+};
+
+/// Каталог демо-проекта по умолчанию.
+///
+/// `RDE_PROJECT` (или `RDE_DEMO_PROJECT`) переопределяет путь; иначе ищется `demo-project/`
+/// вверх от текущего каталога, затем — рядом с крейтом (`rde/demo-project`).
+pub fn demo_project_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("RDE_PROJECT").or_else(|| std::env::var_os("RDE_DEMO_PROJECT")) {
+        return PathBuf::from(dir);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        for base in cwd.ancestors() {
+            let candidate = base.join("demo-project");
+            if candidate.join("rde.toml").is_file() {
+                return candidate;
+            }
         }
     }
-
-    /// Символ-иконка: без внешних ассетов, чтобы не тащить icon-библиотеки в прототип.
-    /// Короткая буквенная метка типа (глифы-иконки не во всех шрифтах).
-    pub fn icon(self) -> &'static str {
-        match self {
-            ObjectKind::Document => "Д",
-            ObjectKind::Artifact => "А",
-            ObjectKind::Constants => "π",
-            ObjectKind::Source => "И",
-            ObjectKind::Note => "З",
-            ObjectKind::Repository => "R",
-        }
-    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../demo-project")
 }
 
-/// Свежесть/целостность объекта (упрощение `stale` из tz-02 §7.3).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Freshness {
-    UpToDate,
-    Stale,
-    Failed,
-    External,
-}
-
-impl Freshness {
-    pub fn label_ru(self) -> &'static str {
-        match self {
-            Freshness::UpToDate => "актуален",
-            Freshness::Stale => "устарел",
-            Freshness::Failed => "ошибка",
-            Freshness::External => "внешний",
-        }
-    }
-}
-
-/// Объект дерева проекта.
-#[derive(Clone, Debug)]
-pub struct Object {
-    pub id: String,
-    pub title: String,
-    pub kind: ObjectKind,
-    pub freshness: Freshness,
-    pub detail: String,
-}
-
-impl Object {
-    fn new(id: &str, title: &str, kind: ObjectKind, freshness: Freshness, detail: &str) -> Self {
-        Self {
-            id: id.to_owned(),
-            title: title.to_owned(),
-            kind,
-            freshness,
-            detail: detail.to_owned(),
-        }
-    }
-}
-
-/// Группа объектов одного типа.
-#[derive(Clone, Debug)]
-pub struct Group {
-    pub kind: ObjectKind,
-    pub title: &'static str,
-    pub objects: Vec<Object>,
-}
-
-/// Уровень строки журнала.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Level {
-    Info,
-    Ok,
-    Warn,
-}
-
-/// Строка журнала проекта/обновлений.
-#[derive(Clone, Debug)]
-pub struct LogLine {
-    pub time: &'static str,
-    pub level: Level,
-    pub text: String,
-}
-
-/// Демонстрационный проект RDE.
-#[derive(Clone, Debug)]
-pub struct Project {
-    pub name: String,
-    pub root: String,
-    pub branch: String,
-    pub updated: String,
-    pub groups: Vec<Group>,
-    pub stale: usize,
-    pub figures: usize,
-    /// Путь к демонстрационному `.docx` (в реальном проекте — объект-документ).
-    pub docx: PathBuf,
-    pub document_title: String,
-    pub document_pages: usize,
-    pub document_paragraphs: usize,
-    pub log: Vec<LogLine>,
-}
-
-impl Project {
-    /// Путь к демонстрационному `.docx` (фикстура репозитория).
-    pub fn demo_docx_path(&self) -> PathBuf {
-        self.docx.clone()
-    }
-
-    /// Всего объектов в дереве.
-    pub fn object_count(&self) -> usize {
-        self.groups.iter().map(|g| g.objects.len()).sum()
-    }
-}
-
-/// Путь к фикстуре демо-документа. `RDE_DEMO_DOC` переопределяет (удобно для тестов и скриншотов).
-pub fn demo_docx_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("RDE_DEMO_DOC") {
-        return PathBuf::from(p);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo-report.docx")
-}
-
-/// Демонстрационный проект: отражает целевой UX RDE (дерево, DAG-статусы, вставки, агент).
+/// Демо-проект (паникует, если он сломан — это ошибка репозитория, а не пользовательского ввода).
 pub fn demo() -> Project {
-    let groups = vec![
-        Group {
-            kind: ObjectKind::Document,
-            title: "Документы",
-            objects: vec![Object::new(
-                "doc-report",
-                "Отчёт по НИР (демо)",
-                ObjectKind::Document,
-                Freshness::UpToDate,
-                "2 страницы · 1 рисунок",
-            )],
-        },
-        Group {
-            kind: ObjectKind::Artifact,
-            title: "Артефакты",
-            objects: vec![
-                Object::new("art-realizations", "realizations.csv", ObjectKind::Artifact, Freshness::UpToDate, "вход · 4 файла"),
-                Object::new("art-stats", "stats (compute)", ObjectKind::Artifact, Freshness::Stale, "изменён script.py"),
-                Object::new("art-plot", "plot.svg / plot.png", ObjectKind::Artifact, Freshness::Stale, "выход · 2 файла"),
-            ],
-        },
-        Group {
-            kind: ObjectKind::Constants,
-            title: "Константы",
-            objects: vec![Object::new(
-                "const-rn",
-                "R_н — сопротивление нагрузки",
-                ObjectKind::Constants,
-                Freshness::UpToDate,
-                "12.4 Ом · вставок: 1",
-            )],
-        },
-        Group {
-            kind: ObjectKind::Source,
-            title: "Источники",
-            objects: vec![
-                Object::new("src-gost", "ГОСТ 7.32-2017", ObjectKind::Source, Freshness::UpToDate, "PDF · 41 стр."),
-                Object::new("src-cw", "Cumming & Wong, гл. 7", ObjectKind::Source, Freshness::UpToDate, "PDF · стр. 312–361"),
-                Object::new("note-chapter2", "Заметка к главе 2", ObjectKind::Note, Freshness::UpToDate, "md · 18 строк"),
-            ],
-        },
-        Group {
-            kind: ObjectKind::Repository,
-            title: "Репозитории",
-            objects: vec![Object::new(
-                "repo-simdata",
-                "sim-data",
-                ObjectKind::Repository,
-                Freshness::External,
-                "~/proj/rde-demo/sim-data",
-            )],
-        },
-    ];
+    let dir = demo_project_dir();
+    load_project(&dir).unwrap_or_else(|e| panic!("демо-проект {} не загружается: {e}", dir.display()))
+}
 
-    let log = vec![
-        LogLine { time: "21:12:03", level: Level::Warn, text: "stats: изменён script.py → устарел (in_hash)".into() },
-        LogLine { time: "21:12:03", level: Level::Warn, text: "plot.svg: устарел — изменился входной артефакт".into() },
-        LogLine { time: "21:12:04", level: Level::Info, text: "Документ «Отчёт по НИР»: устаревших вставок — 1 (рисунок 1)".into() },
-        LogLine { time: "21:12:05", level: Level::Ok, text: "Проект открыт: 2 страницы, 13 абзацев, 3 источника".into() },
-        LogLine { time: "21:12:06", level: Level::Info, text: "Агент: сессия ACP готова — dsh --profile acp · workspace-write · ask".into() },
-    ];
+/// Загрузить проект из каталога (внешние ошибки — `Err`, проблемы объектов — `Project::issues`).
+pub fn load(root: impl AsRef<std::path::Path>) -> Result<Project, String> {
+    load_project(root.as_ref())
+}
 
-    Project {
-        name: "Отчёт по НИР".to_owned(),
-        docx: demo_docx_path(),
-        root: "~/proj/rde-demo".to_owned(),
-        branch: "main".to_owned(),
-        updated: "2 мин назад".to_owned(),
-        groups,
-        stale: 2,
-        figures: 1,
-        document_title: "Отчёт по НИР (демо)".to_owned(),
-        document_pages: 2,
-        document_paragraphs: 13,
-        log,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::{self, ManifestKind};
+
+    fn unique_tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rde-core-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn demo_project_loads_and_has_expected_objects() {
+        let project = demo();
+        assert!(project.issues.is_empty(), "issues: {:?}", project.issues);
+        assert_eq!(
+            project.object_count(),
+            9,
+            "демо-проект: 1 документ + 4 артефакта + 2 источника + 1 заметка + 1 репозиторий"
+        );
+        // compute-артефакты без выходов честно «устарели»; данные/источники/заметки — актуальны/внешние.
+        assert_eq!(project.stale_count(), 2);
+        assert!(project.document_path().is_some_and(|p| p.is_file()));
+        assert_eq!(project.artifacts().count(), 4);
+        // Порядок артефактов топологический: realizations → stats → plot.
+        let artifacts: Vec<&str> = project.artifacts().map(|a| a.title.as_str()).collect();
+        let pos = |title: &str| artifacts.iter().position(|t| *t == title).unwrap();
+        assert!(pos("Реализации случайного процесса") < pos("Статистики реализаций"));
+        assert!(pos("Статистики реализаций") < pos("График статистик"));
+        // DAG: stats зависит от realizations.
+        let stats_id = project
+            .objects
+            .iter()
+            .find(|o| o.title == "Статистики реализаций")
+            .map(|o| o.id.clone())
+            .unwrap();
+        let real_id = project
+            .objects
+            .iter()
+            .find(|o| o.title == "Реализации случайного процесса")
+            .map(|o| o.id.clone())
+            .unwrap();
+        let edges = project.dag_edges();
+        assert!(edges.contains(&(real_id, stats_id)));
+        // Константа из artifact type=constants попадает в группу «Константы».
+        assert!(project.groups.iter().any(|g| g.kind == ObjectKind::Constants && !g.objects.is_empty()));
+        assert_eq!(project.figures(), 1);
+        assert!(!project.log.is_empty());
+    }
+
+    #[test]
+    fn broken_manifest_is_reported_not_fatal() {
+        let dir = unique_tmp("broken");
+        std::fs::write(
+            dir.join("rde.toml"),
+            "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"T\"\n",
+        )
+        .unwrap();
+        let art = dir.join("objects/artifacts/01M5VJ1JG0HD99FDTGJ8YEPFZX");
+        std::fs::create_dir_all(&art).unwrap();
+        // Нет обязательного title и неверный type.
+        std::fs::write(
+            art.join("artifact.toml"),
+            "schema = \"rde/artifact@1\"\nid = \"01M5VJ1JG0HD99FDTGJ8YEPFZX\"\ntype = \"nonsense\"\n",
+        )
+        .unwrap();
+        let project = load(&dir).expect("rde.toml валиден — загрузка не фатальна");
+        assert_eq!(project.object_count(), 0);
+        assert!(!project.issues.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_schema_rejects_bad_types() {
+        let good: toml::Value = toml::from_str(
+            "schema=\"rde/artifact@1\"\nid=\"01M5VJ1JG0HD99FDTGJ8YEPFZX\"\ntitle=\"A\"\ntype=\"compute\"\n",
+        )
+        .unwrap();
+        assert!(manifest::validate(ManifestKind::Artifact, &good).is_empty());
+        let bad: toml::Value =
+            toml::from_str("schema=\"rde/artifact@1\"\nid=42\ntitle=\"A\"\ntype=\"compute\"\n").unwrap();
+        assert!(!manifest::validate(ManifestKind::Artifact, &bad).is_empty());
+        // Все схемы генерируются и являются JSON-объектами.
+        for kind in [
+            ManifestKind::Project,
+            ManifestKind::Artifact,
+            ManifestKind::Document,
+            ManifestKind::Source,
+            ManifestKind::Note,
+            ManifestKind::Repository,
+        ] {
+            let schema = kind.schema();
+            assert!(schema.is_object(), "схема {} пуста", kind.file_name());
+        }
+    }
+
+    #[test]
+    fn wrong_schema_version_is_an_issue() {
+        let dir = unique_tmp("issue-schema");
+        std::fs::write(
+            dir.join("rde.toml"),
+            "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"T\"\n",
+        )
+        .unwrap();
+        let art = dir.join("objects/artifacts/01M5VJ1JG0HD99FDTGJ8YEPFZX");
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(
+            art.join("artifact.toml"),
+            "schema = \"rde/artifact@2\"\nid = \"01M5VJ1JG0QQJM2S6R76FQCZ25\"\ntitle = \"A\"\ntype = \"data\"\n",
+        )
+        .unwrap();
+        let project = load(&dir).unwrap();
+        assert_eq!(project.object_count(), 0, "несовместимая schema не должна загружаться");
+        assert!(project.issues.iter().any(|i| i.message.contains("schema")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

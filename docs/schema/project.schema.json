@@ -1,0 +1,67 @@
+{
+  "$defs": {
+    "AuthorManifest": {
+      "description": "Автор проекта (профиль; см. tz-02 §3.2).",
+      "properties": {
+        "email": {
+          "default": "",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "initials": {
+          "default": "",
+          "type": "string"
+        },
+        "kind": {
+          "default": "human",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`rde.toml` — манифест проекта.",
+  "properties": {
+    "authors": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AuthorManifest"
+      },
+      "type": "array"
+    },
+    "default_rebuild": {
+      "default": "manual",
+      "type": "string"
+    },
+    "default_template": {
+      "default": "",
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "schema": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "id",
+    "name"
+  ],
+  "title": "ProjectManifest",
+  "type": "object"
+}

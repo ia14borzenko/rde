@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`note.toml` — манифест заметки.",
+  "properties": {
+    "file": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "id",
+    "title",
+    "file"
+  ],
+  "title": "NoteManifest",
+  "type": "object"
+}

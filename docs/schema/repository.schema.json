@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`repo.toml` — манифест репозитория.",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "description": "`internal` | `external` | `git` (git-клоны — фаза 2).",
+      "type": "string"
+    },
+    "path": {
+      "description": "Путь: относительный внутри проекта или абсолютный (внешний).",
+      "type": "string"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "id",
+    "title",
+    "kind",
+    "path"
+  ],
+  "title": "RepositoryManifest",
+  "type": "object"
+}
