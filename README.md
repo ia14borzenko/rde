@@ -88,6 +88,7 @@ rde/
 - [`docs/adr/0001-repo-layout-and-build.md`](docs/adr/0001-repo-layout-and-build.md) — решения по
   репозиторию, вендорингу, CI, форк-политике.
 - [`docs/wordcraft-fork.md`](docs/wordcraft-fork.md) — журнал изменений WordCraft.
+- [`docs/state.md`](docs/state.md) — зафиксированное состояние проекта и форка (снимок 2026-10-24).
 - `.agent/tz-02.md` — ТЗ; `.agent/plan-v01.md` — детальный план; `refs/` — первоисточники (вне репо).
 
 Лицензия: MIT OR Apache-2.0, атрибуция сторонних компонентов — в [NOTICE](NOTICE).
