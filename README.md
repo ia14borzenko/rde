@@ -39,7 +39,7 @@ v0.10.0 (git-субмодуль).
 Тесты (включая автотест клавиатурного ввода в DocView и RDE-сохранения):
 
 ```bash
-cargo test -p rde-core -p rde-ui    # модель/схемы/загрузка проекта + ввод и сохранение DocView
+cargo test -p rde-core -p rde-hash -p rde-store -p rde-ui   # модель, хеши, хранилище (kill -9), DocView
 ```
 
 ```bash
@@ -50,6 +50,13 @@ cargo run -p rde -- --project <каталог>   # открыть другой �
 ```
 
 Форк-ветка WordCraft: <https://github.com/ia14borzenko/wordcraft-rde> (ветка `rde/main`).
+
+Хранилище проекта (CAS/журнал) — можно посмотреть без окна:
+
+```bash
+CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target cargo run -p rde-store --example demo
+# создаст demo-project/.rde/{cas,trees,index.db} и напечатает статистику
+```
 
 ### Концепт-скриншот без видимого окна (headless)
 
@@ -66,6 +73,7 @@ rde/
   apps/rde/            # eframe-приложение (окно)
   crates/rde-core/     # модель проекта: манифесты, JSON Schema, загрузчик, статусы
   crates/rde-hash/     # канонизация, Merkle-деревья, group/in/script/params/env → act_key (M2.2)
+  crates/rde-store/    # CAS, атомарная запись, журнал транзакций, пересборка индекса (M2.2)
   crates/rde-ui/       # каркас UI + DocView WordCraft + панели на модели проекта
   demo-project/        # демо-проект: rde.toml, objects/{artifacts,documents,sources,notes,repos}
   docs/schema/         # сгенерированные JSON Schema манифестов (rde-core examples/dump-schemas)
