@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/rde", "crates/rde-core", "crates/rde-dag", "crates/rde-hash", "crates/rde-run", "crates/rde-store", "crates/rde-ui"]
+members = ["apps/rde", "crates/rde-core", "crates/rde-dag", "crates/rde-doc", "crates/rde-docx", "crates/rde-hash", "crates/rde-run", "crates/rde-store", "crates/rde-ui"]
 # WordCraft vendored as a submodule keeps its own Cargo workspace (workspace-inherited
 # dependencies like `chrono = { workspace = true }`); the outer workspace must not
 # claim it, or those fields would inherit from RDE's manifest.
@@ -20,6 +20,8 @@ toml = "1"
 schemars = "1"
 jsonschema = "0.60"
 ulid = "3"
+zip = { version = "3", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
 sha2 = "0.11"
 rusqlite = { version = "0.41", features = ["bundled"] }
 
@@ -33,6 +35,8 @@ eframe = { version = "0.36.2", default-features = false, features = [
 ] }
 rde-core = { path = "crates/rde-core" }
 rde-dag = { path = "crates/rde-dag" }
+rde-doc = { path = "crates/rde-doc" }
+rde-docx = { path = "crates/rde-docx" }
 rde-hash = { path = "crates/rde-hash" }
 rde-run = { path = "crates/rde-run" }
 rde-store = { path = "crates/rde-store" }
