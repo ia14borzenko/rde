@@ -10,7 +10,7 @@ egui = { workspace = true }
 rde-core = { workspace = true }
 wordcraft-engine = { workspace = true }
 wordcraft-ui-egui = { path = "../../vendor/wordcraft/crates/ui-egui", features = ["rde-docview"] }
-serde_json = "1"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu"] }

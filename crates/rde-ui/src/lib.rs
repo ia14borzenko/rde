@@ -6,18 +6,19 @@
 //! **по-настоящему**: `.docx` читается движком WordCraft, размечается его
 //! layout-движком и растеризуется в текстуры страниц.
 //!
-//! Что здесь демонстрационное (mock), а что настоящее:
-//! - настоящее: рендер страниц документа, экспорт-путь WordCraft (позже), каркас панелей;
-//! - mock: дерево объектов, DAG и статусы, журнал, чат агента, вкладки «Структура»/«Источник»/«Код».
-//! Следующие итерации заменяют mock-данные на `rde-core`/`rde-store`/`rde-dag`
-//! (см. `.agent/plan-v01.md`).
+//! Что здесь настоящее (M2.1), а что ещё mock:
+//! - настоящее: дерево/статусы/журнал/источники загружаются из реального проекта на диске
+//!   (`rde.toml` + `objects/**`); документ рендерится/редактируется движком WordCraft;
+//!   DAG-панель рисуется по реальным `hashed`-зависимостям манифестов;
+//! - mock: чат агента, вкладки «Структура»/«Код документа», «Обновить связанные» —
+//!   заменяются в M2.2/M2.3 (store/CAS, hash/DAG, run).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
-use rde_core::{Freshness, Level, Project};
+use rde_core::{Freshness, Level, ObjectData, Project};
 
 pub const APP_TITLE: &str = "RDE — Research Development Environment";
 
@@ -82,20 +83,25 @@ struct ReadyDoc {
 
 /// Предпросмотр документа: ленивая загрузка и растеризация страниц движком WordCraft.
 struct DocPreview {
-    path: std::path::PathBuf,
+    path: Option<std::path::PathBuf>,
     state: DocState,
 }
 
 impl DocPreview {
-    fn new(path: std::path::PathBuf) -> Self {
-        Self { path, state: DocState::Pending }
+    fn new(path: Option<std::path::PathBuf>) -> Self {
+        let state = if path.is_some() { DocState::Pending } else { DocState::Failed("в проекте нет документа".to_owned()) };
+        Self { path, state }
     }
 
     fn ensure(&mut self, ctx: &egui::Context) {
         if !matches!(self.state, DocState::Pending) {
             return;
         }
-        match load_and_render(&self.path, ctx) {
+        let Some(path) = self.path.clone() else {
+            self.state = DocState::Failed("в проекте нет документа".to_owned());
+            return;
+        };
+        match load_and_render(&path, ctx) {
             Ok((pages, page_pt, count)) => self.state = DocState::Ready(ReadyDoc { pages, page_pt, count }),
             Err(e) => self.state = DocState::Failed(e),
         }
@@ -152,6 +158,7 @@ impl DocMode {
 /// Встроенный редактор WordCraft: полноценный `WordApp` (ribbon + canvas + ввод).
 struct EmbeddedEditor {
     app: wordcraft_ui_egui::WordApp,
+    pages: usize,
 }
 
 /// Приложение прототипа RDE.
@@ -179,7 +186,8 @@ pub struct RdeApp {
 
 impl RdeApp {
     pub fn new(project: Project) -> Self {
-        let doc = DocPreview::new(project.demo_docx_path());
+        let doc = DocPreview::new(project.document_path());
+        let export_dir = project.root.join("exports");
         Self {
             project,
             tab: Tab::Document,
@@ -197,8 +205,31 @@ impl RdeApp {
             doc_mode: DocMode::DocView,
             editor: None,
             editor_error: None,
-            export_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("exports"),
+            export_dir,
         }
+    }
+
+    /// Для демо/скриншотов: переключить центральную вкладку по имени
+    /// (`document|structure|artifacts|source|code`).
+    pub fn demo_select_tab(&mut self, name: &str) {
+        self.tab = match name {
+            "structure" => Tab::Structure,
+            "artifacts" => Tab::Artifacts,
+            "source" => Tab::Source,
+            "code" => Tab::Code,
+            _ => Tab::Document,
+        };
+    }
+
+    /// Сколько страниц в документе (из редактора или предпросмотра), если известно.
+    fn doc_pages(&self) -> Option<usize> {
+        if let Some(ed) = &self.editor {
+            return Some(ed.pages);
+        }
+        if let DocState::Ready(doc) = &self.doc.state {
+            return Some(doc.count);
+        }
+        None
     }
 
     /// Сохранить текущее содержимое встроенного редактора средствами RDE (владелец сохранения — RDE).
@@ -228,15 +259,19 @@ impl RdeApp {
         if self.editor.is_some() || self.editor_error.is_some() {
             return;
         }
+        let Some(doc_path) = self.doc.path.clone() else {
+            self.editor_error = Some("в проекте нет документа".to_owned());
+            return;
+        };
         let region = wordcraft_engine::Region::from_tag("ru-RU");
         // Встроенный WordApp умеет сам сохранять документ (autosave/сохранение при выходе).
         // Пока у RDE нет своего слоя сохранения проекта (rde:doc/транзакции — следующая веха),
         // открываем временную копию: правки редактора не могут испортить файлы проекта.
         let copy = std::env::temp_dir().join("rde-embedded-doc.docx");
-        if let Ok(bytes) = std::fs::read(&self.doc.path) {
+        if let Ok(bytes) = std::fs::read(&doc_path) {
             let _ = std::fs::write(&copy, bytes);
         }
-        let edit_path = if copy.is_file() { copy } else { self.doc.path.clone() };
+        let edit_path = if copy.is_file() { copy } else { doc_path };
         match wordcraft_engine::io::open_path_in(&edit_path, None, &region) {
             Ok((doc, _encrypted)) => {
                 let mut session = wordcraft_engine::Session::new(doc);
@@ -246,7 +281,8 @@ impl RdeApp {
                 app.ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
                 // RDE owns saving: no WordCraft autosave recovery writes behind its back.
                 app.autosave = false;
-                self.editor = Some(EmbeddedEditor { app });
+                let pages = app.session.layout().pages.len();
+                self.editor = Some(EmbeddedEditor { app, pages });
             }
             Err(e) => self.editor_error = Some(e),
         }
@@ -361,7 +397,7 @@ impl RdeApp {
                     }
                     let _ = ui.button(RichText::new("Поиск").size(13.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("• {} устаревших · документ: 2 вставки", self.project.stale)).small().color(AMBER));
+                        ui.label(RichText::new(format!("• {} устаревших объектов", self.project.stale_count())).small().color(AMBER));
                         ui.separator();
                         ui.label(RichText::new("MCP: off").small().color(MUTED));
                     });
@@ -388,15 +424,15 @@ impl RdeApp {
                     ui.label(RichText::new("•  RDE").color(ACCENT).size(11.0));
                     ui.label(RichText::new("прототип v0.1").small().color(MUTED));
                     ui.separator();
-                    ui.label(RichText::new(&self.project.root).small().color(MUTED));
+                    ui.label(RichText::new(self.project.root.display().to_string()).small().color(MUTED));
                     ui.separator();
-                    ui.label(RichText::new(format!("git: {} · чистый", self.project.branch)).small().color(MUTED));
+                    ui.label(RichText::new(format!("git: {}", self.project.branch)).small().color(MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new("A4 · ru-RU").small().color(MUTED));
                         ui.separator();
                         ui.label(RichText::new(format!("{} объектов", self.project.object_count())).small().color(MUTED));
                         ui.separator();
-                        ui.label(RichText::new(format!("• {} устаревших", self.project.stale)).small().color(AMBER));
+                        ui.label(RichText::new(format!("• {} устаревших", self.project.stale_count())).small().color(AMBER));
                         ui.separator();
                         ui.label(RichText::new("Агент: ожидает").small().color(GREEN));
                     });
@@ -459,6 +495,7 @@ impl RdeApp {
     // ── дерево проекта ──────────────────────────────────────────────────────
     fn tree_panel(&mut self, ui: &mut egui::Ui) {
         let groups = self.project.groups.clone();
+        let objects = self.project.objects.clone();
         let object_count = self.project.object_count();
         let filter = self.tree_filter.to_lowercase();
         let selected = self.selected.clone();
@@ -493,15 +530,17 @@ impl RdeApp {
                     for group in &groups {
                         let header = RichText::new(format!("{}  {}", group.kind.icon(), group.title)).strong().size(12.5).color(TEXT);
                         egui::CollapsingHeader::new(header).default_open(true).show(ui, |ui| {
-                            for obj in &group.objects {
+                            for &idx in &group.objects {
+                                let Some(obj) = objects.get(idx) else {
+                                    continue;
+                                };
                                 if !filter.is_empty() && !obj.title.to_lowercase().contains(&filter) {
                                     continue;
                                 }
                                 let is_sel = selected.as_deref() == Some(obj.id.as_str());
-                                let color = freshness_color(obj.freshness);
                                 let resp = ui
                                     .horizontal(|ui| {
-                                        ui.label(RichText::new("•").color(color).size(13.0));
+                                        ui.label(RichText::new("•").color(freshness_color(obj.freshness)).size(13.0));
                                         ui.label(RichText::new(obj.kind.icon()).color(MUTED).size(12.0));
                                         ui.selectable_label(is_sel, RichText::new(&obj.title).size(13.0))
                                     })
@@ -523,7 +562,7 @@ impl RdeApp {
             self.selected = Some(id);
         }
         if new_object {
-            self.push_log(Level::Info, "Создание объекта: мастер появится вместе с rde-core");
+            self.push_log(Level::Info, "Создание объекта: мастер появится вместе с rde-store (M2.2)");
         }
     }
 
@@ -617,12 +656,15 @@ impl RdeApp {
                         ui.add_space(2.0);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.project.stale > 0 {
-                            ui.label(RichText::new(format!("• {} устаревшие вставки", self.project.stale)).small().color(AMBER));
+                        let stale = self.project.stale_count();
+                        if stale > 0 {
+                            ui.label(RichText::new(format!("• {stale} устаревших объектов")).small().color(AMBER));
                         } else {
-                            ui.label(RichText::new("• документ актуален").small().color(GREEN));
+                            ui.label(RichText::new("• проект актуален").small().color(GREEN));
                         }
-                        ui.label(RichText::new(format!("{} стр. · A4", self.project.document_pages)).small().color(MUTED));
+                        if let Some(pages) = self.doc_pages() {
+                            ui.label(RichText::new(format!("{pages} стр. · A4")).small().color(MUTED));
+                        }
                     });
                 });
                 ui.separator();
@@ -688,9 +730,6 @@ impl RdeApp {
                     let _ = ui.button(RichText::new("Открыть копию в Word").size(12.0));
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("Документ: демо-отчёт · 2 страницы").small().color(MUTED));
-            });
         });
         ui.separator();
         self.doc_mode = mode;
@@ -829,10 +868,23 @@ impl RdeApp {
 
     fn artifacts_tab(&mut self, ui: &mut egui::Ui) {
         let mut refresh = false;
+        let artifacts: Vec<rde_core::Object> = self
+            .project
+            .objects
+            .iter()
+            .filter(|o| matches!(&o.data, ObjectData::Artifact(a) if a.kind != "constants"))
+            .cloned()
+            .collect();
+        let edges = self.project.dag_edges();
+        let stale: Vec<(String, String)> = artifacts
+            .iter()
+            .filter(|o| matches!(o.freshness, Freshness::Stale | Freshness::Failed))
+            .map(|o| (o.title.clone(), o.detail.clone()))
+            .collect();
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.label(RichText::new("DAG артефактов").strong().color(TEXT));
-            ui.label(RichText::new(format!("{} устаревших", self.project.stale)).small().color(AMBER));
+            ui.label(RichText::new(format!("{} устаревших", stale.len())).small().color(AMBER));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(RichText::new("Обновить связанные").size(12.0)).clicked() {
                     refresh = true;
@@ -840,67 +892,119 @@ impl RdeApp {
             });
         });
         ui.separator();
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 250.0), Sense::hover());
+        if artifacts.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(RichText::new("В проекте нет артефактов").color(MUTED));
+            });
+            return;
+        }
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 240.0), Sense::hover());
         let painter = ui.painter_at(rect);
+        let n = artifacts.len().min(4);
         let nw = 178.0;
         let nh = 62.0;
         let margin = 26.0;
-        let step = (rect.width() - 2.0 * margin - nw) / 3.0;
-        let y = rect.top() + 64.0;
-        let node = |i: usize| Rect::from_min_size(pos2(rect.left() + margin + step * i as f32, y), vec2(nw, nh));
-        let n0 = node(0);
-        let n1 = node(1);
-        let n2 = node(2);
-        let n3 = node(3);
-        draw_node(&painter, n0, "realizations.csv", "data · 4 файла", GREEN, "актуален");
-        draw_node(&painter, n1, "stats (compute)", "script.py · params", AMBER, "устарел");
-        draw_node(&painter, n2, "plot.svg", "figure · out_hash 8f3a", AMBER, "устарел");
-        draw_node(&painter, n3, "Отчёт по НИР", "вставка: рисунок 1", AMBER, "устарел");
-        arrow(&painter, n0, n1, AMBER);
-        arrow(&painter, n1, n2, AMBER);
-        arrow(&painter, n2, n3, AMBER);
-        painter.text(
-            pos2(rect.left() + margin, rect.bottom() - 54.0),
-            Align2::LEFT_TOP,
-            "Изменён script.py → in_hash изменился → устарели stats.csv, plot.svg и 1 вставка в документе.",
-            FontId::proportional(12.5),
-            MUTED,
-        );
-        painter.text(
-            pos2(rect.left() + margin, rect.bottom() - 32.0),
-            Align2::LEFT_TOP,
-            "Кнопка «Обновить связанные» пересчитает их по топологическому порядку и обновит документ одной транзакцией.",
-            FontId::proportional(12.5),
-            MUTED,
-        );
+        let step = if n > 1 { (rect.width() - 2.0 * margin - nw) / (n as f32 - 1.0) } else { 0.0 };
+        let y = rect.top() + 46.0;
+        let nodes: Vec<Rect> = (0..n)
+            .map(|i| Rect::from_min_size(pos2(rect.left() + margin + step * i as f32, y), vec2(nw, nh)))
+            .collect();
+        let index_of = |id: &str| artifacts.iter().position(|o| o.id == id);
+        for (i, object) in artifacts.iter().take(n).enumerate() {
+            let color = freshness_color(object.freshness);
+            draw_node(&painter, nodes[i], &object.title, &object.detail, color, object.freshness.label_ru());
+        }
+        for (from, to) in &edges {
+            if let (Some(a), Some(b)) = (index_of(from), index_of(to)) {
+                if a < n && b < n {
+                    arrow(&painter, nodes[a], nodes[b], AMBER);
+                }
+            }
+        }
+        let mut line_y = rect.bottom() - 70.0;
+        for (title, detail) in &stale {
+            painter.text(
+                pos2(rect.left() + margin, line_y),
+                Align2::LEFT_TOP,
+                format!("• {title}: {detail}"),
+                FontId::proportional(12.0),
+                AMBER,
+            );
+            line_y += 17.0;
+        }
+        if artifacts.len() > n {
+            painter.text(
+                pos2(rect.left() + margin, rect.bottom() - 22.0),
+                Align2::LEFT_TOP,
+                format!("…и ещё {} артефакт(ов)", artifacts.len() - n),
+                FontId::proportional(11.5),
+                MUTED,
+            );
+        }
         if refresh {
-            self.push_log(Level::Info, "Обновление связанных (mock): DAG-транзакция — следующая итерация");
+            self.push_log(Level::Info, "Обновление связанных: DAG-транзакция появится в M2.3 (сейчас mock)");
         }
     }
 
     fn source_tab(&mut self, ui: &mut egui::Ui) {
+        let source = self
+            .project
+            .objects
+            .iter()
+            .find(|o| matches!(o.data, ObjectData::Source(_)))
+            .cloned();
         ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
+        let Some(obj) = source else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(RichText::new("В проекте нет источников").color(MUTED));
+            });
+            return;
+        };
+        let ObjectData::Source(src) = &obj.data else {
+            return;
+        };
+        let locator = src.file.clone().or_else(|| src.url.clone()).unwrap_or_default();
+        let retrieved = src.retrieved_at.clone().unwrap_or_else(|| "—".to_owned());
+        let reference = src.reference.clone();
+        let dir = obj.dir.display().to_string();
+        ui.vertical(|ui| {
+            ui.add_space(0.0);
             egui::Frame::new()
                 .fill(PANEL_HI)
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::same(14))
                 .show(ui, |ui| {
-                    ui.set_max_width(560.0);
-                    ui.label(RichText::new("▣  ГОСТ 7.32-2017").size(18.0).strong().color(TEXT));
+                    ui.set_max_width(680.0);
+                    ui.label(RichText::new(format!("▣  {}", obj.title)).size(18.0).strong().color(TEXT));
                     ui.add_space(2.0);
-                    ui.label(RichText::new("Источник проекта · локальная копия PDF").small().color(MUTED));
+                    ui.label(
+                        RichText::new(format!("Источник проекта · {}", fresh_label(obj.freshness))).small().color(MUTED),
+                    );
                     ui.add_space(10.0);
+                    let mut rows: Vec<(&str, String)> = vec![
+                        ("Тип", src.kind.clone()),
+                        ("Локатор", locator.clone()),
+                        ("Получен", retrieved.clone()),
+                        ("Каталог", dir.clone()),
+                    ];
+                    if let Some(r) = &reference {
+                        if !r.designation.is_empty() {
+                            rows.push(("Обозначение", r.designation.clone()));
+                        }
+                        if !r.title.is_empty() {
+                            rows.push(("Название", r.title.clone()));
+                        }
+                        if !r.authors.is_empty() {
+                            rows.push(("Авторы", r.authors.join("; ")));
+                        }
+                        if let Some(year) = r.year {
+                            rows.push(("Год", year.to_string()));
+                        }
+                    }
                     egui::Grid::new("rde_source_meta").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
-                        for (k, v) in [
-                            ("Обозначение", "ГОСТ 7.32-2017"),
-                            ("Область", "отчёт о НИР: структура и правила оформления"),
-                            ("Файл", "sources/gost-7.32-2017/files/gost.pdf"),
-                            ("Хеш", "sha256:3f9a…c41d"),
-                            ("Вставок в документ", "[1] — список источников"),
-                            ("Используется шаблоном", "семейства: рисунки, таблицы, заголовки"),
-                        ] {
+                        for (k, v) in rows {
                             ui.label(RichText::new(k).small().color(MUTED));
                             ui.label(RichText::new(v).size(12.5).color(TEXT));
                             ui.end_row();
@@ -908,28 +1012,31 @@ impl RdeApp {
                     });
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        let _ = ui.button(RichText::new("Открыть PDF").size(12.0));
+                        let _ = ui.button(RichText::new("Открыть источник").size(12.0));
                         let _ = ui.button(RichText::new("Ссылка в чат агента").size(12.0));
                         let _ = ui.button(RichText::new("Показать в дереве").size(12.0));
                     });
                 });
             ui.add_space(12.0);
-            egui::Frame::new().fill(PANEL).corner_radius(CornerRadius::same(8)).inner_margin(Margin::same(14)).show(ui, |ui| {
-                ui.set_max_width(430.0);
-                ui.label(RichText::new("Извлечённый текст (демо)").small().strong().color(MUTED));
-                ui.add_space(6.0);
-                for line in [
-                    "Требования к структуре и оформлению отчёта о НИР:",
-                    "  · титульный лист, список исполнителей, реферат;",
-                    "  · содержание, введение, основная часть;",
-                    "  · заключение, список использованных источников;",
-                    "  · приложения (при наличии).",
-                    "",
-                    "Правила применяются шаблоном как данные (без текста стандарта).",
-                ] {
-                    ui.label(RichText::new(line).monospace().size(11.5).color(TEXT));
-                }
-            });
+            egui::Frame::new()
+                .fill(PANEL)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(14))
+                .show(ui, |ui| {
+                    ui.set_max_width(680.0);
+                    ui.label(RichText::new("Текст источника").small().strong().color(MUTED));
+                    ui.add_space(6.0);
+                    for line in [
+                        "Метаданные загружены из source.toml.",
+                        "Извлечение текста (PDF/HTML), веб-архив и цитаты —",
+                        "следующая веха rde-sources (v0.2).",
+                        "",
+                        "Пока источник виден в дереве и доступен агенту",
+                        "как объект проекта.",
+                    ] {
+                        ui.label(RichText::new(line).size(12.0).color(TEXT));
+                    }
+                });
         });
     }
 
@@ -976,6 +1083,19 @@ impl RdeApp {
 }
 
 // ── вспомогательная отрисовка ────────────────────────────────────────────────
+
+/// Обрезать строку до `max` символов, добавив многоточие.
+fn ellipsize(s: &str, max: usize) -> String {
+    let mut chars = s.char_indices();
+    match chars.nth(max) {
+        Some((idx, _)) => format!("{}…", &s[..idx]),
+        None => s.to_owned(),
+    }
+}
+
+fn fresh_label(f: Freshness) -> &'static str {
+    f.label_ru()
+}
 
 fn freshness_color(f: Freshness) -> Color32 {
     match f {
@@ -1044,9 +1164,27 @@ fn draw_node(painter: &egui::Painter, rect: Rect, title: &str, sub: &str, color:
     painter.rect_filled(rect, CornerRadius::same(8), PANEL_HI);
     painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
     painter.circle_filled(rect.left_top() + vec2(12.0, 14.0), 4.0, color);
-    painter.text(rect.left_top() + vec2(24.0, 7.0), Align2::LEFT_TOP, title, FontId::proportional(13.0), TEXT);
-    painter.text(rect.left_top() + vec2(12.0, 30.0), Align2::LEFT_TOP, sub, FontId::proportional(11.0), MUTED);
-    painter.text(rect.left_bottom() + vec2(12.0, -16.0), Align2::LEFT_TOP, status, FontId::proportional(10.5), color);
+    painter.text(
+        rect.left_top() + vec2(24.0, 7.0),
+        Align2::LEFT_TOP,
+        ellipsize(title, 21),
+        FontId::proportional(13.0),
+        TEXT,
+    );
+    painter.text(
+        rect.left_top() + vec2(12.0, 30.0),
+        Align2::LEFT_TOP,
+        ellipsize(sub, 26),
+        FontId::proportional(11.0),
+        MUTED,
+    );
+    painter.text(
+        rect.left_bottom() + vec2(12.0, -16.0),
+        Align2::LEFT_TOP,
+        status,
+        FontId::proportional(10.5),
+        color,
+    );
 }
 
 fn arrow(painter: &egui::Painter, from: Rect, to: Rect, color: Color32) {

@@ -8,7 +8,11 @@ use rde_ui::RdeApp;
 
 fn main() {
     let out = std::env::args().nth(1).unwrap_or_else(|| "/tmp/rde-concept.png".to_owned());
-    let state = RdeApp::new(demo());
+    let tab = std::env::args().nth(2);
+    let mut state = RdeApp::new(demo());
+    if let Some(tab) = tab {
+        state.demo_select_tab(&tab);
+    }
 
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::vec2(1600.0, 1000.0))
