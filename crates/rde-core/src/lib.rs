@@ -15,6 +15,7 @@ pub mod manifest;
 pub mod ops;
 pub mod project;
 pub mod selector;
+pub mod settings;
 
 pub use manifest::{
     ArtifactManifest, AuthorManifest, ConstantValue, DocumentManifest, GroupManifest, InputSpec,
@@ -23,12 +24,19 @@ pub use manifest::{
 };
 pub use ops::{
     CreateRequest, NewObjectKind, clear_artifact_out_hash, create_document_stub, create_object,
-    create_project, delete_object, record_artifact_out_hash, rename_object, set_project_trusted,
+    create_project, delete_object, record_artifact_out_hash, rename_object, set_project_authors,
+    set_project_trusted,
 };
 pub use project::{
     Freshness, Group, Issue, Level, LogLine, Object, ObjectData, ObjectKind, Project, load_project,
 };
 pub use selector::{SelectorMatch, expand_selector, glob_match, is_glob};
+pub use settings::{AppSettings, config_dir, load_from as load_app_settings, save_to as save_app_settings};
+
+/// Новый ULID для объектов проекта (единая точка генерации id).
+pub fn new_id() -> String {
+    ulid::Ulid::generate().to_string()
+}
 
 /// Каталог демо-проекта по умолчанию.
 ///

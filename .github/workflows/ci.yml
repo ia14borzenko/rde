@@ -1,0 +1,61 @@
+# RDE CI (P5, G1): ядро без GUI + docx-гейты + схемы + перф 10k.
+#
+# GUI-сборка (rde-ui/eframe) требует системных библиотек X11/Wayland и в этот workflow не входит;
+# для неё отдельный job `ui-check` помечен continue-on-error до настройки раннера с GPU/дисплеем.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+      - name: System deps (docx gates: LibreOffice; OCR: tesseract; PDF: poppler)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer tesseract-ocr tesseract-ocr-rus poppler-utils
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rde-core-${{ hashFiles('Cargo.lock') }}
+      - name: Tests (core crates)
+        run: |
+          cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-env -p rde-dag \
+            -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-vcs
+      - name: Docx corpus gates (S6/G7)
+        run: cargo run -p xtask -- docx-gates
+      - name: Schemas are up to date
+        run: cargo run -p xtask -- schemas
+      - name: Perf 10k objects (NFR-PERF-01)
+        run: cargo run -p xtask -- perf
+      - name: Demo fidelity gate
+        run: cargo run -p xtask -- fidelity
+
+  ui-check:
+    # GUI-крейт: проверка сборки (без запуска окна). До появления GPU-раннера — не блокирует.
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: System deps (egui/eframe, Wayland/X11)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libx11-dev \
+            libxrandr-dev libxi-dev libxcursor-dev libgl1-mesa-dev libegl1-mesa-dev pkg-config
+      - name: cargo check (UI)
+        run: cargo check -p rde-ui -p rde

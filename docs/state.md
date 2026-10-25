@@ -191,3 +191,22 @@ store/kill -9, запуск, DAG, `.doc.rde`, docx-гейты, ГОСТ, ист�
 
 **Тестов: 126** (было 118). Демо-документ пересобран с wiring §8.5 и вставками; в «Структуре»
 видны блоки/paraId/вставки. Следующий шаг — **P5** (VCS/настройки/диагностика/гейты).
+
+---
+
+## Обновление 2026-10-25 (P5 «VCS/настройки/диагностика/гейты», тег `p5-gates`)
+
+| Пункт | Что сделано | Подтверждение |
+|---|---|---|
+| R-VCS-01/02 | новый `rde-vcs`: init/status/commit/revert/log/diff, `.gitignore`/`.gitattributes`, автор из rde.toml, git-рассинхрон в проверке, UI git-меню | тесты rde-vcs/UI |
+| R-SET-01/04 | app-settings (`settings.toml`: язык/тема/ретенция/автор), авторы проекта в настройках | тесты rde-core/UI |
+| R-UI-06 | каркас i18n ru/en (`i18n::tr`), переведены меню/вкладки/панель действий/статус | тест i18n |
+| R-SET-03/07 | «Экспорт диагностики» (zip без документов/CAS), git в «Проверить» | UI-тест диагностики |
+| G1/G7 | `xtask` (ci/schemas/docx-gates/fidelity/perf/demo), GitHub Actions CI, OPC/XSD-lite-гейт, корпус docx 13/13 PASS | `docs/fidelity/corpus-report.json` |
+| NFR-PERF-01 | 10k объектов: загрузка 396 мс (бюджет 2 с), кэш JSON Schema | `docs/perf/10k.json` |
+| Hardening | kill -9 во время транзакций с корнями — консистентность | тест rde-store |
+| Exit v0.1 | критерий фазы выполнен (оговорка: Word COM/Windows-CI) | `docs/exit-v0.1.md` |
+
+**Тестов: 136** (было 126). Прототип v0.1 завершён: см. `docs/exit-v0.1.md`; следующие шаги —
+v0.2/v0.3 по ТЗ §10.2/10.3 (шаблоны/профили, `.rde`-шаринг, OCR-движок, monolith, PDF/pdfium;
+MCP-сервер и ACP-агент).

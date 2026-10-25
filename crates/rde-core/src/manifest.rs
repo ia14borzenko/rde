@@ -359,17 +359,34 @@ fn schema_json<T: JsonSchema>() -> serde_json::Value {
     serde_json::to_value(schema).unwrap_or(serde_json::Value::Null)
 }
 
+/// Скомпилированные JSON Schema (кэш на процесс): компиляция схемы на каждый манифест —
+/// доминирующая стоимость загрузки больших проектов (NFR-PERF-01: 10k объектов < 2 с).
+fn validator_cache() -> &'static std::sync::Mutex<std::collections::BTreeMap<&'static str, jsonschema::Validator>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<&'static str, jsonschema::Validator>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
 /// Проверить TOML-значение против JSON Schema манифеста. Возвращает список ошибок.
 pub fn validate(kind: ManifestKind, value: &toml::Value) -> Vec<String> {
-    let schema = kind.schema();
-    if schema.is_null() {
-        return vec!["не удалось сгенерировать JSON Schema".to_owned()];
-    }
     let Ok(json) = serde_json::to_value(value) else {
         return vec!["манифест не конвертируется в JSON для валидации".to_owned()];
     };
-    let Ok(validator) = jsonschema::validator_for(&schema) else {
-        return vec!["JSON Schema манифеста не компилируется".to_owned()];
+    let mut cache = match validator_cache().lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
     };
+    let schema_id = kind.schema_id();
+    if !cache.contains_key(schema_id) {
+        let schema = kind.schema();
+        if schema.is_null() {
+            return vec!["не удалось сгенерировать JSON Schema".to_owned()];
+        }
+        let Ok(validator) = jsonschema::validator_for(&schema) else {
+            return vec!["JSON Schema манифеста не компилируется".to_owned()];
+        };
+        cache.insert(schema_id, validator);
+    }
+    let validator = cache.get(schema_id).expect("валидатор добавлен выше");
     validator.iter_errors(&json).map(|e| e.to_string()).collect()
 }

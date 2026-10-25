@@ -12,6 +12,7 @@ rde-dag = { workspace = true }
 rde-doc = { workspace = true }
 rde-env = { workspace = true }
 rde-templates = { workspace = true }
+rde-vcs = { workspace = true }
 rde-sources = { workspace = true }
 zip = { workspace = true }
 rde-run = { workspace = true }

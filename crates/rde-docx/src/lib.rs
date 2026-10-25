@@ -9,8 +9,9 @@
 //!
 //! Отчёт — JSON, пригодный для CI/артефакта.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,6 +50,142 @@ pub struct LoOracle {
 }
 
 /// Полный отчёт fidelity-гейта.
+/// Результат OPC/XML-валидации пакета (XSD-lite: без внешних XSD-схем, но с проверкой
+/// well-formed XML, покрытия [Content_Types].xml и целостности relationships).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpcValidation {
+    pub ok: bool,
+    pub parts: usize,
+    pub xml_parts: usize,
+    pub errors: Vec<String>,
+}
+
+/// Проверить OPC-инварианты `.docx`/`.doc.rde`: well-formed XML, Content_Types покрывает части,
+/// все внутренние цели relationships существуют, `word/document.xml` на месте.
+pub fn validate_opc(input: &Path) -> Result<OpcValidation, String> {
+    let file = File::open(input).map_err(|e| format!("открыть {}: {e}", input.display()))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("zip {}: {e}", input.display()))?;
+    let mut entries: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|e| format!("часть #{index}: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|e| format!("прочитать {}: {e}", entry.name()))?;
+        entries.insert(entry.name().to_owned(), bytes);
+    }
+    let mut validation = OpcValidation { parts: entries.len(), ..OpcValidation::default() };
+    if !entries.contains_key("word/document.xml") {
+        validation.errors.push("нет word/document.xml".to_owned());
+    }
+    let content_types = entries.get("[Content_Types].xml").map(|bytes| String::from_utf8_lossy(bytes).to_string());
+    let Some(content_types) = content_types else {
+        validation.errors.push("нет [Content_Types].xml".to_owned());
+        validation.ok = false;
+        return Ok(validation);
+    };
+    let defaults: BTreeSet<String> = extract_attr_values(&content_types, "Default", "Extension")
+        .into_iter()
+        .map(|ext| ext.to_ascii_lowercase())
+        .collect();
+    let overrides: BTreeSet<String> = extract_attr_values(&content_types, "Override", "PartName")
+        .into_iter()
+        .map(|name| name.trim_start_matches('/').to_owned())
+        .collect();
+    let mut xml_parts = 0usize;
+    for (name, bytes) in &entries {
+        if name == "[Content_Types].xml" {
+            continue;
+        }
+        let is_xml = name.ends_with(".xml") || name.ends_with(".rels");
+        if is_xml {
+            xml_parts += 1;
+            // Well-formed XML: читаем все события до EOF.
+            let text = String::from_utf8_lossy(bytes);
+            let mut reader = quick_xml::Reader::from_str(&text);
+            reader.config_mut().trim_text(false);
+            let mut malformed = None;
+            loop {
+                match reader.read_event() {
+                    Ok(quick_xml::events::Event::Eof) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        malformed = Some(format!("{name}: XML не well-formed: {error}"));
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = malformed {
+                validation.errors.push(error);
+            }
+        }
+        // Content_Types покрывает часть (по Override или Default-расширению).
+        if !overrides.contains(name) {
+            let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+            if !defaults.contains(&ext) {
+                validation.errors.push(format!("{name}: нет Content_Types (ни Override, ни Default .{ext})"));
+            }
+        }
+        // Relationships: внутренние цели должны существовать.
+        if name.ends_with(".rels") {
+            let text = String::from_utf8_lossy(bytes);
+            let base = relationship_base_dir(name);
+            for target in extract_attr_values(&text, "Relationship", "Target") {
+                if target.starts_with("http://") || target.starts_with("https://") || target.starts_with("mailto:") {
+                    continue;
+                }
+                let resolved = normalize_zip_path(&format!("{base}{target}"));
+                if !entries.contains_key(&resolved) {
+                    validation.errors.push(format!("{name}: цель связи не найдена: {target} ({resolved})"));
+                }
+            }
+        }
+    }
+    validation.xml_parts = xml_parts;
+    validation.ok = validation.errors.is_empty();
+    Ok(validation)
+}
+
+fn extract_attr_values(xml: &str, element: &str, attr: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&format!("<{element}")) {
+        let Some(end) = rest[start..].find('>') else { break };
+        let tag = &rest[start..start + end + 1];
+        if let Some(attr_start) = tag.find(&format!("{attr}=\"")) {
+            let value = &tag[attr_start + attr.len() + 2..];
+            if let Some(close) = value.find('"') {
+                values.push(value[..close].to_owned());
+            }
+        }
+        rest = &rest[start + end + 1..];
+    }
+    values
+}
+
+fn relationship_base_dir(rels_name: &str) -> String {
+    // word/_rels/document.xml.rels → word/
+    match rels_name.rsplit_once("_rels/") {
+        Some((prefix, _)) => prefix.to_owned(),
+        None => String::new(),
+    }
+}
+
+fn normalize_zip_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FidelityReport {
     pub source: String,
@@ -65,6 +202,9 @@ pub struct FidelityReport {
     pub paragraphs_source: usize,
     pub paragraphs_roundtrip: usize,
     pub lo: LoOracle,
+    /// OPC/XML-валидация (XSD-lite, P5).
+    #[serde(default)]
+    pub opc: OpcValidation,
     pub generated_unix: u64,
 }
 
@@ -74,7 +214,31 @@ impl FidelityReport {
             && self.media_preserved
             && self.paragraphs_source == self.paragraphs_roundtrip
             && self.lo.pdf_is_valid
+            && self.opc.ok
     }
+}
+
+/// Прогнать гейт по корпусу `.docx`-файлов (S6): возвращает (файл, отчёт).
+pub fn run_corpus(dir: &Path) -> Vec<(String, Result<FidelityReport, String>)> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("docx"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    let work = temp_work_dir("corpus");
+    let mut reports = Vec::new();
+    for file in files {
+        let name = file.file_name().and_then(|name| name.to_str()).unwrap_or("file.docx").to_owned();
+        let work_dir = work.join(name.replace(".docx", ""));
+        let report = run_gate(&file, &work_dir);
+        reports.push((name, report));
+    }
+    reports
 }
 
 fn now_unix() -> u64 {
@@ -206,6 +370,7 @@ pub fn run_gate(input: &Path, work_dir: &Path) -> Result<FidelityReport, String>
     let paragraphs_source = paragraph_count(input)?;
     let paragraphs_roundtrip = paragraph_count(&roundtrip_path)?;
     let lo = lo_oracle(&roundtrip_path, work_dir);
+    let opc = validate_opc(&roundtrip_path)?;
     Ok(FidelityReport {
         source: input.display().to_string(),
         source_parts: source.len(),
@@ -218,6 +383,7 @@ pub fn run_gate(input: &Path, work_dir: &Path) -> Result<FidelityReport, String>
         paragraphs_source,
         paragraphs_roundtrip,
         lo,
+        opc,
         generated_unix: now_unix(),
     })
 }

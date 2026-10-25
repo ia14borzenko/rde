@@ -3548,6 +3548,7 @@ dependencies = [
 name = "rde-docx"
 version = "0.1.0"
 dependencies = [
+ "quick-xml 0.42.0",
  "rde-core",
  "rde-doc",
  "rde-hash",
@@ -3638,10 +3639,18 @@ dependencies = [
  "rde-sources",
  "rde-store",
  "rde-templates",
+ "rde-vcs",
  "serde_json",
  "wordcraft-engine",
  "wordcraft-ui-egui",
  "zip",
+]
+
+[[package]]
+name = "rde-vcs"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -6050,6 +6059,10 @@ name = "xmp-writer"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9440ea3e5aeabb0ac63af70daf835274065238cdd0cec83418f417eae38bacee"
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
 
 [[package]]
 name = "yoke"

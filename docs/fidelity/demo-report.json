@@ -1,5 +1,5 @@
 {
-  "source": "/tmp/rde-docx-example-209110/clean.docx",
+  "source": "/tmp/rde-docx-example-216136/clean.docx",
   "source_parts": 11,
   "roundtrip_parts": 11,
   "missing": [],
@@ -19,5 +19,11 @@
     "pdf_is_valid": true,
     "error": null
   },
-  "generated_unix": 1792911944
+  "opc": {
+    "ok": true,
+    "parts": 11,
+    "xml_parts": 8,
+    "errors": []
+  },
+  "generated_unix": 1792913135
 }

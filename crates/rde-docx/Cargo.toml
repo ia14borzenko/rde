@@ -13,5 +13,6 @@ rde-doc = { workspace = true }
 rde-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+quick-xml = { workspace = true }
 zip = { workspace = true }
 wordcraft-engine = { workspace = true }

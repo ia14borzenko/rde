@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
+pub mod i18n;
+
+use i18n::{Lang, tr};
 use rde_core::{CreateRequest, Freshness, Level, NewObjectKind, ObjectData, ObjectKind, Project};
 use rde_dag::{LiveStatus, UpdateAction};
 use rde_store::Store;
@@ -50,13 +53,13 @@ enum Tab {
 impl Tab {
     const ALL: [Tab; 5] = [Tab::Document, Tab::Structure, Tab::Artifacts, Tab::Source, Tab::Code];
 
-    fn title(self) -> &'static str {
+    fn title(self, lang: Lang) -> &'static str {
         match self {
-            Tab::Document => "Документ",
-            Tab::Structure => "Структура",
-            Tab::Artifacts => "Артефакты",
-            Tab::Source => "Источник",
-            Tab::Code => "Код документа",
+            Tab::Document => tr(lang, "tab.document"),
+            Tab::Structure => tr(lang, "tab.structure"),
+            Tab::Artifacts => tr(lang, "tab.artifacts"),
+            Tab::Source => tr(lang, "tab.source"),
+            Tab::Code => tr(lang, "tab.code"),
         }
     }
 
@@ -238,6 +241,18 @@ struct DocBlock {
 }
 
 /// Приложение прототипа RDE.
+/// Диалог настроек проекта (R-SET-01): имя/шаблон/режим пересборки + авторы.
+#[derive(Clone, Debug)]
+pub struct ProjectSettingsState {
+    name: String,
+    template: String,
+    rebuild: String,
+    authors: Vec<rde_core::AuthorManifest>,
+    new_author_name: String,
+    new_author_initials: String,
+    new_author_email: String,
+}
+
 /// Диалог согласия на запуск скриптов (R-RUN-06): что запустить после подтверждения.
 #[derive(Clone, Debug)]
 struct TrustDialogState {
@@ -309,7 +324,7 @@ pub struct RdeApp {
     search_focus: bool,
     open_project_dialog: Option<String>,
     new_project_dialog: Option<(String, String)>,
-    settings_dialog: Option<(String, String, String)>,
+    settings_dialog: Option<ProjectSettingsState>,
     check_dialog: Option<String>,
     audit_dialog: Option<Vec<String>>,
     about_open: bool,
@@ -319,10 +334,24 @@ pub struct RdeApp {
     update_job: Option<UpdateJob>,
     /// Диалог вставки значения/рисунка из артефакта.
     insert_dialog: Option<InsertDialogState>,
+    /// Состояние git-репозитория проекта (P5, R-VCS-01).
+    git_status: Option<rde_vcs::GitStatus>,
+    /// Диалог коммита: текст сообщения.
+    commit_dialog: Option<String>,
+    /// Окно истории git.
+    history_dialog: Option<Vec<rde_vcs::CommitEntry>>,
+    /// Язык интерфейса (R-UI-06) из настроек приложения.
+    lang: Lang,
+    /// Настройки приложения (R-SET-01) — загружаются при старте.
+    app_settings: rde_core::AppSettings,
+    /// Диалог настроек приложения.
+    app_settings_dialog: Option<rde_core::AppSettings>,
 }
 
 impl RdeApp {
     pub fn new(project: Project) -> Self {
+        let app_settings = rde_core::settings::load();
+        let lang = i18n::lang(&app_settings.language);
         let doc = DocPreview::new(project.document_path());
         let export_dir = project.root.join("exports");
         let selected = project.document_object().map(|object| object.id.clone());
@@ -362,6 +391,12 @@ impl RdeApp {
             trust_dialog: None,
             update_job: None,
             insert_dialog: None,
+            git_status: None,
+            commit_dialog: None,
+            history_dialog: None,
+            lang,
+            app_settings,
+            app_settings_dialog: None,
         };
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
         let _ = rde_run::prune_runs(&app.project.root, 200);
@@ -372,8 +407,52 @@ impl RdeApp {
             }
             Err(error) => app.push_log(Level::Warn, format!("Хранилище проекта недоступно: {error}")),
         }
+        app.refresh_git_status();
         app.check_external_edit_on_startup();
         app
+    }
+
+    /// Обновить состояние git-репозитория (для статус-бара/«Проверить»).
+    pub fn refresh_git_status(&mut self) {
+        self.git_status = rde_vcs::status(&self.project.root).ok();
+    }
+
+    /// Инициализировать git-репозиторий проекта (R-VCS-01) и сделать начальный коммит.
+    pub fn git_init(&mut self) {
+        match rde_vcs::init(&self.project.root) {
+            Ok(true) => self.push_log(Level::Ok, "Git: репозиторий инициализирован, создан начальный коммит"),
+            Ok(false) => self.push_log(Level::Info, "Git: репозиторий уже существует"),
+            Err(error) => self.push_log(Level::Warn, format!("Git init: {error}")),
+        }
+        self.refresh_git_status();
+    }
+
+    /// Закоммитить изменения проекта с сообщением (автор — из rde.toml).
+    pub fn git_commit(&mut self, message: &str) {
+        let author = self
+            .project
+            .manifest
+            .authors
+            .iter()
+            .find(|author| author.kind != "agent" && author.kind != "system")
+            .cloned();
+        let (name, email) = author
+            .map(|author| (author.name, author.email))
+            .unwrap_or_else(|| ("RDE".to_owned(), String::new()));
+        match rde_vcs::commit(&self.project.root, message, &name, &email) {
+            Ok(result) => self.push_log(Level::Ok, format!("Git: коммит {} — {} (файлов {})", result.id, result.summary, result.files)),
+            Err(error) => self.push_log(Level::Warn, format!("Git commit: {error}")),
+        }
+        self.refresh_git_status();
+    }
+
+    /// Открыть историю git (или сообщить, что репозитория нет).
+    pub fn git_history(&mut self) {
+        match rde_vcs::log(&self.project.root, 30) {
+            Ok(entries) if !entries.is_empty() => self.history_dialog = Some(entries),
+            Ok(_) => self.push_log(Level::Info, "Git: истории пока нет"),
+            Err(error) => self.push_log(Level::Warn, format!("Git history: {error}")),
+        }
     }
 
     /// Сохранить документ в проект (`.doc.rde`) — RDE владелец сохранения.
@@ -885,6 +964,7 @@ impl RdeApp {
                     self.doc = DocPreview::new(new_path);
                 }
                 self.refresh_dag_statuses();
+                self.refresh_git_status();
             }
             Err(error) => self.push_log(Level::Warn, format!("Не удалось перезагрузить проект: {error}")),
         }
@@ -1058,6 +1138,11 @@ impl RdeApp {
                 None
             }
         }
+    }
+
+    /// Для демо/скриншотов: открыть настройки приложения.
+    pub fn demo_open_app_settings(&mut self) {
+        self.app_settings_dialog = Some(self.app_settings.clone());
     }
 
     /// Для демо/скриншотов: открыть диалог вставки (`value` или `figure`).
@@ -1261,13 +1346,18 @@ impl RdeApp {
             InsertFigure,
             UpdateDocument,
             RollbackDocument,
+            GitInit,
+            GitCommit,
+            GitHistory,
+            AppSettings,
+            ExportDiagnostics,
         }
         let mut action: Option<MenuAction> = None;
         egui::Panel::top("rde_menu")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 2)))
             .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
-                    ui.menu_button("Файл", |ui| {
+                    ui.menu_button(tr(self.lang, "menu.file"), |ui| {
                         if ui.button("Новый проект…").clicked() {
                             action = Some(MenuAction::NewProject);
                             ui.close();
@@ -1286,7 +1376,7 @@ impl RdeApp {
                             ui.close();
                         }
                     });
-                    ui.menu_button("Правка", |ui| {
+                    ui.menu_button(tr(self.lang, "menu.edit"), |ui| {
                         let can_undo = self.editor.as_ref().is_some_and(|editor| editor.app.session.can_undo());
                         let can_redo = self.editor.as_ref().is_some_and(|editor| editor.app.session.can_redo());
                         if ui.add_enabled(can_undo, egui::Button::new("Отменить")).clicked() {
@@ -1303,7 +1393,7 @@ impl RdeApp {
                             ui.close();
                         }
                     });
-                    ui.menu_button("Документ", |ui| {
+                    ui.menu_button(tr(self.lang, "menu.document"), |ui| {
                         if ui.button("Вставить значение артефакта…").clicked() {
                             action = Some(MenuAction::InsertValue);
                             ui.close();
@@ -1323,7 +1413,7 @@ impl RdeApp {
                             ui.close();
                         }
                     });
-                    ui.menu_button("Проект", |ui| {
+                    ui.menu_button(tr(self.lang, "menu.project"), |ui| {
                         if ui.button("Проверить и починить…").clicked() {
                             action = Some(MenuAction::CheckProject);
                             ui.close();
@@ -1332,25 +1422,46 @@ impl RdeApp {
                             action = Some(MenuAction::UpdateAll);
                             ui.close();
                         }
-                        if ui.button("Настройки проекта…").clicked() {
+                        if ui.button(tr(self.lang, "settings.project")).clicked() {
                             action = Some(MenuAction::Settings);
                             ui.close();
                         }
+                        if ui.button(tr(self.lang, "settings.app")).clicked() {
+                            action = Some(MenuAction::AppSettings);
+                            ui.close();
+                        }
+                        if ui.button(tr(self.lang, "settings.diagnostics")).clicked() {
+                            action = Some(MenuAction::ExportDiagnostics);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button(tr(self.lang, "git.init")).clicked() {
+                            action = Some(MenuAction::GitInit);
+                            ui.close();
+                        }
+                        if ui.button(tr(self.lang, "git.commit")).clicked() {
+                            action = Some(MenuAction::GitCommit);
+                            ui.close();
+                        }
+                        if ui.button(tr(self.lang, "git.history")).clicked() {
+                            action = Some(MenuAction::GitHistory);
+                            ui.close();
+                        }
                     });
-                    ui.menu_button("Вид", |ui| {
+                    ui.menu_button(tr(self.lang, "menu.view"), |ui| {
                         ui.checkbox(&mut self.show_tree, "Дерево проекта");
                         ui.checkbox(&mut self.show_agent, "Панель агента");
                         ui.checkbox(&mut self.show_logs, "Журнал и задачи");
                         ui.checkbox(&mut self.show_inspector, "Инспектор объекта");
                     });
-                    ui.menu_button("Агент", |ui| {
+                    ui.menu_button(tr(self.lang, "menu.agent"), |ui| {
                         ui.label(RichText::new("MCP/ACP — v0.3 (не подключён)").small().color(MUTED));
                         if ui.button("Аудит действий…").clicked() {
                             action = Some(MenuAction::Audit);
                             ui.close();
                         }
                     });
-                    ui.menu_button("Помощь", |ui| {
+                    ui.menu_button(tr(self.lang, "menu.help"), |ui| {
                         if ui.button("О прототипе").clicked() {
                             action = Some(MenuAction::About);
                             ui.close();
@@ -1385,11 +1496,21 @@ impl RdeApp {
                 self.request_update(None, true);
             }
             Some(MenuAction::Settings) => {
-                self.settings_dialog = Some((
-                    self.project.manifest.name.clone(),
-                    self.project.manifest.default_template.clone(),
-                    self.project.manifest.default_rebuild.clone(),
-                ));
+                self.settings_dialog = Some(ProjectSettingsState {
+                    name: self.project.manifest.name.clone(),
+                    template: self.project.manifest.default_template.clone(),
+                    rebuild: self.project.manifest.default_rebuild.clone(),
+                    authors: self.project.manifest.authors.clone(),
+                    new_author_name: String::new(),
+                    new_author_initials: String::new(),
+                    new_author_email: String::new(),
+                });
+            }
+            Some(MenuAction::AppSettings) => {
+                self.app_settings_dialog = Some(self.app_settings.clone());
+            }
+            Some(MenuAction::ExportDiagnostics) => {
+                self.export_diagnostics();
             }
             Some(MenuAction::About) => self.about_open = true,
             Some(MenuAction::Audit) => self.audit_dialog = Some(self.audit_lines()),
@@ -1397,6 +1518,16 @@ impl RdeApp {
             Some(MenuAction::InsertFigure) => self.open_insert_dialog("figure"),
             Some(MenuAction::UpdateDocument) => self.update_project_document(),
             Some(MenuAction::RollbackDocument) => self.rollback_document(),
+            Some(MenuAction::GitInit) => self.git_init(),
+            Some(MenuAction::GitCommit) => {
+                let last = self.git_status.as_ref().and_then(|status| status.last_commit.as_ref()).map(|commit| commit.summary.clone());
+                let default_message = match last {
+                    Some(summary) => format!("RDE: изменения после «{summary}»"),
+                    None => "RDE: изменения проекта".to_owned(),
+                };
+                self.commit_dialog = Some(default_message);
+            }
+            Some(MenuAction::GitHistory) => self.git_history(),
             None => {}
         }
     }
@@ -1420,7 +1551,7 @@ impl RdeApp {
                     if ui
                         .add_enabled(
                             !running,
-                            egui::Button::new(RichText::new("Обновить всё").color(Color32::WHITE)).fill(ACCENT),
+                            egui::Button::new(RichText::new(tr(self.lang, "toolbar.update_all")).color(Color32::WHITE)).fill(ACCENT),
                         )
                         .on_hover_text("Реально пересчитать устаревшие артефакты (rde-dag: act_key/out_hash, транзакции)")
                         .clicked()
@@ -1438,31 +1569,31 @@ impl RdeApp {
                         }
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new("Экспорт .docx").color(TEXT)).fill(PANEL_HI))
+                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.export_docx")).color(TEXT)).fill(PANEL_HI))
                         .on_hover_text("Собрать чистый .docx из .doc.rde")
                         .clicked()
                     {
                         export = true;
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new("Сохранить проект").color(TEXT)).fill(PANEL_HI))
+                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.save_project")).color(TEXT)).fill(PANEL_HI))
                         .on_hover_text("Записать документ в .doc.rde (RDE — владелец сохранения)")
                         .clicked()
                     {
                         save_project = true;
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new("Обновить документ").color(TEXT)).fill(PANEL_HI))
+                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.update_document")).color(TEXT)).fill(PANEL_HI))
                         .on_hover_text("Перенумеровать подписи/обновить вставки и пересохранить .doc.rde")
                         .clicked()
                     {
                         update_document = true;
                     }
                     ui.separator();
-                    if ui.button(RichText::new("+ Объект").size(13.0)).clicked() {
+                    if ui.button(RichText::new(tr(self.lang, "toolbar.new_object")).size(13.0)).clicked() {
                         new_object = true;
                     }
-                    if ui.button(RichText::new("Поиск").size(13.0)).on_hover_text("Поиск по объектам (Ctrl+F)").clicked() {
+                    if ui.button(RichText::new(tr(self.lang, "toolbar.search")).size(13.0)).on_hover_text("Поиск по объектам (Ctrl+F)").clicked() {
                         search_clicked = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1509,16 +1640,21 @@ impl RdeApp {
                     ui.separator();
                     ui.label(RichText::new(self.project.root.display().to_string()).small().color(MUTED));
                     ui.separator();
-                    let branch = if self.project.branch.trim().is_empty() { "—".to_owned() } else { self.project.branch.clone() };
-                    ui.label(RichText::new(format!("git: {branch}")).small().color(MUTED));
+                    let git_summary = self
+                        .git_status
+                        .as_ref()
+                        .map(rde_vcs::GitStatus::summary_ru)
+                        .unwrap_or_else(|| "git: —".to_owned());
+                    let git_color = if self.git_status.as_ref().is_some_and(|status| status.is_dirty()) { AMBER } else { MUTED };
+                    ui.label(RichText::new(git_summary).small().color(git_color));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new("A4 · ru-RU").small().color(MUTED));
                         ui.separator();
-                        ui.label(RichText::new(format!("{} объектов", self.project.object_count())).small().color(MUTED));
+                        ui.label(RichText::new(format!("{} {}", self.project.object_count(), tr(self.lang, "status.objects"))).small().color(MUTED));
                         ui.separator();
-                        ui.label(RichText::new(format!("• {} устаревших", self.project.stale_count())).small().color(AMBER));
+                        ui.label(RichText::new(format!("• {} {}", self.project.stale_count(), tr(self.lang, "status.stale"))).small().color(AMBER));
                         ui.separator();
-                        ui.label(RichText::new("Агент: не подключён (v0.3)").small().color(MUTED));
+                        ui.label(RichText::new(tr(self.lang, "status.agent_offline")).small().color(MUTED));
                     });
                 });
             });
@@ -1542,7 +1678,7 @@ impl RdeApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("ПАНЕЛЬ").small().strong().color(MUTED));
                     ui.add_space(4.0);
-                    for (i, name) in ["Журнал", "Задачи", "Агент"].iter().enumerate() {
+                    for (i, name) in [tr(self.lang, "panel.journal"), tr(self.lang, "panel.tasks"), tr(self.lang, "panel.agent")].iter().enumerate() {
                         if ui.selectable_label(tab == i, RichText::new(*name).size(12.0)).clicked() {
                             tab = i;
                         }
@@ -2286,8 +2422,23 @@ impl RdeApp {
     /// Создать новый проект и открыть его.
     pub fn create_project_ui(&mut self, root: &Path, name: &str) -> Result<(), String> {
         rde_core::create_project(root, name)?;
+        // R-VCS-01: служебные файлы и начальный git-коммит нового проекта.
+        let mut notes = Vec::new();
+        match rde_vcs::ensure_project_files(root) {
+            Ok(created) if !created.is_empty() => notes.push(format!("созданы {}", created.join(", "))),
+            Ok(_) => {}
+            Err(error) => notes.push(format!("служебные файлы: {error}")),
+        }
+        match rde_vcs::init(root) {
+            Ok(true) => notes.push("git-репозиторий инициализирован".to_owned()),
+            Ok(false) => notes.push("git-репозиторий уже есть".to_owned()),
+            Err(error) => notes.push(format!("git: {error}")),
+        }
         self.open_project(root);
         self.push_log(Level::Ok, format!("Создан проект «{}»: {}", name.trim(), root.display()));
+        for note in notes {
+            self.push_log(Level::Info, format!("Проект: {note}"));
+        }
         Ok(())
     }
 
@@ -2303,6 +2454,124 @@ impl RdeApp {
         self.reload_project();
         self.push_log(Level::Ok, "Настройки проекта сохранены");
         Ok(())
+    }
+
+    /// Сохранить настройки проекта вместе со списком авторов (R-SET-01).
+    pub fn save_project_settings_with_authors(&mut self, dialog: &ProjectSettingsState) -> Result<(), String> {
+        self.save_project_settings(&dialog.name, &dialog.template, &dialog.rebuild)?;
+        rde_core::set_project_authors(&self.project.root, &dialog.authors)?;
+        self.reload_project();
+        self.push_log(Level::Ok, format!("Настройки проекта сохранены (авторов: {})", dialog.authors.len()));
+        Ok(())
+    }
+
+    /// Экспорт диагностического архива (R-SET-03/07): окружение, git, транзакции, issues, хвосты
+    /// логов — **без содержимого документов и без CAS**.
+    pub fn export_diagnostics(&mut self) -> Option<PathBuf> {
+        let dir = self.export_dir.clone();
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            self.push_log(Level::Warn, format!("Экспорт диагностики: {error}"));
+            return None;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let path = dir.join(format!("diagnostics-{stamp}.zip"));
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Экспорт диагностики: {error}"));
+                return None;
+            }
+        };
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut put = |name: &str, bytes: &[u8]| -> Result<(), String> {
+            zip.start_file(name.to_owned(), options).map_err(|e| format!("zip {name}: {e}"))?;
+            use std::io::Write;
+            zip.write_all(bytes).map_err(|e| format!("zip write {name}: {e}"))
+        };
+        let mut summary = String::new();
+        summary.push_str(&format!("RDE diagnostics · v{}\n", env!("CARGO_PKG_VERSION")));
+        summary.push_str(&format!("OS: {} {}\n", std::env::consts::OS, std::env::consts::ARCH));
+        summary.push_str(&format!("Project: «{}» id={} root={}\n", self.project.name, self.project.manifest.id, self.project.root.display()));
+        summary.push_str(&format!("Objects: {} (stale {})\n", self.project.object_count(), self.project.stale_count()));
+        if let Some(status) = &self.git_status {
+            summary.push_str(&format!("Git: {}\n", status.summary_ru()));
+        }
+        if let Some(store) = &self.store {
+            if let Ok(stats) = store.stats() {
+                summary.push_str(&format!("Store: blobs={} trees={} txs={}\n", stats.blobs, stats.trees, stats.txs));
+            }
+        }
+        summary.push_str(&format!("Runtimes: python3={}\n", std::process::Command::new("python3").arg("--version").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_else(|_| "нет".to_owned())));
+        let mut result = put("summary.txt", summary.as_bytes());
+        if result.is_ok() {
+            if let Ok(text) = std::fs::read_to_string(self.project.root.join("rde.toml")) {
+                result = put("rde.toml", text.as_bytes());
+            }
+        }
+        if result.is_ok() {
+            if let Ok(text) = std::fs::read_to_string(self.project.root.join("rde.lock")) {
+                result = put("rde.lock", text.as_bytes());
+            }
+        }
+        if result.is_ok() {
+            let sync = rde_vcs::check_sync(&self.project.root).unwrap_or_else(|error| format!("git: {error}"));
+            result = put("git-status.txt", sync.as_bytes());
+        }
+        if result.is_ok() {
+            let mut tx_lines = String::new();
+            if let Some(store) = &self.store {
+                if let Ok(txs) = store.list_txs() {
+                    for tx in txs.iter().take(100) {
+                        tx_lines.push_str(&format!("{}  {:?}  {}\n", tx.started_unix, tx.status, tx.note));
+                    }
+                }
+            }
+            result = put("transactions.txt", tx_lines.as_bytes());
+        }
+        if result.is_ok() {
+            let issues: Vec<String> = self.project.issues.iter().map(|issue| format!("{}: {}", issue.path.display(), issue.message)).collect();
+            result = put("issues.txt", issues.join("\n").as_bytes());
+        }
+        // Хвосты логов последних запусков (без выходов/CAS).
+        if result.is_ok() {
+            let runs_root = self.project.root.join(".rde/runs");
+            let mut runs: Vec<PathBuf> = std::fs::read_dir(&runs_root)
+                .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+                .unwrap_or_default();
+            runs.sort();
+            for run_dir in runs.iter().rev().take(5) {
+                let Some(run_id) = run_dir.file_name().and_then(|name| name.to_str()) else { continue };
+                for log_name in ["stdout.log", "stderr.log"] {
+                    let log_path = run_dir.join(log_name);
+                    let Ok(bytes) = std::fs::read(&log_path) else { continue };
+                    let tail = if bytes.len() > 64 * 1024 { &bytes[bytes.len() - 64 * 1024..] } else { &bytes[..] };
+                    if let Err(error) = put(&format!("runs/{run_id}/{log_name}"), tail) {
+                        result = Err(error);
+                        break;
+                    }
+                }
+                if result.is_err() {
+                    break;
+                }
+            }
+        }
+        match result.and_then(|_| zip.finish().map(|_| ()).map_err(|e| format!("zip finish: {e}"))) {
+            Ok(()) => {
+                self.push_log(
+                    Level::Ok,
+                    format!("Экспорт диагностики: {} (без содержимого документов, R-SET-07)", path.display()),
+                );
+                Some(path)
+            }
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Экспорт диагностики: {error}"));
+                None
+            }
+        }
     }
 
     /// «Проверить и починить»: целостность CAS/индекса, статусы артефактов, документ, issues.
@@ -2349,6 +2618,10 @@ impl RdeApp {
             }
         } else {
             lines.push("Хранилище проекта не открыто".to_owned());
+        }
+        match rde_vcs::check_sync(&self.project.root) {
+            Ok(sync) => lines.extend(sync.lines().map(str::to_owned)),
+            Err(error) => lines.push(format!("Git: ошибка — {error}")),
         }
         if let Some(path) = self.project.document_path() {
             if rde_doc::is_rde_package(&path) {
@@ -2425,6 +2698,11 @@ impl RdeApp {
                 Err(error) => lines.push(format!("Журнал: ошибка — {error}")),
             },
             None => lines.push("Хранилище проекта не открыто".to_owned()),
+        }
+        // R-SET-03: рассинхрон git (ветка/незакоммиченные изменения).
+        match rde_vcs::check_sync(&self.project.root) {
+            Ok(sync) => lines.extend(sync.lines().map(str::to_owned)),
+            Err(error) => lines.push(format!("Git: {error}")),
         }
         lines
     }
@@ -2564,54 +2842,163 @@ impl RdeApp {
             }
         }
 
-        if let Some((mut name, mut template, mut rebuild)) = self.settings_dialog.take() {
+        if let Some(mut dialog) = self.settings_dialog.take() {
             let mut save = false;
             let mut cancel = false;
-            egui::Window::new("Настройки проекта")
+            let mut add_author = false;
+            let mut remove_author: Option<usize> = None;
+            let lang = self.lang;
+            egui::Window::new(tr(lang, "settings.project"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
                 .show(ctx, |ui| {
-                    ui.set_min_width(460.0);
+                    ui.set_min_width(560.0);
                     egui::Grid::new("rde_settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                         ui.label(RichText::new("Название").color(MUTED));
-                        ui.add(egui::TextEdit::singleline(&mut name).desired_width(300.0));
+                        ui.add(egui::TextEdit::singleline(&mut dialog.name).desired_width(360.0));
                         ui.end_row();
                         ui.label(RichText::new("Шаблон по умолчанию").color(MUTED));
                         egui::ComboBox::from_id_salt("rde_settings_template")
-                            .selected_text(if template.is_empty() { "—" } else { &template })
+                            .selected_text(if dialog.template.is_empty() { "—" } else { &dialog.template })
                             .show_ui(ui, |ui| {
                                 for builtin in rde_templates::builtin_templates() {
-                                    ui.selectable_value(&mut template, builtin.id.clone(), builtin.title.clone());
+                                    ui.selectable_value(&mut dialog.template, builtin.id.clone(), builtin.title.clone());
                                 }
                             });
                         ui.end_row();
                         ui.label(RichText::new("Пересборка").color(MUTED));
                         egui::ComboBox::from_id_salt("rde_settings_rebuild")
-                            .selected_text(if rebuild.is_empty() { "—" } else { &rebuild })
+                            .selected_text(if dialog.rebuild.is_empty() { "—" } else { &dialog.rebuild })
                             .show_ui(ui, |ui| {
                                 for value in ["manual", "auto"] {
-                                    ui.selectable_value(&mut rebuild, value.to_owned(), value);
+                                    ui.selectable_value(&mut dialog.rebuild, value.to_owned(), value);
                                 }
                             });
                         ui.end_row();
                     });
+                    ui.separator();
+                    ui.label(RichText::new(tr(lang, "settings.authors")).strong().small().color(MUTED));
+                    for (index, author) in dialog.authors.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut author.name).hint_text("Имя").desired_width(150.0));
+                            ui.add(egui::TextEdit::singleline(&mut author.initials).hint_text("Иниц.").desired_width(60.0));
+                            ui.add(egui::TextEdit::singleline(&mut author.email).hint_text("email").desired_width(180.0));
+                            egui::ComboBox::from_id_salt(format!("rde_author_kind_{index}"))
+                                .selected_text(author.kind.clone())
+                                .width(90.0)
+                                .show_ui(ui, |ui| {
+                                    for kind in ["human", "agent", "system"] {
+                                        ui.selectable_value(&mut author.kind, kind.to_owned(), kind);
+                                    }
+                                });
+                            if ui.small_button("×").on_hover_text("Удалить автора").clicked() {
+                                remove_author = Some(index);
+                            }
+                        });
+                    }
                     ui.horizontal(|ui| {
-                        if ui.button("Сохранить").clicked() {
+                        ui.add(egui::TextEdit::singleline(&mut dialog.new_author_name).hint_text("Новый автор: имя").desired_width(150.0));
+                        ui.add(egui::TextEdit::singleline(&mut dialog.new_author_initials).hint_text("Иниц.").desired_width(60.0));
+                        ui.add(egui::TextEdit::singleline(&mut dialog.new_author_email).hint_text("email").desired_width(180.0));
+                        if ui.button(tr(lang, "settings.add_author")).clicked() {
+                            add_author = true;
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(tr(lang, "action.save")).clicked() {
                             save = true;
                         }
-                        if ui.button("Отмена").clicked() {
+                        if ui.button(tr(lang, "action.cancel")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if add_author && !dialog.new_author_name.trim().is_empty() {
+                dialog.authors.push(rde_core::AuthorManifest {
+                    id: rde_core::new_id(),
+                    name: dialog.new_author_name.trim().to_owned(),
+                    initials: dialog.new_author_initials.trim().to_owned(),
+                    email: dialog.new_author_email.trim().to_owned(),
+                    kind: "human".to_owned(),
+                });
+                dialog.new_author_name.clear();
+                dialog.new_author_initials.clear();
+                dialog.new_author_email.clear();
+            }
+            if let Some(index) = remove_author {
+                if index < dialog.authors.len() {
+                    dialog.authors.remove(index);
+                }
+            }
+            if save {
+                if let Err(error) = self.save_project_settings_with_authors(&dialog) {
+                    self.push_log(Level::Warn, format!("Настройки: {error}"));
+                }
+            } else if !cancel {
+                self.settings_dialog = Some(dialog);
+            }
+        }
+
+        // R-SET-01: настройки приложения (язык, тема, лимиты, автор по умолчанию).
+        if let Some(mut settings) = self.app_settings_dialog.take() {
+            let mut save = false;
+            let mut cancel = false;
+            egui::Window::new(tr(self.lang, "settings.app"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(480.0);
+                    egui::Grid::new("rde_app_settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label(RichText::new(tr(self.lang, "settings.language")).color(MUTED));
+                        egui::ComboBox::from_id_salt("rde_lang")
+                            .selected_text(settings.language.clone())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut settings.language, "ru".to_owned(), "Русский");
+                                ui.selectable_value(&mut settings.language, "en".to_owned(), "English");
+                            });
+                        ui.end_row();
+                        ui.label(RichText::new(tr(self.lang, "settings.theme")).color(MUTED));
+                        egui::ComboBox::from_id_salt("rde_theme")
+                            .selected_text(settings.theme.clone())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut settings.theme, "dark".to_owned(), "dark");
+                                ui.selectable_value(&mut settings.theme, "light".to_owned(), "light (позже)");
+                            });
+                        ui.end_row();
+                        ui.label(RichText::new(tr(self.lang, "settings.keep_runs")).color(MUTED));
+                        ui.add(egui::DragValue::new(&mut settings.keep_runs).range(10..=10_000));
+                        ui.end_row();
+                        ui.label(RichText::new(tr(self.lang, "settings.author_name")).color(MUTED));
+                        ui.add(egui::TextEdit::singleline(&mut settings.author_name).desired_width(280.0));
+                        ui.end_row();
+                        ui.label(RichText::new("email").color(MUTED));
+                        ui.add(egui::TextEdit::singleline(&mut settings.author_email).desired_width(280.0));
+                        ui.end_row();
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button(tr(self.lang, "action.save")).clicked() {
+                            save = true;
+                        }
+                        if ui.button(tr(self.lang, "action.cancel")).clicked() {
                             cancel = true;
                         }
                     });
                 });
             if save {
-                if let Err(error) = self.save_project_settings(&name, &template, &rebuild) {
-                    self.push_log(Level::Warn, format!("Настройки: {error}"));
+                settings.normalize();
+                match rde_core::settings::save(&settings) {
+                    Ok(path) => {
+                        self.lang = i18n::lang(&settings.language);
+                        self.app_settings = settings;
+                        self.push_log(Level::Ok, format!("Настройки приложения сохранены: {}", path.display()));
+                    }
+                    Err(error) => self.push_log(Level::Warn, format!("Настройки приложения: {error}")),
                 }
-            }
-            if !save && !cancel {
-                self.settings_dialog = Some((name, template, rebuild));
+            } else if !cancel {
+                self.app_settings_dialog = Some(settings);
             }
         }
 
@@ -2808,6 +3195,74 @@ impl RdeApp {
                 self.insert_dialog = Some(dialog);
             }
         }
+
+        // P5: коммит изменений проекта (R-VCS-01).
+        if let Some(mut message) = self.commit_dialog.take() {
+            let mut confirm = false;
+            let mut cancel = false;
+            let status = self.git_status.clone().unwrap_or_default();
+            egui::Window::new("Git: закоммитить изменения")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(560.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Ветка {} · изменений: {} (изменено {}, новых {})",
+                            if status.branch.is_empty() { "—" } else { &status.branch },
+                            status.changed.len() + status.untracked.len(),
+                            status.changed.len(),
+                            status.untracked.len()
+                        ))
+                        .small()
+                        .color(MUTED),
+                    );
+                    ui.add(egui::TextEdit::multiline(&mut message).desired_rows(3).desired_width(f32::INFINITY));
+                    ui.label(RichText::new("Автор — первый human-автор из rde.toml (R-SET-01)").small().color(MUTED));
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new("Закоммитить").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if confirm {
+                self.git_commit(&message);
+            } else if !cancel {
+                self.commit_dialog = Some(message);
+            }
+        }
+
+        // P5: история git.
+        if let Some(entries) = self.history_dialog.take() {
+            let mut close = false;
+            egui::Window::new("Git: история")
+                .collapsible(false)
+                .resizable(true)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(640.0);
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        for entry in &entries {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&entry.id).monospace().small().color(ACCENT));
+                                ui.label(RichText::new(&entry.time).small().color(MUTED));
+                                ui.label(RichText::new(&entry.summary).size(12.5).color(TEXT));
+                                ui.label(RichText::new(&entry.author).small().color(MUTED));
+                            });
+                        }
+                    });
+                    if ui.button("Закрыть").clicked() {
+                        close = true;
+                    }
+                });
+            if !close {
+                self.history_dialog = Some(entries);
+            }
+        }
     }
 
     /// Окна диалогов создания/переименования/удаления.
@@ -2935,7 +3390,7 @@ impl RdeApp {
                     ui.add_space(8.0);
                     for tab in Tab::ALL {
                         let sel = self.tab == tab;
-                        let text = RichText::new(format!("{} {}", tab.icon(), tab.title())).size(13.0).color(if sel { TEXT } else { MUTED });
+                        let text = RichText::new(format!("{} {}", tab.icon(), tab.title(self.lang))).size(13.0).color(if sel { TEXT } else { MUTED });
                         if ui.add(egui::Button::new(text).fill(if sel { PANEL_HI } else { Color32::TRANSPARENT })).clicked() {
                             self.tab = tab;
                         }
@@ -4403,6 +4858,118 @@ mod docview_tests {
             bytes
         };
         assert!(String::from_utf8_lossy(&media).contains("fill=\"red\""), "рисунок обновлён из артефакта");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P5: git-интеграция из UI ────────────────────────────────────────────
+
+    #[test]
+    fn git_init_commit_history_and_check_from_ui() {
+        if std::process::Command::new("git").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("git недоступен — тест пропущен");
+            return;
+        }
+        let parent = std::env::temp_dir().join(format!("rde-ui-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = parent.join("git-project");
+        let mut app = RdeApp::new(rde_core::demo());
+        app.create_project_ui(&root, "Git-проект").expect("создать проект");
+        let status = app.git_status.clone().expect("статус git");
+        assert!(status.is_repo, "новый проект инициализируется в git: {status:?}");
+        assert!(root.join(".gitignore").is_file());
+        assert!(root.join(".gitattributes").is_file());
+
+        // Создаём объект и коммитим изменения.
+        app.create_object_action(super::UiObjectKind::Core(rde_core::NewObjectKind::Note), "Заметка для git").expect("заметка");
+        app.git_commit("RDE: тестовая заметка");
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Git: коммит")),
+            "журнал: {:?}",
+            app.project.log.iter().map(|line| &line.text).collect::<Vec<_>>()
+        );
+        let status = app.git_status.clone().unwrap();
+        assert!(!status.is_dirty(), "после коммита чисто: {status:?}");
+        assert!(status.last_commit.is_some());
+
+        // История и проверка проекта содержат git-сведения.
+        app.git_history();
+        assert!(app.history_dialog.as_ref().is_some_and(|entries| !entries.is_empty()));
+        app.run_project_check();
+        let check = app.check_dialog.clone().unwrap_or_default();
+        assert!(check.contains("git:"), "проверка проекта: {check}");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    // ── P5: настройки/авторы/диагностика ───────────────────────────────────
+
+    #[test]
+    fn project_settings_with_authors_persist() {
+        let root = temp_demo_copy("authors");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        let dialog = super::ProjectSettingsState {
+            name: "Отчёт с авторами".into(),
+            template: "gost-7.32-2017".into(),
+            rebuild: "manual".into(),
+            authors: vec![
+                rde_core::AuthorManifest {
+                    id: rde_core::new_id(),
+                    name: "Илья".into(),
+                    initials: "И".into(),
+                    email: "ilunix@pc.ubuntu".into(),
+                    kind: "human".into(),
+                },
+                rde_core::AuthorManifest {
+                    id: rde_core::new_id(),
+                    name: "Агент".into(),
+                    initials: "AI".into(),
+                    email: String::new(),
+                    kind: "agent".into(),
+                },
+            ],
+            new_author_name: String::new(),
+            new_author_initials: String::new(),
+            new_author_email: String::new(),
+        };
+        app.save_project_settings_with_authors(&dialog).expect("сохранить настройки");
+        let reloaded = rde_core::load_project(&root).unwrap();
+        assert_eq!(reloaded.manifest.name, "Отчёт с авторами");
+        assert_eq!(reloaded.manifest.default_template, "gost-7.32-2017");
+        assert_eq!(reloaded.manifest.authors.len(), 2);
+        assert_eq!(reloaded.manifest.authors[1].kind, "agent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diagnostics_export_has_environment_but_no_documents() {
+        if !python_available() {
+            return;
+        }
+        let root = temp_demo_copy("diagnostics");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        app.update_dependencies(None, true).expect("обновление артефактов");
+        let path = app.export_diagnostics().expect("архив диагностики");
+        assert!(path.is_file(), "{}", path.display());
+        let file = std::fs::File::open(&path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..zip.len()).map(|index| zip.by_index(index).unwrap().name().to_owned()).collect();
+        assert!(names.iter().any(|name| name == "summary.txt"), "{names:?}");
+        assert!(names.iter().any(|name| name == "rde.toml"), "{names:?}");
+        assert!(names.iter().any(|name| name == "rde.lock"), "{names:?}");
+        assert!(names.iter().any(|name| name == "transactions.txt"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name.starts_with("objects/") || name.contains(".doc.rde") || name.contains("cas/")),
+            "в диагностике нет содержимого документов/CAS (R-SET-07): {names:?}"
+        );
+        let mut summary = String::new();
+        {
+            use std::io::Read;
+            zip.by_name("summary.txt").unwrap().read_to_string(&mut summary).unwrap();
+        }
+        assert!(summary.contains("RDE diagnostics"), "{summary}");
+        assert!(summary.contains("Демо"), "{summary}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

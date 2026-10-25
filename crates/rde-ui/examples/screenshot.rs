@@ -27,6 +27,7 @@ fn main() {
         Some("update") => state.request_update(None, true),
         Some("insert-value") => state.demo_open_insert_dialog("value"),
         Some("insert-figure") => state.demo_open_insert_dialog("figure"),
+        Some("app-settings") => state.demo_open_app_settings(),
         _ => {}
     }
 

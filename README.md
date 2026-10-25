@@ -12,13 +12,13 @@ v0.10.0 (git-субмодуль).
 
 ## Вехи
 
-Текущая: **P4 «Документ: живые вставки + транзакция»** (после M6/P1/P2/P3) — `.doc.rde` по §8.5
-(root-rels на customXml, `docProps/custom.xml`-надгробие, `w14:paraId`-анкоры), живые вставки
-значений/рисунков из артефактов в `w:sdt`, обновление документа из выходов, транзакция с бэкапами
-и откатом O(1), diff версий.
+Текущая: **P5 «VCS/настройки/диагностика/гейты» — прототип v0.1 завершён** — `rde-vcs`
+(init/status/commit/revert, `.gitignore`/`.gitattributes`), настройки приложения и авторы проекта,
+каркас i18n ru/en, экспорт диагностики без содержимого документов, OPC/XSD-lite-гейт, корпус docx
+13/13 PASS, `xtask`+CI, перф 10k (396 мс). Exit-критерий v0.1: [`docs/exit-v0.1.md`](docs/exit-v0.1.md).
 Предыдущие: M1 (`m1-concept`), S5 (`s5-docview`), M2.1 (`m2.1-project-model`), M2.2 (`m2.2-store`),
 M2.3 (`m2.3-run-dag`), M2.4 (`m2.4-ui`), M3 (`m3-doc`), M4 (`m4-templates`), M5 (`m5-sources-review`),
-M6 (`ui-live`), P1 (`p1-artifacts`), P2 (`p2-store`), P3 (`p3-run-env`).
+M6 (`ui-live`), P1 (`p1-artifacts`), P2 (`p2-store`), P3 (`p3-run-env`), P4 (`p4-doc-live`).
 История и критерии вех: [`docs/milestones.md`](docs/milestones.md).
 
 ## Что уже есть в прототипе
@@ -40,6 +40,7 @@ M6 (`ui-live`), P1 (`p1-artifacts`), P2 (`p2-store`), P3 (`p3-run-env`).
 | Транзакции/откат (P2) | **работает**: транзакция «пачки» с переключением корней, откат O(1) (выходы восстанавливаются из CAS), панель «Задачи» → «Откатить», GC/pins, zstd, lock |
 | Окружения/запуск (P3) | **работает**: `rde-env` + `rde.lock`, согласие «проект доверенный», сеть запрещена best-effort, read-only входы, ошибка на лишние файлы, SIGTERM→grace, фоновое обновление с «Отменить», `provenance.json` |
 | Документ (P4) | **работает**: §8.5 wiring (root-rels/tombstone/paraId), живые вставки значения/рисунка из артефакта в `w:sdt`, «Обновить документ» из выходов, транзакция + бэкапы + diff + откат |
+| VCS/настройки/гейты (P5) | **работает**: git init/status/commit/revert/log, `.gitignore`/`.gitattributes`, настройки приложения и авторы, i18n-каркас ru/en, экспорт диагностики, OPC-гейт, корпус docx, `xtask`/CI, перф 10k |
 | MCP-сервер, ACP-агент | **следующие итерации** (v0.3, см. `.agent/plan-v01.md`) |
 | S5 (чистый DocView) | ✅ первая версия: feature `rde-docview` в форк-ветке WordCraft; см. `docs/wordcraft-fork.md` |
 
@@ -50,7 +51,7 @@ M6 (`ui-live`), P1 (`p1-artifacts`), P2 (`p2-store`), P3 (`p3-run-env`).
 Тесты (включая автотест клавиатурного ввода в DocView и RDE-сохранения):
 
 ```bash
-cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-ui   # 126 тестов: модель, хеши (JCS/property), store (kill -9, транзакции/откат/GC), окружения, запуск (безопасность/provenance), DAG (property), .doc.rde (§8.5/вставки/транзакция), docx-гейты, ГОСТ, источники/PDF/OCR, UI
+cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-ui   # 136 тестов: модель, хеши (JCS/property), store (kill -9/транзакции/откат/GC), окружения, запуск (безопасность/provenance), DAG (property), .doc.rde (§8.5/вставки/транзакция), docx-гейты/OPC, ГОСТ, источники/PDF/OCR, VCS, настройки/i18n, UI
 ```
 
 ```bash

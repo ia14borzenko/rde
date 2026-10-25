@@ -259,6 +259,57 @@ fn write_artifact_scaffold(dir: &Path, kind: NewObjectKind, title: &str) -> Resu
     Ok(())
 }
 
+/// Записать список авторов проекта в `rde.toml` (R-SET-01, R-UI-06): заменяет `[[authors]]`-блоки,
+/// остальной файл не трогает. Пустой список удаляет авторов.
+pub fn set_project_authors(root: &Path, authors: &[crate::manifest::AuthorManifest]) -> Result<(), String> {
+    let path = root.join("rde.toml");
+    let text = fs::read_to_string(&path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
+    // Удаляем все существующие [[authors]]-секции (до следующего заголовка таблицы).
+    let mut kept: Vec<String> = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("[[authors]]") {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            let is_table = trimmed.starts_with('[') && !trimmed.starts_with("[[authors]]");
+            if is_table {
+                skipping = false;
+            } else {
+                continue;
+            }
+        }
+        kept.push(line.to_owned());
+    }
+    // Убираем возможные пустые хвостовые строки перед добавлением.
+    while kept.last().is_some_and(|line| line.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut out = kept.join("\n");
+    out.push('\n');
+    for author in authors {
+        out.push_str(&format!(
+            "\n[[authors]]\nid = {}\nname = {}\ninitials = {}\nemail = {}\nkind = {}\n",
+            toml_string(&author.id),
+            toml_string(&author.name),
+            toml_string(&author.initials),
+            toml_string(&author.email),
+            toml_string(&author.kind),
+        ));
+    }
+    fs::write(&path, out).map_err(|e| format!("записать {}: {e}", path.display()))?;
+    let text = fs::read_to_string(&path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
+    let value: toml::Value = toml::from_str(&text).map_err(|e| format!("TOML {}: {e}", path.display()))?;
+    let errors = manifest::validate(ManifestKind::Project, &value);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} не проходит JSON Schema: {}", path.display(), errors.join("; ")))
+    }
+}
+
 /// Записать `trusted` в `rde.toml`, не трогая остальной файл (R-RUN-06): согласие пользователя
 /// на запуск скриптов проекта. Ключ верхнего уровня — вставляется перед первой таблицей.
 pub fn set_project_trusted(root: &Path, trusted: bool) -> Result<(), String> {
@@ -631,6 +682,53 @@ mod tests {
         let artifact = project.artifact_object(&project.objects[0].id).unwrap();
         let crate::ObjectData::Artifact(manifest) = &artifact.data else { panic!() };
         assert_eq!(manifest.out_hash.as_deref(), Some(hash2.as_str()));
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod authors_tests {
+    use super::*;
+
+    #[test]
+    fn set_project_authors_replaces_blocks_and_keeps_rest() {
+        let root = std::env::temp_dir().join(format!("rde-core-authors-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("rde.toml"),
+            "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"T\"\n# комментарий\ntrusted = true\n\n[[authors]]\nid = \"01M5VJ1JG0YAJDSX5VK7TBXABK\"\nname = \"Старый\"\n",
+        )
+        .unwrap();
+        let authors = vec![
+            crate::manifest::AuthorManifest {
+                id: "01M5VJ1JG0YAJDSX5VK7TBXABK".into(),
+                name: "Илья".into(),
+                initials: "И".into(),
+                email: "ilunix@pc.ubuntu".into(),
+                kind: "human".into(),
+            },
+            crate::manifest::AuthorManifest {
+                id: "01M5VJ1JG0ZZZZZZZZZZZZZZZZ".into(),
+                name: "Агент".into(),
+                initials: "AI".into(),
+                email: String::new(),
+                kind: "agent".into(),
+            },
+        ];
+        set_project_authors(&root, &authors).unwrap();
+        let text = fs::read_to_string(root.join("rde.toml")).unwrap();
+        assert!(text.contains("# комментарий"), "комментарии сохраняются");
+        assert!(text.contains("trusted = true"));
+        assert!(text.contains("name = \"Илья\""));
+        assert!(text.contains("name = \"Агент\""));
+        assert!(!text.contains("Старый"), "старые авторы заменены: {text}");
+        let project = crate::load_project(&root).unwrap();
+        assert_eq!(project.manifest.authors.len(), 2);
+        assert_eq!(project.manifest.authors[1].kind, "agent");
+        // Пустой список удаляет авторов.
+        set_project_authors(&root, &[]).unwrap();
+        assert_eq!(crate::load_project(&root).unwrap().manifest.authors.len(), 0);
         let _ = fs::remove_dir_all(&root);
     }
 }

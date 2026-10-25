@@ -1,0 +1,9 @@
+[package]
+name = "rde-vcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDE git integration (P5): init/status/commit/revert/log, project .gitignore/.gitattributes (R-VCS)"
+
+[dependencies]
+serde = { workspace = true }

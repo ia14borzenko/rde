@@ -1,0 +1,399 @@
+{
+  "corpus": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus",
+  "failed": 0,
+  "generated_unix": 1792912977,
+  "passed": 13,
+  "reports": [
+    {
+      "name": "01-empty.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912970,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 6459,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 1,
+        "paragraphs_source": 1,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/01-empty.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "02-one-paragraph.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912971,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 13179,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 2,
+        "paragraphs_source": 2,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/02-one-paragraph.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "03-headings.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912971,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 23088,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 6,
+        "paragraphs_source": 6,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/03-headings.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "04-unicode.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912972,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 27718,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 3,
+        "paragraphs_source": 3,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/04-unicode.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "05-long-100.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912972,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 35055,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 101,
+        "paragraphs_source": 101,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/05-long-100.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "06-long-300.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912973,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 76425,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 301,
+        "paragraphs_source": 301,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/06-long-300.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "07-bold-italic.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912973,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 20203,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 4,
+        "paragraphs_source": 4,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/07-bold-italic.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "08-caption-like.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912974,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 14223,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 3,
+        "paragraphs_source": 3,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/08-caption-like.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "09-many-headings.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912974,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 43698,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 81,
+        "paragraphs_source": 81,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/09-many-headings.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "10-empty-paragraphs.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912975,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 13068,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 5,
+        "paragraphs_source": 5,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/10-empty-paragraphs.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "11-numeric.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912975,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 14664,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 2,
+        "paragraphs_source": 2,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/11-numeric.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "12-mixed.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912976,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 22656,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 9,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 6,
+        "paragraphs_source": 6,
+        "roundtrip_parts": 9,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/12-mixed.docx",
+        "source_parts": 9
+      }
+    },
+    {
+      "name": "13-demo-report.docx",
+      "passed": true,
+      "report": {
+        "changed": [],
+        "critical_missing": [],
+        "extra": [],
+        "generated_unix": 1792912977,
+        "lo": {
+          "available": true,
+          "error": null,
+          "pdf_bytes": 121264,
+          "pdf_is_valid": true,
+          "version": "LibreOffice 26.2.6.3 620(Build:3)"
+        },
+        "media_preserved": true,
+        "missing": [],
+        "opc": {
+          "errors": [],
+          "ok": true,
+          "parts": 10,
+          "xml_parts": 8
+        },
+        "paragraphs_roundtrip": 16,
+        "paragraphs_source": 16,
+        "roundtrip_parts": 10,
+        "source": "/home/admin-pc/proj/rde-dev/rde/crates/rde-docx/tests/corpus/13-demo-report.docx",
+        "source_parts": 10
+      }
+    }
+  ],
+  "total": 13
+}

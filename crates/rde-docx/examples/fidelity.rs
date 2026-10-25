@@ -38,6 +38,10 @@ fn main() {
     println!("медиа сохранены: {}", report.media_preserved);
     println!("абзацев: {} → {}", report.paragraphs_source, report.paragraphs_roundtrip);
     println!("LibreOffice: available={} version={:?} pdf={} байт valid={}", report.lo.available, report.lo.version, report.lo.pdf_bytes, report.lo.pdf_is_valid);
+    println!("OPC/XML: {} (частей {}, XML {})", if report.opc.ok { "OK" } else { "ОШИБКИ" }, report.opc.parts, report.opc.xml_parts);
+    for error in report.opc.errors.iter().take(10) {
+        println!("  OPC: {error}");
+    }
     if let Some(error) = &report.lo.error { println!("  LO error: {error}"); }
     println!("ГЕЙТ: {}", if report.passed() { "PASS" } else { "FAIL" });
     if let Some(out) = std::env::args().nth(2) {
