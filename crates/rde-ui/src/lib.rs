@@ -2606,6 +2606,45 @@ impl RdeApp {
         self.selected.as_ref().and_then(|id| self.project.object(id).cloned())
     }
 
+    /// Цель «Открыть» из инспектора: вкладка, где объект реально показан.
+    /// Документ → вкладка Документ, артефакт (включая константы — у них то же
+    /// рабочее место) → Артефакты, источник → Источник. У заметок и репозиториев
+    /// центрального вьюера нет (вкладки Источник/Артефакты показали бы чужой
+    /// объект через fallback на первый источник/артефакт) — их показывает только
+    /// сам инспектор, открывать нечего.
+    fn inspector_open_tab(object: &rde_core::Object) -> Option<Tab> {
+        match &object.data {
+            ObjectData::Document(_) => Some(Tab::Document),
+            ObjectData::Artifact(_) => Some(Tab::Artifacts),
+            ObjectData::Source(_) => Some(Tab::Source),
+            ObjectData::Note(_) | ObjectData::Repository(_) => None,
+        }
+    }
+
+    /// Честный переход «Открыть» (инспектор): вкладка объекта + выбор в дереве;
+    /// артефакту сбрасываем рабочее место к результату под выбранный объект.
+    /// Консистентно с «Открыть в инспекторе» из DAG-меню (выбор + инспектор + журнал).
+    /// Возвращает false, если объекту некуда вести (см. [`Self::inspector_open_tab`]).
+    fn open_inspector_object(&mut self, id: &str) -> bool {
+        let Some(object) = self.project.object(id).cloned() else {
+            return false;
+        };
+        let Some(tab) = Self::inspector_open_tab(&object) else {
+            return false;
+        };
+        self.selected = Some(object.id.clone());
+        self.show_inspector = true;
+        self.tab = tab;
+        if matches!(&object.data, ObjectData::Artifact(_)) {
+            // Рабочее место артефакта: входы/генерация/результат — открываем результат
+            // под выбранный объект (как «Открыть» из контекстного меню дерева).
+            self.artifact_editor = None;
+            self.artifact_section = ArtifactSection::Result;
+        }
+        self.push_log(Level::Info, format!("Открыт объект: {} ({})", object.title, object.detail));
+        true
+    }
+
     fn inspector_panel(&mut self, ui: &mut egui::Ui) {
         let object = self.selected_object();
         let mut open_clicked = false;
@@ -2645,7 +2684,14 @@ impl RdeApp {
                     field_row(ui, "детали", &object.detail, false);
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if ui.button(RichText::new("Открыть").size(12.0)).clicked() {
+                        // Честная кнопка «Открыть»: у заметок и репозиториев центрального
+                        // вьюера нет (их показывает только сам инспектор) — открывать нечего.
+                        let can_open = Self::inspector_open_tab(object).is_some();
+                        if ui
+                            .add_enabled(can_open, egui::Button::new(RichText::new("Открыть").size(12.0)))
+                            .on_disabled_hover_text("нечего открывать")
+                            .clicked()
+                        {
                             open_clicked = true;
                         }
                         if ui.button(RichText::new("Переименовать").size(12.0)).clicked() {
@@ -2813,12 +2859,12 @@ impl RdeApp {
             });
         if let Some(object) = &object {
             if open_clicked {
-                self.tab = match object.kind {
-                    ObjectKind::Document => Tab::Document,
-                    ObjectKind::Artifact | ObjectKind::Constants => Tab::Artifacts,
-                    ObjectKind::Source | ObjectKind::Note => Tab::Source,
-                    ObjectKind::Repository => Tab::Artifacts,
-                };
+                // Переход выполняет open_inspector_object: вкладка объекта + выбор
+                // в дереве + рабочее место артефакта; консистентно с «Открыть
+                // в инспекторе» из DAG-меню. Для заметок/репозиториев кнопка
+                // disabled, так что сюда попадаем только когда открывать есть что.
+                let id = object.id.clone();
+                let _ = self.open_inspector_object(&id);
             }
             if rename_clicked {
                 self.rename_dialog = Some(RenameDialogState { id: object.id.clone(), title: object.title.clone() });
@@ -6808,6 +6854,89 @@ mod docview_tests {
             "{:?}",
             statuses[STATS].status
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Track A: честная кнопка «Открыть» в инспекторе ────────────────────
+
+    #[test]
+    fn inspector_open_selects_object_and_its_workplace() {
+        let root = temp_demo_copy("inspector-open");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        let doc = app
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(object.data, rde_core::ObjectData::Document(_)))
+            .map(|object| object.id.clone())
+            .expect("документ в демо-проекте");
+        let source = app
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(object.data, rde_core::ObjectData::Source(_)))
+            .map(|object| object.id.clone())
+            .expect("источник в демо-проекте");
+        // Документ → вкладка Документ + выбор в дереве + журнал (как DAG-меню).
+        app.tab = super::Tab::Artifacts;
+        app.show_inspector = false;
+        assert!(app.open_inspector_object(&doc));
+        assert_eq!(app.selected.as_deref(), Some(doc.as_str()));
+        assert!(app.show_inspector);
+        assert!(app.tab == super::Tab::Document);
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Открыт объект")),
+            "журнал: {:?}",
+            app.project.log.iter().map(|line| &line.text).collect::<Vec<_>>()
+        );
+        // Артефакт → вкладка Артефакты + рабочее место сброшено к результату.
+        app.tab = super::Tab::Document;
+        app.artifact_section = super::ArtifactSection::Inputs;
+        assert!(app.open_inspector_object(STATS));
+        assert_eq!(app.selected.as_deref(), Some(STATS));
+        assert!(app.tab == super::Tab::Artifacts);
+        assert_eq!(app.artifact_section, super::ArtifactSection::Result);
+        // Источник → вкладка Источник.
+        assert!(app.open_inspector_object(&source));
+        assert!(app.tab == super::Tab::Source);
+        assert_eq!(app.selected.as_deref(), Some(source.as_str()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inspector_open_nothing_to_open_leaves_state_untouched() {
+        let root = temp_demo_copy("inspector-open-none");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        let note = app
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(object.data, rde_core::ObjectData::Note(_)))
+            .map(|object| object.id.clone())
+            .expect("заметка в демо-проекте");
+        // У заметки центрального вьюера нет: кнопка disabled, переход — false,
+        // вкладка и выбор не меняются, не паникует.
+        assert!(super::RdeApp::inspector_open_tab(app.project.object(&note).unwrap()).is_none());
+        app.tab = super::Tab::Document;
+        app.selected = Some(note.clone());
+        assert!(!app.open_inspector_object(&note));
+        assert!(app.tab == super::Tab::Document);
+        assert_eq!(app.selected.as_deref(), Some(note.as_str()));
+        // Репозиторий — тоже нечего открывать (показывает только инспектор).
+        if let Some(repo) = app
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(object.data, rde_core::ObjectData::Repository(_)))
+            .map(|object| object.id.clone())
+        {
+            assert!(super::RdeApp::inspector_open_tab(app.project.object(&repo).unwrap()).is_none());
+            assert!(!app.open_inspector_object(&repo));
+        }
+        // Неизвестный id — тоже false без паники.
+        assert!(!app.open_inspector_object("нет-такого-объекта"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
