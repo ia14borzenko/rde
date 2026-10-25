@@ -8,9 +8,16 @@ use std::path::PathBuf;
 use rde_dag::{update, UpdateAction, UpdateOptions};
 
 fn main() {
-    let root = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
+    let mut force = false;
+    let mut root_arg: Option<PathBuf> = None;
+    for arg in std::env::args().skip(1) {
+        if arg == "--force" {
+            force = true;
+        } else {
+            root_arg = Some(PathBuf::from(arg));
+        }
+    }
+    let root = root_arg
         .or_else(|| std::env::var_os("RDE_PROJECT").map(PathBuf::from))
         .unwrap_or_else(|| rde_core::demo_project_dir());
     let project = match rde_core::load_project(&root) {
@@ -27,7 +34,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let report = match update(&project, &mut store, &UpdateOptions::default()) {
+    let options = UpdateOptions { force, ..UpdateOptions::default() };
+    let report = match update(&project, &mut store, &options) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("обновление не выполнено: {error}");

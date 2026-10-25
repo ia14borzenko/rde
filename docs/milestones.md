@@ -481,3 +481,58 @@ store владеет корнями/снапшотами/GC, dag оркестр�
 **P3 — запуск/окружения/безопасность/provenance:** `rde-env` (uv/`rde.lock`/digests), trust-consent,
 network deny, read-only входы, ошибка на лишние выходы, SIGTERM→grace, очередь/логи;
 provenance: `runDetails` (rde-run) + `externalParameters/subject/resolvedDependencies` (rde-dag).
+
+---
+
+## P3 — «Запуск, окружения, безопасность, provenance» — ✅ достигнута 2026-10-25, тег `p3-run-env`
+
+**Главный вывод:** запуск артефактов стал воспроизводимым и подотчётным: окружение разрешается
+отдельным слоем `rde-env` и входит в `env_hash`, запуск требует согласия, сеть по умолчанию
+запрещена, лишние файлы — ошибка, каждый запуск оставляет SLSA-подобный `provenance.json`.
+
+### Что проверено
+1. **`rde-env` (новый крейт)**: разрешение окружений (`python` — `uv venv .venv` + `uv.lock`,
+   `node` — `pnpm-lock.yaml`, `r` — `pixi.lock`, `shell`), версии интерпретаторов/менеджеров,
+   digest записи (JCS) → вход `env_hash` (§7.2); `rde.lock` (TOML) фиксирует окружение в git.
+   Смена режима (`project`/`system`) или объявленных `vars` меняет `env_hash` → статус
+   «изменилось окружение» (тест dag).
+2. **rde-run hardening** (R-RUN-04/05/06/08):
+   - согласие «проект доверенный» (`trusted` в `rde.toml`): без него запуск отклоняется;
+   - сеть по умолчанию запрещена best-effort (blackhole-прокси + `RDE_NETWORK=deny`), включается
+     декларативно (`network_allow`); в provenance честно фиксируется «best-effort»;
+   - входы и скрипт материализуются только для чтения (`chmod 0444`);
+   - файлы вне объявленных `outputs` — ошибка с перечнем (кроме `__pycache__`/`.rde*`);
+   - отмена/таймаут: SIGTERM → grace 2 с → SIGKILL процессной группы;
+   - интерпретатор берётся из разрешённого окружения (`.venv/bin/python`), а не из PATH;
+   - `runDetails` provenance: script_hash, env_lock_digest, platform, network/trusted, exit_code,
+     digest логов, время, extra_files;
+   - логи: чтение с байтового смещения, поиск, ретенция запусков (`prune_runs`).
+3. **Provenance** (R-ART-08): `runs/<run_id>/provenance.json` — SLSA-подобный statement:
+   `subject` = out_hash, `externalParameters` (артефакт, act_key, in/script/params/env hash, params,
+   инициатор), `resolvedDependencies` (`rde://artifact/<id>@<out_hash>`, файлы/заметки/источники/
+   константы), `runDetails`. Пишется для успешных и неуспешных запусков (с `error`).
+4. **UI**: диалог согласия перед первым запуском («Доверяю проекту и запустить» → `trusted = true`);
+   фоновое обновление (UI не блокируется) с индикатором и кнопкой «Отменить»; в инспекторе —
+   режим окружения, `env digest` (сверка с `rde.lock`), политика сети, согласие, кнопка
+   «копировать путь provenance».
+
+### Подтверждение
+- Тесты: **118** (было 100): +4 `rde-env` (разрешение/digest/rde.lock), +7 `rde-run`
+  (доверенность, read-only, лишние файлы, сеть, provenance, SIGTERM-grace, логи),
+  +4 `rde-dag` (provenance, failed-provenance, отказ без согласия, network deny/allow),
+  +2 UI (диалог согласия, отмена фонового обновления); `cargo test --workspace` зелёный.
+- Скриншоты: [`docs/assets/p3-env-network.png`](assets/p3-env-network.png) — инспектор с окружением/
+  сетью/provenance; [`docs/assets/p3-trust-dialog.png`](assets/p3-trust-dialog.png) — диалог согласия.
+
+### Известные ограничения (уходят в следующие шаги)
+- Сеть — best-effort без ОС-песочницы (`unshare -n` в текущем окружении запрещён); полная
+  песочница (bwrap/landlock/WASI) — фаза 2+ по ТЗ.
+- Очередь обновлений — из одного задания (второй запрос не запускается); лимит параллелизма и
+  очередь нескольких проектов — позже.
+- `git_commit`/`git_dirty` в `runDetails` появятся с `rde-vcs` (P5); сейчас поля нет.
+- Документные транзакции и вставки — P4.
+
+### Следующий шаг
+**P4 — документ: живые вставки артефакт→документ + транзакция обновления** (R-DOC-02/03/04/11/12):
+`_rels/.rels`-wiring, `docProps/custom.xml`-надгробие, `paraId`-анкоры, `sdt`-вставки, обновление
+рисунка/значения из артефакта, транзакция+бэкапы+откат+diff. Закрывает C1/G6 и exit v0.1.

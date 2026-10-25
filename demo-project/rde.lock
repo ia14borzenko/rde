@@ -1,0 +1,12 @@
+schema = "rde/lock@1"
+updated_unix = 1792909409
+
+[envs.python]
+runtime = "python"
+mode = "project"
+interpreter = ".venv/bin/python"
+version = "3.12.14"
+manager = "uv"
+manager_version = "0.12.19"
+platform = "linux-x86_64"
+digest = "3e3eea792094552abb134f74d9cf2c8e91682f2a422c303ad8d0981676b0a6ad"

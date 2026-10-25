@@ -10,9 +10,11 @@ egui = { workspace = true }
 rde-core = { workspace = true }
 rde-dag = { workspace = true }
 rde-doc = { workspace = true }
+rde-env = { workspace = true }
 rde-templates = { workspace = true }
 rde-sources = { workspace = true }
 zip = { workspace = true }
+rde-run = { workspace = true }
 rde-store = { workspace = true }
 wordcraft-engine = { workspace = true }
 wordcraft-ui-egui = { path = "../../vendor/wordcraft/crates/ui-egui", features = ["rde-docview"] }

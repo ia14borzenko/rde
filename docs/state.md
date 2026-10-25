@@ -157,3 +157,21 @@ store/kill -9, запуск, DAG, `.doc.rde`, docx-гейты, ГОСТ, ист�
 **Тестов: 100** (было 90). Демо-проект: после обновлений в `artifact.toml` фиксируется `out_hash`;
 `.rde/` (CAS, журнал, корни, снапшоты) — генерируемое состояние. Следующий шаг — **P3**
 (`rde-env`, run security/provenance), затем P4 (документ), P5 (vcs/settings/гейты).
+
+---
+
+## Обновление 2026-10-25 (P3 «Запуск/окружения/безопасность/provenance», тег `p3-run-env`)
+
+| Пункт | Что сделано | Подтверждение |
+|---|---|---|
+| R-RUN-02/07 | новый `rde-env`: разрешение окружений, `rde.lock`, digest → `env_hash` | тесты rde-env + dag EnvChanged |
+| R-RUN-06 | согласие «проект доверенный» (диалог в UI, `trusted` в rde.toml) | тесты run/dag/UI |
+| R-RUN-06 | сеть по умолчанию запрещена best-effort, `network_allow` декларативно | тест deny/allow + provenance |
+| R-RUN-04 | read-only входы, ошибка на лишние файлы вне outputs | тесты run |
+| R-RUN-05 | SIGTERM→grace→SIGKILL, отмена из UI (фоновое обновление) | тесты run/UI |
+| R-ART-08 | `provenance.json` (SLSA-подобно): subject, externalParameters, resolvedDependencies, runDetails | тесты dag |
+| R-RUN-08 | чтение логов с offset, поиск, ретенция запусков | тест run |
+
+**Тестов: 118** (было 100). Демо: `demo-project/rde.lock` фиксирует uv-окружение Python;
+`.venv/` и `uv.lock` — локальные (gitignore). Следующий шаг — **P4** (документ: живые вставки +
+транзакция обновления), затем P5 (vcs/settings/гейты).

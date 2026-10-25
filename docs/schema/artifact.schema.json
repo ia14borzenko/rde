@@ -129,11 +129,20 @@
         },
         "env": {
           "default": "project",
+          "description": "Режим окружения: `project` (uv/pnpm/pixi), `system` или `artifact`.",
           "type": "string"
         },
         "kind": {
           "description": "`python` | `shell` | `node` | `r`.",
           "type": "string"
+        },
+        "vars": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Объявленные переменные окружения (входят в `env_hash`, tz-02 §7.2).",
+          "type": "object"
         }
       },
       "required": [

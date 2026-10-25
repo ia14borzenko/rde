@@ -3,3 +3,5 @@
 /exports/
 objects/*/*/out/
 __pycache__/
+.venv/
+uv.lock

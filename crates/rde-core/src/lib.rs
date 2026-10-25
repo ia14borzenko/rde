@@ -23,7 +23,7 @@ pub use manifest::{
 };
 pub use ops::{
     CreateRequest, NewObjectKind, clear_artifact_out_hash, create_document_stub, create_object,
-    create_project, delete_object, record_artifact_out_hash, rename_object,
+    create_project, delete_object, record_artifact_out_hash, rename_object, set_project_trusted,
 };
 pub use project::{
     Freshness, Group, Issue, Level, LogLine, Object, ObjectData, ObjectKind, Project, load_project,

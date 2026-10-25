@@ -4,8 +4,13 @@
 //! - входы копируются в `work/inputs/...` (детерминированно, без симлинков);
 //! - скрипт копируется из каталога артефакта;
 //! - stdout/stderr пишутся в `runs/<run_id>/stdout.log|stderr.log`;
-//! - объявленные выходы должны появиться в work; их собирает вызывающая сторона (rde-dag);
-//! - таймаут и отмена (SIGKILL процессной группы) — чтобы не оставлять потомков.
+//! - входы материализуются только для чтения (R-RUN-04), лишние файлы вне объявленных
+//!   выходов — ошибка (защита от загрязнения графа);
+//! - таймаут и отмена: SIGTERM → grace → SIGKILL процессной группы (R-RUN-05);
+//! - сеть по умолчанию запрещена best-effort (proxy-blackhole + флаг в provenance), включается
+//!   декларативно (`network_allow`); запуск требует согласия «проект доверенный» (R-RUN-06);
+//! - `runDetails` provenance пишется в `runs/<run_id>/run_details.json` (R-ART-08);
+//! - хелперы логов: чтение с байтового смещения, поиск, ретенция запусков (R-RUN-08).
 //!
 //! Платформенная зависимость (см. ADR-0001 §3): process group/SIGKILL — Unix; на других ОС
 //! код компилируется с fallback `Child::kill` (полноценный Windows Job Object — v1.x).
@@ -57,6 +62,34 @@ pub struct InputFile {
     pub inline: Option<Vec<u8>>,
 }
 
+impl RunSpec {
+    /// Минимальный RunSpec: python/shell-скрипт в каталоге артефакта, сеть запрещена,
+    /// запуск требует согласия (`trusted` выставляет вызывающий слой после проверки проекта).
+    pub fn new(
+        artifact_id: impl Into<String>,
+        runtime: impl Into<String>,
+        entry: impl Into<String>,
+        artifact_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            artifact_id: artifact_id.into(),
+            runtime: runtime.into(),
+            entry: entry.into(),
+            artifact_dir: artifact_dir.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            timeout: None,
+            env: BTreeMap::new(),
+            interpreter: None,
+            network: NetworkPolicy::Deny,
+            trusted: false,
+            initiator: "user".to_owned(),
+            script_hash: None,
+            env_lock_digest: None,
+        }
+    }
+}
+
 impl InputFile {
     pub fn new(source: impl Into<PathBuf>, dest: impl Into<String>) -> Self {
         Self { source: source.into(), dest: dest.into(), inline: None }
@@ -66,6 +99,13 @@ impl InputFile {
     pub fn from_bytes(dest: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
         Self { source: PathBuf::new(), dest: dest.into(), inline: Some(bytes.into()) }
     }
+}
+
+/// Политика сети для запуска (R-RUN-06): по умолчанию запрещена, best-effort без ОС-песочницы.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkPolicy {
+    Allow,
+    Deny,
 }
 
 /// Задание на запуск артефакта.
@@ -83,6 +123,16 @@ pub struct RunSpec {
     pub outputs: Vec<String>,
     pub timeout: Option<Duration>,
     pub env: BTreeMap<String, String>,
+    /// Интерпретатор из разрешённого окружения (R-RUN-02); None — по runtime.
+    pub interpreter: Option<String>,
+    pub network: NetworkPolicy,
+    /// Согласие пользователя «проект доверенный» (R-RUN-06).
+    pub trusted: bool,
+    /// Инициатор запуска (`user`, `agent`, …) — в provenance.
+    pub initiator: String,
+    /// `script_hash` и digest окружения — в `runDetails` provenance.
+    pub script_hash: Option<String>,
+    pub env_lock_digest: Option<String>,
 }
 
 /// Итог запуска.
@@ -96,6 +146,12 @@ pub struct RunOutcome {
     pub stderr_log: PathBuf,
     pub work_dir: PathBuf,
     pub outputs: Vec<RunOutput>,
+    /// Файлы, созданные скриптом вне объявленных выходов (ошибка R-RUN-04).
+    pub extra_files: Vec<String>,
+    /// Сеть блокировалась best-effort (proxy-blackhole) — в provenance.
+    pub network_denied: bool,
+    /// Путь к `runDetails`-provenance запуска.
+    pub run_details_path: PathBuf,
     /// Описание ошибки (например, нет объявленных выходов).
     pub error: Option<String>,
 }
@@ -137,14 +193,30 @@ pub fn run(project_root: &Path, spec: &RunSpec, cancel: Option<Arc<AtomicBool>>)
     fs::create_dir_all(&work_dir).map_err(|e| format!("создать workdir: {e}"))?;
     let stdout_log = run_dir.join("stdout.log");
     let stderr_log = run_dir.join("stderr.log");
+    let started_unix = now_unix();
+
+    // R-RUN-06: запуск произвольного кода требует явного согласия «проект доверенный».
+    if !spec.trusted {
+        return Ok(spawn_error(
+            spec,
+            &run_id,
+            &run_dir,
+            &work_dir,
+            &stdout_log,
+            &stderr_log,
+            started_unix,
+            "проект не помечен доверенным: запуск скриптов требует согласия (R-RUN-06)".to_owned(),
+        ));
+    }
 
     // Скрипт и входы.
     let entry_src = spec.artifact_dir.join(&spec.entry);
     if !entry_src.is_file() {
-        return Ok(spawn_error(&run_id, &run_dir, &work_dir, &stdout_log, &stderr_log, 0, format!("скрипт не найден: {}", entry_src.display())));
+        return Ok(spawn_error(spec, &run_id, &run_dir, &work_dir, &stdout_log, &stderr_log, started_unix, format!("скрипт не найден: {}", entry_src.display())));
     }
     let entry_dst = work_dir.join(&spec.entry);
     copy_file(&entry_src, &entry_dst).map_err(|e| format!("скопировать скрипт: {e}"))?;
+    set_read_only(&entry_dst);
     for input in &spec.inputs {
         let dest = work_dir.join(&input.dest);
         match &input.inline {
@@ -156,19 +228,28 @@ pub fn run(project_root: &Path, spec: &RunSpec, cancel: Option<Arc<AtomicBool>>)
             }
             None => {
                 if !input.source.is_file() {
-                    return Ok(spawn_error(&run_id, &run_dir, &work_dir, &stdout_log, &stderr_log, 0, format!("вход не найден: {}", input.source.display())));
+                    return Ok(spawn_error(spec, &run_id, &run_dir, &work_dir, &stdout_log, &stderr_log, started_unix, format!("вход не найден: {}", input.source.display())));
                 }
                 copy_file(&input.source, &dest).map_err(|e| format!("скопировать вход {}: {e}", input.dest))?;
             }
         }
+        // R-RUN-04: входы материализуются только для чтения.
+        set_read_only(&dest);
     }
 
     let runtime = RuntimeKind::from_kind(&spec.runtime)?;
-    let (program, extra) = runtime.command();
+    let (program, extra) = match &spec.interpreter {
+        Some(interpreter) if !interpreter.trim().is_empty() => (interpreter.clone(), Vec::new()),
+        _ => {
+            let (program, extra) = runtime.command();
+            (program.to_owned(), extra.to_vec())
+        }
+    };
+    let network_denied = spec.network == NetworkPolicy::Deny;
     let started = Instant::now();
-    let mut command = Command::new(program);
+    let mut command = Command::new(&program);
     command
-        .args(extra)
+        .args(&extra)
         .arg(&spec.entry)
         .current_dir(&work_dir)
         .stdin(Stdio::null())
@@ -177,6 +258,18 @@ pub fn run(project_root: &Path, spec: &RunSpec, cancel: Option<Arc<AtomicBool>>)
     for (key, value) in &spec.env {
         command.env(key, value);
     }
+    if network_denied {
+        // Best-effort без ОС-песочницы: blackhole-прокси для типовых HTTP-клиентов
+        // + явный флаг RDE_NETWORK=deny; в provenance фиксируется, что это best-effort.
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+            command.env(key, "http://127.0.0.1:9");
+        }
+        command.env("NO_PROXY", "").env("no_proxy", "");
+        command.env("RDE_NETWORK", "deny");
+    } else {
+        command.env("RDE_NETWORK", "allow");
+    }
+    command.env("RDE_RUN_ID", &run_id).env("RDE_ARTIFACT_ID", &spec.artifact_id);
     // Отдельная процессная группа: при отмене/таймауте убиваем и всех потомков.
     #[cfg(unix)]
     {
@@ -187,7 +280,7 @@ pub fn run(project_root: &Path, spec: &RunSpec, cancel: Option<Arc<AtomicBool>>)
         Ok(child) => child,
         Err(e) => {
             let error = format!("не удалось запустить `{program}`: {e}");
-            return Ok(spawn_error(&run_id, &run_dir, &work_dir, &stdout_log, &stderr_log, 0, error));
+            return Ok(spawn_error(spec, &run_id, &run_dir, &work_dir, &stdout_log, &stderr_log, started_unix, error));
         }
     };
 
@@ -221,15 +314,13 @@ pub fn run(project_root: &Path, spec: &RunSpec, cancel: Option<Arc<AtomicBool>>)
         }
         if cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             cancelled = true;
-            kill_tree(&mut child);
-            let _ = child.wait();
+            terminate_tree(&mut child, Duration::from_secs(2));
             break None;
         }
         if let Some(timeout) = spec.timeout {
             if started.elapsed() >= timeout {
                 timeout_hit = true;
-                kill_tree(&mut child);
-                let _ = child.wait();
+                terminate_tree(&mut child, Duration::from_secs(2));
                 break None;
             }
         }
@@ -254,34 +345,78 @@ pub fn run(project_root: &Path, spec: &RunSpec, cancel: Option<Arc<AtomicBool>>)
             missing.push(rel.clone());
         }
     }
+    // R-RUN-04: файлы вне объявленных выходов — ошибка, а не предупреждение.
+    let extra_files = scan_extra_files(&work_dir, spec);
     let (final_status, exit_code, error) = if cancelled {
         (RunStatus::Cancelled, None, Some("отменено пользователем".to_owned()))
     } else if timeout_hit {
         (RunStatus::Timeout, None, Some("превышен таймаут".to_owned()))
     } else {
         match status {
-            Some(status) if status.success() && missing.is_empty() => (RunStatus::Ok, status.code(), None),
-            Some(status) if status.success() => (
+            Some(status) if status.success() && missing.is_empty() && extra_files.is_empty() => {
+                (RunStatus::Ok, status.code(), None)
+            }
+            Some(status) if status.success() && !missing.is_empty() => (
                 RunStatus::Failed,
                 status.code(),
                 Some(format!("нет объявленных выходов: {}", missing.join(", "))),
+            ),
+            Some(status) if status.success() => (
+                RunStatus::Failed,
+                status.code(),
+                Some(format!(
+                    "лишние файлы вне объявленных outputs (R-RUN-04): {}",
+                    extra_files.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+                )),
             ),
             Some(status) => (RunStatus::Failed, status.code(), None),
             None => (RunStatus::SpawnError, None, Some("процесс не вернул статус".to_owned())),
         }
     };
+    let finished_unix = now_unix();
     let outcome = RunOutcome {
-        run_id,
+        run_id: run_id.clone(),
         status: final_status,
         exit_code,
         duration_ms: duration.as_millis() as u64,
-        stdout_log,
-        stderr_log,
-        work_dir,
+        stdout_log: stdout_log.clone(),
+        stderr_log: stderr_log.clone(),
+        work_dir: work_dir.clone(),
         outputs: outcomes,
+        extra_files,
+        network_denied,
+        run_details_path: run_dir.join("run_details.json"),
         error,
     };
-    // provenance: пишем итог рядом с логами.
+    // provenance: runDetails (R-ART-08) пишет rde-run; dag добавит subject/dependencies.
+    let details = RunDetails {
+        run_id: run_id.clone(),
+        artifact_id: spec.artifact_id.clone(),
+        runtime: spec.runtime.clone(),
+        entry: spec.entry.clone(),
+        interpreter: program.clone(),
+        initiator: spec.initiator.clone(),
+        platform: platform(),
+        trusted: spec.trusted,
+        network: if network_denied { "deny".to_owned() } else { "allow".to_owned() },
+        network_denied_best_effort: network_denied,
+        script_hash: spec.script_hash.clone(),
+        env_lock_digest: spec.env_lock_digest.clone(),
+        exit_code: outcome.exit_code,
+        status: outcome.status,
+        duration_ms: outcome.duration_ms,
+        started_unix,
+        finished_unix,
+        stdout_log: stdout_log.display().to_string(),
+        stderr_log: stderr_log.display().to_string(),
+        stdout_digest: file_digest(&stdout_log),
+        stderr_digest: file_digest(&stderr_log),
+        work_dir: work_dir.display().to_string(),
+        extra_files: outcome.extra_files.clone(),
+    };
+    if let Ok(json) = serde_json::to_vec_pretty(&details) {
+        let _ = fs::write(&outcome.run_details_path, json);
+    }
     let run_json = run_dir.join("run.json");
     if let Ok(json) = serde_json::to_vec_pretty(&outcome) {
         let _ = fs::write(run_json, json);
@@ -289,27 +424,261 @@ pub fn run(project_root: &Path, spec: &RunSpec, cancel: Option<Arc<AtomicBool>>)
     Ok(outcome)
 }
 
+/// `runDetails` provenance запуска (R-ART-08); `rde-dag` объединяет его с subject/dependencies.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunDetails {
+    pub run_id: String,
+    pub artifact_id: String,
+    pub runtime: String,
+    pub entry: String,
+    pub interpreter: String,
+    pub initiator: String,
+    pub platform: String,
+    pub trusted: bool,
+    /// `allow` | `deny` (сеть).
+    pub network: String,
+    /// true — сеть блокировалась best-effort (без ОС-песочницы).
+    pub network_denied_best_effort: bool,
+    pub script_hash: Option<String>,
+    pub env_lock_digest: Option<String>,
+    pub exit_code: Option<i32>,
+    pub status: RunStatus,
+    pub duration_ms: u64,
+    pub started_unix: u64,
+    pub finished_unix: u64,
+    pub stdout_log: String,
+    pub stderr_log: String,
+    pub stdout_digest: Option<String>,
+    pub stderr_digest: Option<String>,
+    pub work_dir: String,
+    #[serde(default)]
+    pub extra_files: Vec<String>,
+}
+
+/// Платформа для provenance (`RDE_PLATFORM` может переопределить).
+pub fn platform() -> String {
+    std::env::var("RDE_PLATFORM").unwrap_or_else(|_| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn file_digest(path: &Path) -> Option<String> {
+    std::fs::read(path).ok().map(|bytes| rde_hash::sha256(&bytes).hex())
+}
+
+/// Сделать файл только для чтения (R-RUN-04: входы не должны меняться скриптом).
+fn set_read_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o444);
+            let _ = fs::set_permissions(path, permissions);
+        }
+    }
+    let _ = path;
+}
+
+/// Файлы workdir вне объявленных выходов/входов/скрипта (R-RUN-04).
+fn scan_extra_files(work_dir: &Path, spec: &RunSpec) -> Vec<String> {
+    let mut allowed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    allowed.insert(spec.entry.clone());
+    for input in &spec.inputs {
+        allowed.insert(input.dest.clone());
+    }
+    for output in &spec.outputs {
+        allowed.insert(output.clone());
+    }
+    let mut extra = Vec::new();
+    let mut stack = vec![work_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel = path.strip_prefix(work_dir).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            if path.is_dir() {
+                // Служебные каталоги Python/сборки не считаются загрязнением outputs.
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name == "__pycache__" || name.starts_with(".rde") {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if allowed.contains(&rel) {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".pyc") || name.starts_with(".rde-tmp") {
+                continue;
+            }
+            extra.push(rel);
+        }
+    }
+    extra.sort();
+    extra
+}
+
+/// Корректное завершение: SIGTERM группе → grace-ожидание → SIGKILL (R-RUN-05).
+fn terminate_tree(child: &mut std::process::Child, grace: Duration) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        if pid > 0 {
+            // SAFETY: отрицательный pid — сигнал всей процессной группе.
+            unsafe {
+                libc::kill(-pid, libc::SIGTERM);
+            }
+        }
+        let deadline = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
+    }
+    kill_tree(child);
+}
+
+// ── логи (R-RUN-08): чтение с байтового смещения, поиск, ретенция ───────────
+
+/// Кусок лога, прочитанный с байтового смещения (для переподключения к логу).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogChunk {
+    pub bytes: Vec<u8>,
+    pub next_offset: u64,
+    pub eof: bool,
+}
+
+/// Прочитать лог начиная с `offset` (не более `max_bytes`; `eof` — прочитан до конца файла).
+pub fn read_log_from(path: &Path, offset: u64, max_bytes: usize) -> std::io::Result<LogChunk> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if offset >= len {
+        return Ok(LogChunk { bytes: Vec::new(), next_offset: len, eof: true });
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let take = ((len - offset) as usize).min(max_bytes);
+    let mut bytes = vec![0u8; take];
+    let read = file.read(&mut bytes)?;
+    bytes.truncate(read);
+    let next_offset = offset + read as u64;
+    Ok(LogChunk { bytes, next_offset, eof: next_offset >= len })
+}
+
+/// Найденная строка лога.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogHit {
+    pub line_no: usize,
+    pub offset: u64,
+    pub text: String,
+}
+
+/// Поиск по логу (регистронезависимо), не более `max_hits` строк.
+pub fn search_log(path: &Path, query: &str, max_hits: usize) -> std::io::Result<Vec<LogHit>> {
+    let text = fs::read_to_string(path)?;
+    let needle = query.to_lowercase();
+    let mut hits = Vec::new();
+    let mut offset = 0u64;
+    for (line_no, line) in text.lines().enumerate() {
+        if needle.is_empty() || line.to_lowercase().contains(&needle) {
+            hits.push(LogHit { line_no: line_no + 1, offset, text: line.to_owned() });
+            if hits.len() >= max_hits {
+                break;
+            }
+        }
+        offset += line.len() as u64 + 1;
+    }
+    Ok(hits)
+}
+
+/// Ретенция запусков: оставить `keep_last` последних каталогов `.rde/runs/`.
+/// Возвращает число удалённых запусков.
+pub fn prune_runs(project_root: &Path, keep_last: usize) -> std::io::Result<usize> {
+    let root = runs_root(project_root);
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(&root)?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let modified = entry.metadata().and_then(|meta| meta.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            dirs.push((modified, path));
+        }
+    }
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut removed = 0;
+    for (_, path) in dirs.into_iter().skip(keep_last) {
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 fn spawn_error(
+    spec: &RunSpec,
     run_id: &str,
     run_dir: &Path,
     work_dir: &Path,
     stdout_log: &Path,
     stderr_log: &Path,
-    duration_ms: u64,
+    started_unix: u64,
     error: String,
 ) -> RunOutcome {
     let _ = fs::create_dir_all(run_dir);
     let _ = File::create(stdout_log);
     let _ = File::create(stderr_log);
+    let run_details_path = run_dir.join("run_details.json");
+    let details = RunDetails {
+        run_id: run_id.to_owned(),
+        artifact_id: spec.artifact_id.clone(),
+        runtime: spec.runtime.clone(),
+        entry: spec.entry.clone(),
+        interpreter: spec.interpreter.clone().unwrap_or_else(|| spec.runtime.clone()),
+        initiator: spec.initiator.clone(),
+        platform: platform(),
+        trusted: spec.trusted,
+        network: if spec.network == NetworkPolicy::Deny { "deny".to_owned() } else { "allow".to_owned() },
+        network_denied_best_effort: spec.network == NetworkPolicy::Deny,
+        script_hash: spec.script_hash.clone(),
+        env_lock_digest: spec.env_lock_digest.clone(),
+        exit_code: None,
+        status: RunStatus::SpawnError,
+        duration_ms: 0,
+        started_unix,
+        finished_unix: now_unix(),
+        stdout_log: stdout_log.display().to_string(),
+        stderr_log: stderr_log.display().to_string(),
+        stdout_digest: file_digest(stdout_log),
+        stderr_digest: file_digest(stderr_log),
+        work_dir: work_dir.display().to_string(),
+        extra_files: Vec::new(),
+    };
+    if let Ok(json) = serde_json::to_vec_pretty(&details) {
+        let _ = fs::write(&run_details_path, json);
+    }
     RunOutcome {
         run_id: run_id.to_owned(),
         status: RunStatus::SpawnError,
         exit_code: None,
-        duration_ms,
+        duration_ms: 0,
         stdout_log: stdout_log.to_path_buf(),
         stderr_log: stderr_log.to_path_buf(),
         work_dir: work_dir.to_path_buf(),
         outputs: Vec::new(),
+        extra_files: Vec::new(),
+        network_denied: spec.network == NetworkPolicy::Deny,
+        run_details_path,
         error: Some(error),
     }
 }

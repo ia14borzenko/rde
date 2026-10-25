@@ -18,13 +18,44 @@ use std::time::Duration;
 
 use rde_core::{ArtifactManifest, InputSpec, Object, ObjectData, Project};
 use rde_hash::{act_key, env_hash, group_hash, in_hash, params_hash, script_hash, sha256, tree_hash, GroupMember, Hash, InGroup, TreeEntry};
-use rde_run::{run, InputFile, RunOutcome, RunSpec, RunStatus};
+use rde_run::{run, InputFile, NetworkPolicy, RunOutcome, RunSpec, RunStatus};
 use rde_store::{Store, TxRecord, TxStatus};
 use serde::{Deserialize, Serialize};
 
-/// Платформенная строка для `env_hash`.
+/// Платформенная строка для `env_hash` (`RDE_PLATFORM` может переопределить).
 pub fn platform() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    rde_env::platform()
+}
+
+/// Разрешённые окружения артефактов проекта (P3): ключ — `(runtime.kind, runtime.env)`.
+#[derive(Clone, Debug, Default)]
+pub struct EnvContext {
+    locks: BTreeMap<(String, String), Result<rde_env::RuntimeLock, String>>,
+}
+
+impl EnvContext {
+    /// Разрешить окружения для всех runtime, встречающихся у compute-артефактов.
+    pub fn resolve(project: &Project) -> Self {
+        let mut context = Self::default();
+        for artifact in project.artifacts().filter(|artifact| artifact.kind == "compute") {
+            let Some(runtime) = &artifact.runtime else { continue };
+            let key = (runtime.kind.clone(), runtime.env.clone());
+            context
+                .locks
+                .entry(key)
+                .or_insert_with_key(|(kind, mode)| rde_env::resolve(&project.root, kind, mode));
+        }
+        context
+    }
+
+    /// Разрешённое окружение артефакта.
+    pub fn lock(&self, runtime: &rde_core::RuntimeManifest) -> Result<&rde_env::RuntimeLock, String> {
+        match self.locks.get(&(runtime.kind.clone(), runtime.env.clone())) {
+            Some(Ok(lock)) => Ok(lock),
+            Some(Err(error)) => Err(format!("окружение {}: {error}", runtime.kind)),
+            None => Err(format!("окружение для runtime `{}` не разрешено", runtime.kind)),
+        }
+    }
 }
 
 /// Запись выхода в ledger.
@@ -64,6 +95,19 @@ pub struct ArtifactState {
     pub updated_unix: u64,
 }
 
+/// Разрешённый hashed-вход артефакта — для provenance (`resolvedDependencies`, R-ART-08).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedInput {
+    pub group: String,
+    pub mode: String,
+    /// Цель: id артефакта, `file:<rel>`, `note:<id>`, `source:<id>`, `constants:<id>`.
+    pub target: String,
+    /// URI вида `rde://artifact/<id>@<out_hash>` (или `rde://file/...@<sha256>`).
+    pub uri: String,
+    pub digest: String,
+    pub selector: String,
+}
+
 /// Вычисленные компоненты ключа активации.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Activation {
@@ -73,7 +117,11 @@ pub struct Activation {
     pub script_hash: Option<Hash>,
     pub params_hash: Hash,
     pub env_hash: Hash,
+    /// Digest разрешённого окружения (вход `env_hash`, R-RUN-07).
+    pub env_lock_digest: String,
     pub schema_version: String,
+    /// Разрешённые hashed-входы (для provenance).
+    pub resolved: Vec<ResolvedInput>,
 }
 
 /// Причина устаревания по компонентам `act_key`/выходов (tz-02 §7.3 п.2).
@@ -162,6 +210,8 @@ pub struct ArtifactStatus {
     pub updated_unix: Option<u64>,
     pub outputs: usize,
     pub run_id: Option<String>,
+    /// Digest окружения, при котором актуален артефакт.
+    pub env_lock_digest: Option<String>,
 }
 
 /// Прочитать ledger из committed-транзакций (порядок — по времени начала).
@@ -329,6 +379,7 @@ pub fn activation(
     project: &Project,
     artifact: &ArtifactManifest,
     ledger: &HashMap<String, ArtifactState>,
+    env: &EnvContext,
 ) -> Result<Activation, String> {
     let artifact_object = object(project, &artifact.id)?;
     let artifact_dir = artifact_object.dir.clone();
@@ -341,6 +392,7 @@ pub fn activation(
         .ok_or_else(|| format!("у compute-артефакта {} нет runtime", artifact.id))?;
 
     let mut groups = Vec::new();
+    let mut resolved = Vec::new();
     for group in artifact.groups.iter().filter(|group| group.is_hashed()) {
         let mut members = Vec::new();
         for input in &group.inputs {
@@ -358,6 +410,21 @@ pub fn activation(
                 InputSpec::Source { source } => source.clone(),
                 InputSpec::Constants { selector, .. } => selector.clone(),
             };
+            let uri_target = match input {
+                InputSpec::Artifact { artifact, .. } => format!("rde://artifact/{artifact}"),
+                InputSpec::File { file } => format!("rde://file/{file}"),
+                InputSpec::Note { note } => format!("rde://note/{note}"),
+                InputSpec::Source { source } => format!("rde://source/{source}"),
+                InputSpec::Constants { constants, .. } => format!("rde://constants/{constants}"),
+            };
+            resolved.push(ResolvedInput {
+                group: group.name.clone(),
+                mode: group.mode.clone(),
+                target: target.clone(),
+                uri: format!("{uri_target}@{}", hash.hex()),
+                digest: hash.hex(),
+                selector: selector.clone(),
+            });
             members.push(GroupMember { target, out: hash, selector });
         }
         groups.push(InGroup { name: group.name.clone(), mode: "hashed".into(), grp_hash: group_hash(&group.name, "hashed", &members) });
@@ -369,16 +436,22 @@ pub fn activation(
     let extra_files = script_extra_files(&artifact_dir, &artifact.script_files);
     let script = Some(script_hash(&runtime.kind, &runtime.entry, &script_bytes, &extra_files));
     let params = params_hash(&artifact.params)?;
-    let env = env_hash(&runtime.kind, &platform(), None, &BTreeMap::new());
-    let key = act_key(&artifact.kind, &artifact.schema, in_hash, script, params, env);
+    // Окружение (P3): digest разрешённого окружения + объявленные переменные (R-RUN-07).
+    let env_lock = env.lock(runtime)?;
+    let lock_digest = Hash::from_hex(&env_lock.digest)
+        .map_err(|e| format!("digest окружения `{}`: {e}", env_lock.digest))?;
+    let env_hash = env_hash(&runtime.kind, &env_lock.platform, Some(lock_digest), &runtime.vars);
+    let key = act_key(&artifact.kind, &artifact.schema, in_hash, script, params, env_hash);
     Ok(Activation {
         artifact_id: artifact.id.clone(),
         act_key: key,
         in_hash,
         script_hash: script,
         params_hash: params,
-        env_hash: env,
+        env_hash,
+        env_lock_digest: env_lock.digest.clone(),
         schema_version: artifact.schema.clone(),
+        resolved,
     })
 }
 
@@ -455,14 +528,15 @@ fn stale_reasons(artifact_dir: &Path, state: &ArtifactState, activation: &Activa
 /// Оценить все артефакты проекта (compute — по хешам, data/constants — актуальны).
 pub fn evaluate(project: &Project, store: &Store) -> Result<BTreeMap<String, ArtifactStatus>, String> {
     let ledger = ledger(store)?;
+    let env = EnvContext::resolve(project);
     let mut result = BTreeMap::new();
     for artifact_object in project.objects.iter().filter(|o| matches!(o.data, ObjectData::Artifact(_))) {
         let ObjectData::Artifact(artifact) = &artifact_object.data else { continue };
-        let (status, act_key, out_hash, updated, run_id) = if artifact.kind != "compute" {
-            (LiveStatus::Fresh, None, None, None, None)
+        let (status, act_key, out_hash, updated, run_id, env_digest) = if artifact.kind != "compute" {
+            (LiveStatus::Fresh, None, None, None, None, None)
         } else {
-            match activation(project, artifact, &ledger) {
-                Err(error) => (LiveStatus::NotComputable(error), None, None, None, None),
+            match activation(project, artifact, &ledger, &env) {
+                Err(error) => (LiveStatus::NotComputable(error), None, None, None, None, None),
                 Ok(activation) => {
                     let state = ledger.get(&artifact.id);
                     let updated = state.map(|state| state.updated_unix);
@@ -479,7 +553,14 @@ pub fn evaluate(project: &Project, store: &Store) -> Result<BTreeMap<String, Art
                             }
                         }
                     };
-                    (status, Some(activation.act_key.hex()), out_hash, updated, run_id)
+                    (
+                        status,
+                        Some(activation.act_key.hex()),
+                        out_hash,
+                        updated,
+                        run_id,
+                        Some(activation.env_lock_digest.clone()),
+                    )
                 }
             }
         };
@@ -495,6 +576,7 @@ pub fn evaluate(project: &Project, store: &Store) -> Result<BTreeMap<String, Art
                 updated_unix: updated,
                 outputs: artifact.outputs.len(),
                 run_id,
+                env_lock_digest: env_digest,
             },
         );
     }
@@ -554,7 +636,7 @@ pub fn dependents_closure(project: &Project, targets: &[String]) -> HashSet<Stri
     closure
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct UpdateOptions {
     /// Ограничить обновление целями (None — все устаревшие).
     pub targets: Option<Vec<String>>,
@@ -568,6 +650,21 @@ pub struct UpdateOptions {
     pub batch: bool,
     /// Продолжать после ошибки отдельного артефакта.
     pub continue_on_error: bool,
+    /// Отмена обновления из UI: передаётся в rde-run (SIGTERM → grace → SIGKILL).
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl std::fmt::Debug for UpdateOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateOptions")
+            .field("targets", &self.targets)
+            .field("include_dependents", &self.include_dependents)
+            .field("force", &self.force)
+            .field("batch", &self.batch)
+            .field("continue_on_error", &self.continue_on_error)
+            .field("cancel", &self.cancel.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -593,7 +690,10 @@ pub struct UpdatedArtifact {
 #[derive(Clone, Debug, Default)]
 pub struct UpdateReport {
     pub artifacts: Vec<UpdatedArtifact>,
+    /// Ошибки, из-за которых артефакт не обновлён (или предупреждения обновления).
     pub errors: Vec<String>,
+    /// Информационные заметки (например, обновление `rde.lock`).
+    pub notes: Vec<String>,
     pub tx_ids: Vec<String>,
 }
 
@@ -617,7 +717,12 @@ impl UpdateReport {
 /// - выход другого артефакта: selector-файл → `inputs/<basename>`, glob → все совпавшие файлы;
 /// - константы → сгенерированный `inputs/constants.json` / `inputs/constant-<имя>.json`;
 /// - заметка/источник → `inputs/<basename>`.
-fn build_spec(project: &Project, artifact: &ArtifactManifest) -> Result<RunSpec, String> {
+fn build_spec(
+    project: &Project,
+    artifact: &ArtifactManifest,
+    env: &EnvContext,
+    activation: &Activation,
+) -> Result<RunSpec, String> {
     let artifact_object = object(project, &artifact.id)?;
     let runtime = artifact.runtime.as_ref().ok_or_else(|| "нет runtime".to_owned())?;
     let mut inputs = Vec::new();
@@ -684,6 +789,18 @@ fn build_spec(project: &Project, artifact: &ArtifactManifest) -> Result<RunSpec,
     if artifact.outputs.is_empty() {
         return Err("у compute-артефакта нет объявленных выходов".to_owned());
     }
+    // P3: интерпретатор/политика сети/согласие/провенанс из разрешённого окружения и проекта.
+    let env_lock = env.lock(runtime)?;
+    let interpreter = if env_lock.interpreter.trim().is_empty() {
+        None
+    } else if env_lock.interpreter.contains('/') {
+        // Абсолютный путь: cwd процесса запуска — workdir, а не корень проекта.
+        let project_root = project.root.canonicalize().unwrap_or_else(|_| project.root.clone());
+        Some(project_root.join(&env_lock.interpreter).display().to_string())
+    } else {
+        Some(env_lock.interpreter.clone())
+    };
+    let network_allow = artifact.network_allow.unwrap_or(project.manifest.network_allow);
     Ok(RunSpec {
         artifact_id: artifact.id.clone(),
         runtime: runtime.kind.clone(),
@@ -692,7 +809,13 @@ fn build_spec(project: &Project, artifact: &ArtifactManifest) -> Result<RunSpec,
         inputs,
         outputs: artifact.outputs.clone(),
         timeout: artifact.timeout_s.map(Duration::from_secs),
-        env: BTreeMap::new(),
+        env: runtime.vars.clone(),
+        interpreter,
+        network: if network_allow { NetworkPolicy::Allow } else { NetworkPolicy::Deny },
+        trusted: project.manifest.trusted,
+        initiator: "user".to_owned(),
+        script_hash: activation.script_hash.map(|hash| hash.hex()),
+        env_lock_digest: Some(env_lock.digest.clone()),
     })
 }
 
@@ -751,6 +874,73 @@ fn state_from_outcome(artifact: &ArtifactManifest, outcome: &RunOutcome, activat
     }
 }
 
+/// Записать `runs/<run_id>/provenance.json` (R-ART-08): SLSA-подобный statement с subject,
+/// externalParameters, resolvedDependencies и runDetails (их пишет rde-run).
+fn write_provenance(
+    artifact: &ArtifactManifest,
+    outcome: &RunOutcome,
+    activation: &Activation,
+    subject_out_hash: Option<&str>,
+    error: Option<&str>,
+) -> Result<PathBuf, String> {
+    let run_dir = outcome
+        .stdout_log
+        .parent()
+        .ok_or_else(|| format!("у лога {} нет каталога", outcome.stdout_log.display()))?;
+    let details: serde_json::Value = fs::read(&outcome.run_details_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let dependencies: Vec<serde_json::Value> = activation
+        .resolved
+        .iter()
+        .map(|input| {
+            serde_json::json!({
+                "uri": input.uri,
+                "digest": { "sha256": input.digest },
+                "group": input.group,
+                "selector": input.selector,
+                "mode": input.mode,
+            })
+        })
+        .collect();
+    let subject: Vec<serde_json::Value> = match subject_out_hash {
+        Some(hash) => vec![serde_json::json!({ "name": artifact.id, "digest": { "sha256": hash } })],
+        None => Vec::new(),
+    };
+    let provenance = serde_json::json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": subject,
+        "predicateType": "https://rde.dev/provenance/v1",
+        "predicate": {
+            "buildDefinition": {
+                "buildType": "rde/dag-update@1",
+                "externalParameters": {
+                    "artifact": artifact.id,
+                    "title": artifact.title,
+                    "type": artifact.kind,
+                    "schema_version": artifact.schema,
+                    "act_key": activation.act_key.hex(),
+                    "in_hash": activation.in_hash.hex(),
+                    "script_hash": activation.script_hash.map(|hash| hash.hex()),
+                    "params_hash": activation.params_hash.hex(),
+                    "env_hash": activation.env_hash.hex(),
+                    "env_lock_digest": activation.env_lock_digest,
+                    "params": artifact.params,
+                    "initiator": details.get("initiator").cloned().unwrap_or(serde_json::json!("user")),
+                },
+                "resolvedDependencies": dependencies,
+            },
+            "runDetails": details,
+            "error": error,
+        }
+    });
+    let path = run_dir.join("provenance.json");
+    let bytes = serde_json::to_vec_pretty(&provenance).map_err(|e| format!("json provenance: {e}"))?;
+    fs::write(&path, bytes).map_err(|e| format!("записать {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// Имя корня артефакта в store: `artifact/<id>` → tree_hash его выходов.
 pub fn artifact_root_name(artifact_id: &str) -> String {
     format!("artifact/{artifact_id}")
@@ -786,6 +976,18 @@ fn commit_update(
     }
 }
 
+/// Зафиксировать разрешённое окружение артефакта в `rde.lock` (R-RUN-02): версии/lock-файлы
+/// становятся частью проекта и git-истории; `env_hash` считается из фактического окружения.
+fn record_env_lock(project: &Project, artifact: &ArtifactManifest, env: &EnvContext, report: &mut UpdateReport) {
+    let Some(runtime) = &artifact.runtime else { return };
+    let Ok(lock) = env.lock(runtime) else { return };
+    match rde_env::update_entry(&project.root, lock) {
+        Ok(true) => report.notes.push(format!("{}: rde.lock обновлён ({} {})", artifact.title, lock.runtime, lock.version)),
+        Ok(false) => {}
+        Err(error) => report.errors.push(format!("{}: rde.lock не записан: {error}", artifact.title)),
+    }
+}
+
 /// Успешный запуск, ожидающий commit в режиме одной транзакции на пачку.
 struct PendingCommit {
     artifact_id: String,
@@ -796,6 +998,8 @@ struct PendingCommit {
     duration_ms: u64,
     stdout_log: PathBuf,
     act_key: String,
+    outcome: RunOutcome,
+    activation: Activation,
 }
 
 /// Зафиксировать пачку обновлений одной транзакцией (§7.3 п.7): все корни переключаются атомарно.
@@ -826,7 +1030,15 @@ fn commit_batch(store: &mut Store, pending: &[PendingCommit]) -> Result<String, 
 /// состоянии (прогрессивное обновление, см. §L плана).
 pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> Result<UpdateReport, String> {
     let mut ledger = ledger(store)?;
+    let env = EnvContext::resolve(project);
     let order = topological_compute(project)?;
+    // R-RUN-06: первый запуск скриптов требует явного согласия «проект доверенный».
+    if !project.manifest.trusted {
+        return Err(
+            "запуск скриптов требует согласия: проект не помечен доверенным (trusted = true в rde.toml)"
+                .to_owned(),
+        );
+    }
     let allowed: Option<HashSet<String>> = options.targets.as_ref().map(|targets| {
         if options.include_dependents {
             dependents_closure(project, targets)
@@ -839,6 +1051,14 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
     let artifacts: HashMap<&str, &ArtifactManifest> = project.artifacts().map(|a| (a.id.as_str(), a)).collect();
 
     for artifact_id in order {
+        if options
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            report.errors.push("обновление отменено пользователем".to_owned());
+            break;
+        }
         if let Some(allowed) = &allowed {
             if !allowed.contains(&artifact_id) {
                 continue;
@@ -846,7 +1066,7 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
         }
         let Some(artifact) = artifacts.get(artifact_id.as_str()).copied() else { continue };
         let artifact_object = object(project, &artifact.id)?;
-        let activation = match activation(project, artifact, &ledger) {
+        let activation = match activation(project, artifact, &ledger, &env) {
             Ok(activation) => activation,
             Err(error) => {
                 report.errors.push(format!("{}: {error}", artifact.title));
@@ -868,7 +1088,12 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
             }
         };
         let state = ledger.get(&artifact.id);
-        let forced = options.force && options.targets.as_ref().is_some_and(|targets| targets.contains(&artifact.id));
+        // force: при явных целях — пересчитать их; при targets = None — пересчитать всё.
+        let forced = options.force
+            && match &options.targets {
+                Some(targets) => targets.contains(&artifact.id),
+                None => true,
+            };
         if !forced && state.is_some_and(|state| stale_reasons(&artifact_object.dir, state, &activation).is_empty()) {
             report.artifacts.push(UpdatedArtifact {
                 artifact_id: artifact.id.clone(),
@@ -884,7 +1109,7 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
             continue;
         }
 
-        let spec = match build_spec(project, artifact) {
+        let spec = match build_spec(project, artifact, &env, &activation) {
             Ok(spec) => spec,
             Err(error) => {
                 report.errors.push(format!("{}: {error}", artifact.title));
@@ -905,7 +1130,7 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
                 continue;
             }
         };
-        let outcome = match run(&project.root, &spec, None) {
+        let outcome = match run(&project.root, &spec, options.cancel.clone()) {
             Ok(outcome) => outcome,
             Err(error) => {
                 report.errors.push(format!("{}: {error}", artifact.title));
@@ -928,6 +1153,9 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
         };
         if outcome.status != RunStatus::Ok {
             let message = outcome.error.clone().unwrap_or_else(|| format!("код возврата {:?}", outcome.exit_code));
+            if let Err(error) = write_provenance(artifact, &outcome, &activation, None, Some(&message)) {
+                report.errors.push(format!("{}: provenance не записан: {error}", artifact.title));
+            }
             report.errors.push(format!("{}: {message}", artifact.title));
             report.artifacts.push(UpdatedArtifact {
                 artifact_id: artifact.id.clone(),
@@ -1019,6 +1247,8 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
                 duration_ms: outcome.duration_ms,
                 stdout_log: outcome.stdout_log.clone(),
                 act_key: activation.act_key.hex(),
+                outcome: outcome.clone(),
+                activation: activation.clone(),
             });
             continue;
         }
@@ -1032,6 +1262,10 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
                         report.errors.push(format!("{}: out_hash не записан в artifact.toml: {error}", artifact.title));
                     }
                 }
+                if let Err(error) = write_provenance(artifact, &outcome, &activation, state.out_hash.as_deref(), None) {
+                    report.errors.push(format!("{}: provenance не записан: {error}", artifact.title));
+                }
+                record_env_lock(project, artifact, &env, &mut report);
                 report.artifacts.push(UpdatedArtifact {
                     artifact_id: artifact.id.clone(),
                     title: artifact.title.clone(),
@@ -1068,6 +1302,14 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
             Ok(tx) => {
                 report.tx_ids.push(tx);
                 for item in pending {
+                    if let Some(artifact) = artifacts.get(item.artifact_id.as_str()) {
+                        record_env_lock(project, artifact, &env, &mut report);
+                        if let Err(error) =
+                            write_provenance(artifact, &item.outcome, &item.activation, item.state.out_hash.as_deref(), None)
+                        {
+                            report.errors.push(format!("{}: provenance не записан: {error}", item.title));
+                        }
+                    }
                     if let Some(out_hash) = &item.state.out_hash {
                         let dir = artifacts
                             .get(item.artifact_id.as_str())
@@ -1095,6 +1337,9 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
             Err(error) => {
                 report.errors.push(format!("транзакция пачки не зафиксирована: {error}"));
                 for item in pending {
+                    if let Some(artifact) = artifacts.get(item.artifact_id.as_str()) {
+                        let _ = write_provenance(artifact, &item.outcome, &item.activation, None, Some(&error));
+                    }
                     report.artifacts.push(UpdatedArtifact {
                         artifact_id: item.artifact_id,
                         title: item.title,

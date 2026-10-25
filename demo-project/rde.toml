@@ -3,6 +3,8 @@ id = "01M5VJ1JG0V3RS3DTR98H6BCFN"
 name = "Демо: отчёт по НИР"
 default_rebuild = "manual"
 default_template = "free"
+trusted = true
+network_allow = false
 
 [[authors]]
 id = "01M5VJ1JG0YAJDSX5VK7TBXABK"

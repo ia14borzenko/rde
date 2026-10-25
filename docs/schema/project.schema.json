@@ -53,8 +53,18 @@
     "name": {
       "type": "string"
     },
+    "network_allow": {
+      "default": false,
+      "description": "Сеть разрешена артефактам проекта по умолчанию (R-RUN-06; артефакт может переопределить).",
+      "type": "boolean"
+    },
     "schema": {
       "type": "string"
+    },
+    "trusted": {
+      "default": false,
+      "description": "Проект доверенный: пользователь дал согласие на запуск скриптов (R-RUN-06).",
+      "type": "boolean"
     }
   },
   "required": [

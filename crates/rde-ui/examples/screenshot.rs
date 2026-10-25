@@ -22,6 +22,10 @@ fn main() {
     if let Some(logs_tab) = std::env::args().nth(4).and_then(|value| value.parse::<usize>().ok()) {
         state.demo_set_logs_tab(logs_tab);
     }
+    // 5-й аргумент `update` — запросить обновление артефактов (для снимка диалога согласия).
+    if std::env::args().nth(5).as_deref() == Some("update") {
+        state.request_update(None, true);
+    }
 
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::vec2(1600.0, 1000.0))

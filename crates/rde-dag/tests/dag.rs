@@ -301,8 +301,7 @@ fn single_artifact_update_and_force() {
         targets: Some(vec![STATS.to_owned()]),
         include_dependents: false,
         force: true,
-        batch: false,
-        continue_on_error: false,
+        ..Default::default()
     };
     let report = update(&project, &mut store, &options).unwrap();
     assert_eq!(report.failed(), 0, "{:?}", report.errors);
@@ -316,7 +315,7 @@ fn single_artifact_update_and_force() {
         include_dependents: true,
         force: true,
         batch: true,
-        continue_on_error: false,
+        ..Default::default()
     };
     let report = update(&project, &mut store, &options).unwrap();
     assert_eq!(report.failed(), 0, "{:?}", report.errors);
@@ -331,7 +330,7 @@ fn write_min_project(root: &Path) {
     std::fs::create_dir_all(root.join("objects/artifacts")).unwrap();
     std::fs::write(
         root.join("rde.toml"),
-        "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"P1\"\n",
+        "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"P1\"\ntrusted = true\n",
     )
     .unwrap();
 }
@@ -566,5 +565,202 @@ fn gc_after_update_keeps_current_roots_and_frees_orphans() {
         assert!(store.get_blob(entry.blob).unwrap().is_some(), "блоб {} текущего корня удалён", entry.blob);
     }
     assert_eq!(store.current_roots().unwrap(), roots);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── P3: окружения и rde.lock ─────────────────────────────────────────────────
+
+#[test]
+fn update_records_rde_lock_and_env_change_marks_stale() {
+    if !python_available() {
+        return;
+    }
+    let (root, project) = demo_copy("env-lock");
+    let mut store = Store::open(&root).unwrap();
+    let report = update(&project, &mut store, &UpdateOptions::default()).unwrap();
+    assert_eq!(report.failed(), 0, "{:?}", report.errors);
+    let lock_path = root.join("rde.lock");
+    assert!(lock_path.is_file(), "rde.lock создан после запуска");
+    let lock_text = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(lock_text.contains("schema = \"rde/lock@1\""), "{lock_text}");
+    assert!(lock_text.contains("[envs.python]"), "{lock_text}");
+    let env_lock = rde_env::load(&root).expect("rde.lock читается");
+    let python = env_lock.envs.get("python").expect("запись python");
+    assert!(!python.version.is_empty());
+    assert_eq!(python.digest.len(), 64);
+
+    // Повторное обновление не переписывает rde.lock (окружение не изменилось).
+    let project = load_project(&root).unwrap();
+    let report = update(&project, &mut store, &UpdateOptions::default()).unwrap();
+    assert_eq!(report.ran(), 0, "{:?}", report.artifacts);
+    assert!(!report.notes.iter().any(|note| note.contains("rde.lock обновлён")), "{:?}", report.notes);
+
+    // Смена режима окружения (project → system) меняет env_hash → «изменилось окружение».
+    let stats_manifest = artifact_dir(&project, STATS).join("artifact.toml");
+    let text = std::fs::read_to_string(&stats_manifest).unwrap();
+    std::fs::write(&stats_manifest, text.replace("env = \"project\"", "env = \"system\"")).unwrap();
+    let project = load_project(&root).unwrap();
+    let statuses = evaluate(&project, &store).unwrap();
+    assert_eq!(
+        statuses[STATS].status,
+        LiveStatus::Stale(vec![StaleReason::EnvChanged]),
+        "смена окружения — причина EnvChanged"
+    );
+    let report = update(&project, &mut store, &UpdateOptions::default()).unwrap();
+    assert_eq!(report.failed(), 0, "{:?}", report.errors);
+    let project = load_project(&root).unwrap();
+    assert_eq!(evaluate(&project, &store).unwrap()[STATS].status, LiveStatus::Fresh);
+
+    // Объявленные переменные окружения входят в env_hash (R-RUN-07).
+    let text = std::fs::read_to_string(&stats_manifest).unwrap();
+    std::fs::write(
+        &stats_manifest,
+        text.replace("entry = \"script.py\"", "entry = \"script.py\"\nvars = { RDE_MODE = \"test\" }"),
+    )
+    .unwrap();
+    let project = load_project(&root).unwrap();
+    let statuses = evaluate(&project, &store).unwrap();
+    assert_eq!(statuses[STATS].status, LiveStatus::Stale(vec![StaleReason::EnvChanged]));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── P3: provenance, согласие на запуск, политика сети ───────────────────────
+
+fn run_dir_of(report: &rde_dag::UpdateReport, artifact_id: &str) -> PathBuf {
+    let entry = report
+        .artifacts
+        .iter()
+        .find(|entry| entry.artifact_id == artifact_id)
+        .expect("артефакт в отчёте");
+    entry
+        .log_path
+        .as_ref()
+        .expect("путь лога")
+        .parent()
+        .expect("каталог запуска")
+        .to_path_buf()
+}
+
+#[test]
+fn provenance_written_with_subject_and_resolved_dependencies() {
+    if !python_available() {
+        return;
+    }
+    let (root, project) = demo_copy("provenance");
+    let mut store = Store::open(&root).unwrap();
+    let report = update(&project, &mut store, &UpdateOptions { batch: true, ..UpdateOptions::default() }).unwrap();
+    assert_eq!(report.failed(), 0, "{:?}", report.errors);
+    let stats_report = report.artifacts.iter().find(|entry| entry.artifact_id == STATS).unwrap();
+    let run_dir = run_dir_of(&report, STATS);
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("provenance.json")).unwrap()).unwrap();
+    assert_eq!(provenance["_type"], "https://in-toto.io/Statement/v1");
+    assert_eq!(provenance["subject"][0]["name"], STATS);
+    assert_eq!(
+        provenance["subject"][0]["digest"]["sha256"].as_str(),
+        stats_report.out_hash.as_deref(),
+        "subject = out_hash"
+    );
+    let external = &provenance["predicate"]["buildDefinition"]["externalParameters"];
+    assert_eq!(external["artifact"], STATS);
+    assert_eq!(external["act_key"].as_str(), stats_report.act_key.as_deref());
+    assert!(external["params"].is_object());
+    assert_eq!(external["initiator"], "user");
+    let dependencies = provenance["predicate"]["buildDefinition"]["resolvedDependencies"].as_array().unwrap();
+    assert!(!dependencies.is_empty(), "resolvedDependencies: {provenance}");
+    assert!(
+        dependencies.iter().any(|dependency| dependency["uri"].as_str().unwrap_or("").starts_with("rde://artifact/")),
+        "URI входа-артефакта: {dependencies:?}"
+    );
+    let details = &provenance["predicate"]["runDetails"];
+    assert_eq!(details["status"], "ok");
+    assert_eq!(details["network"], "deny");
+    assert!(details["env_lock_digest"].as_str().is_some_and(|digest| digest.len() == 64));
+    assert!(details["script_hash"].as_str().is_some_and(|digest| digest.len() == 64));
+    assert!(provenance["predicate"]["error"].is_null());
+    // Провенанс пишется для каждого запуска пачки.
+    let plot_provenance = run_dir_of(&report, PLOT).join("provenance.json");
+    assert!(plot_provenance.is_file());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn failed_run_writes_provenance_with_error() {
+    if !python_available() {
+        return;
+    }
+    let (root, project) = demo_copy("provenance-fail");
+    // Ломаем скрипт графика: падение после stats.
+    let plot_script = artifact_dir(&project, PLOT).join("script.py");
+    std::fs::write(&plot_script, "raise SystemExit(3)\n").unwrap();
+    let mut store = Store::open(&root).unwrap();
+    let report = update(&project, &mut store, &UpdateOptions { continue_on_error: true, ..UpdateOptions::default() }).unwrap();
+    assert_eq!(report.failed(), 1, "{:?}", report.artifacts);
+    let run_dir = run_dir_of(&report, PLOT);
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("provenance.json")).unwrap()).unwrap();
+    assert!(provenance["subject"].as_array().unwrap().is_empty(), "у неуспешного запуска нет subject");
+    assert!(provenance["predicate"]["error"].as_str().is_some_and(|error| !error.is_empty()));
+    assert_eq!(provenance["predicate"]["runDetails"]["status"], "failed");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn untrusted_project_refuses_update() {
+    let root = tmp("untrusted");
+    write_min_project(&root);
+    // write_min_project пишет trusted = true; убираем согласие.
+    let text = std::fs::read_to_string(root.join("rde.toml")).unwrap();
+    std::fs::write(root.join("rde.toml"), text.replace("trusted = true", "trusted = false")).unwrap();
+    let project = load_project(&root).unwrap();
+    assert!(!project.manifest.trusted);
+    let mut store = Store::open(&root).unwrap();
+    let error = update(&project, &mut store, &UpdateOptions::default()).unwrap_err();
+    assert!(error.contains("доверен"), "{error}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn network_policy_deny_by_default_and_allow_declaratively() {
+    if !python_available() {
+        return;
+    }
+    let root = tmp("network-policy");
+    write_min_project(&root);
+    let compute = "01M5VJ1JG039MMV97SZGY6V9EQ";
+    write_artifact(
+        &root,
+        compute,
+        &format!(
+            "schema=\"rde/artifact@1\"\nid=\"{compute}\"\ntitle=\"Сеть\"\ntype=\"compute\"\n\
+             outputs=[\"out/net.txt\"]\nnetwork_allow=false\n[runtime]\nkind=\"python\"\nenv=\"system\"\nentry=\"script.py\"\n"
+        ),
+    );
+    std::fs::write(
+        root.join("objects/artifacts").join(compute).join("script.py"),
+        "import os\nfrom pathlib import Path\nPath('out').mkdir(exist_ok=True)\nPath('out/net.txt').write_text(os.environ.get('RDE_NETWORK', 'unset'))\n",
+    )
+    .unwrap();
+    let project = load_project(&root).unwrap();
+    let mut store = Store::open(&root).unwrap();
+    let report = update(&project, &mut store, &UpdateOptions::default()).unwrap();
+    assert_eq!(report.failed(), 0, "{:?}", report.errors);
+    let out = artifact_dir(&project, compute).join("out/net.txt");
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "deny", "сеть по умолчанию запрещена");
+
+    // Декларативное разрешение сети на артефакте.
+    let manifest_path = artifact_dir(&project, compute).join("artifact.toml");
+    let text = std::fs::read_to_string(&manifest_path).unwrap();
+    std::fs::write(&manifest_path, text.replace("network_allow=false", "network_allow=true")).unwrap();
+    let project = load_project(&root).unwrap();
+    let options = UpdateOptions {
+        targets: Some(vec![compute.to_owned()]),
+        include_dependents: false,
+        force: true,
+        ..Default::default()
+    };
+    let report = update(&project, &mut store, &options).unwrap();
+    assert_eq!(report.failed(), 0, "{:?}", report.errors);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "allow");
     let _ = std::fs::remove_dir_all(&root);
 }

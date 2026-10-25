@@ -7,6 +7,7 @@ description = "RDE DAG execution (M2.3): act_key/out_hash ledger, statuses, topo
 
 [dependencies]
 rde-core = { workspace = true }
+rde-env = { workspace = true }
 rde-hash = { workspace = true }
 rde-run = { workspace = true }
 rde-store = { workspace = true }
@@ -15,3 +16,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 ulid = { workspace = true }
+rde-env = { workspace = true }

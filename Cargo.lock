@@ -3520,6 +3520,7 @@ name = "rde-dag"
 version = "0.1.0"
 dependencies = [
  "rde-core",
+ "rde-env",
  "rde-hash",
  "rde-run",
  "rde-store",
@@ -3555,6 +3556,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rde-env"
+version = "0.1.0"
+dependencies = [
+ "rde-hash",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "rde-hash"
 version = "0.1.0"
 dependencies = [
@@ -3568,6 +3579,7 @@ name = "rde-run"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rde-hash",
  "serde",
  "serde_json",
  "ulid",
@@ -3619,6 +3631,8 @@ dependencies = [
  "rde-dag",
  "rde-doc",
  "rde-docx",
+ "rde-env",
+ "rde-run",
  "rde-sources",
  "rde-store",
  "rde-templates",

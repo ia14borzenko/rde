@@ -56,6 +56,12 @@ pub struct ProjectManifest {
     pub default_template: String,
     #[serde(default)]
     pub authors: Vec<AuthorManifest>,
+    /// Проект доверенный: пользователь дал согласие на запуск скриптов (R-RUN-06).
+    #[serde(default)]
+    pub trusted: bool,
+    /// Сеть разрешена артефактам проекта по умолчанию (R-RUN-06; артефакт может переопределить).
+    #[serde(default)]
+    pub network_allow: bool,
 }
 
 /// Окружение исполнения скрипта артефакта.
@@ -63,10 +69,14 @@ pub struct ProjectManifest {
 pub struct RuntimeManifest {
     /// `python` | `shell` | `node` | `r`.
     pub kind: String,
+    /// Режим окружения: `project` (uv/pnpm/pixi), `system` или `artifact`.
     #[serde(default = "default_env")]
     pub env: String,
     /// Относительный путь к исполняемому файлу артефакта.
     pub entry: String,
+    /// Объявленные переменные окружения (входят в `env_hash`, tz-02 §7.2).
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
 }
 
 /// Вход артефакта: ссылка на выход другого артефакта, файл, заметка, источник или константы.

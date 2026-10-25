@@ -238,6 +238,27 @@ struct DocBlock {
 }
 
 /// Приложение прототипа RDE.
+/// Диалог согласия на запуск скриптов (R-RUN-06): что запустить после подтверждения.
+#[derive(Clone, Debug)]
+struct TrustDialogState {
+    targets: Option<Vec<String>>,
+    dependents: bool,
+}
+
+/// Результат фонового обновления (возвращается из потока вместе с хранилищем).
+struct UpdateJobResult {
+    store: Option<Store>,
+    report: Option<rde_dag::UpdateReport>,
+    error: Option<String>,
+}
+
+/// Фоновое обновление артефактов: UI не блокируется, есть отмена (R-RUN-05).
+struct UpdateJob {
+    handle: std::thread::JoinHandle<UpdateJobResult>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    started: std::time::Instant,
+}
+
 pub struct RdeApp {
     pub project: Project,
     tab: Tab,
@@ -281,6 +302,10 @@ pub struct RdeApp {
     check_dialog: Option<String>,
     audit_dialog: Option<Vec<String>>,
     about_open: bool,
+    /// Диалог «проект доверенный» перед первым запуском скриптов.
+    trust_dialog: Option<TrustDialogState>,
+    /// Фоновое обновление артефактов (очередь/отмена).
+    update_job: Option<UpdateJob>,
 }
 
 impl RdeApp {
@@ -321,7 +346,11 @@ impl RdeApp {
             check_dialog: None,
             audit_dialog: None,
             about_open: false,
+            trust_dialog: None,
+            update_job: None,
         };
+        // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
+        let _ = rde_run::prune_runs(&app.project.root, 200);
         match Store::open(&app.project.root) {
             Ok(store) => {
                 app.store = Some(store);
@@ -646,6 +675,115 @@ impl RdeApp {
         }
     }
 
+    /// Запросить обновление: если проект не помечен доверенным — сначала диалог согласия
+    /// (R-RUN-06); если обновление уже идёт — не запускать второе (очередь из одного задания).
+    pub fn request_update(&mut self, targets: Option<Vec<String>>, dependents: bool) {
+        if self.update_job.is_some() {
+            self.push_log(Level::Info, "Обновление уже выполняется — дождитесь завершения или отмените");
+            return;
+        }
+        if !self.project.manifest.trusted {
+            self.trust_dialog = Some(TrustDialogState { targets, dependents });
+            return;
+        }
+        self.start_update(targets, dependents);
+    }
+
+    /// Запустить обновление в фоне: UI остаётся отзывчивым, есть кнопка «Отменить» (R-RUN-05).
+    pub fn start_update(&mut self, targets: Option<Vec<String>>, dependents: bool) {
+        let Some(store) = self.store.take() else {
+            self.push_log(Level::Warn, "Обновление невозможно: хранилище проекта не открыто");
+            return;
+        };
+        let project = self.project.clone();
+        let force = targets.is_some() && !dependents;
+        let batch = targets.is_none() || dependents;
+        let options = rde_dag::UpdateOptions { targets, include_dependents: dependents, force, batch, ..Default::default() };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut options = options;
+        options.cancel = Some(cancel.clone());
+        let handle = std::thread::spawn(move || {
+            let mut store = store;
+            let (report, error) = match rde_dag::update(&project, &mut store, &options) {
+                Ok(report) => (Some(report), None),
+                Err(error) => (None, Some(error)),
+            };
+            UpdateJobResult { store: Some(store), report, error }
+        });
+        self.update_job = Some(UpdateJob { handle, cancel, started: std::time::Instant::now() });
+        self.push_log(Level::Info, "Обновление артефактов запущено в фоне (кнопка «Отменить» в панели сверху)");
+    }
+
+    /// Отменить текущее фоновое обновление (SIGTERM → grace → SIGKILL для запущенного скрипта).
+    pub fn cancel_update(&mut self) {
+        if let Some(job) = &self.update_job {
+            job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.push_log(Level::Info, "Отмена обновления: текущий запуск будет остановлен");
+        }
+    }
+
+    /// Забрать результат фонового задания, когда оно завершилось.
+    fn poll_update_job(&mut self) {
+        let Some(job) = self.update_job.take() else { return };
+        if !job.handle.is_finished() {
+            self.update_job = Some(job);
+            return;
+        }
+        let was_cancelled = job.cancel.load(std::sync::atomic::Ordering::Relaxed);
+        match job.handle.join() {
+            Ok(result) => {
+                if let Some(store) = result.store {
+                    self.store = Some(store);
+                }
+                if let Some(report) = result.report {
+                    self.reload_project();
+                    self.log_update_report(&report);
+                }
+                if let Some(error) = result.error {
+                    self.push_log(Level::Warn, format!("Обновление не удалось: {error}"));
+                }
+                if was_cancelled {
+                    self.push_log(Level::Info, "Обновление отменено пользователем");
+                }
+            }
+            Err(_) => self.push_log(Level::Warn, "Обновление: фоновый поток завершился аварийно"),
+        }
+    }
+
+    /// Записать отчёт обновления в журнал (общий путь для синхронного и фонового запуска).
+    fn log_update_report(&mut self, report: &rde_dag::UpdateReport) {
+        for artifact in &report.artifacts {
+            let text = match artifact.action {
+                UpdateAction::Ran => format!(
+                    "Артефакт «{}»: {} (act_key {})",
+                    artifact.title,
+                    artifact.message,
+                    artifact.act_key.as_deref().map(|key| &key[..12.min(key.len())]).unwrap_or("—")
+                ),
+                UpdateAction::Skipped => format!("Артефакт «{}»: актуален, запуск не нужен", artifact.title),
+                UpdateAction::Failed => format!("Артефакт «{}»: ошибка — {}", artifact.title, artifact.message),
+            };
+            let level = match artifact.action {
+                UpdateAction::Ran => Level::Ok,
+                UpdateAction::Skipped => Level::Info,
+                UpdateAction::Failed => Level::Warn,
+            };
+            self.push_log(level, text);
+        }
+        for note in &report.notes {
+            self.push_log(Level::Info, note.clone());
+        }
+        if report.failed() == 0 {
+            for error in &report.errors {
+                self.push_log(Level::Warn, error.clone());
+            }
+        }
+        self.push_log(
+            if report.failed() > 0 { Level::Warn } else { Level::Ok },
+            format!("Обновление связанных: выполнено {}, пропущено {}, ошибок {}", report.ran(), report.skipped(), report.failed()),
+        );
+    }
+
     /// Реальное обновление артефактов через DAG/транзакции (`targets=None` — все устаревшие).
     ///
     /// `dependents = true` — «обновить связанные» (цели + транзитивно зависимые);
@@ -659,7 +797,7 @@ impl RdeApp {
         // «Обновить всё»/«связанные» — одна транзакция на пачку (атомарный откат),
         // точечное «обновить артефакт» — своя транзакция (гранулярный откат).
         let batch = targets.is_none() || dependents;
-        let options = rde_dag::UpdateOptions { targets, include_dependents: dependents, force, batch, continue_on_error: false };
+        let options = rde_dag::UpdateOptions { targets, include_dependents: dependents, force, batch, ..Default::default() };
         let result = {
             let store = self.store.as_mut().expect("store проверен выше");
             rde_dag::update(&self.project, store, &options)
@@ -672,23 +810,7 @@ impl RdeApp {
             }
         };
         self.reload_project();
-        for artifact in &report.artifacts {
-            let text = match artifact.action {
-                UpdateAction::Ran => format!("Артефакт «{}»: {} (act_key {})", artifact.title, artifact.message, artifact.act_key.as_deref().map(|key| &key[..12.min(key.len())]).unwrap_or("—")),
-                UpdateAction::Skipped => format!("Артефакт «{}»: актуален, запуск не нужен", artifact.title),
-                UpdateAction::Failed => format!("Артефакт «{}»: ошибка — {}", artifact.title, artifact.message),
-            };
-            let level = match artifact.action {
-                UpdateAction::Ran => Level::Ok,
-                UpdateAction::Skipped => Level::Info,
-                UpdateAction::Failed => Level::Warn,
-            };
-            self.push_log(level, text);
-        }
-        self.push_log(
-            if report.failed() > 0 { Level::Warn } else { Level::Ok },
-            format!("Обновление связанных: выполнено {}, пропущено {}, ошибок {}", report.ran(), report.skipped(), report.failed()),
-        );
+        self.log_update_report(&report);
         Some(report)
     }
 
@@ -840,6 +962,7 @@ impl RdeApp {
 
     /// Нарисовать всё окно. Вызывается и из eframe, и из headless-харнесса скриншотов.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        self.poll_update_job();
         if !self.fonts_installed {
             install_fonts(ui.ctx());
             install_style(ui.ctx());
@@ -1015,7 +1138,7 @@ impl RdeApp {
             }
             Some(MenuAction::CheckProject) => self.run_project_check(),
             Some(MenuAction::UpdateAll) => {
-                self.update_dependencies(None, true);
+                self.request_update(None, true);
             }
             Some(MenuAction::Settings) => {
                 self.settings_dialog = Some((
@@ -1038,17 +1161,33 @@ impl RdeApp {
         let mut update_document = false;
         let mut new_object = false;
         let mut search_clicked = false;
+        let mut cancel_update = false;
+        let running = self.update_job.is_some();
+        let running_secs = self.update_job.as_ref().map(|job| job.started.elapsed().as_secs_f32()).unwrap_or(0.0);
         egui::Panel::top("rde_toolbar")
             .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(10, 4)))
             .exact_size(36.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if ui
-                        .add(egui::Button::new(RichText::new("Обновить всё").color(Color32::WHITE)).fill(ACCENT))
+                        .add_enabled(
+                            !running,
+                            egui::Button::new(RichText::new("Обновить всё").color(Color32::WHITE)).fill(ACCENT),
+                        )
                         .on_hover_text("Реально пересчитать устаревшие артефакты (rde-dag: act_key/out_hash, транзакции)")
                         .clicked()
                     {
                         update_all = true;
+                    }
+                    if running {
+                        ui.label(RichText::new(format!("● обновление… {running_secs:.0} с")).small().color(AMBER));
+                        if ui
+                            .add(egui::Button::new(RichText::new("Отменить").color(TEXT)).fill(PANEL_HI))
+                            .on_hover_text("Остановить текущий запуск (SIGTERM → grace → SIGKILL) и отменить обновление")
+                            .clicked()
+                        {
+                            cancel_update = true;
+                        }
                     }
                     if ui
                         .add(egui::Button::new(RichText::new("Экспорт .docx").color(TEXT)).fill(PANEL_HI))
@@ -1085,8 +1224,11 @@ impl RdeApp {
                     });
                 });
             });
+        if cancel_update {
+            self.cancel_update();
+        }
         if update_all {
-            self.update_dependencies(None, true);
+            self.request_update(None, true);
         }
         if export {
             self.ensure_editor();
@@ -1436,10 +1578,10 @@ impl RdeApp {
             TreeAction::Delete(id) => self.delete_confirm = Some(id),
             TreeAction::CopyId(id) => self.push_log(Level::Info, format!("id объекта: {id}")),
             TreeAction::Update(id) => {
-                self.update_dependencies(Some(vec![id]), false);
+                self.request_update(Some(vec![id]), false);
             }
             TreeAction::UpdateDependents(id) => {
-                self.update_dependencies(Some(vec![id]), true);
+                self.request_update(Some(vec![id]), true);
             }
             TreeAction::FormatGost(id) => {
                 self.selected = Some(id);
@@ -1530,7 +1672,7 @@ impl RdeApp {
             self.run_project_check();
         }
         if update {
-            self.update_dependencies(None, true);
+            self.request_update(None, true);
         }
         if gost {
             self.update_document_package(true, true);
@@ -1601,10 +1743,35 @@ impl RdeApp {
                             field_row(ui, "тип", &artifact.kind, false);
                             if let Some(runtime) = &artifact.runtime {
                                 field_row(ui, "runtime", &format!("{} · {}", runtime.kind, runtime.entry), false);
+                                field_row(ui, "окружение", &format!("режим {}", runtime.env), false);
+                                if let Some(status) = self.dag_statuses.get(&object.id) {
+                                    if let Some(digest) = &status.env_lock_digest {
+                                        let recorded = rde_env::recorded_digest(&self.project.root, &runtime.kind);
+                                        let drift = match &recorded {
+                                            Some(recorded) if recorded != digest => " · изменилось",
+                                            Some(_) => " · совпадает с rde.lock",
+                                            None => " · rde.lock ещё нет",
+                                        };
+                                        field_row(ui, "env digest", &format!("{}{drift}", digest.chars().take(16).collect::<String>()), true);
+                                    }
+                                }
                             }
                             if !artifact.outputs.is_empty() {
                                 field_row(ui, "выходы", &artifact.outputs.join(", "), false);
                             }
+                            let network_allowed = artifact.network_allow.unwrap_or(self.project.manifest.network_allow);
+                            field_row(
+                                ui,
+                                "сеть",
+                                if network_allowed { "разрешена (network_allow)" } else { "запрещена (best-effort)" },
+                                false,
+                            );
+                            field_row(
+                                ui,
+                                "запуск",
+                                if self.project.manifest.trusted { "разрешён (trusted)" } else { "требует согласия (trusted = false)" },
+                                false,
+                            );
                             if !artifact.params.is_null() {
                                 field_row(ui, "params", &artifact.params.to_string(), true);
                             }
@@ -1625,6 +1792,14 @@ impl RdeApp {
                                 }
                                 if let Some(run_id) = &status.run_id {
                                     field_row(ui, "последний run", run_id, true);
+                                    let provenance = self.project.root.join(".rde/runs").join(run_id).join("provenance.json");
+                                    if provenance.is_file() {
+                                        ui.horizontal(|ui| {
+                                            if ui.small_button("копировать путь provenance").clicked() {
+                                                ui.ctx().copy_text(provenance.display().to_string());
+                                            }
+                                        });
+                                    }
                                 }
                                 if let Some(updated) = status.updated_unix {
                                     field_row(ui, "обновлён", &format!("unix {updated}"), false);
@@ -1735,7 +1910,7 @@ impl RdeApp {
             }
             if update_clicked {
                 // «Обновить артефакт» — только этот артефакт, принудительно.
-                self.update_dependencies(Some(vec![object.id.clone()]), false);
+                self.request_update(Some(vec![object.id.clone()]), false);
             }
             if gost_clicked {
                 self.update_document_package(true, true);
@@ -2266,6 +2441,63 @@ impl RdeApp {
                 self.about_open = false;
             }
         }
+
+        // R-RUN-06: согласие на запуск скриптов проекта (первый запуск / trusted = false).
+        if let Some(state) = self.trust_dialog.take() {
+            let mut confirm = false;
+            let mut cancel = false;
+            let project_name = self.project.manifest.name.clone();
+            let root = self.project.root.display().to_string();
+            egui::Window::new("Запуск скриптов проекта")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(560.0);
+                    ui.label(
+                        RichText::new("Проект содержит скрипты, которые будут выполнены на вашей машине.")
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("Проект: «{project_name}»")).small().color(TEXT));
+                    ui.label(RichText::new(format!("Каталог: {root}")).small().color(MUTED));
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "RDE запускает код артефактов от вашего имени (без ОС-песочницы в v0.1): \
+                             сеть по умолчанию запрещена best-effort, входы доступны только для чтения, \
+                             а запуск и его provenance фиксируются в журнале. Доверяйте только своим проектам.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new(RichText::new("Доверяю проекту и запустить").color(Color32::WHITE)).fill(ACCENT))
+                            .clicked()
+                        {
+                            confirm = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if confirm {
+                match rde_core::set_project_trusted(&self.project.root, true) {
+                    Ok(()) => {
+                        self.reload_project();
+                        self.push_log(Level::Ok, "Проект помечен доверенным (trusted = true): запуск скриптов разрешён");
+                        self.start_update(state.targets, state.dependents);
+                    }
+                    Err(error) => self.push_log(Level::Warn, format!("Не удалось записать trusted в rde.toml: {error}")),
+                }
+            } else if !cancel {
+                self.trust_dialog = Some(state);
+            }
+        }
     }
 
     /// Окна диалогов создания/переименования/удаления.
@@ -2749,7 +2981,7 @@ impl RdeApp {
                     .filter(|object| matches!(&object.data, ObjectData::Artifact(artifact) if artifact.kind == "compute"))
                     .map(|object| vec![object.id.clone()])
             });
-            self.update_dependencies(targets, false);
+            self.request_update(targets, false);
         }
     }
 
@@ -3647,6 +3879,85 @@ mod docview_tests {
         );
         // После отката панель показывает пометку «откачено».
         assert!(app.rollback_candidates().iter().any(|candidate| candidate.rolled_back));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn untrusted_project_asks_consent_before_running_scripts() {
+        if !python_available() {
+            return;
+        }
+        let root = temp_demo_copy("trust");
+        rde_core::set_project_trusted(&root, false).unwrap();
+        let project = rde_core::load_project(&root).unwrap();
+        assert!(!project.manifest.trusted);
+        let mut app = RdeApp::new(project);
+
+        app.request_update(None, true);
+        assert!(app.trust_dialog.is_some(), "без согласия показывается диалог");
+        assert!(app.update_job.is_none(), "скрипты не запускаются до согласия");
+
+        // Подтверждение согласия (как кнопка диалога): trusted=true, затем запуск.
+        rde_core::set_project_trusted(&root, true).unwrap();
+        app.reload_project();
+        assert!(app.project.manifest.trusted);
+        app.trust_dialog = None;
+        app.start_update(None, true);
+        for _ in 0..200 {
+            app.poll_update_job();
+            if app.update_job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(app.update_job.is_none(), "фоновое обновление завершилось");
+        assert!(app.store.is_some(), "хранилище вернулось в UI после потока");
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Обновление связанных")),
+            "журнал: {:?}",
+            app.project.log.iter().map(|line| &line.text).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn background_update_can_be_cancelled() {
+        if !python_available() {
+            return;
+        }
+        let root = temp_demo_copy("cancel");
+        // График «зависает»: даём время нажать «Отменить».
+        std::fs::write(
+            root.join("objects/artifacts/01M5VJ1JG0QQJM2S6R76FQCZ25/script.py"),
+            "import time\nwhile True:\n    time.sleep(0.1)\n",
+        )
+        .unwrap();
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        app.start_update(None, true);
+        assert!(app.update_job.is_some(), "обновление идёт в фоне");
+        // Повторный запрос не создаёт второе задание.
+        app.request_update(None, true);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        app.cancel_update();
+        for _ in 0..200 {
+            app.poll_update_job();
+            if app.update_job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(app.update_job.is_none(), "отменённое обновление завершилось");
+        assert!(app.store.is_some());
+        let log: Vec<String> = app.project.log.iter().map(|line| line.text.clone()).collect();
+        assert!(
+            log.iter().any(|line| line.contains("отменено пользователем") || line.contains("Обновление отменено")),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|line| line.contains("отменено пользователем") || line.contains("Обновление связанных")),
+            "отчёт об отмене: {log:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

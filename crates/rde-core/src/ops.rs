@@ -259,6 +259,47 @@ fn write_artifact_scaffold(dir: &Path, kind: NewObjectKind, title: &str) -> Resu
     Ok(())
 }
 
+/// Записать `trusted` в `rde.toml`, не трогая остальной файл (R-RUN-06): согласие пользователя
+/// на запуск скриптов проекта. Ключ верхнего уровня — вставляется перед первой таблицей.
+pub fn set_project_trusted(root: &Path, trusted: bool) -> Result<(), String> {
+    let path = root.join("rde.toml");
+    let text = fs::read_to_string(&path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
+    let new_line = format!("trusted = {trusted}");
+    let mut lines: Vec<String> = Vec::new();
+    let mut replaced = false;
+    let mut inserted = false;
+    for line in text.lines() {
+        let top_level = !line.starts_with(' ') && !line.starts_with('\t');
+        let key = line.split('=').next().map(str::trim).unwrap_or("");
+        if top_level && key == "trusted" {
+            if !replaced {
+                lines.push(new_line.clone());
+                replaced = true;
+            }
+            continue;
+        }
+        if !replaced && !inserted && top_level && line.starts_with('[') {
+            lines.push(new_line.clone());
+            inserted = true;
+        }
+        lines.push(line.to_owned());
+    }
+    if !replaced && !inserted {
+        lines.push(new_line);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    fs::write(&path, out).map_err(|e| format!("записать {}: {e}", path.display()))?;
+    let text = fs::read_to_string(&path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
+    let value: toml::Value = toml::from_str(&text).map_err(|e| format!("TOML {}: {e}", path.display()))?;
+    let errors = manifest::validate(ManifestKind::Project, &value);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} не проходит JSON Schema: {}", path.display(), errors.join("; ")))
+    }
+}
+
 /// Убрать `out_hash` из `artifact.toml` (откат к состоянию «артефакт ещё не запускался»).
 pub fn clear_artifact_out_hash(artifact_dir: &Path) -> Result<(), String> {
     let path = artifact_dir.join("artifact.toml");
@@ -330,7 +371,7 @@ pub fn create_project(root: &Path, name: &str) -> Result<(), String> {
     }
     let id = new_id();
     let manifest = format!(
-        "schema = \"{}\"\nid = \"{id}\"\nname = {}\ndefault_rebuild = \"manual\"\ndefault_template = \"gost-7.32-2017\"\n",
+        "schema = \"{}\"\nid = \"{id}\"\nname = {}\ndefault_rebuild = \"manual\"\ndefault_template = \"gost-7.32-2017\"\ntrusted = false\nnetwork_allow = false\n",
         crate::manifest::SCHEMA_PROJECT,
         toml_string(name)
     );
