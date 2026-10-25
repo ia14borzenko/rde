@@ -259,6 +259,25 @@ fn write_artifact_scaffold(dir: &Path, kind: NewObjectKind, title: &str) -> Resu
     Ok(())
 }
 
+/// Убрать `out_hash` из `artifact.toml` (откат к состоянию «артефакт ещё не запускался»).
+pub fn clear_artifact_out_hash(artifact_dir: &Path) -> Result<(), String> {
+    let path = artifact_dir.join("artifact.toml");
+    let text = fs::read_to_string(&path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let top_level = !line.starts_with(' ') && !line.starts_with('\t');
+        let key = line.split('=').next().map(str::trim).unwrap_or("");
+        if top_level && key == "out_hash" {
+            continue;
+        }
+        lines.push(line.to_owned());
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    fs::write(&path, out).map_err(|e| format!("записать {}: {e}", path.display()))?;
+    validate_manifest(ManifestKind::Artifact, &path)
+}
+
 /// Записать `out_hash` последнего успешного обновления в `artifact.toml`, не трогая остальной
 /// файл (комментарии и порядок сохраняются): ключ верхнего уровня, вставляется перед первой
 /// таблицей `[...]` или заменяет существующий. `out_hash` — идентичность выходов для git (R-VCS-02).

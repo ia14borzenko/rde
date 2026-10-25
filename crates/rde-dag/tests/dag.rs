@@ -301,6 +301,7 @@ fn single_artifact_update_and_force() {
         targets: Some(vec![STATS.to_owned()]),
         include_dependents: false,
         force: true,
+        batch: false,
         continue_on_error: false,
     };
     let report = update(&project, &mut store, &options).unwrap();
@@ -314,6 +315,7 @@ fn single_artifact_update_and_force() {
         targets: Some(vec![STATS.to_owned()]),
         include_dependents: true,
         force: true,
+        batch: true,
         continue_on_error: false,
     };
     let report = update(&project, &mut store, &options).unwrap();
@@ -439,5 +441,130 @@ fn glob_input_materializes_all_matching_files() {
     let project = load_project(&root).unwrap();
     let statuses = evaluate(&project, &store).unwrap();
     assert_eq!(statuses[compute].status, LiveStatus::Stale(vec![StaleReason::InputsChanged]));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── P2: транзакции с корнями, откат O(1), GC после обновлений ────────────────
+
+#[test]
+fn batch_update_commits_single_transaction_with_roots() {
+    if !python_available() {
+        return;
+    }
+    let (root, project) = demo_copy("batch");
+    let mut store = Store::open(&root).unwrap();
+    let options = UpdateOptions { batch: true, ..UpdateOptions::default() };
+    let report = update(&project, &mut store, &options).unwrap();
+    assert_eq!(report.failed(), 0, "{:?}", report.errors);
+    assert_eq!(report.ran(), 2);
+    assert_eq!(report.tx_ids.len(), 1, "пачка — одна транзакция: {:?}", report.tx_ids);
+    let roots = store.current_roots().unwrap();
+    assert!(roots.get(&format!("artifact/{STATS}")).is_some(), "корень stats: {:?}", roots.names().collect::<Vec<_>>());
+    assert!(roots.get(&format!("artifact/{PLOT}")).is_some());
+    assert_eq!(store.current_txid().unwrap().as_deref(), Some(report.tx_ids[0].as_str()));
+    // ledger восстановим из журнала: обе записи в одной транзакции.
+    let ledger = rde_dag::ledger(&store).unwrap();
+    assert!(ledger.contains_key(STATS) && ledger.contains_key(PLOT));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rollback_restores_outputs_and_ledger_state() {
+    if !python_available() {
+        return;
+    }
+    let (root, project) = demo_copy("rollback-dag");
+    let mut store = Store::open(&root).unwrap();
+    let options = UpdateOptions { batch: true, ..UpdateOptions::default() };
+    update(&project, &mut store, &options).unwrap();
+    let stats_out = artifact_dir(&project, STATS).join("out/stats.json");
+    let v1 = std::fs::read_to_string(&stats_out).unwrap();
+
+    // Меняем вход и пересчитываем пачку: появляется новая версия выходов и транзакция.
+    let input = artifact_dir(&project, REALIZATIONS).join("inputs/experiment.csv");
+    let mut text = std::fs::read_to_string(&input).unwrap();
+    text.push_str("50,50.0,50.0\n");
+    std::fs::write(&input, text).unwrap();
+    let project = load_project(&root).unwrap();
+    update(&project, &mut store, &options).unwrap();
+    let v2 = std::fs::read_to_string(&stats_out).unwrap();
+    assert_ne!(v1, v2, "вход изменился — выход другой");
+
+    // Откат последней пачки: корни переключены O(1), выходы материализованы из CAS.
+    let project = load_project(&root).unwrap();
+    let outcome = rde_dag::rollback(&project, &mut store, None).unwrap().expect("есть что откатывать");
+    assert!(outcome.restored.contains(&STATS.to_owned()), "stats восстановлен: {outcome:?}");
+    assert_eq!(std::fs::read_to_string(&stats_out).unwrap(), v1, "выход восстановлен из CAS");
+    let restored_ledger = rde_dag::ledger(&store).unwrap();
+    let stats_state = restored_ledger.get(STATS).expect("состояние stats вернулось");
+    assert_ne!(stats_state.act_key, v2, "ledger-состояние откатано");
+
+    // Входной файл откат не трогает — статус честно «изменились входы».
+    let project = load_project(&root).unwrap();
+    let statuses = evaluate(&project, &store).unwrap();
+    assert!(matches!(&statuses[STATS].status, LiveStatus::Stale(reasons) if reasons.contains(&StaleReason::InputsChanged)));
+
+    // Возвращаем вход — и статус снова «актуален» (выходы/ledger от v1).
+    let mut text = std::fs::read_to_string(&input).unwrap();
+    text.truncate(text.rfind("50,50.0,50.0\n").unwrap());
+    std::fs::write(&input, text).unwrap();
+    let project = load_project(&root).unwrap();
+    assert_eq!(evaluate(&project, &store).unwrap()[STATS].status, LiveStatus::Fresh);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rollback_before_first_run_resets_artifact() {
+    if !python_available() {
+        return;
+    }
+    let (root, project) = demo_copy("rollback-reset");
+    let mut store = Store::open(&root).unwrap();
+    let options = UpdateOptions { batch: true, ..UpdateOptions::default() };
+    update(&project, &mut store, &options).unwrap();
+    let stats_out = artifact_dir(&project, STATS).join("out/stats.json");
+    assert!(stats_out.is_file());
+
+    let project = load_project(&root).unwrap();
+    let outcome = rde_dag::rollback(&project, &mut store, None).unwrap().expect("откат первой пачки");
+    assert_eq!(outcome.reset.len(), 2, "{outcome:?}");
+    assert!(!stats_out.exists(), "выходы удалены (артефакт ещё не запускался)");
+    let manifest = std::fs::read_to_string(artifact_dir(&project, STATS).join("artifact.toml")).unwrap();
+    assert!(!manifest.contains("out_hash"), "out_hash снят при откате к «не запускался»");
+    let project = load_project(&root).unwrap();
+    let statuses = evaluate(&project, &store).unwrap();
+    assert_eq!(statuses[STATS].status, LiveStatus::NeverRun);
+    assert_eq!(statuses[PLOT].status, LiveStatus::NeverRun);
+    // Откат сам — транзакция: его тоже можно откатить (вернуть обновление).
+    let undo = rde_dag::rollback(&project, &mut store, None).unwrap().expect("откат отката доступен");
+    assert!(!undo.restored.is_empty(), "{undo:?}");
+    assert!(stats_out.is_file(), "повторный откат вернул выходы обновления");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gc_after_update_keeps_current_roots_and_frees_orphans() {
+    if !python_available() {
+        return;
+    }
+    let (root, project) = demo_copy("gc-dag");
+    let mut store = Store::open(&root).unwrap();
+    let options = UpdateOptions { batch: true, ..UpdateOptions::default() };
+    update(&project, &mut store, &options).unwrap();
+    let orphan = store.put_blob(b"orphan after update").unwrap();
+    let roots = store.current_roots().unwrap();
+    let stats_tree = roots.get(&format!("artifact/{STATS}")).expect("корень stats");
+
+    let report = store
+        .gc(&rde_store::GcOptions { keep_last_txs: 0, keep_days: 0, dry_run: false, prune_failed_txs: true })
+        .unwrap();
+    assert!(report.removed_blobs >= 1, "{report:?}");
+    assert!(store.get_blob(orphan).unwrap().is_none(), "сиротский блоб удалён");
+    // Текущие корни защищены: деревья и их блобы на месте, выходы можно восстановить из CAS.
+    let entries = store.get_tree(stats_tree).unwrap().expect("дерево stats на месте");
+    for entry in entries {
+        assert!(store.get_blob(entry.blob).unwrap().is_some(), "блоб {} текущего корня удалён", entry.blob);
+    }
+    assert_eq!(store.current_roots().unwrap(), roots);
     let _ = std::fs::remove_dir_all(&root);
 }

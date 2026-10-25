@@ -139,3 +139,21 @@ store/kill -9, запуск, DAG, `.doc.rde`, docx-гейты, ГОСТ, ист�
 **Тестов: 90** (было 67). Демо-проект и `.doc.rde` не менялись; `docs/schema/*.json`
 перегенерированы. Следующий шаг — **P2** (`rde-store`: roots/snapshots/rollback O(1)/GC/lock/zstd),
 затем P3 (run/env/security/provenance), P4 (документ), P5 (vcs/settings/гейты).
+
+---
+
+## Обновление 2026-10-25 (P2 «Транзакционное ядро store», тег `p2-store`)
+
+| Пункт | Что сделано | Подтверждение |
+|---|---|---|
+| §7.3 п.7 | `current.toml`, `snapshots/<txid>.json`, транзакция с корнями, crash-safe порядок | тесты recovery/rollback |
+| R-ART-05 | O(1)-откат `Store::rollback`/`rollback_latest`; откат — тоже транзакция | `tests/p2.rs` |
+| R-ART-04 | `batch`-транзакция «пачки»; dag материализует прежние выходы и ledger при откате | dag-тесты |
+| §7.3 п.8 / R-ART-11 | GC mark-and-sweep (current + окно + pins), отчёт/dry-run, pins, prune failed | `tests/p2.rs` |
+| §8.4 | zstd-сжатие крупных блобов в CAS (`RDEZ`), прозрачное для чтения/индекса | `tests/p2.rs` |
+| — | блокировка писателя `.rde/lock` (pid+liveness, reentrant в процессе) | `tests/p2.rs` |
+| UI | панель «Задачи»: транзакции обновлений + «Откатить» | UI-тест, скриншот |
+
+**Тестов: 100** (было 90). Демо-проект: после обновлений в `artifact.toml` фиксируется `out_hash`;
+`.rde/` (CAS, журнал, корни, снапшоты) — генерируемое состояние. Следующий шаг — **P3**
+(`rde-env`, run security/provenance), затем P4 (документ), P5 (vcs/settings/гейты).

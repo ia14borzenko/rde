@@ -18,6 +18,10 @@ fn main() {
     if let Some(select) = select {
         state.demo_select_object(&select);
     }
+    // 4-й аргумент — нижняя панель: 0 журнал, 1 задачи (транзакции/откат), 2 агент.
+    if let Some(logs_tab) = std::env::args().nth(4).and_then(|value| value.parse::<usize>().ok()) {
+        state.demo_set_logs_tab(logs_tab);
+    }
 
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::vec2(1600.0, 1000.0))

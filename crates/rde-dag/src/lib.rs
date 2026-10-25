@@ -182,6 +182,13 @@ pub fn ledger(store: &Store) -> Result<HashMap<String, ArtifactState>, String> {
         let Some(data) = tx.data else { continue };
         let Some(items) = data.get("artifacts").and_then(|value| value.as_array()) else { continue };
         for item in items {
+            // Откат к состоянию «ещё не запускался»: состояние артефакта удаляется из ledger.
+            if item.get("removed").and_then(|value| value.as_bool()) == Some(true) {
+                if let Some(artifact_id) = item.get("artifact_id").and_then(|value| value.as_str()) {
+                    ledger.remove(artifact_id);
+                }
+                continue;
+            }
             if let Ok(state) = serde_json::from_value::<ArtifactState>(item.clone()) {
                 ledger.insert(state.artifact_id.clone(), state);
             }
@@ -556,6 +563,9 @@ pub struct UpdateOptions {
     pub include_dependents: bool,
     /// Принудительно пересчитать явно указанные цели, даже если они актуальны.
     pub force: bool,
+    /// Одна транзакция на всю пачку обновлений (атомарный commit корней).
+    /// `false` — по транзакции на артефакт (гранулярный откат).
+    pub batch: bool,
     /// Продолжать после ошибки отдельного артефакта.
     pub continue_on_error: bool,
 }
@@ -741,6 +751,12 @@ fn state_from_outcome(artifact: &ArtifactManifest, outcome: &RunOutcome, activat
     }
 }
 
+/// Имя корня артефакта в store: `artifact/<id>` → tree_hash его выходов.
+pub fn artifact_root_name(artifact_id: &str) -> String {
+    format!("artifact/{artifact_id}")
+}
+
+/// Зафиксировать обновление артефакта транзакцией с переключением корня (`artifact/<id>`).
 fn commit_update(
     store: &mut Store,
     artifact: &ArtifactManifest,
@@ -750,8 +766,11 @@ fn commit_update(
 ) -> Result<(String, ArtifactState), String> {
     let state = state_from_outcome(artifact, outcome, activation, entries);
     let payload = serde_json::json!({ "kind": "dag-update", "artifacts": [state] });
+    let tree = tree_hash(entries);
+    let mut roots = store.current_roots().map_err(|e| e.to_string())?;
+    roots.insert(artifact_root_name(&artifact.id), tree);
     let tx = store
-        .begin_tx_with(&format!("dag update: {}", artifact.title), Some(payload))
+        .begin_tx_with_roots(&format!("dag update: {}", artifact.title), Some(payload), roots)
         .map_err(|e| e.to_string())?;
     if let Err(error) = store.put_tree(entries).map_err(|e| e.to_string()) {
         let _ = store.fail_tx(&tx, &error);
@@ -759,6 +778,39 @@ fn commit_update(
     }
     match store.commit_tx(&tx) {
         Ok(()) => Ok((tx, state)),
+        Err(error) => {
+            let message = error.to_string();
+            let _ = store.fail_tx(&tx, &message);
+            Err(message)
+        }
+    }
+}
+
+/// Успешный запуск, ожидающий commit в режиме одной транзакции на пачку.
+struct PendingCommit {
+    artifact_id: String,
+    title: String,
+    state: ArtifactState,
+    tree: Hash,
+    run_id: String,
+    duration_ms: u64,
+    stdout_log: PathBuf,
+    act_key: String,
+}
+
+/// Зафиксировать пачку обновлений одной транзакцией (§7.3 п.7): все корни переключаются атомарно.
+fn commit_batch(store: &mut Store, pending: &[PendingCommit]) -> Result<String, String> {
+    let states: Vec<ArtifactState> = pending.iter().map(|item| item.state.clone()).collect();
+    let payload = serde_json::json!({ "kind": "dag-update", "batch": true, "artifacts": states });
+    let mut roots = store.current_roots().map_err(|e| e.to_string())?;
+    for item in pending {
+        roots.insert(artifact_root_name(&item.artifact_id), item.tree);
+    }
+    let tx = store
+        .begin_tx_with_roots("dag update: пачка", Some(payload), roots)
+        .map_err(|e| e.to_string())?;
+    match store.commit_tx(&tx) {
+        Ok(()) => Ok(tx),
         Err(error) => {
             let message = error.to_string();
             let _ = store.fail_tx(&tx, &message);
@@ -783,6 +835,7 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
         }
     });
     let mut report = UpdateReport::default();
+    let mut pending: Vec<PendingCommit> = Vec::new();
     let artifacts: HashMap<&str, &ArtifactManifest> = project.artifacts().map(|a| (a.id.as_str(), a)).collect();
 
     for artifact_id in order {
@@ -935,6 +988,40 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
             continue;
         }
 
+        if options.batch {
+            // Пачка: деревья пишем сразу, состояния/корни фиксируем одной транзакцией в конце.
+            if let Err(error) = store.put_tree(&entries).map_err(|e| e.to_string()) {
+                report.errors.push(format!("{}: {error}", artifact.title));
+                report.artifacts.push(UpdatedArtifact {
+                    artifact_id: artifact.id.clone(),
+                    title: artifact.title.clone(),
+                    action: UpdateAction::Failed,
+                    message: error.clone(),
+                    run_id: Some(outcome.run_id.clone()),
+                    act_key: Some(activation.act_key.hex()),
+                    out_hash: None,
+                    log_path: Some(outcome.stderr_log.clone()),
+                    duration_ms: outcome.duration_ms,
+                });
+                if !options.continue_on_error {
+                    return Ok(report);
+                }
+                continue;
+            }
+            let state = state_from_outcome(artifact, &outcome, &activation, &entries);
+            ledger.insert(artifact.id.clone(), state.clone());
+            pending.push(PendingCommit {
+                artifact_id: artifact.id.clone(),
+                title: artifact.title.clone(),
+                state,
+                tree: tree_hash(&entries),
+                run_id: outcome.run_id.clone(),
+                duration_ms: outcome.duration_ms,
+                stdout_log: outcome.stdout_log.clone(),
+                act_key: activation.act_key.hex(),
+            });
+            continue;
+        }
         match commit_update(store, artifact, &outcome, &activation, &entries) {
             Ok((tx, state)) => {
                 ledger.insert(artifact.id.clone(), state.clone());
@@ -976,7 +1063,203 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
             }
         }
     }
+    if options.batch && !pending.is_empty() {
+        match commit_batch(store, &pending) {
+            Ok(tx) => {
+                report.tx_ids.push(tx);
+                for item in pending {
+                    if let Some(out_hash) = &item.state.out_hash {
+                        let dir = artifacts
+                            .get(item.artifact_id.as_str())
+                            .and_then(|artifact| object(project, &artifact.id).ok())
+                            .map(|object| object.dir.clone());
+                        if let Some(dir) = dir {
+                            if let Err(error) = rde_core::record_artifact_out_hash(&dir, out_hash) {
+                                report.errors.push(format!("{}: out_hash не записан в artifact.toml: {error}", item.title));
+                            }
+                        }
+                    }
+                    report.artifacts.push(UpdatedArtifact {
+                        artifact_id: item.artifact_id,
+                        title: item.title,
+                        action: UpdateAction::Ran,
+                        message: format!("обновлён за {} мс", item.duration_ms),
+                        run_id: Some(item.run_id),
+                        act_key: Some(item.act_key),
+                        out_hash: item.state.out_hash.clone(),
+                        log_path: Some(item.stdout_log),
+                        duration_ms: item.duration_ms,
+                    });
+                }
+            }
+            Err(error) => {
+                report.errors.push(format!("транзакция пачки не зафиксирована: {error}"));
+                for item in pending {
+                    report.artifacts.push(UpdatedArtifact {
+                        artifact_id: item.artifact_id,
+                        title: item.title,
+                        action: UpdateAction::Failed,
+                        message: error.clone(),
+                        run_id: Some(item.run_id),
+                        act_key: Some(item.act_key),
+                        out_hash: None,
+                        log_path: Some(item.stdout_log),
+                        duration_ms: item.duration_ms,
+                    });
+                }
+            }
+        }
+    }
     Ok(report)
+}
+
+/// Состояние ledger до указанной транзакции (для отката: каким был артефакт раньше).
+fn ledger_before(store: &Store, before_txid: &str) -> Result<HashMap<String, ArtifactState>, String> {
+    let mut txs: Vec<TxRecord> = store.list_txs().map_err(|e| e.to_string())?;
+    txs.retain(|tx| tx.status == TxStatus::Committed);
+    txs.sort_by(|a, b| a.started_unix.cmp(&b.started_unix).then_with(|| a.id.cmp(&b.id)));
+    let mut ledger = HashMap::new();
+    for tx in txs {
+        // Останавливаемся на целевой транзакции: нужны состояния строго до неё.
+        if tx.id == before_txid {
+            break;
+        }
+        let is_dag_update = tx
+            .data
+            .as_ref()
+            .and_then(|data| data.get("kind"))
+            .and_then(|kind| kind.as_str())
+            == Some("dag-update");
+        if !is_dag_update {
+            continue;
+        }
+        let Some(data) = tx.data else { continue };
+        let Some(items) = data.get("artifacts").and_then(|value| value.as_array()) else { continue };
+        for item in items {
+            if item.get("removed").and_then(|value| value.as_bool()) == Some(true) {
+                if let Some(artifact_id) = item.get("artifact_id").and_then(|value| value.as_str()) {
+                    ledger.remove(artifact_id);
+                }
+                continue;
+            }
+            if let Ok(state) = serde_json::from_value::<ArtifactState>(item.clone()) {
+                ledger.insert(state.artifact_id.clone(), state);
+            }
+        }
+    }
+    Ok(ledger)
+}
+
+/// Результат отката обновления артефактов.
+#[derive(Clone, Debug, Default)]
+pub struct RollbackOutcome {
+    /// Транзакция store, переключившая корни.
+    pub rollback_tx: String,
+    /// Транзакция ledger, вернувшая состояния артефактов.
+    pub ledger_tx: String,
+    pub rolled_back_tx: String,
+    /// Артефакты, у которых восстановлены выходы/состояние.
+    pub restored: Vec<String>,
+    /// Артефакты, вернувшиеся в состояние «ещё не запускался».
+    pub reset: Vec<String>,
+}
+
+/// Откатить обновление (последнее или конкретную транзакцию): store переключает корни O(1),
+/// dag материализует прежние выходы из CAS в каталоги артефактов и возвращает ledger-состояния.
+pub fn rollback(project: &Project, store: &mut Store, txid: Option<&str>) -> Result<Option<RollbackOutcome>, String> {
+    let report = match txid {
+        Some(txid) => store.rollback(txid).map_err(|e| e.to_string())?,
+        None => match store.rollback_latest().map_err(|e| e.to_string())? {
+            Some(report) => report,
+            None => return Ok(None),
+        },
+    };
+    let rolled_tx = store
+        .read_tx(&report.rolled_back_tx)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("транзакция {} не найдена", report.rolled_back_tx))?;
+    let history = ledger_before(store, &report.rolled_back_tx)?;
+    let mut outcome = RollbackOutcome {
+        rollback_tx: report.rollback_tx.clone(),
+        ledger_tx: String::new(),
+        rolled_back_tx: report.rolled_back_tx.clone(),
+        restored: Vec::new(),
+        reset: Vec::new(),
+    };
+    let mut ledger_items: Vec<serde_json::Value> = Vec::new();
+
+    // Меняем только корни артефактов: document/<id> и прочие имена — зона rde-doc (P4).
+    let mut names: BTreeSet<String> = report.previous.names().map(str::to_owned).collect();
+    names.extend(report.restored.names().map(str::to_owned));
+    for name in names {
+        let Some(artifact_id) = name.strip_prefix("artifact/") else { continue };
+        let Some(artifact_object) = project.artifact_object(artifact_id) else { continue };
+        let prev_tree = report.previous.get(&name);
+        let restored_tree = report.restored.get(&name);
+        if prev_tree == restored_tree {
+            continue;
+        }
+        // Материализуем восстановленное дерево выходов в каталог артефакта.
+        let mut restored_paths: BTreeSet<String> = BTreeSet::new();
+        if let Some(tree) = restored_tree {
+            let entries = store.get_tree(tree).map_err(|e| e.to_string())?.ok_or_else(|| {
+                format!("дерево {tree} отката отсутствует в store (вне окна отката?)")
+            })?;
+            for entry in &entries {
+                let bytes = store
+                    .get_blob(entry.blob)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("блоб {} отсутствует в CAS", entry.blob))?;
+                let dest = artifact_object.dir.join(&entry.path);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| format!("создать каталог выхода: {e}"))?;
+                }
+                fs::write(&dest, bytes).map_err(|e| format!("записать {}: {e}", dest.display()))?;
+                restored_paths.insert(entry.path.clone());
+            }
+        }
+        // Удаляем выходы, которых нет в восстановленной версии (в т.ч. все — при откате
+        // к состоянию «ещё не запускался»).
+        if let Some(prev_tree) = prev_tree {
+            if let Some(prev_entries) = store.get_tree(prev_tree).map_err(|e| e.to_string())? {
+                for entry in prev_entries {
+                    if !restored_paths.contains(&entry.path) {
+                        let _ = fs::remove_file(artifact_object.dir.join(&entry.path));
+                    }
+                }
+            }
+        }
+        // Ledger: прежнее состояние или «ещё не запускался».
+        match history.get(artifact_id) {
+            Some(state) => {
+                if let Some(out_hash) = &state.out_hash {
+                    let _ = rde_core::record_artifact_out_hash(&artifact_object.dir, out_hash);
+                }
+                ledger_items.push(serde_json::to_value(state).map_err(|e| e.to_string())?);
+                outcome.restored.push(artifact_id.to_owned());
+            }
+            None => {
+                let _ = rde_core::clear_artifact_out_hash(&artifact_object.dir);
+                ledger_items.push(serde_json::json!({ "removed": true, "artifact_id": artifact_id }));
+                outcome.reset.push(artifact_id.to_owned());
+            }
+        }
+    }
+
+    if !ledger_items.is_empty() {
+        let payload = serde_json::json!({
+            "kind": "dag-update",
+            "rollback": true,
+            "rolled_back": report.rolled_back_tx,
+            "artifacts": ledger_items,
+        });
+        let ledger_tx = store
+            .begin_tx_with(&format!("dag rollback: {}", rolled_tx.note), Some(payload))
+            .map_err(|e| e.to_string())?;
+        store.commit_tx(&ledger_tx).map_err(|e| e.to_string())?;
+        outcome.ledger_tx = ledger_tx;
+    }
+    Ok(Some(outcome))
 }
 
 /// Удобный хелпер: идентификаторы устаревших compute-артефактов в топологическом порядке.

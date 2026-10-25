@@ -656,7 +656,10 @@ impl RdeApp {
             return None;
         }
         let force = targets.is_some() && !dependents;
-        let options = rde_dag::UpdateOptions { targets, include_dependents: dependents, force, continue_on_error: false };
+        // «Обновить всё»/«связанные» — одна транзакция на пачку (атомарный откат),
+        // точечное «обновить артефакт» — своя транзакция (гранулярный откат).
+        let batch = targets.is_none() || dependents;
+        let options = rde_dag::UpdateOptions { targets, include_dependents: dependents, force, batch, continue_on_error: false };
         let result = {
             let store = self.store.as_mut().expect("store проверен выше");
             rde_dag::update(&self.project, store, &options)
@@ -687,6 +690,50 @@ impl RdeApp {
             format!("Обновление связанных: выполнено {}, пропущено {}, ошибок {}", report.ran(), report.skipped(), report.failed()),
         );
         Some(report)
+    }
+
+    /// Откатить обновление артефактов (последнее или конкретную транзакцию): store переключает
+    /// корни O(1), dag материализует прежние выходы из CAS и возвращает ledger-состояния.
+    pub fn rollback_transaction(&mut self, txid: Option<String>) -> Option<rde_dag::RollbackOutcome> {
+        let Some(store) = self.store.as_mut() else {
+            self.push_log(Level::Warn, "Откат невозможен: хранилище проекта не открыто");
+            return None;
+        };
+        match rde_dag::rollback(&self.project, store, txid.as_deref()) {
+            Ok(Some(outcome)) => {
+                let message = format!(
+                    "Откат выполнен: восстановлено {}, сброшено {} (транзакция {})",
+                    outcome.restored.len(),
+                    outcome.reset.len(),
+                    outcome.rolled_back_tx.chars().take(10).collect::<String>()
+                );
+                // reload_project пересоздаёт проект и его журнал — пишем строку после перезагрузки.
+                self.reload_project();
+                self.push_log(Level::Ok, message);
+                Some(outcome)
+            }
+            Ok(None) => {
+                self.push_log(Level::Info, "Нечего откатывать: нет транзакций обновлений со снапшотом");
+                None
+            }
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Откат не выполнен: {error}"));
+                None
+            }
+        }
+    }
+
+    /// Для демо/скриншотов: переключить нижнюю панель (0 — Журнал, 1 — Задачи, 2 — Агент).
+    pub fn demo_set_logs_tab(&mut self, tab: usize) {
+        self.logs_tab = tab.min(2);
+    }
+
+    /// Кандидаты на откат для панели «Задачи».
+    pub fn rollback_candidates(&self) -> Vec<rde_store::RollbackCandidate> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.rollback_candidates().ok())
+            .unwrap_or_default()
     }
 
     /// Для демо/скриншотов: выбрать объект по id или вхождению в название.
@@ -1094,6 +1141,8 @@ impl RdeApp {
         let mut clear = false;
         let log = self.project.log.clone();
         let tasks = self.run_history_lines();
+        let rollback_candidates = self.rollback_candidates();
+        let mut rollback_clicked: Option<String> = None;
         egui::Panel::bottom("rde_logs")
             .resizable(true)
             .default_size(150.0)
@@ -1134,6 +1183,25 @@ impl RdeApp {
                                 for line in &tasks {
                                     ui.label(RichText::new(line).monospace().size(11.5).color(TEXT));
                                 }
+                                ui.add_space(8.0);
+                                ui.label(RichText::new("ТРАНЗАКЦИИ ОБНОВЛЕНИЙ — ОТКАТ (O(1))").small().strong().color(MUTED));
+                                if rollback_candidates.is_empty() {
+                                    ui.label(RichText::new("Пока нет транзакций со снапшотом корней").small().color(MUTED));
+                                }
+                                for candidate in rollback_candidates.iter().take(8) {
+                                    ui.horizontal(|ui| {
+                                        let stamp = candidate
+                                            .updated_unix
+                                            .map(|unix| format!("unix {unix}"))
+                                            .unwrap_or_else(|| "—".to_owned());
+                                        ui.label(RichText::new(format!("{} · {stamp}", candidate.note)).size(11.5).color(TEXT));
+                                        if candidate.rolled_back {
+                                            ui.label(RichText::new("откачено").small().color(MUTED));
+                                        } else if ui.small_button("Откатить").on_hover_text("Переключить корни на предыдущие (O(1)) и восстановить выходы из CAS").clicked() {
+                                            rollback_clicked = Some(candidate.txid.clone());
+                                        }
+                                    });
+                                }
                             }
                             2 => {
                                 ui.label(RichText::new("Агент не подключён (MCP/ACP — v0.3).").strong().color(TEXT));
@@ -1164,6 +1232,9 @@ impl RdeApp {
         }
         if clear {
             self.project.log.clear();
+        }
+        if let Some(txid) = rollback_clicked {
+            self.rollback_transaction(Some(txid));
         }
     }
 
@@ -3183,7 +3254,9 @@ mod docview_tests {
     /// S5-полировка: клавиатурный ввод доходит до встроенного DocView, а сохраняет документ RDE.
     #[test]
     fn docview_receives_keyboard_input_and_rde_saves() {
-        let mut app = RdeApp::new(rde_core::demo());
+        // Копия демо: тест пишет документ и не конкурирует с другими тестами за demo-project.
+        let root = temp_demo_copy("docview-input");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
         app.doc_mode = DocMode::DocView;
         app.export_dir = std::env::temp_dir().join(format!("rde-ui-test-{}", std::process::id()));
         let mut harness = egui_kittest::Harness::builder()
@@ -3236,6 +3309,7 @@ mod docview_tests {
         let out = harness.state().export_dir.join("demo-report-edited.docx");
         assert!(out.is_file(), "RDE-сохранение не создало {}", out.display());
         let _ = std::fs::remove_dir_all(&harness.state().export_dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── M2.3: статусы из хешей и реальное обновление связанных артефактов ─────
@@ -3432,7 +3506,8 @@ mod docview_tests {
         let _ = std::fs::remove_dir_all(&parent);
         std::fs::create_dir_all(&parent).unwrap();
         let root = parent.join("new-project");
-        let mut app = RdeApp::new(rde_core::demo());
+        let demo_copy = temp_demo_copy("project-create");
+        let mut app = RdeApp::new(rde_core::load_project(&demo_copy).unwrap());
 
         app.create_project_ui(&root, "UI-проект").expect("создать проект");
         assert_eq!(app.project.root, root);
@@ -3464,6 +3539,7 @@ mod docview_tests {
         assert!(names.contains(&"rde.toml".to_owned()), "{names:?}");
         assert!(names.iter().any(|name| name.ends_with("document.toml")), "{names:?}");
         let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&demo_copy);
     }
 
     #[test]
@@ -3523,6 +3599,54 @@ mod docview_tests {
         assert!(app.selected.is_none());
         assert!(root.join(".rde/trash").is_dir());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_from_ui_restores_previous_outputs() {
+        if !python_available() {
+            return;
+        }
+        let root = temp_demo_copy("rollback");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        let report = app.update_dependencies(None, true).expect("обновление");
+        assert_eq!(report.failed(), 0, "{:?}", report.errors);
+        let stats_out = app
+            .project
+            .artifact_object(STATS)
+            .unwrap()
+            .dir
+            .join("out/stats.json");
+        let v1 = std::fs::read_to_string(&stats_out).unwrap();
+
+        // Меняем вход и обновляем — появляется новая версия.
+        let input = app
+            .project
+            .artifact_object(REALIZATIONS)
+            .unwrap()
+            .dir
+            .join("inputs/experiment.csv");
+        let mut text = std::fs::read_to_string(&input).unwrap();
+        text.push_str("50,50.0,50.0\n");
+        std::fs::write(&input, text).unwrap();
+        app.reload_project();
+        app.update_dependencies(None, true).expect("повторное обновление");
+        assert_ne!(std::fs::read_to_string(&stats_out).unwrap(), v1);
+
+        // Кандидат на откат виден панели «Задачи», откат возвращает выходы и ledger.
+        let candidates = app.rollback_candidates();
+        assert!(!candidates.is_empty(), "должна быть транзакция для отката");
+        let outcome = app.rollback_transaction(None).expect("откат из UI");
+        assert!(!outcome.restored.is_empty(), "{outcome:?}");
+        assert_eq!(std::fs::read_to_string(&stats_out).unwrap(), v1, "выходы восстановлены из CAS");
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Откат выполнен")),
+            "журнал: {:?}",
+            app.project.log.iter().map(|line| &line.text).collect::<Vec<_>>()
+        );
+        // После отката панель показывает пометку «откачено».
+        assert!(app.rollback_candidates().iter().any(|candidate| candidate.rolled_back));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
