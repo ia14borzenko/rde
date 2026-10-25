@@ -8,6 +8,10 @@
 | `DejaVuSans.ttf` | `rde-sans` — пропорциональный, первый в `FontFamily::Proportional` | `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` |
 | `DejaVuSansMono.ttf` | `rde-mono` — моноширинный, первый в `FontFamily::Monospace` | `/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf` |
 
+Именованные семьи WordCraft (`medium`/`semibold`) тоже привязаны к `rde-sans`:
+WordCraft ставит на `semibold` глобальный `TextStyle::Heading`, и без привязки
+заголовки окон RDE паникуют, когда активны шрифты оболочки.
+
 Покрытие кириллицы (проверено `fontTools`): оба файла содержат все 96
 символов U+0400–U+045F, включая Ё/ё.
 

@@ -438,6 +438,10 @@ pub struct RdeApp {
     ui_scale: f32,
     logs_tab: usize,
     fonts_installed: bool,
+    /// Счётчик кадров `ui()`: диалоги (`Window` с заголовком в стиле Heading)
+    /// рисуются со второго кадра — `set_fonts` применяется только в конце пасса,
+    /// и заголовок на первом кадре мог бы запросить ещё неактивную семью.
+    ui_frames: u64,
     // видимость панелей (скрываются через меню «Вид» или кнопкой × в заголовке)
     show_tree: bool,
     show_agent: bool,
@@ -528,6 +532,7 @@ impl RdeApp {
             ui_scale: 1.0,
             logs_tab: 0,
             fonts_installed: false,
+            ui_frames: 0,
             show_tree: true,
             show_agent: true,
             show_logs: true,
@@ -1837,6 +1842,7 @@ impl RdeApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.poll_update_job();
         self.maybe_auto_boot_update();
+        self.ui_frames += 1;
         if !self.fonts_installed {
             install_fonts(ui.ctx());
             self.fonts_installed = true;
@@ -1888,8 +1894,14 @@ impl RdeApp {
             self.inspector_panel(ui);
         }
         self.central(ui);
-        self.dialogs(ui.ctx());
-        self.dialogs_extra(ui.ctx());
+        // Диалоги — со второго кадра: шрифты из set_fonts() активны только после
+        // конца первого пасса, а заголовок Window уже на первом кадре может
+        // запросить семью (напр. semibold из глобального Heading), которой ещё нет
+        // в атласе. Задержка в один кадр незаметна, паники нет.
+        if self.ui_frames > 1 {
+            self.dialogs(ui.ctx());
+            self.dialogs_extra(ui.ctx());
+        }
     }
 
     fn push_log(&mut self, level: Level, text: impl Into<String>) {
@@ -6108,7 +6120,11 @@ const VENDORED_SANS: &[u8] = include_bytes!("../fonts/DejaVuSans.ttf");
 const VENDORED_MONO: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
 
 /// Определения шрифтов оболочки: `rde-sans` — первый в пропорциональной семье,
-/// `rde-mono` — первый в моноширинной. Чистая функция — покрыта тестом.
+/// `rde-mono` — первый в моноширинной. Именованные семьи WordCraft
+/// (`medium`/`semibold`) тоже привязаны к `rde-sans`: WordCraft ставит на
+/// `semibold` глобальный `TextStyle::Heading`, и без привязки заголовки наших
+/// `Window` паникуют, когда активны шрифты оболочки (а не его `set_fonts`).
+/// Чистая функция — покрыта тестом.
 pub fn font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     fonts
@@ -6117,7 +6133,11 @@ pub fn font_definitions() -> egui::FontDefinitions {
     fonts
         .font_data
         .insert("rde-mono".to_owned(), Arc::new(egui::FontData::from_owned(VENDORED_MONO.to_vec())));
-    fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "rde-sans".to_owned());
+    let mut proportional = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    proportional.insert(0, "rde-sans".to_owned());
+    fonts.families.insert(egui::FontFamily::Proportional, proportional.clone());
+    fonts.families.insert(egui::FontFamily::Name("medium".into()), proportional.clone());
+    fonts.families.insert(egui::FontFamily::Name("semibold".into()), proportional);
     fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "rde-mono".to_owned());
     fonts
 }
@@ -6290,6 +6310,46 @@ mod theme_tests {
         assert_eq!(monospace.first().map(String::as_str), Some("rde-mono"));
         assert!(proportional.len() > 1, "дефолтный fallback пропал из Proportional");
         assert!(monospace.len() > 1, "дефолтный fallback пропал из Monospace");
+        // Именованные семьи WordCraft связаны с rde-sans (иначе паника заголовков Window).
+        for family in ["medium", "semibold"] {
+            let list = fonts
+                .families
+                .get(&egui::FontFamily::Name(family.into()))
+                .unwrap_or_else(|| panic!("нет семьи {family}"));
+            assert_eq!(list.first().map(String::as_str), Some("rde-sans"), "{family}");
+        }
+    }
+
+    /// Заголовок `Window` (стиль Heading) не паникует, когда WordCraft уже
+    /// переназначил глобальный Heading на `semibold`, а активны наши шрифты.
+    #[test]
+    fn window_title_survives_vendor_semibold_heading() {
+        let mut open = true;
+        let mut harness = egui_kittest::Harness::builder().build_ui_state(
+            |ui, warmed: &mut bool| {
+                // set_fonts применяется в конце пасса: установка — на первом кадре,
+                // использование — со второго (как диалоги RDE после ui_frames-guard).
+                if !*warmed {
+                    super::install_fonts(ui.ctx());
+                    // Симуляция мутации WordCraft (theme.rs: Heading → semibold).
+                    ui.ctx().all_styles_mut(|style| {
+                        style.text_styles.insert(
+                            egui::TextStyle::Heading,
+                            egui::FontId::new(17.0, egui::FontFamily::Name("semibold".into())),
+                        );
+                    });
+                    *warmed = true;
+                    return;
+                }
+                egui::Window::new("Настройки приложения…").open(&mut open).show(ui.ctx(), |ui| {
+                    ui.label("Кириллица: Привет, Ёё!");
+                });
+            },
+            false,
+        );
+        for _ in 0..4 {
+            harness.step();
+        }
     }
 
     /// Применение темы на headless-контексте: предпочтение вступает сразу;
