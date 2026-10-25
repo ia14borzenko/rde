@@ -12,11 +12,11 @@ v0.10.0 (git-субмодуль).
 
 ## Вехи
 
-Текущая: **M2.4 «Полноценный UI объектов»** — инспектор выбранного объекта, создание/переименование/
-удаление объектов из UI, реальные вкладки «Структура документа» (разбор WordCraft-модели) и
-«Код документа» (манифест объекта). Real-статусы и запуск артефактов — из M2.3.
+Текущая: **M5 «Источники, PDF/OCR, ревью»** — импорт цитат (BibTeX/RIS/CSL-JSON), PDF-текст и
+рендер (poppler), OCR (tesseract rus+eng), комментарии Word и импорт внешнего ревью; плюс M4
+(шаблон ГОСТ 7.32-2017, библиография ГОСТ 7.0.100) и M3 (`.doc.rde`, docx-гейты, LO-оракул).
 Предыдущие: M1 (`m1-concept`), S5 (`s5-docview`), M2.1 (`m2.1-project-model`),
-M2.2 (`m2.2-store`), M2.3 «Запуск и обновление» (`m2.3-run-dag`).
+M2.2 (`m2.2-store`), M2.3 (`m2.3-run-dag`), M2.4 (`m2.4-ui`), M3 (`m3-doc`), M4 (`m4-templates`).
 История и критерии вех: [`docs/milestones.md`](docs/milestones.md).
 
 ## Что уже есть в прототипе
@@ -26,12 +26,14 @@ M2.2 (`m2.2-store`), M2.3 «Запуск и обновление» (`m2.3-run-da
 | Дерево проекта (документы, артефакты, константы, источники, заметки, репозитории) | **реальные объекты** из `demo-project/` (`rde.toml` + `objects/**`), статусы вычисляются из фактов на диске |
 | Центральные вкладки: Документ / Структура / Артефакты (DAG) / Источник / Код документа | UI готов |
 | **Документ** | три режима: **«Редактор RDE (DocView)»** — canvas WordCraft без его ribbon/titlebar (форк-патч `rde-docview`, feature-gate), ввод/вёрстка/undo как в WordCraft; **«Полный WordCraft»** — весь WordApp в панели (для сравнения); **«Предпросмотр страниц»** — растровые страницы |
-| Сохранение | **одна кнопка «Экспорт .docx»** в верхней панели: RDE сохраняет текущий документ в `demo-project/exports/`; WordCraft-autosave отключён — решения о сохранении принимает RDE. Пока это экспорт; «Сохранить проект» (`.doc.rde`, транзакции) — M3 |
+| Сохранение | **RDE — владелец сохранения**: «Сохранить проект» пишет `.doc.rde` (OOXML + `rde:doc`), «Экспорт .docx» — чистая копия в `exports/`; WordCraft-autosave отключён. Детект внешних правок по `rde:doc`/`body_hash` |
 | DAG артефактов | **реальный**: узлы/рёбра/статусы из `act_key`/`out_hash` (`rde-dag`); причины устаревания — из хешей, а не эвристик |
 | Панель агента (ACP/DSH), предложения, tool-calls; вкладки «Структура»/«Код документа» | mock (следующие вехи) |
 | Панели (дерево, агент, журнал) | скрываются: × в заголовке панели или меню «Вид» |
 | Журнал | **реальный** журнал загрузки проекта + строки запусков артефактов с act_key |
-| Экспорт `.docx`, обновление вставок, CAS/транзакции, шаблоны ГОСТ, MCP-сервер | **следующие итерации** (см. `.agent/plan-v01.md`) |
+| Шаблоны/библиография | **работает**: ГОСТ 7.32-2017 (поля/шрифты/интервалы/заголовки/подписи), библиография ГОСТ 7.0.100 из источников проекта |
+| Источники/PDF/OCR/ревью | **работает**: импорт BibTeX/RIS/CSL-JSON, PDF-текст и OCR страницы, комментарии Word + импорт внешнего ревью; веб-архив — при наличии `monolith` |
+| MCP-сервер, ACP-агент | **следующие итерации** (v0.3, см. `.agent/plan-v01.md`) |
 | S5 (чистый DocView) | ✅ первая версия: feature `rde-docview` в форк-ветке WordCraft; см. `docs/wordcraft-fork.md` |
 
 ## Сборка и запуск
@@ -41,24 +43,25 @@ M2.2 (`m2.2-store`), M2.3 «Запуск и обновление» (`m2.3-run-da
 Тесты (включая автотест клавиатурного ввода в DocView и RDE-сохранения):
 
 ```bash
-cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-ui   # модель, хеши, store (kill -9), запуск, DAG, DocView
+cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-ui   # 64 теста: модель, хеши, store (kill -9), запуск, DAG, .doc.rde, docx-гейты, ГОСТ, источники/PDF/OCR, UI
 ```
 
 ```bash
 git submodule update --init --recursive   # WordCraft v0.10.0 + форк-патч DocView (ветка rde/main)
-cargo build --release -p rde              # приложение
-cargo run -p rde                          # окно RDE, демо-проект demo-project/
-cargo run -p rde -- --project <каталог>   # открыть другой проект RDE
+./scripts/build.sh build -p rde           # приложение (target на внешнем диске)
+./scripts/build.sh run -p rde             # окно RDE, демо-проект demo-project/
+./scripts/build.sh run -p rde -- --project <каталог>   # другой проект RDE
 ```
 
 Форк-ветка WordCraft: <https://github.com/ia14borzenko/wordcraft-rde> (ветка `rde/main`).
 
-Хранилище проекта (CAS/журнал) и реальное обновление артефактов — можно посмотреть без окна:
+Хранилище, обновление артефактов и docx-гейты — без окна:
 
 ```bash
-CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target cargo run -p rde-store --example demo
-CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target cargo run -p rde-dag --example update-demo
-# второй запуск update-demo: «выполнено 0, пропущено 2» — act_key/out_hash совпали
+./scripts/build.sh run -p rde-store --example demo
+./scripts/build.sh run -p rde-dag --example update-demo      # второй запуск: «выполнено 0, пропущено 2»
+./scripts/build.sh run -p rde-docx --example fidelity -- <файл.docx> docs/fidelity/report.json
+./scripts/build.sh run -p rde-templates --example format-demo    # оформить демо-документ по ГОСТ + библиография
 ```
 
 ### Концепт-скриншот без видимого окна (headless)
@@ -79,9 +82,16 @@ rde/
   crates/rde-store/    # CAS, атомарная запись, журнал транзакций, пересборка индекса (M2.2)
   crates/rde-run/      # исполнение скриптов артефактов: workdir, логи, timeout/cancel (M2.3)
   crates/rde-dag/      # act_key/out_hash ledger, статусы, топологическое обновление (M2.3)
+  crates/rde-doc/      # .doc.rde: OOXML + rde:doc customXml, сохранение/извлечение, подписи (M3)
+  crates/rde-docx/     # docx fidelity-гейты: части, roundtrip WordCraft, LO-оракул (M3)
+  crates/rde-templates/# ГОСТ 7.32-2017 и профили, библиография ГОСТ 7.0.100 (M4)
+  crates/rde-sources/  # импорт цитат BibTeX/RIS/CSL-JSON, PDF-текст/рендер, OCR, веб-архив (M5)
   crates/rde-ui/       # каркас UI + DocView WordCraft + панели на модели проекта
-  demo-project/        # демо-проект: rde.toml, objects/{artifacts,documents,sources,notes,repos}
+  demo-project/        # демо-проект: rde.toml, objects/**; документ — .doc.rde
   docs/schema/         # сгенерированные JSON Schema манифестов (rde-core examples/dump-schemas)
+  docs/fidelity/       # отчёты docx-гейтов (JSON)
+  scripts/build.sh     # cargo-обёртка: target на /srv/yocto/rde-target + защита от переполнения
+  .cargo/config.toml   # target-dir на внешний диск (на другой машине переопределите CARGO_TARGET_DIR)
   vendor/wordcraft/    # git-субмодуль форка ia14borzenko/wordcraft-rde, ветка rde/main (DocView); журнал — docs/wordcraft-fork.md
   patches/wordcraft/   # экспорт патчей форка (для bootstrap до публикации GitHub-форка)
   docs/adr/            # архитектурные решения

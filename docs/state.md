@@ -76,3 +76,34 @@ cargo run -p rde-store --example demo  # CAS/деревья/индекс на de
 Правила работы: изменения WordCraft — только коммитом в форк-ветке `rde/main` + запись в
 `docs/wordcraft-fork.md`; после каждой итерации — блок «Как запустить» в отчёте; архитектурные
 решения — в `docs/adr/`.
+
+---
+
+## Обновление 2026-10-25 — M3–M5 (снимок `snapshot-2026-10-25`)
+
+После снимка 2026-10-24 реализованы и зафиксированы тегами вехи **M3**, **M4**, **M5**.
+
+| Веха | Тег | Что появилось |
+|---|---|---|
+| M3 «`rde:doc` и docx-гейты» | `m3-doc` | документ — `.doc.rde` (OOXML + `rde:doc` в customXml); сохранение/обновление под контролем RDE; детект внешних правок; `rde-docx` fidelity-гейты (части, WordCraft-roundtrip, LO-оракул → PDF); демо-документ мигрирован |
+| M4 «Шаблоны ГОСТ и библиография» | `m4-templates` | `rde-templates`: ГОСТ 7.32-2017 + профили; применение полей/шрифтов/интервалов/заголовков/подписей; библиография ГОСТ 7.0.100 из источников; UI «Оформить по ГОСТ» |
+| M5 «Источники, PDF/OCR, ревью» | `m5-sources-review` | `rde-sources`: импорт BibTeX/RIS/CSL-JSON, PDF-текст/рендер (poppler), OCR (tesseract rus+eng), веб-архив (monolith); комментарии Word и импорт внешнего ревью; UI PDF/OCR/ревью |
+
+**Состав:** 10 крейтов (`rde-core`, `rde-hash`, `rde-store`, `rde-run`, `rde-dag`, `rde-doc`,
+`rde-docx`, `rde-templates`, `rde-sources`, `rde-ui`) + `apps/rde`; **64 теста** (модель, хеши,
+store/kill -9, запуск, DAG, `.doc.rde`, docx-гейты, ГОСТ, источники/PDF/OCR, UI). Демо-проект:
+10 объектов, документ оформлен по ГОСТ с библиографией, добавлен PDF-источник; `docs/fidelity/`
+содержит отчёты гейтов (PASS, LO 26.2 → PDF).
+
+**Сборка:** target вынесен на `/srv/yocto/rde-target` (внешний ext4), `incremental = false`,
+`debug = "line-tables-only"` — 3–12 ГБ вместо 46 ГБ; обёртки `scripts/build.sh` (guard по свободному
+месту) и `scripts/clean-build.sh`; `.cargo/config.toml` задаёт target-dir (на другой машине
+переопределите `CARGO_TARGET_DIR`).
+
+**Известные ограничения:** PDF-бэкенд — poppler CLI (pdfium — следующий шаг, библиотека в
+`refs/bin/pdfium`); веб-архив без `monolith`; полное обновление вставок документа (не только
+подписи) — после v0.3; MCP-сервер/ACP-агент — v0.3 по ТЗ §8.7; ГОСТ 2.105 (рамки/штампы) и
+вузовские профили — v0.2.
+
+**Следующий шаг:** v0.3 — `rde-mcp` (rmcp: инструменты/ресурсы/approvals) и `rde-agent`
+(ACP-клиент DSH), затем полное обновление вставок и hardening v1.0.
