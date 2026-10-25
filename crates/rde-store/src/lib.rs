@@ -191,6 +191,8 @@ pub struct RollbackCandidate {
     pub updated_unix: Option<u64>,
     pub rolled_back: bool,
     pub roots: usize,
+    /// Имена корней, которые переключает транзакция (`artifact/<id>`, `document/<id>`, …).
+    pub root_names: Vec<String>,
 }
 
 /// Pin корня: GC не удаляет помеченные деревья/блобы (экспорты, шаринги, R-ART-11).
@@ -791,12 +793,18 @@ impl Store {
             if self.read_snapshot(&record.id)?.is_none() {
                 continue;
             }
+            let root_names = record
+                .roots
+                .as_ref()
+                .map(|roots| roots.names().map(str::to_owned).collect())
+                .unwrap_or_default();
             result.push(RollbackCandidate {
                 txid: record.id.clone(),
                 note: record.note.clone(),
                 updated_unix: record.updated_unix,
                 rolled_back: record.rolled_back,
                 roots: record.roots.as_ref().map(|roots| roots.len()).unwrap_or(0),
+                root_names,
             });
         }
         Ok(result)

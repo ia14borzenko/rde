@@ -39,6 +39,12 @@ pub const RDE_ITEM_PROPS: &str = "customXml/itemProps1.xml";
 pub const RDE_ITEM_RELS: &str = "customXml/_rels/item1.xml.rels";
 pub const CONTENT_TYPES: &str = "[Content_Types].xml";
 pub const DOCUMENT_XML: &str = "word/document.xml";
+pub const ROOT_RELS: &str = "_rels/.rels";
+pub const DOC_PROPS_CUSTOM: &str = "docProps/custom.xml";
+/// Пространство имён Word 2010 для `w14:paraId` (стабильные анкоры блоков).
+pub const W14_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
+/// Префикс tag content-control (`w:sdt`) для вставок RDE.
+pub const INSERT_TAG_PREFIX: &str = "rde:";
 
 /// Блок документа, которым оперирует RDE (стабильный id + путь в WordCraft-модели).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,14 +55,18 @@ pub struct RdeBlock {
     /// `heading1|heading2|heading|paragraph|figure|caption|table`.
     pub kind: String,
     pub text: String,
+    /// Стабильный анкор Word `w14:paraId` (R-DOC-04): карта block_id ↔ paraId.
+    #[serde(default)]
+    pub para_id: Option<String>,
 }
 
 /// Вставка RDE (рисунок/подпись/таблица), привязанная к блоку.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RdeInsert {
     pub id: String,
+    /// Блок-анкор (id блока) или paraId.
     pub block: String,
-    /// `figure|caption|table|note`.
+    /// `figure|caption|table|note|value`.
     pub kind: String,
     /// URI цели: `rde://artifact/<id>@<out_hash>/<selector>` или `rde://source/<id>`.
     pub target: String,
@@ -65,6 +75,18 @@ pub struct RdeInsert {
     pub number: Option<u32>,
     #[serde(default)]
     pub hash: Option<String>,
+    /// Кэш значения вставки (R-DOC-11): то, что показано в документе.
+    #[serde(default)]
+    pub cached: String,
+    /// Селектор значения внутри выхода артефакта (JSON pointer `#/a/b` или путь файла).
+    #[serde(default)]
+    pub selector: String,
+    /// `text|number|figure`.
+    #[serde(default)]
+    pub value_kind: String,
+    /// Анкор `w14:paraId` content-control'а вставки (если есть).
+    #[serde(default)]
+    pub para_id: Option<String>,
 }
 
 /// Сводка ревью (комментарии/правки; полноценно — M5).
@@ -224,12 +246,16 @@ pub fn render_rde_doc(doc: &RdeDoc) -> String {
     out.push_str("  <rde:blocks>\n");
     for block in &doc.blocks {
         out.push_str(&format!(
-            "    <rde:block id=\"{}\" path=\"{}\" kind=\"{}\" text=\"{}\"/>\n",
+            "    <rde:block id=\"{}\" path=\"{}\" kind=\"{}\" text=\"{}\"",
             escape_attr(&block.id),
             escape_attr(&block.path),
             escape_attr(&block.kind),
             escape_attr(&block.text)
         ));
+        if let Some(para_id) = &block.para_id {
+            out.push_str(&format!(" para_id=\"{}\"", escape_attr(para_id)));
+        }
+        out.push_str("/>\n");
     }
     out.push_str("  </rde:blocks>\n");
     out.push_str("  <rde:inserts>\n");
@@ -247,6 +273,18 @@ pub fn render_rde_doc(doc: &RdeDoc) -> String {
         }
         if let Some(hash) = &insert.hash {
             out.push_str(&format!(" hash=\"{}\"", escape_attr(hash)));
+        }
+        if !insert.cached.is_empty() {
+            out.push_str(&format!(" cached=\"{}\"", escape_attr(&insert.cached)));
+        }
+        if !insert.selector.is_empty() {
+            out.push_str(&format!(" selector=\"{}\"", escape_attr(&insert.selector)));
+        }
+        if !insert.value_kind.is_empty() {
+            out.push_str(&format!(" value_kind=\"{}\"", escape_attr(&insert.value_kind)));
+        }
+        if let Some(para_id) = &insert.para_id {
+            out.push_str(&format!(" para_id=\"{}\"", escape_attr(para_id)));
         }
         out.push_str("/>\n");
     }
@@ -309,7 +347,7 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                         }
                     }
                     "block" => {
-                        let mut block = RdeBlock { id: String::new(), path: String::new(), kind: "paragraph".into(), text: String::new() };
+                        let mut block = RdeBlock { id: String::new(), path: String::new(), kind: "paragraph".into(), text: String::new(), para_id: None };
                         for attr in event.attributes().flatten() {
                             let key = local_name(attr.key.as_ref());
                             let value = unescape(attr.value.as_ref());
@@ -318,13 +356,26 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                                 "path" => block.path = value,
                                 "kind" => block.kind = value,
                                 "text" => block.text = value,
+                                "para_id" => block.para_id = Some(value),
                                 _ => {}
                             }
                         }
                         doc.blocks.push(block);
                     }
                     "insert" => {
-                        let mut insert = RdeInsert { id: String::new(), block: String::new(), kind: "figure".into(), target: String::new(), caption: String::new(), number: None, hash: None };
+                        let mut insert = RdeInsert {
+                            id: String::new(),
+                            block: String::new(),
+                            kind: "figure".into(),
+                            target: String::new(),
+                            caption: String::new(),
+                            number: None,
+                            hash: None,
+                            cached: String::new(),
+                            selector: String::new(),
+                            value_kind: String::new(),
+                            para_id: None,
+                        };
                         for attr in event.attributes().flatten() {
                             let key = local_name(attr.key.as_ref());
                             let value = unescape(attr.value.as_ref());
@@ -336,6 +387,10 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                                 "caption" => insert.caption = value,
                                 "number" => insert.number = value.parse().ok(),
                                 "hash" => insert.hash = Some(value),
+                                "cached" => insert.cached = value,
+                                "selector" => insert.selector = value,
+                                "value_kind" => insert.value_kind = value,
+                                "para_id" => insert.para_id = Some(value),
                                 _ => {}
                             }
                         }
@@ -435,6 +490,353 @@ fn item_rels_xml() -> String {
         .to_owned()
 }
 
+// ── §8.5: wiring пакета (root rels, tombstone, paraId, sdt-вставки) ─────────
+
+/// Добавить relationship из корня пакета на `customXml/item1.xml` (R-DOC-02).
+fn ensure_root_customxml_relationship(entries: &mut BTreeMap<String, Vec<u8>>) {
+    let target = "customXml/item1.xml";
+    let existing = entries.get(ROOT_RELS).map(|bytes| String::from_utf8_lossy(bytes).to_string()).unwrap_or_else(|| {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>\n"
+            .to_owned()
+    });
+    if existing.contains(&format!("Target=\"{target}\"")) {
+        entries.insert(ROOT_RELS.to_owned(), existing.into_bytes());
+        return;
+    }
+    let relationship = format!(
+        "<Relationship Id=\"rIdRdeCustomXml\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml\" Target=\"{target}\"/>"
+    );
+    let updated = match existing.rfind("</Relationships>") {
+        Some(index) => {
+            let mut out = String::with_capacity(existing.len() + relationship.len());
+            out.push_str(&existing[..index]);
+            out.push_str(&relationship);
+            out.push_str(&existing[index..]);
+            out
+        }
+        None => format!("{existing}{relationship}"),
+    };
+    entries.insert(ROOT_RELS.to_owned(), updated.into_bytes());
+}
+
+fn strip_root_customxml_relationship(entries: &mut BTreeMap<String, Vec<u8>>) {
+    let Some(bytes) = entries.get(ROOT_RELS) else { return };
+    let text = String::from_utf8_lossy(bytes).to_string();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("<Relationship") {
+        let Some(end) = rest[start..].find("/>") else {
+            out.push_str(rest);
+            rest = "";
+            break;
+        };
+        let element = &rest[start..start + end + 2];
+        if !element.contains("Target=\"customXml/item1.xml\"") {
+            out.push_str(element);
+        }
+        rest = &rest[start + end + 2..];
+    }
+    out.push_str(rest);
+    entries.insert(ROOT_RELS.to_owned(), out.into_bytes());
+}
+
+fn tombstone_xml(rde_doc: &RdeDoc) -> String {
+    let parts = [RDE_DOC_PART, RDE_ITEM_PROPS, RDE_ITEM_RELS].join(",");
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\" \
+         xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">\
+         <property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"2\" name=\"rdeDocId\"><vt:lpwstr>{}</vt:lpwstr></property>\
+         <property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"3\" name=\"rdeSchema\"><vt:lpwstr>rde/doc@{}</vt:lpwstr></property>\
+         <property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"4\" name=\"rdeBodyHash\"><vt:lpwstr>{}</vt:lpwstr></property>\
+         <property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"5\" name=\"rdeParts\"><vt:lpwstr>{parts}</vt:lpwstr></property>\
+         </Properties>\n",
+        escape_attr(&rde_doc.doc_id),
+        escape_attr(&rde_doc.schema_version),
+        escape_attr(&rde_doc.body_hash)
+    )
+}
+
+/// Записать/обновить `docProps/custom.xml`-надгробие (R-DOC-03): RDE-части видны Word как
+/// свойства документа, а при потере customXml остаётся след для диагностики.
+fn upsert_custom_props(entries: &mut BTreeMap<String, Vec<u8>>, rde_doc: &RdeDoc) {
+    let existing = entries
+        .get(DOC_PROPS_CUSTOM)
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .unwrap_or_else(|| {
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\" \
+             xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">\n</Properties>\n"
+                .to_owned()
+        });
+    let mut cleaned = existing;
+    for name in ["rdeDocId", "rdeSchema", "rdeBodyHash", "rdeParts"] {
+        cleaned = strip_custom_property(&cleaned, name);
+    }
+    let parts = [RDE_DOC_PART, RDE_ITEM_PROPS, RDE_ITEM_RELS].join(",");
+    let properties = format!(
+        "<property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"2\" name=\"rdeDocId\"><vt:lpwstr>{}</vt:lpwstr></property>\
+         <property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"3\" name=\"rdeSchema\"><vt:lpwstr>rde/doc@{}</vt:lpwstr></property>\
+         <property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"4\" name=\"rdeBodyHash\"><vt:lpwstr>{}</vt:lpwstr></property>\
+         <property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"5\" name=\"rdeParts\"><vt:lpwstr>{parts}</vt:lpwstr></property>",
+        escape_attr(&rde_doc.doc_id),
+        escape_attr(&rde_doc.schema_version),
+        escape_attr(&rde_doc.body_hash)
+    );
+    let updated = match cleaned.rfind("</Properties>") {
+        Some(index) => {
+            let mut out = String::with_capacity(cleaned.len() + properties.len());
+            out.push_str(&cleaned[..index]);
+            out.push_str(&properties);
+            out.push_str(&cleaned[index..]);
+            out
+        }
+        None => format!("{cleaned}{properties}"),
+    };
+    entries.insert(DOC_PROPS_CUSTOM.to_owned(), updated.into_bytes());
+    if let Some(content_types) = entries.get_mut(CONTENT_TYPES) {
+        let text = String::from_utf8_lossy(content_types).to_string();
+        let text = ensure_override(
+            &text,
+            DOC_PROPS_CUSTOM,
+            "application/vnd.openxmlformats-officedocument.custom-properties+xml",
+        );
+        *content_types = text.into_bytes();
+    }
+    let _ = tombstone_xml(rde_doc);
+}
+
+fn strip_custom_property(xml: &str, name: &str) -> String {
+    let needle = format!("name=\"{name}\"");
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(start) = rest.find("<property") {
+        let Some(rel_end) = rest[start..].find("</property>") else {
+            out.push_str(rest);
+            return out;
+        };
+        let element = &rest[start..start + rel_end + "</property>".len()];
+        if !element.contains(&needle) {
+            out.push_str(element);
+        }
+        rest = &rest[start + rel_end + "</property>".len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Убрать надгробие RDE из `docProps/custom.xml` (экспорт чистого `.docx`).
+fn strip_custom_props(entries: &mut BTreeMap<String, Vec<u8>>) {
+    let Some(bytes) = entries.get(DOC_PROPS_CUSTOM) else { return };
+    let text = String::from_utf8_lossy(bytes).to_string();
+    let mut cleaned = text;
+    for name in ["rdeDocId", "rdeSchema", "rdeBodyHash", "rdeParts"] {
+        cleaned = strip_custom_property(&cleaned, name);
+    }
+    let has_properties = cleaned.contains("<property");
+    if has_properties {
+        entries.insert(DOC_PROPS_CUSTOM.to_owned(), cleaned.into_bytes());
+    } else {
+        entries.remove(DOC_PROPS_CUSTOM);
+        if let Some(content_types) = entries.get_mut(CONTENT_TYPES) {
+            let text = String::from_utf8_lossy(content_types).to_string();
+            *content_types = strip_content_type_overrides(&text, DOC_PROPS_CUSTOM).into_bytes();
+        }
+        if let Some(rels) = entries.get_mut(ROOT_RELS) {
+            let text = String::from_utf8_lossy(rels).to_string();
+            let mut out = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            while let Some(start) = rest.find("<Relationship") {
+                let Some(end) = rest[start..].find("/>") else {
+                    out.push_str(rest);
+                    rest = "";
+                    break;
+                };
+                let element = &rest[start..start + end + 2];
+                if !element.contains("Target=\"docProps/custom.xml\"") {
+                    out.push_str(element);
+                }
+                rest = &rest[start + end + 2..];
+            }
+            out.push_str(rest);
+            *rels = out.into_bytes();
+        }
+    }
+}
+
+fn para_id_for(doc_id: &str, index: usize) -> String {
+    let hash = rde_hash::sha256(format!("{doc_id}:para:{index}").as_bytes()).hex();
+    hash.chars().take(8).collect::<String>().to_uppercase()
+}
+
+/// Проставить `w14:paraId` всем абзацам `word/document.xml` (R-DOC-04) и вернуть id
+/// «видимых» абзацев (с текстом или рисунком) в порядке документа.
+fn inject_para_ids(document_xml: &[u8], doc_id: &str) -> Result<(Vec<u8>, Vec<String>), String> {
+    use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event as XEvent};
+    use quick_xml::Writer;
+    let text = String::from_utf8_lossy(document_xml).to_string();
+    let mut reader = Reader::from_str(&text);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut visible_ids = Vec::new();
+    let mut para_index = 0usize;
+    let mut in_para = false;
+    let mut current_id = String::new();
+    let mut has_content = false;
+    loop {
+        match reader.read_event() {
+            Ok(XEvent::Start(event)) => {
+                let name = local_name(event.name().as_ref());
+                let name_owned = event.name().as_ref().to_string();
+                let mut out = BytesStart::new(name_owned.as_str());
+                for attr in event.attributes().flatten() {
+                    // w14:paraId перезаписываем ниже (не дублируем атрибут).
+                    if attr.key.as_ref() == "w14:paraId" {
+                        continue;
+                    }
+                    out.push_attribute((attr.key.as_ref(), attr.value.as_ref()));
+                }
+                if name == "document" && !text.contains("xmlns:w14=") {
+                    out.push_attribute(("xmlns:w14", W14_NS));
+                }
+                if name == "drawing" {
+                    has_content = true;
+                }
+                if name == "p" {
+                    let existing = event
+                        .try_get_attribute("w14:paraId")
+                        .ok()
+                        .flatten()
+                        .map(|attr| attr.value.as_ref().to_string());
+                    let id = existing.unwrap_or_else(|| para_id_for(doc_id, para_index));
+                    out.push_attribute(("w14:paraId", id.as_str()));
+                    current_id = id;
+                    in_para = true;
+                    has_content = false;
+                    para_index += 1;
+                }
+                writer.write_event(XEvent::Start(out)).map_err(|e| format!("document.xml: {e}"))?;
+            }
+            Ok(XEvent::Empty(event)) => {
+                let name = local_name(event.name().as_ref());
+                if name == "drawing" {
+                    has_content = true;
+                }
+                let name_owned = event.name().as_ref().to_string();
+                let mut out = BytesStart::new(name_owned.as_str());
+                for attr in event.attributes().flatten() {
+                    out.push_attribute((attr.key.as_ref(), attr.value.as_ref()));
+                }
+                writer.write_event(XEvent::Empty(out)).map_err(|e| format!("document.xml: {e}"))?;
+            }
+            Ok(XEvent::Text(event)) => {
+                if in_para {
+                    let value = event.xml10_content().to_string();
+                    if !value.trim().is_empty() {
+                        has_content = true;
+                    }
+                }
+                writer
+                    .write_event(XEvent::Text(BytesText::new(&event.xml10_content())))
+                    .map_err(|e| format!("document.xml: {e}"))?;
+            }
+            Ok(XEvent::End(event)) => {
+                let name = local_name(event.name().as_ref());
+                if name == "p" && in_para {
+                    if has_content {
+                        visible_ids.push(current_id.clone());
+                    }
+                    in_para = false;
+                }
+                let end_name = event.name().as_ref().to_string();
+                writer
+                    .write_event(XEvent::End(BytesEnd::new(end_name.as_str())))
+                    .map_err(|e| format!("document.xml: {e}"))?;
+            }
+            Ok(XEvent::Eof) => break,
+            Ok(other) => {
+                writer.write_event(other).map_err(|e| format!("document.xml: {e}"))?;
+            }
+            Err(error) => return Err(format!("document.xml: {error}")),
+        }
+    }
+    Ok((writer.into_inner(), visible_ids))
+}
+
+/// Назначить блокам `para_id` по порядку «видимых» абзацев документа.
+fn assign_para_ids(rde_doc: &mut RdeDoc, visible_ids: &[String]) {
+    if rde_doc.blocks.len() != visible_ids.len() {
+        // Разное представление «видимых» абзацев — анкоры не назначаем (не ломаем документ).
+        return;
+    }
+    for (block, para_id) in rde_doc.blocks.iter_mut().zip(visible_ids.iter()) {
+        block.para_id = Some(para_id.clone());
+    }
+    for insert in &mut rde_doc.inserts {
+        if insert.para_id.is_none() {
+            insert.para_id = rde_doc
+                .blocks
+                .iter()
+                .find(|block| block.id == insert.block)
+                .and_then(|block| block.para_id.clone());
+        }
+    }
+}
+
+fn sdt_paragraph_xml(insert: &RdeInsert) -> String {
+    // Подпись/метка вставки — обычный run перед content-control, значение — внутри sdt.
+    let label = if insert.caption.is_empty() {
+        String::new()
+    } else {
+        format!("<w:r><w:t xml:space=\"preserve\">{}: </w:t></w:r>", escape_attr(&insert.caption))
+    };
+    format!(
+        "<w:p>{label}<w:sdt><w:sdtPr><w:tag w:val=\"{prefix}{id}\"/><w:alias w:val=\"{alias}\"/></w:sdtPr>\
+         <w:sdtContent><w:r><w:t xml:space=\"preserve\">{value}</w:t></w:r></w:sdtContent></w:sdt></w:p>",
+        prefix = INSERT_TAG_PREFIX,
+        id = escape_attr(&insert.id),
+        alias = escape_attr(if insert.caption.is_empty() { &insert.kind } else { &insert.caption }),
+        value = escape_attr(&insert.cached),
+    )
+}
+
+/// Заменить текст внутри `w:sdt` вставки (по тегу `rde:<id>`) на новое значение.
+fn replace_sdt_text(xml: &str, insert_id: &str, value: &str) -> Option<String> {
+    let tag = format!("<w:tag w:val=\"{INSERT_TAG_PREFIX}{insert_id}\"");
+    let tag_index = xml.find(&tag)?;
+    let sdt_start = xml[..tag_index].rfind("<w:sdt>")?;
+    let content_start = xml[sdt_start..].find("<w:sdtContent>")? + sdt_start + "<w:sdtContent>".len();
+    let content_end = xml[content_start..].find("</w:sdtContent>")? + content_start;
+    let replacement = format!("<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r>", escape_attr(value));
+    let mut out = String::with_capacity(xml.len() + replacement.len());
+    out.push_str(&xml[..content_start]);
+    out.push_str(&replacement);
+    out.push_str(&xml[content_end..]);
+    Some(out)
+}
+
+/// Вставить новый абзац перед `</w:body>`.
+fn append_paragraph(xml: &str, paragraph: &str) -> String {
+    match xml.rfind("</w:body>") {
+        Some(index) => {
+            let mut out = String::with_capacity(xml.len() + paragraph.len());
+            out.push_str(&xml[..index]);
+            out.push_str(paragraph);
+            out.push_str(&xml[index..]);
+            out
+        }
+        None => format!("{xml}{paragraph}"),
+    }
+}
+
+/// Записать части пакета атомарно (temp + rename).
+fn write_entries_atomic(entries: &BTreeMap<String, Vec<u8>>, out: &Path) -> Result<(), String> {
+    let tmp = out.with_extension("doc.rde.tmp");
+    write_package_entries(entries, &tmp)?;
+    fs::rename(&tmp, out).map_err(|e| format!("заменить {}: {e}", out.display()))
+}
+
 /// Извлечь чистый `.docx` из `.doc.rde` (вырезав RDE-части).
 pub fn extract_docx(package: &Path, out_docx: &Path) -> Result<PackageInfo, String> {
     let mut entries = read_package(package)?.entries;
@@ -447,6 +849,8 @@ pub fn extract_docx(package: &Path, out_docx: &Path) -> Result<PackageInfo, Stri
             *content_types = strip_content_type_overrides(&text, removed).into_bytes();
         }
     }
+    strip_root_customxml_relationship(&mut entries);
+    strip_custom_props(&mut entries);
     if !entries.contains_key(DOCUMENT_XML) {
         return Err("в пакете нет word/document.xml".to_owned());
     }
@@ -455,8 +859,9 @@ pub fn extract_docx(package: &Path, out_docx: &Path) -> Result<PackageInfo, Stri
     Ok(info)
 }
 
-/// Собрать `.doc.rde` из чистого `.docx` + `rde:doc`.
-pub fn write_package(clean_docx: &Path, rde_doc: &RdeDoc, out_package: &Path) -> Result<PackageInfo, String> {
+/// Собрать `.doc.rde` из чистого `.docx` + `rde:doc` (§8.5: root rels на customXml, надгробие
+/// `docProps/custom.xml`, `w14:paraId`-анкоры блоков). Мутирует `rde_doc` (body_hash/para_id).
+pub fn write_package(clean_docx: &Path, rde_doc: &mut RdeDoc, out_package: &Path) -> Result<PackageInfo, String> {
     let mut entries = read_package(clean_docx)?.entries;
     if !entries.contains_key(DOCUMENT_XML) {
         return Err(format!("{} не похож на .docx: нет word/document.xml", clean_docx.display()));
@@ -464,6 +869,12 @@ pub fn write_package(clean_docx: &Path, rde_doc: &RdeDoc, out_package: &Path) ->
     for name in entries.keys().filter(|name| is_rde_part(name.as_str())).cloned().collect::<Vec<_>>() {
         entries.remove(&name);
     }
+    // R-DOC-04: стабильные анкоры w14:paraId; body_hash — уже с анкорами.
+    let document_xml = entries.get(DOCUMENT_XML).cloned().unwrap_or_default();
+    let (document_xml, visible_ids) = inject_para_ids(&document_xml, &rde_doc.doc_id)?;
+    rde_doc.body_hash = rde_hash::sha256(&document_xml).hex();
+    assign_para_ids(rde_doc, &visible_ids);
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml);
     entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(rde_doc).into_bytes());
     entries.insert(RDE_ITEM_PROPS.to_owned(), item_props_xml(&rde_doc.doc_id).into_bytes());
     entries.insert(RDE_ITEM_RELS.to_owned(), item_rels_xml().into_bytes());
@@ -476,11 +887,11 @@ pub fn write_package(clean_docx: &Path, rde_doc: &RdeDoc, out_package: &Path) ->
         );
         *content_types = text.into_bytes();
     }
+    // R-DOC-02/03: relationship из корня пакета + надгробие в docProps/custom.xml.
+    ensure_root_customxml_relationship(&mut entries);
+    upsert_custom_props(&mut entries, rde_doc);
     let info = info_from_entries(&entries);
-    // Атомарная подмена: temp рядом → rename.
-    let tmp = out_package.with_extension("doc.rde.tmp");
-    write_package_entries(&entries, &tmp)?;
-    fs::rename(&tmp, out_package).map_err(|e| format!("заменить {}: {e}", out_package.display()))?;
+    write_entries_atomic(&entries, out_package)?;
     Ok(info)
 }
 
@@ -603,6 +1014,7 @@ pub fn extract_blocks(doc: &wordcraft_engine::doc::Document) -> Vec<RdeBlock> {
             path: path.to_string(),
             kind: kind.to_owned(),
             text: truncate(paragraph.text.trim(), 400),
+            para_id: None,
         });
     }
     blocks
@@ -662,6 +1074,10 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 caption: caption.clone(),
                 number: caption_number(&caption).or(Some(counter)),
                 hash: None,
+                cached: String::new(),
+                selector: String::new(),
+                value_kind: "figure".to_owned(),
+                para_id: block.para_id.clone(),
             });
         } else if block.kind == "caption" {
             inserts.push(RdeInsert {
@@ -672,6 +1088,10 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 caption: block.text.clone(),
                 number: caption_number(&block.text),
                 hash: None,
+                cached: block.text.clone(),
+                selector: String::new(),
+                value_kind: "text".to_owned(),
+                para_id: block.para_id.clone(),
             });
         }
     }
@@ -767,7 +1187,7 @@ pub fn update_document_package(package: &Path) -> Result<DocumentUpdateReport, S
         return Err(format!("сохранить обновлённый .docx: {error}"));
     }
     refresh_rde_doc(&temp_docx, &mut rde_doc)?;
-    let info = write_package(&temp_docx, &rde_doc, package)?;
+    let info = write_package(&temp_docx, &mut rde_doc, package)?;
     let _ = fs::remove_file(&temp_docx);
     Ok(DocumentUpdateReport { changes, package: Some(info), rde_doc: Some(rde_doc) })
 }
@@ -791,8 +1211,588 @@ pub fn save_engine_document(editor_docx: &Path, package: &Path, doc_id_hint: &st
         rde_doc.template = template.to_owned();
     }
     refresh_rde_doc(editor_docx, &mut rde_doc)?;
-    write_package(editor_docx, &rde_doc, package)?;
+    write_package(editor_docx, &mut rde_doc, package)?;
     Ok(rde_doc)
+}
+
+// ── живые вставки (R-DOC-11): sdt content-controls со значением из артефакта ──
+
+fn load_rde_doc_from_entries(entries: &BTreeMap<String, Vec<u8>>) -> Result<RdeDoc, String> {
+    let xml = entries
+        .get(RDE_DOC_PART)
+        .ok_or_else(|| "в пакете нет RDE-части (customXml/item1.xml)".to_owned())?;
+    parse_rde_doc(&String::from_utf8_lossy(xml))
+}
+
+/// Запрос на вставку значения/рисунка в документ.
+#[derive(Clone, Debug)]
+pub struct InsertRequest {
+    /// `value` (текст/число) или `figure`.
+    pub kind: String,
+    /// URI цели: `rde://artifact/<id>@<out_hash>/<selector>`.
+    pub target: String,
+    /// Селектор значения внутри выхода (`#/stats/x1/mean` или путь файла).
+    pub selector: String,
+    /// `text|number|figure`.
+    pub value_kind: String,
+    /// Кэш значения, который сразу попадает в документ.
+    pub cached: String,
+    pub caption: String,
+}
+
+/// Результат добавления вставки.
+#[derive(Clone, Debug)]
+pub struct InsertReport {
+    pub insert: RdeInsert,
+    pub package: PackageInfo,
+}
+
+/// Добавить вставку в `.doc.rde`: content-control `w:sdt` с тегом `rde:<id>` в конце тела
+/// + запись в `rde:doc` (R-DOC-11). Значение обновляется [`update_insert_values`].
+pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport, String> {
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let id = format!("v{}", rde_doc.inserts.len() + 1);
+    let para_id = para_id_for(&format!("{}:insert:{id}", rde_doc.doc_id), 0);
+    let insert = RdeInsert {
+        id,
+        block: String::new(),
+        kind: request.kind,
+        target: request.target,
+        caption: request.caption,
+        number: None,
+        hash: None,
+        cached: request.cached,
+        selector: request.selector,
+        value_kind: request.value_kind,
+        para_id: Some(para_id.clone()),
+    };
+    let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
+    let document_xml = String::from_utf8_lossy(document).to_string();
+    let paragraph = sdt_paragraph_xml(&insert).replacen("<w:p>", &format!("<w:p w14:paraId=\"{para_id}\">"), 1);
+    let document_xml = append_paragraph(&document_xml, &paragraph);
+    rde_doc.inserts.push(insert.clone());
+    rde_doc.updated_unix = now_unix();
+    rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+    upsert_custom_props(&mut entries, &rde_doc);
+    let info = info_from_entries(&entries);
+    write_entries_atomic(&entries, package)?;
+    Ok(InsertReport { insert, package: info })
+}
+
+/// Отчёт обновления вставок.
+#[derive(Clone, Debug)]
+pub struct InsertUpdateReport {
+    pub updated: Vec<String>,
+    pub package: PackageInfo,
+    pub rde_doc: RdeDoc,
+}
+
+/// Обновить значения вставок из артефактов: текст в `w:sdt` и кэш в `rde:doc` (R-DOC-11/12).
+/// `values`: insert_id → новое значение (кэш); hash/URI обновляет вызывающий слой.
+pub fn update_insert_values(
+    package: &Path,
+    values: &BTreeMap<String, String>,
+    hashes: &BTreeMap<String, String>,
+) -> Result<InsertUpdateReport, String> {
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
+    let mut document_xml = String::from_utf8_lossy(document).to_string();
+    let mut updated = Vec::new();
+    for insert in &mut rde_doc.inserts {
+        let Some(value) = values.get(&insert.id) else { continue };
+        if let Some(new_xml) = replace_sdt_text(&document_xml, &insert.id, value) {
+            document_xml = new_xml;
+        }
+        insert.cached = value.clone();
+        if let Some(hash) = hashes.get(&insert.id) {
+            insert.hash = Some(hash.clone());
+        }
+        updated.push(insert.id.clone());
+    }
+    rde_doc.updated_unix = now_unix();
+    rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+    upsert_custom_props(&mut entries, &rde_doc);
+    let info = info_from_entries(&entries);
+    write_entries_atomic(&entries, package)?;
+    Ok(InsertUpdateReport { updated, package: info, rde_doc })
+}
+
+/// Проверить, что вставка актуальна: hash в `rde:doc` совпадает с ожидаемым (out_hash цели).
+pub fn insert_is_stale(insert: &RdeInsert, expected_hash: &str) -> bool {
+    insert.hash.as_deref() != Some(expected_hash)
+}
+
+// ── рисунки из артефактов (R-DOC-11) и транзакционное обновление документа ────
+
+/// Имя корня документа в store: `document/<doc_id>` → tree_hash версии пакета.
+pub fn document_root_name(doc_id: &str) -> String {
+    format!("document/{doc_id}")
+}
+
+fn rels_path_for_document() -> &'static str {
+    "word/_rels/document.xml.rels"
+}
+
+fn image_content_type(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Размер изображения в EMU (1 px = 9525 EMU): SVG по width/height, PNG по IHDR.
+fn image_extent_emu(bytes: &[u8], ext: &str) -> (u64, u64) {
+    let fallback = (400u64 * 9525, 300u64 * 9525);
+    if ext.eq_ignore_ascii_case("svg") {
+        let text = String::from_utf8_lossy(bytes);
+        let parse_attr = |name: &str| -> Option<f64> {
+            let index = text.find(&format!("{name}=\""))?;
+            let rest = &text[index + name.len() + 2..];
+            let end = rest.find('"')?;
+            rest[..end].trim_end_matches("px").parse().ok()
+        };
+        if let (Some(width), Some(height)) = (parse_attr("width"), parse_attr("height")) {
+            return ((width * 9525.0) as u64, (height * 9525.0) as u64);
+        }
+    }
+    if ext.eq_ignore_ascii_case("png") && bytes.len() >= 24 && bytes.starts_with(b"\x89PNG") {
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as u64;
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]) as u64;
+        if width > 0 && height > 0 {
+            return (width * 9525, height * 9525);
+        }
+    }
+    fallback
+}
+
+fn drawing_paragraph_xml(insert: &RdeInsert, rel_id: &str, cx: u64, cy: u64, para_id: &str) -> String {
+    format!(
+        "<w:p w14:paraId=\"{para_id}\"><w:sdt><w:sdtPr><w:tag w:val=\"{prefix}{id}\"/><w:alias w:val=\"{alias}\"/></w:sdtPr>\
+         <w:sdtContent><w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
+         <wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:docPr id=\"{doc_pr}\" name=\"{alias}\"/>\
+         <a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+         <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+         <pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+         <pic:nvPicPr><pic:cNvPr id=\"0\" name=\"{alias}\"/><pic:cNvPicPr/></pic:nvPicPr>\
+         <pic:blipFill><a:blip r:embed=\"{rel_id}\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
+         <pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm><a:prstGeom prst=\"rect\"/></pic:spPr>\
+         </pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:sdtContent></w:sdt></w:p>",
+        prefix = INSERT_TAG_PREFIX,
+        id = escape_attr(&insert.id),
+        alias = escape_attr(if insert.caption.is_empty() { "рисунок" } else { &insert.caption }),
+        doc_pr = para_id.len(),
+    )
+}
+
+fn next_relationship_id(rels: &str) -> String {
+    let mut index = 1u32;
+    loop {
+        let id = format!("rIdRde{index}");
+        if !rels.contains(&format!("Id=\"{id}\"")) {
+            return id;
+        }
+        index += 1;
+    }
+}
+
+fn add_image_relationship(entries: &mut BTreeMap<String, Vec<u8>>, rel_id: &str, target: &str) -> Result<(), String> {
+    let existing = entries
+        .get(rels_path_for_document())
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .unwrap_or_else(|| {
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>\n"
+                .to_owned()
+        });
+    let relationship = format!(
+        "<Relationship Id=\"{rel_id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"{target}\"/>"
+    );
+    let updated = match existing.rfind("</Relationships>") {
+        Some(index) => {
+            let mut out = String::with_capacity(existing.len() + relationship.len());
+            out.push_str(&existing[..index]);
+            out.push_str(&relationship);
+            out.push_str(&existing[index..]);
+            out
+        }
+        None => format!("{existing}{relationship}"),
+    };
+    entries.insert(rels_path_for_document().to_owned(), updated.into_bytes());
+    Ok(())
+}
+
+fn ensure_default_content_type(entries: &mut BTreeMap<String, Vec<u8>>, ext: &str) {
+    let Some(content_types) = entries.get_mut(CONTENT_TYPES) else { return };
+    let text = String::from_utf8_lossy(content_types).to_string();
+    if text.contains(&format!("Extension=\"{ext}\"")) {
+        return;
+    }
+    let default = format!("<Default Extension=\"{ext}\" ContentType=\"{}\"/>", image_content_type(ext));
+    let updated = match text.rfind("</Types>") {
+        Some(index) => {
+            let mut out = String::with_capacity(text.len() + default.len());
+            out.push_str(&text[..index]);
+            out.push_str(&default);
+            out.push_str(&text[index..]);
+            out
+        }
+        None => format!("{text}{default}"),
+    };
+    *content_types = updated.into_bytes();
+}
+
+/// Вставить рисунок из файла артефакта (R-DOC-11): media-часть + relationship + drawing в `w:sdt`.
+/// `caption` — текст подписи (номер обновляется перенумерацией документа).
+pub fn add_figure_insert(
+    package: &Path,
+    image: &Path,
+    target: String,
+    caption: String,
+    out_hash: String,
+) -> Result<InsertReport, String> {
+    let ext = image
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("png")
+        .to_ascii_lowercase();
+    let bytes = fs::read(image).map_err(|e| format!("прочитать рисунок {}: {e}", image.display()))?;
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let index = rde_doc.inserts.iter().filter(|insert| insert.kind == "figure").count() + 1;
+    let id = format!("v{}", rde_doc.inserts.len() + 1);
+    let para_id = para_id_for(&format!("{}:figure:{id}", rde_doc.doc_id), index);
+    let media_name = format!("word/media/rde-figure-{index}.{ext}");
+    let media_target = format!("media/rde-figure-{index}.{ext}");
+    let rels = entries
+        .get(rels_path_for_document())
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .unwrap_or_default();
+    let rel_id = next_relationship_id(&rels);
+    entries.insert(media_name, bytes.clone());
+    ensure_default_content_type(&mut entries, &ext);
+    add_image_relationship(&mut entries, &rel_id, &media_target)?;
+    let (cx, cy) = image_extent_emu(&bytes, &ext);
+    let mut insert = RdeInsert {
+        id: id.clone(),
+        block: String::new(),
+        kind: "figure".to_owned(),
+        target,
+        caption: caption.clone(),
+        number: None,
+        hash: Some(out_hash),
+        cached: caption,
+        selector: String::new(),
+        value_kind: "figure".to_owned(),
+        para_id: Some(para_id.clone()),
+    };
+    let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
+    let document_xml = String::from_utf8_lossy(document).to_string();
+    let paragraph = drawing_paragraph_xml(&insert, &rel_id, cx, cy, &para_id);
+    let mut document_xml = append_paragraph(&document_xml, &paragraph);
+    // Подпись — отдельный абзац после рисунка (номер присвоит перенумерация).
+    let caption_para_id = para_id_for(&format!("{}:caption:{id}", rde_doc.doc_id), index);
+    if !insert.cached.is_empty() {
+        let caption_text = insert.cached.clone();
+        insert.caption = caption_text.clone();
+        let caption_paragraph = format!(
+            "<w:p w14:paraId=\"{caption_para_id}\"><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
+            escape_attr(&caption_text)
+        );
+        document_xml = append_paragraph(&document_xml, &caption_paragraph);
+    }
+    rde_doc.inserts.push(insert.clone());
+    rde_doc.updated_unix = now_unix();
+    rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+    upsert_custom_props(&mut entries, &rde_doc);
+    let info = info_from_entries(&entries);
+    write_entries_atomic(&entries, package)?;
+    Ok(InsertReport { insert, package: info })
+}
+
+/// Обновить рисунки вставок: `images`: insert_id → (расширение, байты). Возвращает
+/// отчёт и признак изменения.
+pub fn update_figure_images(
+    package: &Path,
+    images: &BTreeMap<String, (String, Vec<u8>)>,
+    hashes: &BTreeMap<String, String>,
+) -> Result<InsertUpdateReport, String> {
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let mut updated = Vec::new();
+    for insert in &mut rde_doc.inserts {
+        if insert.kind != "figure" {
+            continue;
+        }
+        let Some((ext, bytes)) = images.get(&insert.id) else { continue };
+        // media-часть для этой вставки: находим по drawing/relationship через tag → rel id.
+        let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
+        let document_xml = String::from_utf8_lossy(document).to_string();
+        let Some(media_part) = figure_media_part(&document_xml, &entries, &insert.id) else { continue };
+        let ext = ext.to_ascii_lowercase();
+        let new_part = media_part
+            .rsplit_once('.')
+            .map(|(stem, _)| format!("{stem}.{ext}"))
+            .unwrap_or_else(|| format!("{media_part}.{ext}"));
+        if new_part != media_part {
+            entries.remove(&media_part);
+            ensure_default_content_type(&mut entries, &ext);
+            replace_relationship_target(&mut entries, &media_part, &new_part);
+        }
+        entries.insert(new_part, bytes.clone());
+        insert.hash = hashes.get(&insert.id).cloned().or(insert.hash.clone());
+        updated.push(insert.id.clone());
+    }
+    rde_doc.updated_unix = now_unix();
+    entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+    upsert_custom_props(&mut entries, &rde_doc);
+    let info = info_from_entries(&entries);
+    write_entries_atomic(&entries, package)?;
+    Ok(InsertUpdateReport { updated, package: info, rde_doc })
+}
+
+/// Найти media-часть рисунка вставки по tag `rde:<id>` → `r:embed` → relationship Target.
+fn figure_media_part(
+    document_xml: &str,
+    entries: &BTreeMap<String, Vec<u8>>,
+    insert_id: &str,
+) -> Option<String> {
+    let tag = format!("<w:tag w:val=\"{INSERT_TAG_PREFIX}{insert_id}\"");
+    let tag_index = document_xml.find(&tag)?;
+    let window = &document_xml[tag_index..document_xml.len().min(tag_index + 6000)];
+    let embed_index = window.find("r:embed=\"")?;
+    let rest = &window[embed_index + "r:embed=\"".len()..];
+    let end = rest.find('"')?;
+    let rel_id = &rest[..end];
+    let rels = entries
+        .get(rels_path_for_document())
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .unwrap_or_default();
+    let id_marker = format!("Id=\"{rel_id}\"");
+    let rel_index = rels.find(&id_marker)?;
+    let target_index = rels[rel_index..].find("Target=\"")? + rel_index + "Target=\"".len();
+    let target_rest = &rels[target_index..];
+    let target_end = target_rest.find('"')?;
+    let target = &target_rest[..target_end];
+    Some(format!("word/{target}"))
+}
+
+fn replace_relationship_target(entries: &mut BTreeMap<String, Vec<u8>>, old_part: &str, new_part: &str) {
+    let Some(rels) = entries.get_mut(rels_path_for_document()) else { return };
+    let text = String::from_utf8_lossy(rels).to_string();
+    let old_target = old_part.trim_start_matches("word/");
+    let new_target = new_part.trim_start_matches("word/");
+    let updated = text.replace(&format!("Target=\"{old_target}\""), &format!("Target=\"{new_target}\""));
+    *rels = updated.into_bytes();
+}
+
+/// Разница версий `rde:doc` (diff-предпросмотр обновления документа).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DocDiff {
+    pub added_blocks: usize,
+    pub removed_blocks: usize,
+    pub changed_blocks: Vec<(String, String, String)>,
+    pub added_inserts: Vec<String>,
+    pub updated_inserts: Vec<String>,
+    pub removed_inserts: Vec<String>,
+}
+
+impl DocDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added_blocks == 0
+            && self.removed_blocks == 0
+            && self.changed_blocks.is_empty()
+            && self.added_inserts.is_empty()
+            && self.updated_inserts.is_empty()
+            && self.removed_inserts.is_empty()
+    }
+
+    pub fn summary_ru(&self) -> String {
+        format!(
+            "блоки +{}/−{}, изменено {}, вставки +{}/~{}",
+            self.added_blocks,
+            self.removed_blocks,
+            self.changed_blocks.len(),
+            self.added_inserts.len(),
+            self.updated_inserts.len()
+        )
+    }
+}
+
+/// Сравнить две версии `rde:doc` (по стабильным id/paraId).
+pub fn diff_rde_docs(before: &RdeDoc, after: &RdeDoc) -> DocDiff {
+    let mut diff = DocDiff::default();
+    let key = |block: &RdeBlock| block.para_id.clone().unwrap_or_else(|| block.id.clone());
+    let before_map: BTreeMap<String, &RdeBlock> = before.blocks.iter().map(|block| (key(block), block)).collect();
+    let after_map: BTreeMap<String, &RdeBlock> = after.blocks.iter().map(|block| (key(block), block)).collect();
+    diff.added_blocks = after_map.keys().filter(|key| !before_map.contains_key(*key)).count();
+    diff.removed_blocks = before_map.keys().filter(|key| !after_map.contains_key(*key)).count();
+    for (key, block) in &after_map {
+        if let Some(old) = before_map.get(key) {
+            if old.text != block.text || old.kind != block.kind {
+                diff.changed_blocks.push((key.clone(), old.text.clone(), block.text.clone()));
+            }
+        }
+    }
+    let before_inserts: BTreeMap<&str, &RdeInsert> =
+        before.inserts.iter().map(|insert| (insert.id.as_str(), insert)).collect();
+    let after_inserts: BTreeMap<&str, &RdeInsert> =
+        after.inserts.iter().map(|insert| (insert.id.as_str(), insert)).collect();
+    diff.added_inserts = after_inserts.keys().filter(|id| !before_inserts.contains_key(*id)).map(|id| (*id).to_owned()).collect();
+    diff.removed_inserts = before_inserts.keys().filter(|id| !after_inserts.contains_key(*id)).map(|id| (*id).to_owned()).collect();
+    for (id, insert) in &after_inserts {
+        if let Some(old) = before_inserts.get(id) {
+            if old.cached != insert.cached || old.hash != insert.hash {
+                diff.updated_inserts.push((*id).to_owned());
+            }
+        }
+    }
+    diff
+}
+
+// ── транзакционное обновление документа (R-DOC-12): бэкапы, версия в store ────
+
+/// Каталог бэкапов документов и число хранимых версий.
+pub fn doc_backups_dir(project_root: &Path) -> PathBuf {
+    project_root.join(".rde/doc-backups")
+}
+const DOC_BACKUP_KEEP: usize = 10;
+
+/// Сделать бэкап пакета перед изменением: `.bak` рядом + копия в `.rde/doc-backups/`
+/// (ротация N последних). Возвращает путь бэкапа.
+pub fn backup_package(project_root: &Path, package: &Path) -> Result<PathBuf, String> {
+    let bytes = fs::read(package).map_err(|e| format!("прочитать {}: {e}", package.display()))?;
+    let bak = package.with_extension("doc.rde.bak");
+    fs::write(&bak, &bytes).map_err(|e| format!("записать {}: {e}", bak.display()))?;
+    let dir = doc_backups_dir(project_root);
+    fs::create_dir_all(&dir).map_err(|e| format!("создать {}: {e}", dir.display()))?;
+    let name = package.file_name().and_then(|name| name.to_str()).unwrap_or("document.doc.rde");
+    let stamp = now_unix();
+    let target = dir.join(format!("{stamp}-{name}"));
+    fs::write(&target, &bytes).map_err(|e| format!("записать {}: {e}", target.display()))?;
+    // Ротация: оставляем DOC_BACKUP_KEEP последних файлов.
+    let mut backups: Vec<PathBuf> = fs::read_dir(&dir)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    backups.sort();
+    while backups.len() > DOC_BACKUP_KEEP {
+        let oldest = backups.remove(0);
+        let _ = fs::remove_file(oldest);
+    }
+    Ok(target)
+}
+
+/// Зафиксировать версию пакета в store: blob + tree + транзакция с корнем `document/<doc_id>`.
+pub fn commit_document(
+    project_root: &Path,
+    package: &Path,
+    doc_id: &str,
+    store: &mut rde_store::Store,
+    note: &str,
+) -> Result<String, String> {
+    let bytes = fs::read(package).map_err(|e| format!("прочитать {}: {e}", package.display()))?;
+    let blob = store.put_blob(&bytes).map_err(|e| e.to_string())?;
+    let entries = [rde_hash::TreeEntry::new("document.doc.rde", 0o644, blob)];
+    let tree = store.put_tree(&entries).map_err(|e| e.to_string())?;
+    let mut roots = store.current_roots().map_err(|e| e.to_string())?;
+    roots.insert(document_root_name(doc_id), tree);
+    let payload = serde_json::json!({ "kind": "document-update", "doc_id": doc_id, "package": package.display().to_string() });
+    let tx = store
+        .begin_tx_with_roots(note, Some(payload), roots)
+        .map_err(|e| e.to_string())?;
+    store.commit_tx(&tx).map_err(|e| e.to_string())?;
+    let _ = project_root;
+    Ok(tx)
+}
+
+/// Восстановить пакет из текущего корня `document/<doc_id>` (после отката корней).
+pub fn restore_document_from_store(
+    project_root: &Path,
+    package: &Path,
+    doc_id: &str,
+    store: &rde_store::Store,
+) -> Result<Option<PathBuf>, String> {
+    let roots = store.current_roots().map_err(|e| e.to_string())?;
+    let Some(tree) = roots.get(&document_root_name(doc_id)) else { return Ok(None) };
+    let entries = store
+        .get_tree(tree)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("дерево документа {tree} отсутствует в store"))?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.path == "document.doc.rde")
+        .ok_or_else(|| "в дереве документа нет document.doc.rde".to_owned())?;
+    let bytes = store
+        .get_blob(entry.blob)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("блоб документа {} отсутствует в CAS", entry.blob))?;
+    // Ротация бэкапов и атомарная замена.
+    let _ = backup_package(project_root, package);
+    let tmp = package.with_extension("doc.rde.tmp");
+    fs::write(&tmp, bytes).map_err(|e| format!("записать {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, package).map_err(|e| format!("заменить {}: {e}", package.display()))?;
+    Ok(Some(package.to_path_buf()))
+}
+
+/// Полный отчёт обновления документа (R-DOC-12): изменения, diff, версия в store.
+#[derive(Clone, Debug, Default)]
+pub struct DocumentUpdateFullReport {
+    pub caption_changes: Vec<CaptionChange>,
+    pub insert_updates: Vec<String>,
+    pub figure_updates: Vec<String>,
+    pub diff: DocDiff,
+    pub backup: Option<PathBuf>,
+    pub txid: Option<String>,
+    pub package: Option<PackageInfo>,
+    pub rde_doc: Option<RdeDoc>,
+}
+
+/// Обновить документ транзакционно: бэкап → значения/рисунки вставок → перенумерация подписей
+/// → пересохранение пакета → diff → версия в store (откат O(1) через корни).
+pub fn update_document_transactional(
+    project_root: &Path,
+    package: &Path,
+    doc_id: &str,
+    values: &BTreeMap<String, String>,
+    hashes: &BTreeMap<String, String>,
+    images: &BTreeMap<String, (String, Vec<u8>)>,
+    store: &mut rde_store::Store,
+) -> Result<DocumentUpdateFullReport, String> {
+    let before = load_rde_doc(package)?;
+    let backup = backup_package(project_root, package)?;
+    let mut report = DocumentUpdateFullReport { backup: Some(backup), ..DocumentUpdateFullReport::default() };
+    // 1) Значения текстовых вставок.
+    if !values.is_empty() {
+        let updated = update_insert_values(package, values, hashes)?;
+        report.insert_updates = updated.updated;
+    }
+    // 2) Рисунки вставок.
+    if !images.is_empty() {
+        let updated = update_figure_images(package, images, hashes)?;
+        report.figure_updates = updated.updated;
+    }
+    // 3) Перенумерация подписей + refresh/сохранение пакета.
+    let update = update_document_package(package)?;
+    report.caption_changes = update.changes;
+    if let Some(rde_doc) = &update.rde_doc {
+        report.diff = diff_rde_docs(&before, rde_doc);
+        report.rde_doc = Some(rde_doc.clone());
+    }
+    report.package = update.package;
+    // 4) Транзакция store с корнем документа.
+    let txid = commit_document(project_root, package, doc_id, store, "document update")?;
+    report.txid = Some(txid);
+    Ok(report)
 }
 
 // ── M5: ревью (комментарии Word, импорт внешнего ревью) ────────────────────────
@@ -905,7 +1905,7 @@ pub fn import_external_review(package: &Path, external_docx: &Path) -> Result<Re
         .unwrap_or(EditVerdict::ExternalEdit);
     refresh_rde_doc(external_docx, &mut rde_doc)?;
     rde_doc.review = RdeReview { open: comments_after as u32, resolved: rde_doc.review.resolved };
-    let package_info = write_package(external_docx, &rde_doc, package)?;
+    let package_info = write_package(external_docx, &mut rde_doc, package)?;
     Ok(ReviewImportReport {
         comments_before,
         comments_after,

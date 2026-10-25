@@ -1507,6 +1507,124 @@ pub fn rollback(project: &Project, store: &mut Store, txid: Option<&str>) -> Res
     Ok(Some(outcome))
 }
 
+/// Разобранная цель вставки документа: `rde://artifact/<id>[@<out_hash>]/<selector>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InsertTarget {
+    pub artifact_id: String,
+    /// Зафиксированный `out_hash` цели (если указан в URI).
+    pub out_hash: Option<String>,
+    /// Путь выхода + (для JSON) JSON pointer после `#`.
+    pub selector: String,
+}
+
+/// Разобрать URI цели вставки (R-DOC-11).
+pub fn parse_insert_target(uri: &str) -> Result<InsertTarget, String> {
+    let rest = uri
+        .strip_prefix("rde://artifact/")
+        .ok_or_else(|| format!("URI вставки должен начинаться с rde://artifact/: {uri}"))?;
+    let (head, selector) = match rest.split_once('/') {
+        Some((head, selector)) => (head, selector.to_owned()),
+        None => (rest, String::new()),
+    };
+    let (artifact_id, out_hash) = match head.split_once('@') {
+        Some((id, hash)) => (id.to_owned(), Some(hash.to_owned())),
+        None => (head.to_owned(), None),
+    };
+    if artifact_id.is_empty() || selector.is_empty() {
+        return Err(format!("URI вставки неполный (нужен artifact/<id>/<selector>): {uri}"));
+    }
+    Ok(InsertTarget { artifact_id, out_hash, selector })
+}
+
+/// Текущий `out_hash` артефакта из ledger (None — data/constants или ещё не запускался).
+fn artifact_out_hash(project: &Project, store: &Store, artifact_id: &str) -> Option<String> {
+    let ledger = ledger(store).ok()?;
+    let _ = project;
+    ledger.get(artifact_id).and_then(|state| state.out_hash.clone())
+}
+
+/// Разрешить значение текстовой вставки: читает выход артефакта и применяет JSON pointer
+/// (`out/stats.json#/stats/x1/mean`) или берёт текст файла. Возвращает (значение, hash цели).
+pub fn resolve_insert_text(project: &Project, store: &Store, uri: &str) -> Result<(String, String), String> {
+    let target = parse_insert_target(uri)?;
+    let object = project.artifact_object(&target.artifact_id).ok_or_else(|| format!("артефакт {} не найден", target.artifact_id))?;
+    let (file_part, pointer) = match target.selector.split_once('#') {
+        Some((file, pointer)) => (file.to_owned(), Some(pointer.to_owned())),
+        None => (target.selector.clone(), None),
+    };
+    let path = object.dir.join(&file_part);
+    let bytes = fs::read(&path).map_err(|e| format!("прочитать выход {}: {e}", path.display()))?;
+    let hash = target
+        .out_hash
+        .clone()
+        .or_else(|| artifact_out_hash(project, store, &target.artifact_id))
+        .unwrap_or_else(|| sha256(&bytes).hex());
+    let value = match pointer {
+        Some(pointer) => {
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| format!("{} не JSON: {e}", path.display()))?;
+            let value = json
+                .pointer(&pointer)
+                .ok_or_else(|| format!("JSON pointer `{pointer}` не найден в {file_part}"))?;
+            match value {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Number(number) => format_display_number(number),
+                other => other.to_string(),
+            }
+        }
+        None => String::from_utf8_lossy(&bytes).trim_end_matches(['\n', '\r']).to_owned(),
+    };
+    Ok((value, hash))
+}
+
+/// Формат числа для отображения во вставке (R-DOC-11): до 4 значащих знаков после запятой,
+/// крупные/малые — экспонента; точное значение остаётся в выходе артефакта.
+fn format_display_number(number: &serde_json::Number) -> String {
+    let Some(value) = number.as_f64() else { return number.to_string() };
+    if !value.is_finite() {
+        return number.to_string();
+    }
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let abs = value.abs();
+    if (1e-3..1e6).contains(&abs) {
+        let mut text = format!("{value:.3}");
+        while text.ends_with('0') && text.contains('.') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+        text
+    } else {
+        format!("{value:.3e}")
+    }
+}
+
+/// Разрешить рисунок вставки: путь к файлу-выходу артефакта + расширение + hash цели.
+pub fn resolve_insert_image(project: &Project, store: &Store, uri: &str) -> Result<(PathBuf, String, String), String> {
+    let target = parse_insert_target(uri)?;
+    let object = project.artifact_object(&target.artifact_id).ok_or_else(|| format!("артефакт {} не найден", target.artifact_id))?;
+    let file_part = target.selector.split('#').next().unwrap_or(&target.selector).to_owned();
+    let path = object.dir.join(&file_part);
+    let bytes = fs::read(&path).map_err(|e| format!("прочитать рисунок {}: {e}", path.display()))?;
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("png")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "svg" | "png" | "jpg" | "jpeg" | "gif") {
+        return Err(format!("выход {file_part} не похож на рисунок (svg/png/jpg)"));
+    }
+    let hash = target
+        .out_hash
+        .clone()
+        .or_else(|| artifact_out_hash(project, store, &target.artifact_id))
+        .unwrap_or_else(|| sha256(&bytes).hex());
+    Ok((path, ext, hash))
+}
+
 /// Удобный хелпер: идентификаторы устаревших compute-артефактов в топологическом порядке.
 pub fn stale_artifacts(project: &Project, store: &Store) -> Result<Vec<String>, String> {
     let statuses = evaluate(project, store)?;

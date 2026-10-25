@@ -7,6 +7,7 @@ description = "RDE document package (M3): .doc.rde = OOXML + rde:doc customXml p
 
 [dependencies]
 rde-hash = { workspace = true }
+rde-store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 quick-xml = { workspace = true }
@@ -15,3 +16,4 @@ wordcraft-engine = { workspace = true }
 
 [dev-dependencies]
 rde-core = { workspace = true }
+rde-dag = { workspace = true }

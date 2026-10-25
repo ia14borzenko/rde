@@ -245,6 +245,17 @@ struct TrustDialogState {
     dependents: bool,
 }
 
+/// Диалог «Вставить в документ»: значение или рисунок из артефакта (R-DOC-11).
+#[derive(Clone, Debug)]
+struct InsertDialogState {
+    /// `value` | `figure`.
+    kind: String,
+    artifact_id: String,
+    selector: String,
+    pointer: String,
+    caption: String,
+}
+
 /// Результат фонового обновления (возвращается из потока вместе с хранилищем).
 struct UpdateJobResult {
     store: Option<Store>,
@@ -306,6 +317,8 @@ pub struct RdeApp {
     trust_dialog: Option<TrustDialogState>,
     /// Фоновое обновление артефактов (очередь/отмена).
     update_job: Option<UpdateJob>,
+    /// Диалог вставки значения/рисунка из артефакта.
+    insert_dialog: Option<InsertDialogState>,
 }
 
 impl RdeApp {
@@ -348,6 +361,7 @@ impl RdeApp {
             about_open: false,
             trust_dialog: None,
             update_job: None,
+            insert_dialog: None,
         };
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
         let _ = rde_run::prune_runs(&app.project.root, 200);
@@ -493,8 +507,17 @@ impl RdeApp {
             self.push_log(Level::Warn, format!("Оформление: не удалось сохранить .docx: {error}"));
             return;
         }
+        // R-DOC-12: бэкап перед изменением пакета (`.bak` + `.rde/doc-backups/`).
+        if let Err(error) = rde_doc::backup_package(&self.project.root, &path) {
+            self.push_log(Level::Warn, format!("Оформление: бэкап не создан: {error}"));
+        }
         match rde_doc::save_engine_document(&formatted, &path, &manifest.id, &template_id) {
             Ok(rde_doc) => {
+                if let Some(store) = self.store.as_mut() {
+                    if let Err(error) = rde_doc::commit_document(&self.project.root, &path, &manifest.id, store, "document format") {
+                        self.push_log(Level::Warn, format!("Оформление: версия документа не зафиксирована: {error}"));
+                    }
+                }
                 let manifest_path = document_object.dir.join("document.toml");
                 set_manifest_string(&manifest_path, "template", &template_id);
                 self.editor = None;
@@ -589,20 +612,205 @@ impl RdeApp {
         }
     }
 
-    /// «Обновить документ»: перенумерация подписей + пересохранение `.doc.rde` под контролем RDE.
+    /// Артефакты, из которых можно вставлять значения/рисунки (есть объявленные выходы).
+    fn insertable_artifacts(&self) -> Vec<rde_core::ArtifactManifest> {
+        self.project
+            .artifacts()
+            .filter(|artifact| artifact.kind == "compute" || artifact.kind == "data")
+            .filter(|artifact| !artifact.outputs.is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Открыть диалог вставки: `kind` = `value` или `figure`.
+    fn open_insert_dialog(&mut self, kind: &str) {
+        if self.project.document_path().is_none() {
+            self.push_log(Level::Warn, "Вставка: в проекте нет документа");
+            return;
+        }
+        let Some(artifact) = self.insertable_artifacts().into_iter().next() else {
+            self.push_log(Level::Warn, "Вставка: нет артефактов с объявленными выходами");
+            return;
+        };
+        let selector = artifact.outputs.first().cloned().unwrap_or_default();
+        self.insert_dialog = Some(InsertDialogState {
+            kind: kind.to_owned(),
+            artifact_id: artifact.id,
+            selector,
+            pointer: String::new(),
+            caption: String::new(),
+        });
+    }
+
+    /// Подтвердить вставку: разрешить значение/рисунок из артефакта и записать в `.doc.rde`.
+    fn confirm_insert(&mut self, dialog: InsertDialogState) {
+        let Some(package) = self.project.document_path() else {
+            self.push_log(Level::Warn, "Вставка: в проекте нет документа");
+            return;
+        };
+        if !rde_doc::is_rde_package(&package) {
+            self.push_log(Level::Warn, "Вставка: документ ещё не в .doc.rde (сначала «Сохранить проект»)");
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            self.push_log(Level::Warn, "Вставка: хранилище проекта не открыто");
+            return;
+        };
+        // Нормализуем JSON pointer: пользователь может ввести как `/a/b`, так и `#/a/b`.
+        let pointer = dialog.pointer.trim().trim_start_matches('#');
+        let uri = if pointer.is_empty() {
+            format!("rde://artifact/{}/{}", dialog.artifact_id, dialog.selector)
+        } else {
+            format!("rde://artifact/{}/{}#{}", dialog.artifact_id, dialog.selector, pointer)
+        };
+        let result = if dialog.kind == "figure" {
+            rde_dag::resolve_insert_image(&self.project, store, &uri).and_then(|(path, ext, hash)| {
+                let caption = if dialog.caption.trim().is_empty() { "Рисунок — вставка из артефакта".to_owned() } else { dialog.caption.trim().to_owned() };
+                rde_doc::add_figure_insert(&package, &path, uri.clone(), caption, hash.clone()).map(|report| (report, hash, ext))
+            })
+        } else {
+            rde_dag::resolve_insert_text(&self.project, store, &uri).and_then(|(value, hash)| {
+                let request = rde_doc::InsertRequest {
+                    kind: "value".to_owned(),
+                    target: uri.clone(),
+                    selector: pointer.to_owned(),
+                    value_kind: if pointer.is_empty() { "text".to_owned() } else { "number".to_owned() },
+                    cached: value,
+                    caption: dialog.caption.clone(),
+                };
+                rde_doc::add_insert(&package, request).map(|report| (report, hash, String::new()))
+            })
+        };
+        match result {
+            Ok((report, hash, _ext)) => {
+                // Версия документа в store (транзакция с корнем document/<id>).
+                let doc_id = self.project.document_object().and_then(|object| match &object.data {
+                    ObjectData::Document(manifest) => Some(manifest.id.clone()),
+                    _ => None,
+                });
+                if let (Some(store), Some(doc_id)) = (self.store.as_mut(), doc_id) {
+                    if let Err(error) = rde_doc::commit_document(&self.project.root, &package, &doc_id, store, "document insert") {
+                        self.push_log(Level::Warn, format!("Вставка: версия документа не зафиксирована: {error}"));
+                    }
+                }
+                self.editor = None;
+                self.doc = DocPreview::new(self.project.document_path());
+                self.structure_cache = None;
+                self.reload_project();
+                self.push_log(
+                    Level::Ok,
+                    format!("Вставка {} добавлена в документ (hash {})", report.insert.id, hash.chars().take(10).collect::<String>()),
+                );
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Вставка не добавлена: {error}")),
+        }
+    }
+
+    /// Кандидат на откат обновления документа (транзакция store с корнем `document/<id>`).
+    fn doc_rollback_candidate(&self) -> Option<rde_store::RollbackCandidate> {
+        let store = self.store.as_ref()?;
+        let document_object = self.project.document_object()?;
+        let ObjectData::Document(manifest) = &document_object.data else { return None };
+        let root = rde_doc::document_root_name(&manifest.id);
+        store
+            .rollback_candidates()
+            .ok()?
+            .into_iter()
+            .find(|candidate| !candidate.rolled_back && candidate.root_names.iter().any(|name| name == &root))
+    }
+
+    /// Откатить последнее обновление документа: store переключает корни, пакет восстанавливается из CAS.
+    pub fn rollback_document(&mut self) {
+        let Some(candidate) = self.doc_rollback_candidate() else {
+            self.push_log(Level::Info, "Откат документа: нет транзакций обновления документа");
+            return;
+        };
+        let Some(package) = self.project.document_path() else { return };
+        let doc_id = self.project.document_object().and_then(|object| match &object.data {
+            ObjectData::Document(manifest) => Some(manifest.id.clone()),
+            _ => None,
+        });
+        let Some(doc_id) = doc_id else { return };
+        let Some(store) = self.store.as_mut() else { return };
+        match store.rollback(&candidate.txid) {
+            Ok(_) => match rde_doc::restore_document_from_store(&self.project.root, &package, &doc_id, store) {
+                Ok(Some(_)) => {
+                    self.editor = None;
+                    self.doc = DocPreview::new(self.project.document_path());
+                    self.structure_cache = None;
+                    self.reload_project();
+                    self.push_log(Level::Ok, format!("Документ откачен к предыдущей версии (транзакция {})", candidate.txid.chars().take(10).collect::<String>()));
+                }
+                Ok(None) => self.push_log(Level::Warn, "Откат документа: в корнях нет версии документа"),
+                Err(error) => self.push_log(Level::Warn, format!("Откат документа: {error}")),
+            },
+            Err(error) => self.push_log(Level::Warn, format!("Откат документа не выполнен: {error}")),
+        }
+    }
+
+    /// «Обновить документ»: значения/рисунки вставок из артефактов, перенумерация подписей,
+    /// пересохранение `.doc.rde` — транзакционно (бэкап + версия в store + diff) (R-DOC-11/12).
     pub fn update_project_document(&mut self) {
-        let Some(path) = self.project.document_path() else {
+        let Some(package) = self.project.document_path() else {
             self.push_log(Level::Warn, "Обновить документ: в проекте нет документа");
             return;
         };
-        if !rde_doc::is_rde_package(&path) {
+        if !rde_doc::is_rde_package(&package) {
             self.push_log(Level::Warn, "Обновить документ: документ ещё не в .doc.rde (запустите миграцию/сохранение)");
             return;
         }
         if self.editor.is_some() {
             self.save_project_document();
         }
-        match rde_doc::update_document_package(&path) {
+        let before = match rde_doc::load_rde_doc(&package) {
+            Ok(doc) => doc,
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Обновить документ: {error}"));
+                return;
+            }
+        };
+        // Разрешаем цели вставок (R-DOC-11): значения из JSON/текста, рисунки из SVG/PNG.
+        let mut values: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        let mut hashes: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        let mut images: std::collections::BTreeMap<String, (String, Vec<u8>)> = std::collections::BTreeMap::new();
+        let mut errors: Vec<String> = Vec::new();
+        {
+            let Some(store) = self.store.as_ref() else {
+                self.push_log(Level::Warn, "Обновить документ: хранилище проекта не открыто");
+                return;
+            };
+            for insert in before.inserts.iter().filter(|insert| !insert.target.is_empty()) {
+                if insert.kind == "figure" {
+                    match rde_dag::resolve_insert_image(&self.project, store, &insert.target) {
+                        Ok((path, ext, hash)) => match std::fs::read(&path) {
+                            Ok(bytes) => {
+                                images.insert(insert.id.clone(), (ext, bytes));
+                                hashes.insert(insert.id.clone(), hash);
+                            }
+                            Err(error) => errors.push(format!("{}: {error}", insert.id)),
+                        },
+                        Err(error) => errors.push(format!("{}: {error}", insert.id)),
+                    }
+                } else if insert.kind == "value" {
+                    match rde_dag::resolve_insert_text(&self.project, store, &insert.target) {
+                        Ok((value, hash)) => {
+                            values.insert(insert.id.clone(), value);
+                            hashes.insert(insert.id.clone(), hash);
+                        }
+                        Err(error) => errors.push(format!("{}: {error}", insert.id)),
+                    }
+                }
+            }
+        }
+        let Some(doc_id) = self.project.document_object().and_then(|object| match &object.data {
+            ObjectData::Document(manifest) => Some(manifest.id.clone()),
+            _ => None,
+        }) else {
+            self.push_log(Level::Warn, "Обновить документ: объект документа не найден");
+            return;
+        };
+        let Some(store) = self.store.as_mut() else { return };
+        match rde_doc::update_document_transactional(&self.project.root, &package, &doc_id, &values, &hashes, &images, store) {
             Ok(report) => {
                 self.editor = None;
                 self.doc = DocPreview::new(self.project.document_path());
@@ -611,16 +819,23 @@ impl RdeApp {
                 self.push_log(
                     Level::Ok,
                     format!(
-                        "Документ обновлён: подписей изменено {}, вставок {}",
-                        report.changes.len(),
-                        report.rde_doc.as_ref().map(|doc| doc.inserts.len()).unwrap_or(0)
+                        "Документ обновлён: вставок {} (значения {} / рисунки {}), подписей изменено {}, diff: {}; транзакция {}",
+                        report.insert_updates.len() + report.figure_updates.len(),
+                        report.insert_updates.len(),
+                        report.figure_updates.len(),
+                        report.caption_changes.len(),
+                        report.diff.summary_ru(),
+                        report.txid.as_deref().map(|txid| &txid[..10.min(txid.len())]).unwrap_or("—")
                     ),
                 );
-                for change in &report.changes {
-                    self.push_log(Level::Info, format!("Подпись: «{}» → «{}»", change.old_text, change.new_text));
+                if let Some(backup) = &report.backup {
+                    self.push_log(Level::Info, format!("Бэкап документа: {}", backup.display()));
                 }
             }
             Err(error) => self.push_log(Level::Warn, format!("Обновить документ: {error}")),
+        }
+        for error in errors {
+            self.push_log(Level::Warn, format!("Вставка не обновлена: {error}"));
         }
     }
 
@@ -845,6 +1060,11 @@ impl RdeApp {
         }
     }
 
+    /// Для демо/скриншотов: открыть диалог вставки (`value` или `figure`).
+    pub fn demo_open_insert_dialog(&mut self, kind: &str) {
+        self.open_insert_dialog(kind);
+    }
+
     /// Для демо/скриншотов: переключить нижнюю панель (0 — Журнал, 1 — Задачи, 2 — Агент).
     pub fn demo_set_logs_tab(&mut self, tab: usize) {
         self.logs_tab = tab.min(2);
@@ -1037,6 +1257,10 @@ impl RdeApp {
             Settings,
             About,
             Audit,
+            InsertValue,
+            InsertFigure,
+            UpdateDocument,
+            RollbackDocument,
         }
         let mut action: Option<MenuAction> = None;
         egui::Panel::top("rde_menu")
@@ -1076,6 +1300,26 @@ impl RdeApp {
                         ui.separator();
                         if ui.button("Найти в проекте…").clicked() {
                             action = Some(MenuAction::Find);
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Документ", |ui| {
+                        if ui.button("Вставить значение артефакта…").clicked() {
+                            action = Some(MenuAction::InsertValue);
+                            ui.close();
+                        }
+                        if ui.button("Вставить рисунок из артефакта…").clicked() {
+                            action = Some(MenuAction::InsertFigure);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Обновить документ (вставки/подписи, транзакция)").clicked() {
+                            action = Some(MenuAction::UpdateDocument);
+                            ui.close();
+                        }
+                        let can_rollback = self.doc_rollback_candidate().is_some();
+                        if ui.add_enabled(can_rollback, egui::Button::new("Откатить обновление документа")).clicked() {
+                            action = Some(MenuAction::RollbackDocument);
                             ui.close();
                         }
                     });
@@ -1149,6 +1393,10 @@ impl RdeApp {
             }
             Some(MenuAction::About) => self.about_open = true,
             Some(MenuAction::Audit) => self.audit_dialog = Some(self.audit_lines()),
+            Some(MenuAction::InsertValue) => self.open_insert_dialog("value"),
+            Some(MenuAction::InsertFigure) => self.open_insert_dialog("figure"),
+            Some(MenuAction::UpdateDocument) => self.update_project_document(),
+            Some(MenuAction::RollbackDocument) => self.rollback_document(),
             None => {}
         }
     }
@@ -1959,7 +2207,7 @@ impl RdeApp {
         };
         let package = dir.join("report.doc.rde");
         let result = rde_doc::build_rde_doc(&temp, &manifest.id, &manifest.template)
-            .and_then(|rde_doc| rde_doc::write_package(&temp, &rde_doc, &package).map(|_| ()));
+            .and_then(|mut rde_doc| rde_doc::write_package(&temp, &mut rde_doc, &package).map(|_| ()));
         let _ = fs::remove_file(&temp);
         if let Err(error) = result {
             let _ = fs::remove_dir_all(&dir);
@@ -2496,6 +2744,68 @@ impl RdeApp {
                 }
             } else if !cancel {
                 self.trust_dialog = Some(state);
+            }
+        }
+
+        // R-DOC-11: вставка значения/рисунка из артефакта в документ.
+        if let Some(mut dialog) = self.insert_dialog.take() {
+            let artifacts = self.insertable_artifacts();
+            let mut confirm = false;
+            let mut cancel = false;
+            let title = if dialog.kind == "figure" { "Вставить рисунок из артефакта" } else { "Вставить значение артефакта" };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(600.0);
+                    let current_title = artifacts
+                        .iter()
+                        .find(|artifact| artifact.id == dialog.artifact_id)
+                        .map(|artifact| artifact.title.clone())
+                        .unwrap_or_else(|| "— выбрать —".to_owned());
+                    egui::ComboBox::from_label("артефакт").selected_text(current_title).show_ui(ui, |ui| {
+                        for artifact in &artifacts {
+                            ui.selectable_value(&mut dialog.artifact_id, artifact.id.clone(), &artifact.title);
+                        }
+                    });
+                    if let Some(artifact) = artifacts.iter().find(|artifact| artifact.id == dialog.artifact_id) {
+                        egui::ComboBox::from_label("выход").selected_text(dialog.selector.clone()).show_ui(ui, |ui| {
+                            for output in &artifact.outputs {
+                                ui.selectable_value(&mut dialog.selector, output.clone(), output);
+                            }
+                        });
+                    }
+                    if dialog.kind == "value" {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("JSON pointer").small().color(MUTED));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dialog.pointer)
+                                    .hint_text("#/stats/x1/mean (пусто — текст файла)")
+                                    .desired_width(360.0),
+                            );
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("подпись").small().color(MUTED));
+                        ui.add(egui::TextEdit::singleline(&mut dialog.caption).hint_text("например, «Среднее x1»").desired_width(360.0));
+                    });
+                    let uri = format!("rde://artifact/{}/{}", dialog.artifact_id, dialog.selector);
+                    ui.label(RichText::new(uri).monospace().small().color(ACCENT));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new("Вставить").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if confirm {
+                self.confirm_insert(dialog);
+            } else if !cancel {
+                self.insert_dialog = Some(dialog);
             }
         }
     }
@@ -3958,6 +4268,141 @@ mod docview_tests {
             log.iter().any(|line| line.contains("отменено пользователем") || line.contains("Обновление связанных")),
             "отчёт об отмене: {log:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P4: живые вставки артефакт→документ и транзакция обновления ─────────
+
+    #[test]
+    fn document_live_value_insert_updates_and_rolls_back() {
+        if !python_available() {
+            return;
+        }
+        let root = temp_demo_copy("doc-insert");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        let report = app.update_dependencies(None, true).expect("обновление артефактов");
+        assert_eq!(report.failed(), 0, "{:?}", report.errors);
+        let package = app.project.document_path().expect("документ");
+        let uri = format!("rde://artifact/{STATS}/out/stats.json#/stats/x1/mean");
+        let value_before = rde_dag::resolve_insert_text(&app.project, app.store.as_ref().unwrap(), &uri)
+            .expect("значение статистики")
+            .0;
+
+        // Вставка значения из артефакта: content-control + запись в rde:doc.
+        app.confirm_insert(super::InsertDialogState {
+            kind: "value".into(),
+            artifact_id: STATS.into(),
+            selector: "out/stats.json".into(),
+            pointer: "#/stats/x1/mean".into(),
+            caption: "Среднее x1".into(),
+        });
+        let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
+        let insert = rde_doc
+            .inserts
+            .iter()
+            .find(|insert| insert.kind == "value")
+            .unwrap_or_else(|| panic!("вставка значения не добавлена; журнал: {:?}", app.project.log.iter().map(|line| &line.text).collect::<Vec<_>>()))
+            .clone();
+        assert_eq!(insert.cached, value_before);
+        let document_xml = {
+            let file = std::fs::File::open(&package).unwrap();
+            let mut zip = zip::ZipArchive::new(file).unwrap();
+            let mut part = zip.by_name("word/document.xml").unwrap();
+            let mut text = String::new();
+            use std::io::Read;
+            part.read_to_string(&mut text).unwrap();
+            text
+        };
+        assert!(document_xml.contains(&format!("rde:{}", insert.id)), "sdt вставки в документе");
+        assert!(app.store.is_some());
+
+        // Меняем вход, пересчитываем артефакты → «Обновить документ» подставляет новое значение.
+        let input = app.project.artifact_object(REALIZATIONS).unwrap().dir.join("inputs/experiment.csv");
+        let mut text = std::fs::read_to_string(&input).unwrap();
+        text.push_str("50,50.0,50.0\n");
+        std::fs::write(&input, text).unwrap();
+        app.reload_project();
+        app.update_dependencies(None, true).expect("повторное обновление артефактов");
+        let value_after = rde_dag::resolve_insert_text(&app.project, app.store.as_ref().unwrap(), &uri)
+            .expect("новое значение")
+            .0;
+        assert_ne!(value_before, value_after, "значение изменилось");
+        app.update_project_document();
+        let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
+        let insert = rde_doc.inserts.iter().find(|insert| insert.kind == "value").expect("вставка значения");
+        assert_eq!(insert.cached, value_after, "вставка обновлена из артефакта");
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Документ обновлён")),
+            "журнал: {:?}",
+            app.project.log.iter().map(|line| &line.text).collect::<Vec<_>>()
+        );
+        assert!(app.doc_rollback_candidate().is_some(), "транзакция документа доступна для отката");
+
+        // Откат документа: пакет восстанавливается из CAS (значение снова прежнее).
+        app.rollback_document();
+        let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
+        let insert = rde_doc.inserts.iter().find(|insert| insert.kind == "value").expect("вставка значения");
+        assert_eq!(insert.cached, value_before, "откат вернул прежнюю версию документа");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn document_figure_insert_from_artifact_and_update() {
+        if !python_available() {
+            return;
+        }
+        let root = temp_demo_copy("doc-figure");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        app.update_dependencies(None, true).expect("обновление артефактов");
+        let package = app.project.document_path().expect("документ");
+        let plot = "01M5VJ1JG0QQJM2S6R76FQCZ25";
+        app.confirm_insert(super::InsertDialogState {
+            kind: "figure".into(),
+            artifact_id: plot.into(),
+            selector: "out/plot.svg".into(),
+            pointer: String::new(),
+            caption: "График статистик".into(),
+        });
+        let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
+        assert!(rde_doc.inserts.iter().any(|insert| insert.kind == "figure" && !insert.target.is_empty()));
+        let info = rde_doc::package_info(&package).unwrap();
+        assert!(
+            info.part_names().iter().any(|name| name.starts_with("word/media/rde-figure")),
+            "media-часть рисунка: {:?}",
+            info.part_names()
+        );
+
+        // Пересобираем график с другим содержимым и обновляем документ: media-часть меняется.
+        let plot_script = app.project.artifact_object(plot).unwrap().dir.join("script.py");
+        std::fs::write(
+            &plot_script,
+            "from pathlib import Path\nPath('out').mkdir(exist_ok=True)\nPath('out/plot.svg').write_text('<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\"><rect width=\"100\" height=\"50\" fill=\"red\"/></svg>')\n",
+        )
+        .unwrap();
+        app.reload_project();
+        let options = rde_dag::UpdateOptions { targets: Some(vec![plot.into()]), force: true, ..Default::default() };
+        {
+            let store = app.store.as_mut().unwrap();
+            rde_dag::update(&app.project, store, &options).expect("пересобрать график");
+        }
+        app.reload_project();
+        app.update_project_document();
+        let media = {
+            let file = std::fs::File::open(&package).unwrap();
+            let mut zip = zip::ZipArchive::new(file).unwrap();
+            let name = (0..zip.len())
+                .map(|index| zip.by_index(index).unwrap().name().to_owned())
+                .find(|name| name.starts_with("word/media/rde-figure"))
+                .expect("media-часть");
+            let mut part = zip.by_name(&name).unwrap();
+            let mut bytes = Vec::new();
+            use std::io::Read;
+            part.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+        assert!(String::from_utf8_lossy(&media).contains("fill=\"red\""), "рисунок обновлён из артефакта");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

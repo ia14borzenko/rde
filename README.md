@@ -12,13 +12,14 @@ v0.10.0 (git-субмодуль).
 
 ## Вехи
 
-Текущая: **P3 «Запуск, окружения, безопасность, provenance»** (после M6/P1/P2) — `rde-env`
-(uv-окружение, `rde.lock`, digest в `env_hash`), согласие «проект доверенный», сеть запрещена
-best-effort, read-only входы, ошибка на лишние файлы, SIGTERM→grace, фоновое обновление с отменой,
-`provenance.json` на каждый запуск.
+Текущая: **P4 «Документ: живые вставки + транзакция»** (после M6/P1/P2/P3) — `.doc.rde` по §8.5
+(root-rels на customXml, `docProps/custom.xml`-надгробие, `w14:paraId`-анкоры), живые вставки
+значений/рисунков из артефактов в `w:sdt`, обновление документа из выходов, транзакция с бэкапами
+и откатом O(1), diff версий.
 Предыдущие: M1 (`m1-concept`), S5 (`s5-docview`), M2.1 (`m2.1-project-model`), M2.2 (`m2.2-store`),
 M2.3 (`m2.3-run-dag`), M2.4 (`m2.4-ui`), M3 (`m3-doc`), M4 (`m4-templates`), M5 (`m5-sources-review`),
-M6 (`ui-live`), P1 (`p1-artifacts`), P2 (`p2-store`). История и критерии вех: [`docs/milestones.md`](docs/milestones.md).
+M6 (`ui-live`), P1 (`p1-artifacts`), P2 (`p2-store`), P3 (`p3-run-env`).
+История и критерии вех: [`docs/milestones.md`](docs/milestones.md).
 
 ## Что уже есть в прототипе
 
@@ -38,6 +39,7 @@ M6 (`ui-live`), P1 (`p1-artifacts`), P2 (`p2-store`). История и крит
 | Артефакты (P1) | **нормативно**: JCS-хеши, `schema_version` в `act_key`, glob-селекторы (`out/*.csv`), входы-константы (`{ constants = "…" }`), «обновить артефакт» (force) и «обновить связанные», `out_hash` в манифесте для git |
 | Транзакции/откат (P2) | **работает**: транзакция «пачки» с переключением корней, откат O(1) (выходы восстанавливаются из CAS), панель «Задачи» → «Откатить», GC/pins, zstd, lock |
 | Окружения/запуск (P3) | **работает**: `rde-env` + `rde.lock`, согласие «проект доверенный», сеть запрещена best-effort, read-only входы, ошибка на лишние файлы, SIGTERM→grace, фоновое обновление с «Отменить», `provenance.json` |
+| Документ (P4) | **работает**: §8.5 wiring (root-rels/tombstone/paraId), живые вставки значения/рисунка из артефакта в `w:sdt`, «Обновить документ» из выходов, транзакция + бэкапы + diff + откат |
 | MCP-сервер, ACP-агент | **следующие итерации** (v0.3, см. `.agent/plan-v01.md`) |
 | S5 (чистый DocView) | ✅ первая версия: feature `rde-docview` в форк-ветке WordCraft; см. `docs/wordcraft-fork.md` |
 
@@ -48,7 +50,7 @@ M6 (`ui-live`), P1 (`p1-artifacts`), P2 (`p2-store`). История и крит
 Тесты (включая автотест клавиатурного ввода в DocView и RDE-сохранения):
 
 ```bash
-cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-ui   # 118 тестов: модель, хеши (JCS/property), store (kill -9, транзакции/откат/GC), окружения, запуск (безопасность/provenance), DAG (property), .doc.rde, docx-гейты, ГОСТ, источники/PDF/OCR, UI
+cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-ui   # 126 тестов: модель, хеши (JCS/property), store (kill -9, транзакции/откат/GC), окружения, запуск (безопасность/provenance), DAG (property), .doc.rde (§8.5/вставки/транзакция), docx-гейты, ГОСТ, источники/PDF/OCR, UI
 ```
 
 ```bash

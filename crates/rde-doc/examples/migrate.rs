@@ -49,7 +49,7 @@ fn main() {
     }
 
     let package = document_object.dir.join("report.doc.rde");
-    write_package(&source, &rde_doc, &package).expect("записать .doc.rde");
+    write_package(&source, &mut rde_doc, &package).expect("записать .doc.rde");
     let check = load_rde_doc(&package).expect("прочитать обратно");
 
     // Обновляем document.toml (file = "report.doc.rde").

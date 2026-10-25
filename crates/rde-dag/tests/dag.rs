@@ -764,3 +764,36 @@ fn network_policy_deny_by_default_and_allow_declaratively() {
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "allow");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── P4: разрешение целей вставок документа (R-DOC-11) ───────────────────────
+
+#[test]
+fn insert_targets_resolve_values_and_images() {
+    if !python_available() {
+        return;
+    }
+    let (root, project) = demo_copy("insert-targets");
+    let mut store = Store::open(&root).unwrap();
+    update(&project, &mut store, &UpdateOptions::default()).unwrap();
+    let project = load_project(&root).unwrap();
+
+    // Значение из JSON-выхода по JSON pointer.
+    let uri = format!("rde://artifact/{STATS}/out/stats.json#/stats/x1/mean");
+    let (value, hash) = rde_dag::resolve_insert_text(&project, &store, &uri).unwrap();
+    let parsed: f64 = value.parse().expect("числовое значение");
+    assert!(parsed.is_finite());
+    assert_eq!(hash.len(), 64);
+    // Текст файла целиком.
+    let (text, _) = rde_dag::resolve_insert_text(&project, &store, &format!("rde://artifact/{STATS}/out/stats.json")).unwrap();
+    assert!(text.contains("stats"), "{text}");
+    // Рисунок из SVG-выхода.
+    let (path, ext, hash) = rde_dag::resolve_insert_image(&project, &store, &format!("rde://artifact/{PLOT}/out/plot.svg")).unwrap();
+    assert!(path.is_file());
+    assert_eq!(ext, "svg");
+    assert_eq!(hash.len(), 64);
+    // Ошибки: несуществующий артефакт/указатель.
+    assert!(rde_dag::resolve_insert_text(&project, &store, "rde://artifact/NOPE/out/x.json").is_err());
+    assert!(rde_dag::resolve_insert_text(&project, &store, &format!("rde://artifact/{STATS}/out/stats.json#/nope")).is_err());
+    assert!(rde_dag::parse_insert_target("bad-uri").is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}

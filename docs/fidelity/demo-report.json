@@ -1,20 +1,23 @@
 {
-  "source": "demo-project/objects/documents/01M5VJ1JG04TFF59TDWH9EDD1R/report.docx",
-  "source_parts": 10,
-  "roundtrip_parts": 10,
+  "source": "/tmp/rde-docx-example-209110/clean.docx",
+  "source_parts": 11,
+  "roundtrip_parts": 11,
   "missing": [],
   "extra": [],
-  "changed": [],
+  "changed": [
+    "_rels/.rels",
+    "word/document.xml"
+  ],
   "critical_missing": [],
   "media_preserved": true,
-  "paragraphs_source": 13,
-  "paragraphs_roundtrip": 13,
+  "paragraphs_source": 19,
+  "paragraphs_roundtrip": 19,
   "lo": {
     "available": true,
     "version": "LibreOffice 26.2.6.3 620(Build:3)",
-    "pdf_bytes": 82883,
+    "pdf_bytes": 129746,
     "pdf_is_valid": true,
     "error": null
   },
-  "generated_unix": 1792877971
+  "generated_unix": 1792911944
 }
