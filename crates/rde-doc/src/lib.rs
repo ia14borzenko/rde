@@ -800,22 +800,95 @@ fn assign_para_ids(rde_doc: &mut RdeDoc, visible_ids: &[String]) {
     }
 }
 
-fn sdt_paragraph_xml(insert: &RdeInsert) -> String {
+/// Внутренние `w:pPr`/`w:rPr` обычного текста документа (для вставок): берём первый
+/// содержательный абзац тела (не наш sdt), чтобы вставка выглядела как основной текст шаблона
+/// (в демо — Times New Roman 14 pt, а не `docDefaults` Aptos).
+fn body_formatting(entries: &BTreeMap<String, Vec<u8>>) -> (String, String) {
+    let Some(bytes) = entries.get(DOCUMENT_XML) else { return (String::new(), String::new()) };
+    let xml = String::from_utf8_lossy(bytes).to_string();
+    let mut rest = xml.as_str();
+    while let Some(start) = rest.find("<w:p") {
+        let Some(end_rel) = rest[start..].find("</w:p>") else { break };
+        let paragraph = &rest[start..start + end_rel + "</w:p>".len()];
+        rest = &rest[start + end_rel + "</w:p>".len()..];
+        if paragraph.contains("<w:sdt") || paragraph.contains("<w:drawing") {
+            continue;
+        }
+        let ppr = extract_inner(paragraph, "<w:pPr", "</w:pPr>").unwrap_or_default();
+        let rpr = extract_inner(paragraph, "<w:rPr", "</w:rPr>")
+            .filter(|props| props.contains("w:rFonts"))
+            .or_else(|| extract_inner(paragraph, "<w:rPr", "</w:rPr>"));
+        if let Some(rpr) = rpr {
+            return (ppr, rpr);
+        }
+    }
+    (String::new(), String::new())
+}
+
+/// Внутреннее содержимое первого элемента `open_tag ... close_tag` в строке.
+fn extract_inner(xml: &str, open_tag: &str, close_tag: &str) -> Option<String> {
+    let start = xml.find(open_tag)?;
+    let open_end = xml[start..].find('>')? + start + 1;
+    let close = xml[open_end..].find(close_tag)? + open_end;
+    Some(xml[open_end..close].to_owned())
+}
+
+/// `w:rPr` стиля из `word/styles.xml` (с учётом `w:basedOn`), для выбранного пользователем стиля.
+fn style_run_props(entries: &BTreeMap<String, Vec<u8>>, style_id: &str) -> Option<String> {
+    let bytes = entries.get("word/styles.xml")?;
+    let xml = String::from_utf8_lossy(bytes).to_string();
+    let mut current = style_id.to_owned();
+    for _ in 0..8 {
+        let marker = format!("w:styleId=\"{current}\"");
+        let index = xml.find(&marker)?;
+        let start = xml[..index].rfind("<w:style ")?;
+        let end = xml[start..].find("</w:style>")? + start + "</w:style>".len();
+        let element = &xml[start..end];
+        if let Some(props) = extract_inner(element, "<w:rPr", "</w:rPr>") {
+            return Some(props);
+        }
+        // Нет прямых rPr — идём по basedOn.
+        let based = extract_attr(element, "w:basedOn", "w:val")?;
+        current = based;
+    }
+    None
+}
+
+fn extract_attr(xml: &str, element: &str, attr: &str) -> Option<String> {
+    let start = xml.find(element)?;
+    let end = xml[start..].find('>')? + start;
+    let tag = &xml[start..end];
+    let marker = format!("{attr}=\"");
+    let index = tag.find(&marker)? + marker.len();
+    let rest = &tag[index..];
+    let close = rest.find('"')?;
+    Some(rest[..close].to_owned())
+}
+
+/// Форматирование вставки: явный стиль пользователя (pStyle + его rPr) или обычный текст документа.
+fn insert_formatting(
+    entries: &BTreeMap<String, Vec<u8>>,
+    style: &str,
+) -> (String, String) {
+    let (body_ppr, body_rpr) = body_formatting(entries);
+    if style.trim().is_empty() {
+        return (body_ppr, body_rpr);
+    }
+    let ppr = format!("<w:pPr><w:pStyle w:val=\"{}\"/></w:pPr>", escape_attr(style.trim()));
+    let rpr = style_run_props(entries, style.trim()).unwrap_or(body_rpr);
+    (ppr, rpr)
+}
+
+fn sdt_paragraph_xml(insert: &RdeInsert, paragraph_props: &str, run_props: &str) -> String {
     // Подпись/метка вставки — обычный run перед content-control, значение — внутри sdt.
     let label = if insert.caption.is_empty() {
         String::new()
     } else {
-        format!("<w:r><w:t xml:space=\"preserve\">{}: </w:t></w:r>", escape_attr(&insert.caption))
-    };
-    // Стиль обычного текста текущего шаблона (R-DOC-11/25): w:pStyle из styles.xml документа.
-    let paragraph_props = if insert.style.is_empty() {
-        String::new()
-    } else {
-        format!("<w:pPr><w:pStyle w:val=\"{}\"/></w:pPr>", escape_attr(&insert.style))
+        format!("<w:r>{run_props}<w:t xml:space=\"preserve\">{}: </w:t></w:r>", escape_attr(&insert.caption))
     };
     format!(
         "<w:p>{paragraph_props}{label}<w:sdt><w:sdtPr><w:tag w:val=\"{prefix}{id}\"/><w:alias w:val=\"{alias}\"/></w:sdtPr>\
-         <w:sdtContent><w:r><w:t xml:space=\"preserve\">{value}</w:t></w:r></w:sdtContent></w:sdt></w:p>",
+         <w:sdtContent><w:r>{run_props}<w:t xml:space=\"preserve\">{value}</w:t></w:r></w:sdtContent></w:sdt></w:p>",
         prefix = INSERT_TAG_PREFIX,
         id = escape_attr(&insert.id),
         alias = escape_attr(if insert.caption.is_empty() { &insert.kind } else { &insert.caption }),
@@ -982,29 +1055,51 @@ pub fn set_insert_format(package: &Path, insert_id: &str, format: &str) -> Resul
 pub fn apply_insert_style(package: &Path, insert_id: &str, style: &str) -> Result<PackageInfo, String> {
     let mut entries = read_package(package)?.entries;
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let (paragraph_props, run_props) = insert_formatting(&entries, style);
     let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
     let document_xml = String::from_utf8_lossy(document).to_string();
     let tag = format!("<w:tag w:val=\"{INSERT_TAG_PREFIX}{insert_id}\"");
     let tag_index = document_xml.find(&tag).ok_or_else(|| format!("вставка {insert_id} не найдена в документе"))?;
     let paragraph_start = document_xml[..tag_index].rfind("<w:p").ok_or_else(|| "не найден абзац вставки".to_owned())?;
-    // Конец открывающего тега <w:p ...>.
-    let open_end = document_xml[paragraph_start..]
-        .find('>')
-        .map(|index| paragraph_start + index + 1)
-        .ok_or_else(|| "некорректный тег абзаца".to_owned())?;
-    let after_open = &document_xml[open_end..];
-    let props = if style.is_empty() { String::new() } else { format!("<w:pPr><w:pStyle w:val=\"{}\"/></w:pPr>", escape_attr(style)) };
-    let new_xml = if let Some(props_end) = after_open.strip_prefix("").and_then(|rest| {
-        if rest.starts_with("<w:pPr") {
-            rest.find("</w:pPr>").map(|index| open_end + index + "</w:pPr>".len())
-        } else {
-            None
+    let paragraph_end = document_xml[tag_index..]
+        .find("</w:p>")
+        .map(|index| tag_index + index + "</w:p>".len())
+        .ok_or_else(|| "не найден конец абзаца вставки".to_owned())?;
+    let paragraph = &document_xml[paragraph_start..paragraph_end];
+    if paragraph.contains("<w:drawing") {
+        // Рисунок: стиль абзаца не меняем (иначе можно потерять drawing).
+        return Ok(info_from_entries(&entries));
+    }
+    let mut rebuilt = String::new();
+    // Открывающий тег <w:p ...>.
+    let open_end = paragraph.find('>').ok_or_else(|| "некорректный тег абзаца".to_owned())? + 1;
+    rebuilt.push_str(&paragraph[..open_end]);
+    rebuilt.push_str(&paragraph_props);
+    let mut body_owned = paragraph[open_end..paragraph.len() - "</w:p>".len()].to_owned();
+    // Убрать старый pPr.
+    if let Some(ppr_start) = body_owned.find("<w:pPr") {
+        if let Some(ppr_end_rel) = body_owned[ppr_start..].find("</w:pPr>") {
+            let tail = body_owned[ppr_start + ppr_end_rel + "</w:pPr>".len()..].to_owned();
+            body_owned.truncate(ppr_start);
+            body_owned.push_str(&tail);
         }
-    }) {
-        format!("{}{}{}", &document_xml[..open_end], props, &document_xml[props_end..])
-    } else {
-        format!("{}{}{}", &document_xml[..open_end], props, &document_xml[open_end..])
-    };
+    }
+    // Заменить rPr у всех run'ов на форматирование обычного текста.
+    let mut out_body = String::new();
+    let body: &str = &body_owned;
+    let mut rest = body;
+    while let Some(rpr_start) = rest.find("<w:rPr") {
+        let Some(open_end) = rest[rpr_start..].find('>') else { break };
+        let inner_start = rpr_start + open_end + 1;
+        let Some(close_rel) = rest[inner_start..].find("</w:rPr>") else { break };
+        out_body.push_str(&rest[..rpr_start]);
+        out_body.push_str(&run_props);
+        rest = &rest[inner_start + close_rel + "</w:rPr>".len()..];
+    }
+    out_body.push_str(rest);
+    rebuilt.push_str(&out_body);
+    rebuilt.push_str("</w:p>");
+    let new_xml = format!("{}{}{}", &document_xml[..paragraph_start], rebuilt, &document_xml[paragraph_end..]);
     for insert in &mut rde_doc.inserts {
         if insert.id == insert_id {
             insert.style = style.to_owned();
@@ -1019,6 +1114,27 @@ pub fn apply_insert_style(package: &Path, insert_id: &str, style: &str) -> Resul
     Ok(info)
 }
 
+/// `w:rPr` абзаца вставки (чтобы при обновлении значения сохранить шрифт/размер обычного текста).
+fn paragraph_run_props(xml: &str, insert_id: &str) -> String {
+    let tag = format!("<w:tag w:val=\"{INSERT_TAG_PREFIX}{insert_id}\"");
+    let Some(tag_index) = xml.find(&tag) else { return String::new() };
+    let Some(start) = xml[..tag_index].rfind("<w:p") else { return String::new() };
+    let Some(end_rel) = xml[start..].find("</w:p>") else { return String::new() };
+    let paragraph = &xml[start..start + end_rel];
+    let mut rest = paragraph;
+    while let Some(rpr_start) = rest.find("<w:rPr") {
+        let Some(open_end) = rest[rpr_start..].find('>') else { break };
+        let inner_start = rpr_start + open_end + 1;
+        let Some(close_rel) = rest[inner_start..].find("</w:rPr>") else { break };
+        let props = &rest[inner_start..inner_start + close_rel];
+        if props.contains("w:rFonts") {
+            return format!("<w:rPr>{props}</w:rPr>");
+        }
+        rest = &rest[inner_start + close_rel + "</w:rPr>".len()..];
+    }
+    String::new()
+}
+
 /// Заменить текст внутри `w:sdt` вставки (по тегу `rde:<id>`) на новое значение.
 fn replace_sdt_text(xml: &str, insert_id: &str, value: &str) -> Option<String> {
     let tag = format!("<w:tag w:val=\"{INSERT_TAG_PREFIX}{insert_id}\"");
@@ -1026,7 +1142,8 @@ fn replace_sdt_text(xml: &str, insert_id: &str, value: &str) -> Option<String> {
     let sdt_start = xml[..tag_index].rfind("<w:sdt>")?;
     let content_start = xml[sdt_start..].find("<w:sdtContent>")? + sdt_start + "<w:sdtContent>".len();
     let content_end = xml[content_start..].find("</w:sdtContent>")? + content_start;
-    let replacement = format!("<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r>", escape_attr(value));
+    let run_props = paragraph_run_props(xml, insert_id);
+    let replacement = format!("<w:r>{run_props}<w:t xml:space=\"preserve\">{}</w:t></w:r>", escape_attr(value));
     let mut out = String::with_capacity(xml.len() + replacement.len());
     out.push_str(&xml[..content_start]);
     out.push_str(&replacement);
@@ -1480,8 +1597,9 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
     let id = format!("v{}", rde_doc.inserts.len() + 1);
     let para_id = para_id_for(&format!("{}:insert:{id}", rde_doc.doc_id), 0);
-    // Стиль обычного текста текущего шаблона — по умолчанию стиль абзаца документа.
-    let style = if request.style.is_empty() { default_paragraph_style(package) } else { request.style };
+    // Пустой style = «обычный текст документа» (формат абзаца-образца из тела).
+    let style = request.style.clone();
+    let (paragraph_props, run_props) = insert_formatting(&entries, &style);
     let insert = RdeInsert {
         id,
         block: String::new(),
@@ -1499,7 +1617,8 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
     };
     let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
     let document_xml = String::from_utf8_lossy(document).to_string();
-    let paragraph = sdt_paragraph_xml(&insert).replacen("<w:p>", &format!("<w:p w14:paraId=\"{para_id}\">"), 1);
+    let paragraph = sdt_paragraph_xml(&insert, &paragraph_props, &run_props)
+        .replacen("<w:p>", &format!("<w:p w14:paraId=\"{para_id}\">"), 1);
     let document_xml = append_paragraph(&document_xml, &paragraph);
     rde_doc.inserts.push(insert.clone());
     rde_doc.updated_unix = now_unix();
@@ -1572,7 +1691,13 @@ fn rels_path_for_document() -> &'static str {
 /// Растеризовать SVG в PNG: WordCraft DocView не умеет SVG (рисует серый прямоугольник),
 /// а Word/LO умеют и PNG. Источник истины (target в rde:doc) остаётся SVG-выход артефакта.
 pub fn rasterize_svg(svg: &[u8]) -> Result<Vec<u8>, String> {
-    let options = resvg::usvg::Options::default();
+    let mut options = resvg::usvg::Options::default();
+    // Текст в SVG (подписи осей/значения): подгружаем системные шрифты, иначе resvg рисует
+    // только геометрию, а текст молча пропадает.
+    options.fontdb_mut().load_system_fonts();
+    options.fontdb_mut().set_serif_family("Times New Roman");
+    options.fontdb_mut().set_sans_serif_family("DejaVu Sans");
+    options.fontdb_mut().set_monospace_family("DejaVu Sans Mono");
     let tree = resvg::usvg::Tree::from_data(svg, &options).map_err(|e| format!("SVG не разобран: {e}"))?;
     let size = tree.size().to_int_size();
     let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
@@ -1766,8 +1891,9 @@ pub fn add_figure_insert(
     if !insert.cached.is_empty() {
         let caption_text = insert.cached.clone();
         insert.caption = caption_text.clone();
+        let (caption_ppr, caption_rpr) = insert_formatting(&entries, &insert.style);
         let caption_paragraph = format!(
-            "<w:p w14:paraId=\"{caption_para_id}\"><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
+            "<w:p w14:paraId=\"{caption_para_id}\">{caption_ppr}<w:r>{caption_rpr}<w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
             escape_attr(&caption_text)
         );
         document_xml = append_paragraph(&document_xml, &caption_paragraph);

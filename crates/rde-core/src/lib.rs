@@ -86,7 +86,7 @@ mod tests {
             for entry in std::fs::read_dir(src).unwrap().flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if matches!(&*name, ".rde" | "exports" | "__pycache__" | "out") {
+                if matches!(&*name, ".rde" | "exports" | "__pycache__" | "out" | ".venv") {
                     continue;
                 }
                 let path = entry.path();

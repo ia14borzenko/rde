@@ -3706,6 +3706,7 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "egui_kittest",
+ "image",
  "rde-core",
  "rde-dag",
  "rde-doc",

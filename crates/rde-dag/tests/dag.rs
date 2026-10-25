@@ -22,7 +22,7 @@ fn copy_tree(src: &Path, dst: &Path) {
     for entry in std::fs::read_dir(src).unwrap().flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == ".rde" || name == "exports" || name == "__pycache__" || name == "out" {
+        if matches!(&*name, ".rde" | "exports" | "__pycache__" | "out" | ".venv") {
             continue;
         }
         let path = entry.path();
@@ -619,6 +619,10 @@ fn update_records_rde_lock_and_env_change_marks_stale() {
     )
     .unwrap();
     let project = load_project(&root).unwrap();
+    if !project.objects.iter().any(|object| object.id == STATS) {
+        eprintln!("ISSUES: {:?}", project.issues.iter().map(|issue| (issue.path.display().to_string(), issue.message.clone())).collect::<Vec<_>>());
+        eprintln!("MANIFEST: {}", std::fs::read_to_string(&stats_manifest).unwrap());
+    }
     let statuses = evaluate(&project, &store).unwrap();
     assert_eq!(statuses[STATS].status, LiveStatus::Stale(vec![StaleReason::EnvChanged]));
     let _ = std::fs::remove_dir_all(&root);

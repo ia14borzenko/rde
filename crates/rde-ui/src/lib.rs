@@ -388,6 +388,10 @@ pub struct RdeApp {
     artifact_section: ArtifactSection,
     /// Редактор выбранного артефакта (манифест + скрипт).
     artifact_editor: Option<ArtifactEditorState>,
+    /// Кэш превью изображений выходов артефактов: путь → (mtime, текстура egui).
+    image_previews: std::collections::HashMap<String, (u64, egui::TextureHandle)>,
+    /// Высота области DAG во вкладке «Артефакты» (перетаскиваемый разделитель).
+    dag_height: f32,
 }
 
 impl RdeApp {
@@ -441,6 +445,8 @@ impl RdeApp {
             app_settings_dialog: None,
             artifact_section: ArtifactSection::Result,
             artifact_editor: None,
+            image_previews: std::collections::HashMap::new(),
+            dag_height: 240.0,
         };
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
         let _ = rde_run::prune_runs(&app.project.root, 200);
@@ -1848,6 +1854,7 @@ impl RdeApp {
         egui::Panel::left("rde_tree")
             .resizable(true)
             .default_size(268.0)
+            .min_size(120.0)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(8, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1895,7 +1902,10 @@ impl RdeApp {
                                     .horizontal(|ui| {
                                         ui.label(RichText::new("●").color(freshness_color(obj.freshness)).size(9.0));
                                         ui.label(RichText::new(obj.kind.icon()).color(MUTED).size(12.0));
-                                        ui.selectable_label(is_sel, RichText::new(&obj.title).size(13.0))
+                                        // Панель можно сузить: длинные названия обрезаются с «…»,
+                                        // полное название — в подсказке и в инспекторе.
+                                        ui.add(egui::Button::selectable(is_sel, RichText::new(&obj.title).size(13.0)).truncate())
+                                            .on_hover_text(&obj.title)
                                     })
                                     .inner;
                                 // M6: контекстное меню объекта (правая кнопка мыши).
@@ -2074,7 +2084,7 @@ impl RdeApp {
         egui::Panel::right("rde_agent")
             .resizable(true)
             .default_size(316.0)
-            .min_size(260.0)
+            .min_size(180.0)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -3905,7 +3915,8 @@ impl RdeApp {
             });
             return;
         }
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 240.0), Sense::hover());
+        let dag_height = self.dag_height.clamp(80.0, 700.0);
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), dag_height), Sense::hover());
         let painter = ui.painter_at(rect);
         let n = artifacts.len().min(4);
         let nw = 178.0;
@@ -3980,7 +3991,19 @@ impl RdeApp {
             });
             self.request_update(targets, false);
         }
-        ui.separator();
+        // Перетаскиваемый разделитель DAG ↔ рабочее место артефакта.
+        let handle = ui.allocate_response(vec2(ui.available_width(), 8.0), Sense::drag());
+        if handle.hovered() || handle.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        if handle.dragged() {
+            self.dag_height = (self.dag_height + handle.drag_delta().y).clamp(80.0, 700.0);
+        }
+        let handle_rect = handle.rect;
+        ui.painter().line_segment(
+            [egui::pos2(handle_rect.left(), handle_rect.center().y), egui::pos2(handle_rect.right(), handle_rect.center().y)],
+            egui::Stroke::new(1.0, if handle.hovered() || handle.dragged() { ACCENT } else { PANEL_HI }),
+        );
         self.artifact_workspace(ui);
     }
 
@@ -4056,6 +4079,29 @@ impl RdeApp {
         self.artifact_editor = None;
         self.push_log(Level::Ok, format!("Артефакт «{}» сохранён (манифест + скрипт)", object.title));
         Ok(())
+    }
+
+    /// Текстура превью изображения (PNG/JPEG/SVG→PNG) с кэшем по пути+mtime.
+    fn image_texture(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+        let key = path.display().to_string();
+        let mtime = std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        if let Some((cached_mtime, texture)) = self.image_previews.get(&key) {
+            if *cached_mtime == mtime {
+                return Some(texture.clone());
+            }
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
+        let bytes = if ext == "svg" { rde_doc::rasterize_svg(&bytes).ok()? } else { bytes };
+        let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let size = [decoded.width() as usize, decoded.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
+        let texture = ctx.load_texture(format!("rde-preview:{key}"), color_image, egui::TextureOptions::LINEAR);
+        self.image_previews.insert(key, (mtime, texture.clone()));
+        Some(texture)
     }
 
     /// Рабочее место артефакта (R-ART-01/02/04): входные данные, генерация, результат генерации.
@@ -4145,6 +4191,16 @@ impl RdeApp {
             }
         });
         ui.separator();
+        // Превью изображений-выходов (PNG/JPEG; SVG растеризуется) — нормальный просмотрщик.
+        let mut image_textures: std::collections::HashMap<String, egui::TextureHandle> = std::collections::HashMap::new();
+        for (rel, path, _, _) in &output_rows {
+            let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
+            if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg") && path.is_file() {
+                if let Some(texture) = self.image_texture(ui.ctx(), path) {
+                    image_textures.insert(rel.clone(), texture);
+                }
+            }
+        }
         let Some(editor_state) = editor.as_mut() else { return };
         egui::ScrollArea::vertical().id_salt("rde_artifact_workspace").auto_shrink([false, false]).show(ui, |ui| {
             match section {
@@ -4335,7 +4391,15 @@ impl RdeApp {
                     }
                     for (rel, path, size, preview) in &output_rows {
                         let header = format!("{rel} · {} байт", size);
-                        egui::CollapsingHeader::new(RichText::new(header).size(12.0)).id_salt(format!("rde_out_{rel}")).show(ui, |ui| {
+                        let is_image = path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg"))
+                            .unwrap_or(false);
+                        egui::CollapsingHeader::new(RichText::new(header).size(12.0))
+                            .id_salt(format!("rde_out_{rel}"))
+                            .default_open(is_image)
+                            .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 if ui.small_button("копировать путь").clicked() {
                                     copy_text = Some(path.display().to_string());
@@ -4346,6 +4410,21 @@ impl RdeApp {
                             });
                             if !path.is_file() {
                                 ui.label(RichText::new("файл ещё не создан — обновите артефакт").small().color(AMBER));
+                            } else if let Some(texture) = image_textures.get(rel) {
+                                // Нормальный просмотрщик изображения (SVG растеризован, PNG/JPEG декодированы).
+                                let texture_size = texture.size_vec2();
+                                let scale = (460.0 / texture_size.x).min(340.0 / texture_size.y).min(1.0);
+                                ui.image((texture.id(), texture_size * scale));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "изображение {}×{} px · {:.1} КБ",
+                                        texture_size.x as u32,
+                                        texture_size.y as u32,
+                                        *size as f64 / 1024.0
+                                    ))
+                                    .small()
+                                    .color(MUTED),
+                                );
                             } else if let Some(preview) = preview {
                                 ui.add(
                                     egui::TextEdit::multiline(&mut preview.clone())
@@ -4355,7 +4434,7 @@ impl RdeApp {
                                         .interactive(false),
                                 );
                             } else {
-                                ui.label(RichText::new("изображение: предпросмотр — в документе или внешнем просмотрщике").small().color(MUTED));
+                                ui.label(RichText::new("предпросмотр недоступен (файл не читается или формат не поддержан)").small().color(AMBER));
                             }
                         });
                     }
@@ -4994,7 +5073,7 @@ mod docview_tests {
         for entry in std::fs::read_dir(src).unwrap().flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if matches!(&*name, ".rde" | "exports" | "__pycache__" | "out") {
+            if matches!(&*name, ".rde" | "exports" | "__pycache__" | "out" | ".venv") {
                 continue;
             }
             let path = entry.path();

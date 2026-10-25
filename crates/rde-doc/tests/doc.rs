@@ -581,3 +581,65 @@ fn insert_value_formats_are_configurable() {
     assert_eq!(format_value("42.5", "auto"), "42.5");
     assert_eq!(format_value("0.00001", "auto"), "1.0000·10^-5");
 }
+
+#[test]
+fn inserts_use_body_text_formatting_of_current_document() {
+    let dir = tmp("insert-font");
+    let clean = dir.join("clean.docx");
+    copy_file(&demo_docx(), &clean);
+    let mut rde_doc = build_rde_doc(&clean, "01TESTDOC", "gost-7.32-2017").unwrap();
+    let package = dir.join("report.doc.rde");
+    write_package(&clean, &mut rde_doc, &package).unwrap();
+    let report = add_insert(
+        &package,
+        InsertRequest {
+            kind: "value".into(),
+            target: "rde://artifact/01A/out/stats.json#/mean".into(),
+            selector: "#/mean".into(),
+            value_kind: "number".into(),
+            cached: "1.23".into(),
+            caption: "Среднее x1".into(),
+            style: String::new(),
+            format: "dec:2".into(),
+        },
+    )
+    .unwrap();
+    let read_document = || {
+        let file = std::fs::File::open(&package).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut part = zip.by_name("word/document.xml").unwrap();
+        let mut text = String::new();
+        use std::io::Read;
+        part.read_to_string(&mut text).unwrap();
+        text
+    };
+    let paragraph_of = |xml: &str, tag: &str| -> String {
+        let index = xml.find(tag).expect("тег вставки");
+        let start = xml[..index].rfind("<w:p ").unwrap();
+        let end = xml[index..].find("</w:p>").unwrap() + index + "</w:p>".len();
+        xml[start..end].to_owned()
+    };
+    let tag = format!("<w:tag w:val=\"rde:{}\"", report.insert.id);
+    let document = read_document();
+    let paragraph = paragraph_of(&document, &tag);
+    // Обычный текст текущего документа/шаблона — Times New Roman, а не docDefaults Aptos.
+    assert!(paragraph.contains("w:rFonts"), "в абзаце вставки есть шрифт: {paragraph}");
+    assert!(!paragraph.contains("Aptos"), "вставка не должна наследовать Aptos: {paragraph}");
+    assert!(paragraph.contains("Times New Roman"), "шрифт обычного текста документа: {paragraph}");
+    // Обновление значения сохраняет шрифт (rPr переносится в новый run).
+    let mut values = std::collections::BTreeMap::new();
+    values.insert(report.insert.id.clone(), "4.56".to_owned());
+    update_insert_values(&package, &values, &std::collections::BTreeMap::new()).unwrap();
+    let paragraph = paragraph_of(&read_document(), &tag);
+    assert!(paragraph.contains("Times New Roman"), "rPr сохранён при обновлении: {paragraph}");
+    assert!(paragraph.contains("4.56"));
+    // Явный стиль пользователя: pStyle + форматирование стиля (или обычного текста).
+    let styles = list_document_styles(&package).unwrap();
+    if let Some(style) = styles.iter().find(|style| style.kind == "paragraph" && style.id != "Normal") {
+        apply_insert_style(&package, &report.insert.id, &style.id).unwrap();
+        let paragraph = paragraph_of(&read_document(), &tag);
+        assert!(paragraph.contains(&format!("w:pStyle w:val=\"{}\"", style.id)), "pStyle {style:?}: {paragraph}");
+        assert!(paragraph.contains("w:rFonts"), "у run'ов есть шрифт: {paragraph}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

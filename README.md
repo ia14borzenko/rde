@@ -54,7 +54,7 @@ P5 (`p5-gates`), P6 (`p6-feedback`).
 Тесты (включая автотест клавиатурного ввода в DocView и RDE-сохранения):
 
 ```bash
-cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-ui   # 140 тестов: модель, хеши (JCS/property), store (kill -9/транзакции/откат/GC), окружения, запуск (безопасность/provenance), DAG (property), .doc.rde (§8.5/вставки/транзакция), docx-гейты/OPC, ГОСТ, источники/PDF/OCR, VCS, настройки/i18n, UI
+cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-ui   # 141 тестов: модель, хеши (JCS/property), store (kill -9/транзакции/откат/GC), окружения, запуск (безопасность/provenance), DAG (property), .doc.rde (§8.5/вставки/транзакция), docx-гейты/OPC, ГОСТ, источники/PDF/OCR, VCS, настройки/i18n, UI
 ```
 
 ```bash
