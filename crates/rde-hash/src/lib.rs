@@ -429,9 +429,6 @@ mod tests {
             let len = self.below(max as u64 + 1) as usize;
             (0..len).map(|_| self.next() as u8).collect()
         }
-        fn json(&mut self, depth: u32) -> serde_json::Value {
-            self.json_with(depth, true)
-        }
         fn json_with(&mut self, depth: u32, floats: bool) -> serde_json::Value {
             if floats {
                 match self.below(if depth == 0 { 5 } else { 7 }) {

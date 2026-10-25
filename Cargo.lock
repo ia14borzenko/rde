@@ -3525,6 +3525,7 @@ dependencies = [
  "rde-store",
  "serde",
  "serde_json",
+ "ulid",
 ]
 
 [[package]]

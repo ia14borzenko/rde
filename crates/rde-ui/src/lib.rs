@@ -616,7 +616,7 @@ impl RdeApp {
             };
             let detail = match &status.status {
                 LiveStatus::Fresh => object.detail.clone(),
-                live => format!("{} · {}", artifact.kind, live.reason().unwrap_or_else(|| live.label_ru())),
+                live => format!("{} · {}", artifact.kind, live.reason().unwrap_or_else(|| live.label_ru().to_owned())),
             };
             overlays.push((artifact.id.clone(), freshness, detail));
         }
@@ -647,12 +647,16 @@ impl RdeApp {
     }
 
     /// Реальное обновление артефактов через DAG/транзакции (`targets=None` — все устаревшие).
-    pub fn update_dependencies(&mut self, targets: Option<Vec<String>>) -> Option<rde_dag::UpdateReport> {
+    ///
+    /// `dependents = true` — «обновить связанные» (цели + транзитивно зависимые);
+    /// `dependents = false` — «обновить артефакт» (только цель, принудительно даже если актуален).
+    pub fn update_dependencies(&mut self, targets: Option<Vec<String>>, dependents: bool) -> Option<rde_dag::UpdateReport> {
         if self.store.is_none() {
             self.push_log(Level::Warn, "Обновление невозможно: хранилище проекта не открыто");
             return None;
         }
-        let options = rde_dag::UpdateOptions { targets, continue_on_error: false };
+        let force = targets.is_some() && !dependents;
+        let options = rde_dag::UpdateOptions { targets, include_dependents: dependents, force, continue_on_error: false };
         let result = {
             let store = self.store.as_mut().expect("store проверен выше");
             rde_dag::update(&self.project, store, &options)
@@ -964,7 +968,7 @@ impl RdeApp {
             }
             Some(MenuAction::CheckProject) => self.run_project_check(),
             Some(MenuAction::UpdateAll) => {
-                self.update_dependencies(None);
+                self.update_dependencies(None, true);
             }
             Some(MenuAction::Settings) => {
                 self.settings_dialog = Some((
@@ -1035,7 +1039,7 @@ impl RdeApp {
                 });
             });
         if update_all {
-            self.update_dependencies(None);
+            self.update_dependencies(None, true);
         }
         if export {
             self.ensure_editor();
@@ -1361,10 +1365,10 @@ impl RdeApp {
             TreeAction::Delete(id) => self.delete_confirm = Some(id),
             TreeAction::CopyId(id) => self.push_log(Level::Info, format!("id объекта: {id}")),
             TreeAction::Update(id) => {
-                self.update_dependencies(Some(vec![id]));
+                self.update_dependencies(Some(vec![id]), false);
             }
             TreeAction::UpdateDependents(id) => {
-                self.update_dependencies(Some(vec![id]));
+                self.update_dependencies(Some(vec![id]), true);
             }
             TreeAction::FormatGost(id) => {
                 self.selected = Some(id);
@@ -1455,7 +1459,7 @@ impl RdeApp {
             self.run_project_check();
         }
         if update {
-            self.update_dependencies(None);
+            self.update_dependencies(None, true);
         }
         if gost {
             self.update_document_package(true, true);
@@ -1659,7 +1663,8 @@ impl RdeApp {
                 self.delete_confirm = Some(object.id.clone());
             }
             if update_clicked {
-                self.update_dependencies(Some(vec![object.id.clone()]));
+                // «Обновить артефакт» — только этот артефакт, принудительно.
+                self.update_dependencies(Some(vec![object.id.clone()]), false);
             }
             if gost_clicked {
                 self.update_document_package(true, true);
@@ -2673,7 +2678,7 @@ impl RdeApp {
                     .filter(|object| matches!(&object.data, ObjectData::Artifact(artifact) if artifact.kind == "compute"))
                     .map(|object| vec![object.id.clone()])
             });
-            self.update_dependencies(targets);
+            self.update_dependencies(targets, false);
         }
     }
 
@@ -3281,14 +3286,14 @@ mod docview_tests {
         assert_eq!(stats.freshness, super::Freshness::Stale, "до запуска артефакт должен быть устаревшим");
         assert!(stats.detail.contains("не запускался"), "detail: {}", stats.detail);
 
-        let report = app.update_dependencies(None).expect("DAG-обновление");
+        let report = app.update_dependencies(None, true).expect("DAG-обновление");
         assert_eq!(report.failed(), 0, "{:?}", report.errors);
         assert_eq!(report.ran(), 2, "stats и plot должны выполниться: {:?}", report.artifacts);
         let stats = app.project.artifact_object(STATS).unwrap();
         assert_eq!(stats.freshness, super::Freshness::UpToDate, "после запуска актуален: {}", stats.detail);
         assert!(app.project.root.join("exports").exists() || root.join(".rde/updates").is_dir());
 
-        let second = app.update_dependencies(None).expect("повторное обновление");
+        let second = app.update_dependencies(None, true).expect("повторное обновление");
         assert_eq!(second.ran(), 0, "повторный запуск не нужен: {:?}", second.artifacts);
         assert_eq!(second.skipped(), 2);
 
@@ -3302,7 +3307,7 @@ mod docview_tests {
         assert_eq!(stats.freshness, super::Freshness::Stale);
         assert!(stats.detail.contains("изменились"), "detail: {}", stats.detail);
 
-        let third = app.update_dependencies(None).expect("обновление после правки входа");
+        let third = app.update_dependencies(None, true).expect("обновление после правки входа");
         assert_eq!(third.ran(), 2, "stats и plot пересчитываются: {:?}", third.artifacts);
         assert_eq!(app.project.artifact_object(STATS).unwrap().freshness, super::Freshness::UpToDate);
         let _ = std::fs::remove_dir_all(&root);

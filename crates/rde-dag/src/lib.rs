@@ -37,10 +37,23 @@ pub struct OutputRecord {
 }
 
 /// Состояние артефакта после успешного обновления (хранится в payload транзакции).
+///
+/// Компоненты ключа хранятся отдельно, чтобы UI показывал причину устаревания по §7.3 п.2
+/// («изменились входы/скрипт/параметры/окружение»), а не одно общее сообщение.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactState {
     pub artifact_id: String,
     pub act_key: String,
+    #[serde(default)]
+    pub in_hash: Option<String>,
+    #[serde(default)]
+    pub script_hash: Option<String>,
+    #[serde(default)]
+    pub params_hash: Option<String>,
+    #[serde(default)]
+    pub env_hash: Option<String>,
+    #[serde(default)]
+    pub schema_version: Option<String>,
     #[serde(default)]
     pub out_hash: Option<String>,
     #[serde(default)]
@@ -60,13 +73,51 @@ pub struct Activation {
     pub script_hash: Option<Hash>,
     pub params_hash: Hash,
     pub env_hash: Hash,
+    pub schema_version: String,
+}
+
+/// Причина устаревания по компонентам `act_key`/выходов (tz-02 §7.3 п.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StaleReason {
+    /// Изменились hashed-входы (`in_hash`).
+    InputsChanged,
+    /// Изменился скрипт (`script_hash`).
+    ScriptChanged,
+    /// Изменились параметры (`params_hash`).
+    ParamsChanged,
+    /// Изменилось окружение (`env_hash`).
+    EnvChanged,
+    /// Изменилась версия схемы манифеста (`schema_version`).
+    SchemaChanged,
+    /// Запись состояния сделана старой версией RDE — компоненты неизвестны.
+    StateIncomplete,
+    /// Объявленные выходы отсутствуют (удалены/потеряны).
+    OutputsMissing,
+    /// Выходы изменены вручную (`out_hash` не совпадает).
+    OutputsModified,
+}
+
+impl StaleReason {
+    pub fn label_ru(self) -> &'static str {
+        match self {
+            StaleReason::InputsChanged => "изменились входы",
+            StaleReason::ScriptChanged => "изменился скрипт",
+            StaleReason::ParamsChanged => "изменились параметры",
+            StaleReason::EnvChanged => "изменилось окружение",
+            StaleReason::SchemaChanged => "изменилась версия схемы",
+            StaleReason::StateIncomplete => "состояние записано старой версией RDE",
+            StaleReason::OutputsMissing => "потеряны/отсутствуют выходы",
+            StaleReason::OutputsModified => "выходы изменены вручную",
+        }
+    }
 }
 
 /// Живой статус артефакта (считается из хешей и файлов, а не эвристик).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LiveStatus {
     Fresh,
-    Stale(String),
+    /// Устарел; список причин по компонентам (может быть несколько).
+    Stale(Vec<StaleReason>),
     NeverRun,
     NotComputable(String),
 }
@@ -81,9 +132,19 @@ impl LiveStatus {
         }
     }
 
-    pub fn reason(&self) -> Option<&str> {
+    /// Человекочитаемая причина (для UI/логов); у `Stale` — причины через ` · `.
+    pub fn reason(&self) -> Option<String> {
         match self {
-            LiveStatus::Stale(reason) | LiveStatus::NotComputable(reason) => Some(reason),
+            LiveStatus::Stale(reasons) => Some(reasons.iter().map(|reason| reason.label_ru()).collect::<Vec<_>>().join(" · ")),
+            LiveStatus::NotComputable(reason) => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
+    /// Структурированные причины устаревания (для панели/инструментов).
+    pub fn stale_reasons(&self) -> Option<&[StaleReason]> {
+        match self {
+            LiveStatus::Stale(reasons) => Some(reasons),
             _ => None,
         }
     }
@@ -273,7 +334,7 @@ pub fn activation(
         .ok_or_else(|| format!("у compute-артефакта {} нет runtime", artifact.id))?;
 
     let mut groups = Vec::new();
-    for group in artifact.groups.iter().filter(|group| group.mode == "hashed") {
+    for group in artifact.groups.iter().filter(|group| group.is_hashed()) {
         let mut members = Vec::new();
         for input in &group.inputs {
             let (target, hash) = match input {
@@ -303,7 +364,15 @@ pub fn activation(
     let params = params_hash(&artifact.params)?;
     let env = env_hash(&runtime.kind, &platform(), None, &BTreeMap::new());
     let key = act_key(&artifact.kind, &artifact.schema, in_hash, script, params, env);
-    Ok(Activation { artifact_id: artifact.id.clone(), act_key: key, in_hash, script_hash: script, params_hash: params, env_hash: env })
+    Ok(Activation {
+        artifact_id: artifact.id.clone(),
+        act_key: key,
+        in_hash,
+        script_hash: script,
+        params_hash: params,
+        env_hash: env,
+        schema_version: artifact.schema.clone(),
+    })
 }
 
 /// Текущий `out_hash` по фактическим файлам в каталоге артефакта (None — если выходов нет).
@@ -319,23 +388,61 @@ fn actual_out_hash(artifact_dir: &Path, state: &ArtifactState) -> Option<Hash> {
     Some(tree_hash(&entries))
 }
 
-fn is_fresh(artifact_dir: &Path, state: Option<&ArtifactState>, act_key: Hash) -> Result<(), String> {
-    let Some(state) = state else {
-        return Err("не запускался".to_owned());
-    };
-    if state.act_key != act_key.hex() {
-        return Err("изменились входы, скрипт или параметры".to_owned());
+/// Проверить свежесть артефакта по компонентам (§7.3 п.2). Возвращает причины устаревания;
+/// пустой список — актуален.
+fn stale_reasons(artifact_dir: &Path, state: &ArtifactState, activation: &Activation) -> Vec<StaleReason> {
+    let mut reasons = Vec::new();
+    if state.act_key == activation.act_key.hex() {
+        // Ключ совпал — входы/скрипт/параметры/окружение не менялись.
+    } else {
+        let mut component_known = false;
+        if let Some(recorded) = &state.in_hash {
+            component_known = true;
+            if *recorded != activation.in_hash.hex() {
+                reasons.push(StaleReason::InputsChanged);
+            }
+        }
+        if let Some(recorded) = &state.script_hash {
+            component_known = true;
+            if Some(recorded.clone()) != activation.script_hash.map(|hash| hash.hex()) {
+                reasons.push(StaleReason::ScriptChanged);
+            }
+        }
+        if let Some(recorded) = &state.params_hash {
+            component_known = true;
+            if *recorded != activation.params_hash.hex() {
+                reasons.push(StaleReason::ParamsChanged);
+            }
+        }
+        if let Some(recorded) = &state.env_hash {
+            component_known = true;
+            if *recorded != activation.env_hash.hex() {
+                reasons.push(StaleReason::EnvChanged);
+            }
+        }
+        if let Some(recorded) = &state.schema_version {
+            component_known = true;
+            if *recorded != activation.schema_version {
+                reasons.push(StaleReason::SchemaChanged);
+            }
+        }
+        if !component_known {
+            reasons.push(StaleReason::StateIncomplete);
+        } else if reasons.is_empty() {
+            // Компоненты совпали, а act_key — нет: состояние записано другой версией формулы.
+            reasons.push(StaleReason::StateIncomplete);
+        }
     }
-    let Some(expected) = state.out_hash.as_deref().and_then(|hex| Hash::from_hex(hex).ok()) else {
-        return Err("выходы не записаны".to_owned());
-    };
-    let Some(actual) = actual_out_hash(artifact_dir, state) else {
-        return Err("выходы отсутствуют (удалены)".to_owned());
-    };
-    if actual != expected {
-        return Err("выход изменён вручную".to_owned());
+    // Целостность выходов: наличие и совпадение out_hash (ручная правка = предупреждение).
+    match state.out_hash.as_deref().and_then(|hex| Hash::from_hex(hex).ok()) {
+        None => reasons.push(StaleReason::OutputsMissing),
+        Some(expected) => match actual_out_hash(artifact_dir, state) {
+            None => reasons.push(StaleReason::OutputsMissing),
+            Some(actual) if actual != expected => reasons.push(StaleReason::OutputsModified),
+            Some(_) => {}
+        },
     }
-    Ok(())
+    reasons
 }
 
 /// Оценить все артефакты проекта (compute — по хешам, data/constants — актуальны).
@@ -354,11 +461,18 @@ pub fn evaluate(project: &Project, store: &Store) -> Result<BTreeMap<String, Art
                     let updated = state.map(|state| state.updated_unix);
                     let out_hash = state.and_then(|state| state.out_hash.clone());
                     let run_id = state.and_then(|state| state.run_id.clone());
-                    match is_fresh(&artifact_object.dir, state, activation.act_key) {
-                        Ok(()) => (LiveStatus::Fresh, Some(activation.act_key.hex()), out_hash, updated, run_id),
-                        Err(reason) if reason == "не запускался" => (LiveStatus::NeverRun, Some(activation.act_key.hex()), None, None, None),
-                        Err(reason) => (LiveStatus::Stale(reason), Some(activation.act_key.hex()), out_hash, updated, run_id),
-                    }
+                    let status = match state {
+                        None => LiveStatus::NeverRun,
+                        Some(state) => {
+                            let reasons = stale_reasons(&artifact_object.dir, state, &activation);
+                            if reasons.is_empty() {
+                                LiveStatus::Fresh
+                            } else {
+                                LiveStatus::Stale(reasons)
+                            }
+                        }
+                    };
+                    (status, Some(activation.act_key.hex()), out_hash, updated, run_id)
                 }
             }
         };
@@ -417,7 +531,7 @@ pub fn topological_compute(project: &Project) -> Result<Vec<String>, String> {
 }
 
 /// Транзитивное замыкание зависимых для набора целей (чтобы «обновить связанные»).
-fn dependents_closure(project: &Project, targets: &[String]) -> HashSet<String> {
+pub fn dependents_closure(project: &Project, targets: &[String]) -> HashSet<String> {
     let mut closure: HashSet<String> = targets.iter().cloned().collect();
     let edges = project.dag_edges();
     let mut changed = true;
@@ -435,8 +549,13 @@ fn dependents_closure(project: &Project, targets: &[String]) -> HashSet<String> 
 
 #[derive(Clone, Debug, Default)]
 pub struct UpdateOptions {
-    /// Ограничить обновление целями + транзитивно зависимыми (None — все устаревшие).
+    /// Ограничить обновление целями (None — все устаревшие).
     pub targets: Option<Vec<String>>,
+    /// Для `targets`: включить транзитивно зависимые артефакты («обновить связанные»).
+    /// `false` — обновить только сами цели («обновить артефакт»).
+    pub include_dependents: bool,
+    /// Принудительно пересчитать явно указанные цели, даже если они актуальны.
+    pub force: bool,
     /// Продолжать после ошибки отдельного артефакта.
     pub continue_on_error: bool,
 }
@@ -589,7 +708,7 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
-fn state_from_outcome(artifact: &ArtifactManifest, outcome: &RunOutcome, act_key: Hash, entries: &[TreeEntry]) -> ArtifactState {
+fn state_from_outcome(artifact: &ArtifactManifest, outcome: &RunOutcome, activation: &Activation, entries: &[TreeEntry]) -> ArtifactState {
     let mut outputs = Vec::with_capacity(entries.len());
     for entry in entries {
         outputs.push(OutputRecord {
@@ -606,7 +725,12 @@ fn state_from_outcome(artifact: &ArtifactManifest, outcome: &RunOutcome, act_key
     }
     ArtifactState {
         artifact_id: artifact.id.clone(),
-        act_key: act_key.hex(),
+        act_key: activation.act_key.hex(),
+        in_hash: Some(activation.in_hash.hex()),
+        script_hash: activation.script_hash.map(|hash| hash.hex()),
+        params_hash: Some(activation.params_hash.hex()),
+        env_hash: Some(activation.env_hash.hex()),
+        schema_version: Some(activation.schema_version.clone()),
         out_hash: Some(tree_hash(entries).hex()),
         outputs,
         run_id: Some(outcome.run_id.clone()),
@@ -621,10 +745,10 @@ fn commit_update(
     store: &mut Store,
     artifact: &ArtifactManifest,
     outcome: &RunOutcome,
-    act_key: Hash,
+    activation: &Activation,
     entries: &[TreeEntry],
 ) -> Result<(String, ArtifactState), String> {
-    let state = state_from_outcome(artifact, outcome, act_key, entries);
+    let state = state_from_outcome(artifact, outcome, activation, entries);
     let payload = serde_json::json!({ "kind": "dag-update", "artifacts": [state] });
     let tx = store
         .begin_tx_with(&format!("dag update: {}", artifact.title), Some(payload))
@@ -651,7 +775,13 @@ fn commit_update(
 pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> Result<UpdateReport, String> {
     let mut ledger = ledger(store)?;
     let order = topological_compute(project)?;
-    let allowed: Option<HashSet<String>> = options.targets.as_ref().map(|targets| dependents_closure(project, targets));
+    let allowed: Option<HashSet<String>> = options.targets.as_ref().map(|targets| {
+        if options.include_dependents {
+            dependents_closure(project, targets)
+        } else {
+            targets.iter().cloned().collect()
+        }
+    });
     let mut report = UpdateReport::default();
     let artifacts: HashMap<&str, &ArtifactManifest> = project.artifacts().map(|a| (a.id.as_str(), a)).collect();
 
@@ -685,7 +815,8 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
             }
         };
         let state = ledger.get(&artifact.id);
-        if is_fresh(&artifact_object.dir, state, activation.act_key).is_ok() {
+        let forced = options.force && options.targets.as_ref().is_some_and(|targets| targets.contains(&artifact.id));
+        if !forced && state.is_some_and(|state| stale_reasons(&artifact_object.dir, state, &activation).is_empty()) {
             report.artifacts.push(UpdatedArtifact {
                 artifact_id: artifact.id.clone(),
                 title: artifact.title.clone(),
@@ -804,10 +935,16 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
             continue;
         }
 
-        match commit_update(store, artifact, &outcome, activation.act_key, &entries) {
+        match commit_update(store, artifact, &outcome, &activation, &entries) {
             Ok((tx, state)) => {
                 ledger.insert(artifact.id.clone(), state.clone());
                 report.tx_ids.push(tx);
+                // R-VCS-02/§7.3 п.10: out_hash — идентичность выходов для git-диффа.
+                if let Some(out_hash) = &state.out_hash {
+                    if let Err(error) = rde_core::record_artifact_out_hash(&artifact_object.dir, out_hash) {
+                        report.errors.push(format!("{}: out_hash не записан в artifact.toml: {error}", artifact.title));
+                    }
+                }
                 report.artifacts.push(UpdatedArtifact {
                     artifact_id: artifact.id.clone(),
                     title: artifact.title.clone(),
