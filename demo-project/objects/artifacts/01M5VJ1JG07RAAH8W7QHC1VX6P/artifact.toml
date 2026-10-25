@@ -1,0 +1,25 @@
+schema = "rde/artifact@1"
+id = "01M5VJ1JG07RAAH8W7QHC1VX6P"
+title = "Реализации (линия)"
+type = "compute"
+rebuild = "manual"
+timeout_s = 120
+network_allow = false
+
+outputs = ["out/line.svg"]
+
+out_hash = "b07d5b44b88ef0b43a87bdc2a5b6c7522b593779da0162d248a5f5639560e636"
+[runtime]
+kind = "python"
+env = "project"
+entry = "script.py"
+
+[params]
+points = 80
+
+[[groups]]
+name = "realizations"
+mode = "hashed"
+inputs = [
+  { artifact = "01M5VJ1JG0HD99FDTGJ8YEPFZX", selector = "inputs/experiment.csv" },
+]

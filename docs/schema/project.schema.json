@@ -47,6 +47,11 @@
       "default": "",
       "type": "string"
     },
+    "document_auto_update": {
+      "default": false,
+      "description": "Автообновление документа при обновлении артефактов (R-DOC-12: off/manual/auto; здесь auto=on).",
+      "type": "boolean"
+    },
     "id": {
       "type": "string"
     },

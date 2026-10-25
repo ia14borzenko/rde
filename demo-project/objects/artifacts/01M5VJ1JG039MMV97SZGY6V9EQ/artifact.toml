@@ -6,9 +6,9 @@ rebuild = "manual"
 timeout_s = 120
 network_allow = false
 
-outputs = ["out/stats.json"]
+outputs = ["out/stats.json", "out/summary.csv"]
 
-out_hash = "4997acb6e936860aa5374d2cffc3b109d7480a6f5747512bbcbf2c31ed0cdc7e"
+out_hash = "dd7e3c10f7b35ebe04104d312d582f2134952c587ec39d9ed08a973ac4c105d1"
 [runtime]
 kind = "python"
 env = "project"

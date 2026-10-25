@@ -62,6 +62,9 @@ pub struct ProjectManifest {
     /// Сеть разрешена артефактам проекта по умолчанию (R-RUN-06; артефакт может переопределить).
     #[serde(default)]
     pub network_allow: bool,
+    /// Автообновление документа при обновлении артефактов (R-DOC-12: off/manual/auto; здесь auto=on).
+    #[serde(default)]
+    pub document_auto_update: bool,
 }
 
 /// Окружение исполнения скрипта артефакта.

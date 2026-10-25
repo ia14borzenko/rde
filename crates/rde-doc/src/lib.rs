@@ -93,6 +93,10 @@ pub struct RdeInsert {
     /// Формат отображения значения: `auto|raw|int|dec:N|sci:N|percent:N` (R-DOC-11).
     #[serde(default)]
     pub format: String,
+    /// Подсказка rich-форматирования значения (`italic`, `italic-subscript` — для констант вида
+    /// `R_н`, R-ART-09); пусто — обычный текст.
+    #[serde(default)]
+    pub run_style: String,
 }
 
 /// Сводка ревью (комментарии/правки; полноценно — M5).
@@ -389,6 +393,7 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                             para_id: None,
                             style: String::new(),
                             format: String::new(),
+            run_style: String::new(),
                         };
                         for attr in event.attributes().flatten() {
                             let key = local_name(attr.key.as_ref());
@@ -815,12 +820,20 @@ fn body_formatting(entries: &BTreeMap<String, Vec<u8>>) -> (String, String) {
             continue;
         }
         let ppr = extract_inner(paragraph, "<w:pPr", "</w:pPr>").unwrap_or_default();
-        let rpr = extract_inner(paragraph, "<w:rPr", "</w:rPr>")
-            .filter(|props| props.contains("w:rFonts"))
-            .or_else(|| extract_inner(paragraph, "<w:rPr", "</w:rPr>"));
-        if let Some(rpr) = rpr {
-            return (ppr, rpr);
+        let Some(rpr) = extract_inner(paragraph, "<w:rPr", "</w:rPr>") else { continue };
+        if !rpr.contains("w:rFonts") {
+            continue;
         }
+        // Пропускаем заголовки/титул/оглавление/подписи и жирный текст: нужен именно
+        // формат обычного (body) абзаца, как в ГОСТ-шаблоне.
+        let styled = ["Heading", "Title", "TOC", "Caption", "Subtitle"]
+            .iter()
+            .any(|prefix| ppr.contains(&format!("w:pStyle w:val=\"{prefix}")));
+        let bold = rpr.contains("<w:b/>") || rpr.contains("<w:bCs/>");
+        if styled || bold {
+            continue;
+        }
+        return (ppr, rpr);
     }
     (String::new(), String::new())
 }
@@ -866,16 +879,29 @@ fn extract_attr(xml: &str, element: &str, attr: &str) -> Option<String> {
 }
 
 /// Форматирование вставки: явный стиль пользователя (pStyle + его rPr) или обычный текст документа.
+/// Следующий свободный id вставки (`v3`, `v4`, …) — не переиспользуем номера после удалений.
+fn next_insert_id(inserts: &[RdeInsert]) -> String {
+    let mut max = 0u32;
+    for insert in inserts {
+        if let Some(number) = insert.id.strip_prefix('v').and_then(|rest| rest.parse::<u32>().ok()) {
+            max = max.max(number);
+        }
+    }
+    format!("v{}", max + 1)
+}
+
 fn insert_formatting(
     entries: &BTreeMap<String, Vec<u8>>,
     style: &str,
 ) -> (String, String) {
     let (body_ppr, body_rpr) = body_formatting(entries);
+    let wrap_ppr = |inner: String| if inner.is_empty() { String::new() } else { format!("<w:pPr>{inner}</w:pPr>") };
+    let wrap_rpr = |inner: String| if inner.is_empty() { String::new() } else { format!("<w:rPr>{inner}</w:rPr>") };
     if style.trim().is_empty() {
-        return (body_ppr, body_rpr);
+        return (wrap_ppr(body_ppr), wrap_rpr(body_rpr));
     }
     let ppr = format!("<w:pPr><w:pStyle w:val=\"{}\"/></w:pPr>", escape_attr(style.trim()));
-    let rpr = style_run_props(entries, style.trim()).unwrap_or(body_rpr);
+    let rpr = wrap_rpr(style_run_props(entries, style.trim()).unwrap_or(body_rpr));
     (ppr, rpr)
 }
 
@@ -886,13 +912,13 @@ fn sdt_paragraph_xml(insert: &RdeInsert, paragraph_props: &str, run_props: &str)
     } else {
         format!("<w:r>{run_props}<w:t xml:space=\"preserve\">{}: </w:t></w:r>", escape_attr(&insert.caption))
     };
+    let value_runs = rich_runs(&insert.cached, &insert.run_style, run_props);
     format!(
         "<w:p>{paragraph_props}{label}<w:sdt><w:sdtPr><w:tag w:val=\"{prefix}{id}\"/><w:alias w:val=\"{alias}\"/></w:sdtPr>\
-         <w:sdtContent><w:r>{run_props}<w:t xml:space=\"preserve\">{value}</w:t></w:r></w:sdtContent></w:sdt></w:p>",
+         <w:sdtContent>{value_runs}</w:sdtContent></w:sdt></w:p>",
         prefix = INSERT_TAG_PREFIX,
         id = escape_attr(&insert.id),
         alias = escape_attr(if insert.caption.is_empty() { &insert.kind } else { &insert.caption }),
-        value = escape_attr(&insert.cached),
     )
 }
 
@@ -1050,6 +1076,32 @@ pub fn set_insert_format(package: &Path, insert_id: &str, format: &str) -> Resul
     Ok(rde_doc)
 }
 
+/// Удалить записи вставок из `rde:doc`, не трогая тело документа (очистка авто-вставок миграции).
+pub fn drop_insert_records(package: &Path, ids: &[String]) -> Result<RdeDoc, String> {
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let before = rde_doc.inserts.len();
+    rde_doc.inserts.retain(|insert| !ids.iter().any(|id| id == &insert.id));
+    if rde_doc.inserts.len() != before {
+        entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+        write_entries_atomic(&entries, package)?;
+    }
+    Ok(rde_doc)
+}
+
+/// Задать подсказку rich-форматирования значения вставки (`italic`, `italic-subscript`).
+pub fn set_insert_run_style(package: &Path, insert_id: &str, run_style: &str) -> Result<RdeDoc, String> {
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let Some(insert) = rde_doc.inserts.iter_mut().find(|insert| insert.id == insert_id) else {
+        return Err(format!("вставка {insert_id} не найдена"));
+    };
+    insert.run_style = run_style.to_owned();
+    entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+    write_entries_atomic(&entries, package)?;
+    Ok(rde_doc)
+}
+
 /// Сменить стиль абзаца вставки (пользователь выбирает стиль из шаблона): правит `w:pStyle`
 /// в документе и `rde:doc` (R-DOC-11/25).
 pub fn apply_insert_style(package: &Path, insert_id: &str, style: &str) -> Result<PackageInfo, String> {
@@ -1135,15 +1187,58 @@ fn paragraph_run_props(xml: &str, insert_id: &str) -> String {
     String::new()
 }
 
+/// Разбить значение на run'ы по подсказке rich-форматирования (`R_н` → «R» + подстрочная «н»).
+fn rich_runs(value: &str, run_style: &str, run_props: &str) -> String {
+    if run_style.is_empty() {
+        return format!("<w:r>{run_props}<w:t xml:space=\"preserve\">{}</w:t></w:r>", escape_attr(value));
+    }
+    let italic = run_style.contains("italic");
+    let subscript = run_style.contains("subscript");
+    let make_props = |extra: &str| {
+        if run_props.is_empty() && extra.is_empty() {
+            String::new()
+        } else {
+            let inner = extract_inner(run_props, "<w:rPr", "</w:rPr>").unwrap_or_default();
+            format!("<w:rPr>{inner}{extra}</w:rPr>")
+        }
+    };
+    let base_extra = if italic { "<w:i/><w:iCs/>" } else { "" };
+    if subscript {
+        // display вида `R_н`: до «_» — обычная часть, после — подстрочная.
+        if let Some((base, sub)) = value.split_once('_') {
+            let mut out = String::new();
+            if !base.is_empty() {
+                out.push_str(&format!(
+                    "<w:r>{}{}<w:t xml:space=\"preserve\">{}</w:t></w:r>",
+                    make_props(base_extra),
+                    "",
+                    escape_attr(base)
+                ));
+            }
+            let sub_extra = if italic { "<w:i/><w:iCs/><w:vertAlign w:val=\"subscript\"/>" } else { "<w:vertAlign w:val=\"subscript\"/>" };
+            out.push_str(&format!(
+                "<w:r>{}{}<w:t xml:space=\"preserve\">{}</w:t></w:r>",
+                make_props(sub_extra),
+                "",
+                escape_attr(sub)
+            ));
+            return out;
+        }
+        let extra = if italic { "<w:i/><w:iCs/><w:vertAlign w:val=\"subscript\"/>" } else { "<w:vertAlign w:val=\"subscript\"/>" };
+        return format!("<w:r>{}{}<w:t xml:space=\"preserve\">{}</w:t></w:r>", make_props(extra), "", escape_attr(value));
+    }
+    format!("<w:r>{}{}<w:t xml:space=\"preserve\">{}</w:t></w:r>", make_props(base_extra), "", escape_attr(value))
+}
+
 /// Заменить текст внутри `w:sdt` вставки (по тегу `rde:<id>`) на новое значение.
-fn replace_sdt_text(xml: &str, insert_id: &str, value: &str) -> Option<String> {
-    let tag = format!("<w:tag w:val=\"{INSERT_TAG_PREFIX}{insert_id}\"");
+fn replace_sdt_text(xml: &str, insert: &RdeInsert, value: &str) -> Option<String> {
+    let tag = format!("<w:tag w:val=\"{INSERT_TAG_PREFIX}{}\"", insert.id);
     let tag_index = xml.find(&tag)?;
     let sdt_start = xml[..tag_index].rfind("<w:sdt>")?;
     let content_start = xml[sdt_start..].find("<w:sdtContent>")? + sdt_start + "<w:sdtContent>".len();
     let content_end = xml[content_start..].find("</w:sdtContent>")? + content_start;
-    let run_props = paragraph_run_props(xml, insert_id);
-    let replacement = format!("<w:r>{run_props}<w:t xml:space=\"preserve\">{}</w:t></w:r>", escape_attr(value));
+    let run_props = paragraph_run_props(xml, &insert.id);
+    let replacement = rich_runs(value, &insert.run_style, &run_props);
     let mut out = String::with_capacity(xml.len() + replacement.len());
     out.push_str(&xml[..content_start]);
     out.push_str(&replacement);
@@ -1151,18 +1246,17 @@ fn replace_sdt_text(xml: &str, insert_id: &str, value: &str) -> Option<String> {
     Some(out)
 }
 
-/// Вставить новый абзац перед `</w:body>`.
+/// Вставить новый абзац в конец тела документа, но **перед** `w:sectPr` (он обязан быть
+/// последним элементом `w:body`, иначе парсер WordCraft/Word теряет всё после него).
 fn append_paragraph(xml: &str, paragraph: &str) -> String {
-    match xml.rfind("</w:body>") {
-        Some(index) => {
-            let mut out = String::with_capacity(xml.len() + paragraph.len());
-            out.push_str(&xml[..index]);
-            out.push_str(paragraph);
-            out.push_str(&xml[index..]);
-            out
-        }
-        None => format!("{xml}{paragraph}"),
-    }
+    let Some(body_end) = xml.rfind("</w:body>") else { return format!("{xml}{paragraph}") };
+    let body = &xml[..body_end];
+    let insert_at = body.rfind("<w:sectPr").unwrap_or(body_end);
+    let mut out = String::with_capacity(xml.len() + paragraph.len());
+    out.push_str(&xml[..insert_at]);
+    out.push_str(paragraph);
+    out.push_str(&xml[insert_at..]);
+    out
 }
 
 /// Записать части пакета атомарно (temp + rename).
@@ -1415,6 +1509,7 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 para_id: block.para_id.clone(),
                 style: String::new(),
                 format: String::new(),
+                run_style: String::new(),
             });
         } else if block.kind == "caption" {
             inserts.push(RdeInsert {
@@ -1431,6 +1526,7 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 para_id: block.para_id.clone(),
                 style: String::new(),
                 format: String::new(),
+                run_style: String::new(),
             });
         }
     }
@@ -1581,6 +1677,8 @@ pub struct InsertRequest {
     pub style: String,
     /// Формат отображения значения (`auto|raw|int|dec:N|sci:N|percent:N`).
     pub format: String,
+    /// Подсказка rich-форматирования значения (`italic`, `italic-subscript`), R-ART-09.
+    pub run_style: String,
 }
 
 /// Результат добавления вставки.
@@ -1595,7 +1693,7 @@ pub struct InsertReport {
 pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport, String> {
     let mut entries = read_package(package)?.entries;
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
-    let id = format!("v{}", rde_doc.inserts.len() + 1);
+    let id = next_insert_id(&rde_doc.inserts);
     let para_id = para_id_for(&format!("{}:insert:{id}", rde_doc.doc_id), 0);
     // Пустой style = «обычный текст документа» (формат абзаца-образца из тела).
     let style = request.style.clone();
@@ -1614,6 +1712,7 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
         para_id: Some(para_id.clone()),
         style,
         format: request.format,
+        run_style: request.run_style,
     };
     let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
     let document_xml = String::from_utf8_lossy(document).to_string();
@@ -1653,7 +1752,7 @@ pub fn update_insert_values(
     let mut updated = Vec::new();
     for insert in &mut rde_doc.inserts {
         let Some(value) = values.get(&insert.id) else { continue };
-        if let Some(new_xml) = replace_sdt_text(&document_xml, &insert.id, value) {
+        if let Some(new_xml) = replace_sdt_text(&document_xml, insert, value) {
             document_xml = new_xml;
         }
         insert.cached = value.clone();
@@ -1835,6 +1934,270 @@ fn ensure_default_content_type(entries: &mut BTreeMap<String, Vec<u8>>, ext: &st
     *content_types = updated.into_bytes();
 }
 
+/// XML таблицы Word из строк CSV/данных артефакта (R-DOC-18: границы, головка).
+fn table_xml(rows: &[Vec<String>], run_props: &str) -> String {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let width = 9000 / columns as i64;
+    let mut out = String::from("<w:tbl><w:tblGrid>");
+    for _ in 0..columns {
+        out.push_str(&format!("<w:gridCol w:w=\"{width}\"/>"));
+    }
+    out.push_str("</w:tblGrid>");
+    for row in rows {
+        out.push_str("<w:tr>");
+        for column in 0..columns {
+            let cell = row.get(column).map(String::as_str).unwrap_or("");
+            let props = if run_props.is_empty() { String::new() } else { run_props.to_owned() };
+            out.push_str(&format!(
+                "<w:tc><w:p><w:r>{props}<w:t xml:space=\"preserve\">{}</w:t></w:r></w:p></w:tc>",
+                escape_attr(cell)
+            ));
+        }
+        out.push_str("</w:tr>");
+    }
+    out.push_str("</w:tbl>");
+    out
+}
+/// Вставить таблицу из данных артефакта (R-DOC-11/18): подпись над таблицей + `w:tbl`.
+pub fn add_table_insert(package: &Path, request: InsertRequest, rows: &[Vec<String>]) -> Result<InsertReport, String> {
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let id = next_insert_id(&rde_doc.inserts);
+    let para_id = para_id_for(&format!("{}:table:{id}", rde_doc.doc_id), 0);
+    let (paragraph_props, run_props) = insert_formatting(&entries, &request.style);
+    let caption = if request.caption.is_empty() { "Таблица".to_owned() } else { request.caption.clone() };
+    let insert = RdeInsert {
+        id: id.clone(),
+        block: String::new(),
+        kind: "table".to_owned(),
+        target: request.target.clone(),
+        caption: caption.clone(),
+        number: None,
+        hash: None,
+        cached: format!("{}×{}", rows.len(), rows.iter().map(Vec::len).max().unwrap_or(0)),
+        selector: request.selector.clone(),
+        value_kind: "table".to_owned(),
+        para_id: Some(para_id.clone()),
+        style: request.style.clone(),
+        format: String::new(),
+        run_style: String::new(),
+    };
+    rde_doc.inserts.push(insert.clone());
+    let mut document_xml = {
+        let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
+        String::from_utf8_lossy(document).to_string()
+    };
+    let caption_paragraph = format!(
+        "<w:p w14:paraId=\"{para_id}\">{paragraph_props}<w:r>{run_props}<w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
+        escape_attr(&caption)
+    );
+    document_xml = append_paragraph(&document_xml, &caption_paragraph);
+    document_xml = append_paragraph(&document_xml, &table_xml(rows, &run_props));
+    rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+    upsert_custom_props(&mut entries, &rde_doc);
+    write_entries_atomic(&entries, package)?;
+    Ok(InsertReport { insert, package: info_from_entries(&entries) })
+}
+
+/// Обновить таблицы вставок из свежих данных артефакта (R-DOC-18).
+pub fn update_table_inserts(package: &Path, tables: &BTreeMap<String, Vec<Vec<String>>>) -> Result<PackageInfo, String> {
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let mut document_xml = {
+        let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
+        String::from_utf8_lossy(document).to_string()
+    };
+    let mut changed = false;
+    for insert in &mut rde_doc.inserts {
+        let Some(rows) = tables.get(&insert.id) else { continue };
+        let Some(para_id) = insert.para_id.clone() else { continue };
+        let anchor = format!("<w:p w14:paraId=\"{para_id}\"");
+        let Some(paragraph_start) = document_xml.find(&anchor) else { continue };
+        let Some(paragraph_end_rel) = document_xml[paragraph_start..].find("</w:p>") else { continue };
+        let search_from = paragraph_start + paragraph_end_rel + "</w:p>".len();
+        let Some(table_start_rel) = document_xml[search_from..].find("<w:tbl>") else { continue };
+        let table_start = search_from + table_start_rel;
+        let Some(table_end_rel) = document_xml[table_start..].find("</w:tbl>") else { continue };
+        let table_end = table_start + table_end_rel + "</w:tbl>".len();
+        let (_, run_props) = insert_formatting(&entries, &insert.style);
+        let new_table = table_xml(rows, &run_props);
+        document_xml.replace_range(table_start..table_end, &new_table);
+        insert.cached = format!("{}×{}", rows.len(), rows.iter().map(Vec::len).max().unwrap_or(0));
+        changed = true;
+    }
+    if !changed {
+        return Ok(info_from_entries(&entries));
+    }
+    rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+    upsert_custom_props(&mut entries, &rde_doc);
+    let info = info_from_entries(&entries);
+    write_entries_atomic(&entries, package)?;
+    Ok(info)
+}
+
+/// Перенумеровать подписи вставок рисунков/таблиц и перекрёстные ссылки на них
+/// (R-DOC-15/17/18): «Рисунок N — …», «Таблица N — …», `rde://insert/<id>` → «Рисунок N».
+pub fn renumber_insert_captions(package: &Path) -> Result<PackageInfo, String> {
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let mut document_xml = {
+        let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
+        String::from_utf8_lossy(document).to_string()
+    };
+    let mut changed = false;
+    // Продолжаем нумерацию после подписей, уже имеющихся в теле документа (миграция из WordCraft),
+    // но не считаем абзацы самих живых вставок — иначе перенумерация не идемпотентна.
+    let live_para_ids: std::collections::HashSet<String> = rde_doc
+        .inserts
+        .iter()
+        .filter(|insert| !insert.target.is_empty())
+        .filter_map(|insert| insert.para_id.clone())
+        .collect();
+    let mut figures = max_caption_number(&document_xml, "Рисунок", &live_para_ids);
+    let mut tables = max_caption_number(&document_xml, "Таблица", &live_para_ids);
+    let mut numbering: BTreeMap<String, String> = BTreeMap::new();
+    for insert in &mut rde_doc.inserts {
+        // Авто-вставки миграции (без URI цели) не перенумеровываем: это исторические блоки.
+        if insert.target.is_empty() {
+            continue;
+        }
+        let (label, number) = match insert.kind.as_str() {
+            "figure" => {
+                figures += 1;
+                ("Рисунок", figures)
+            }
+            "table" => {
+                tables += 1;
+                ("Таблица", tables)
+            }
+            _ => continue,
+        };
+        numbering.insert(insert.id.clone(), format!("{label} {number}"));
+        let base = strip_caption_prefix(&insert.caption);
+        let new_caption = if base.is_empty() { format!("{label} {number}") } else { format!("{label} {number} — {base}") };
+        if new_caption == insert.caption {
+            continue;
+        }
+        if let Some(para_id) = insert.para_id.clone() {
+            if let Some(new_xml) = replace_paragraph_text(&document_xml, &para_id, &new_caption) {
+                document_xml = new_xml;
+                changed = true;
+            }
+        }
+        insert.caption = new_caption.clone();
+        insert.cached = new_caption;
+    }
+    // Перекрёстные ссылки — после того, как известны номера всех рисунков/таблиц.
+    let crossrefs: Vec<(String, String)> = rde_doc
+        .inserts
+        .iter()
+        .filter(|insert| insert.kind == "crossref")
+        .filter_map(|insert| {
+            let target_id = insert.target.strip_prefix("rde://insert/")?;
+            let text = numbering.get(target_id)?;
+            (insert.cached != *text).then(|| (insert.id.clone(), text.clone()))
+        })
+        .collect();
+    for (id, text) in crossrefs {
+        if let Some(insert) = rde_doc.inserts.iter().find(|insert| insert.id == id).cloned() {
+            if let Some(new_xml) = replace_sdt_text(&document_xml, &insert, &text) {
+                document_xml = new_xml;
+                changed = true;
+            }
+        }
+        if let Some(insert) = rde_doc.inserts.iter_mut().find(|insert| insert.id == id) {
+            insert.cached = text;
+        }
+    }
+    if !changed {
+        return Ok(info_from_entries(&entries));
+    }
+    rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+    upsert_custom_props(&mut entries, &rde_doc);
+    let info = info_from_entries(&entries);
+    write_entries_atomic(&entries, package)?;
+    Ok(info)
+}
+
+/// Заменить текст первого `w:t` в абзаце с данным `w14:paraId`.
+fn replace_paragraph_text(xml: &str, para_id: &str, text: &str) -> Option<String> {
+    let anchor = format!("<w:p w14:paraId=\"{para_id}\"");
+    let start = xml.find(&anchor)?;
+    let end = xml[start..].find("</w:p>")? + start + "</w:p>".len();
+    let paragraph = &xml[start..end];
+    let mut rebuilt = String::new();
+    let mut rest = paragraph;
+    let mut replaced = false;
+    while let Some(text_start) = rest.find("<w:t") {
+        let open_end = rest[text_start..].find('>')?;
+        let inner_start = text_start + open_end + 1;
+        let close_rel = rest[inner_start..].find("</w:t>")?;
+        rebuilt.push_str(&rest[..inner_start]);
+        if replaced {
+            rebuilt.push_str(&rest[inner_start..inner_start + close_rel]);
+        } else {
+            rebuilt.push_str(&escape_attr(text));
+            replaced = true;
+        }
+        rebuilt.push_str("</w:t>");
+        rest = &rest[inner_start + close_rel + "</w:t>".len()..];
+    }
+    rebuilt.push_str(rest);
+    Some(format!("{}{}{}", &xml[..start], rebuilt, &xml[end..]))
+}
+
+/// Максимальный номер подписи «Рисунок N»/«Таблица N», уже присутствующей в документе.
+fn max_caption_number(document_xml: &str, label: &str, skip_para_ids: &std::collections::HashSet<String>) -> u32 {
+    let mut max = 0u32;
+    let mut rest = document_xml;
+    while let Some(paragraph_start) = rest.find("<w:p") {
+        let Some(open_end) = rest[paragraph_start..].find('>') else { break };
+        let open_tag = &rest[paragraph_start..paragraph_start + open_end];
+        let Some(close_rel) = rest[paragraph_start..].find("</w:p>") else { break };
+        let paragraph = &rest[paragraph_start..paragraph_start + close_rel];
+        rest = &rest[paragraph_start + close_rel + "</w:p>".len()..];
+        // Пропустить абзацы живых вставок (их номера мы и назначаем).
+        if let Some(para_id) = open_tag.split("w14:paraId=\"").nth(1).and_then(|rest| rest.split('"').next()) {
+            if skip_para_ids.contains(para_id) {
+                continue;
+            }
+        }
+        let mut scan = paragraph;
+        while let Some(index) = scan.find(label) {
+            let after = &scan[index + label.len()..];
+            let digits: String = after.trim_start().chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(number) = digits.parse::<u32>() {
+                max = max.max(number);
+            }
+            scan = &scan[index + label.len()..];
+        }
+    }
+    max
+}
+
+/// Убрать префикс «Рисунок N —»/«Таблица N —» из подписи (для перенумерации).
+fn strip_caption_prefix(caption: &str) -> String {
+    let caption = caption.trim();
+    for label in ["Рисунок", "Таблица"] {
+        if let Some(rest) = caption.strip_prefix(label) {
+            let rest = rest.trim_start();
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if !digits.is_empty() {
+                let rest = rest[digits.len()..].trim_start();
+                let rest = rest.strip_prefix('—').or_else(|| rest.strip_prefix('-')).unwrap_or(rest).trim_start();
+                return rest.to_owned();
+            }
+        }
+    }
+    caption.to_owned()
+}
+
 /// Вставить рисунок из файла артефакта (R-DOC-11): media-часть + relationship + drawing в `w:sdt`.
 /// `caption` — текст подписи (номер обновляется перенумерацией документа).
 pub fn add_figure_insert(
@@ -1854,7 +2217,7 @@ pub fn add_figure_insert(
     let mut entries = read_package(package)?.entries;
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
     let index = rde_doc.inserts.iter().filter(|insert| insert.kind == "figure").count() + 1;
-    let id = format!("v{}", rde_doc.inserts.len() + 1);
+    let id = next_insert_id(&rde_doc.inserts);
     let para_id = para_id_for(&format!("{}:figure:{id}", rde_doc.doc_id), index);
     let media_name = format!("word/media/rde-figure-{index}.{ext}");
     let media_target = format!("media/rde-figure-{index}.{ext}");
@@ -1881,6 +2244,7 @@ pub fn add_figure_insert(
         para_id: Some(para_id.clone()),
         style: String::new(),
         format: String::new(),
+            run_style: String::new(),
     };
     let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
     let document_xml = String::from_utf8_lossy(document).to_string();
@@ -2137,6 +2501,8 @@ pub fn restore_document_from_store(
 /// Полный отчёт обновления документа (R-DOC-12): изменения, diff, версия в store.
 #[derive(Clone, Debug, Default)]
 pub struct DocumentUpdateFullReport {
+    /// Сколько таблиц-вставок обновлено (R-DOC-18).
+    pub table_updates: usize,
     pub caption_changes: Vec<CaptionChange>,
     pub insert_updates: Vec<String>,
     pub figure_updates: Vec<String>,
@@ -2156,6 +2522,7 @@ pub fn update_document_transactional(
     values: &BTreeMap<String, String>,
     hashes: &BTreeMap<String, String>,
     images: &BTreeMap<String, (String, Vec<u8>)>,
+    tables: &BTreeMap<String, Vec<Vec<String>>>,
     store: &mut rde_store::Store,
 ) -> Result<DocumentUpdateFullReport, String> {
     let before = load_rde_doc(package)?;
@@ -2171,7 +2538,13 @@ pub fn update_document_transactional(
         let updated = update_figure_images(package, images, hashes)?;
         report.figure_updates = updated.updated;
     }
-    // 3) Перенумерация подписей + refresh/сохранение пакета.
+    // 3) Таблицы вставок из данных артефактов (R-DOC-18).
+    if !tables.is_empty() {
+        update_table_inserts(package, tables)?;
+        report.table_updates = tables.len();
+    }
+    // 4) Перенумерация подписей/перекрёстных ссылок + refresh/сохранение пакета.
+    renumber_insert_captions(package)?;
     let update = update_document_package(package)?;
     report.caption_changes = update.changes;
     if let Some(rde_doc) = &update.rde_doc {
@@ -2179,7 +2552,7 @@ pub fn update_document_transactional(
         report.rde_doc = Some(rde_doc.clone());
     }
     report.package = update.package;
-    // 4) Транзакция store с корнем документа.
+    // 5) Транзакция store с корнем документа.
     let txid = commit_document(project_root, package, doc_id, store, "document update")?;
     report.txid = Some(txid);
     Ok(report)

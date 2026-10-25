@@ -326,6 +326,102 @@ pub fn set_project_authors(root: &Path, authors: &[crate::manifest::AuthorManife
 
 /// Записать `trusted` в `rde.toml`, не трогая остальной файл (R-RUN-06): согласие пользователя
 /// на запуск скриптов проекта. Ключ верхнего уровня — вставляется перед первой таблицей.
+/// Каталог бэкапов проекта: `.rde/backups/`.
+pub fn project_backups_dir(root: &Path) -> PathBuf {
+    root.join(".rde").join("backups")
+}
+
+/// Сделать zip-бэкап проекта (R-VCS-04/R-SET-06): все файлы проекта, кроме служебных
+/// (`.rde`, `exports`, `.git`, `__pycache__`, `.venv`, `node_modules`).
+/// Возвращает путь к архиву.
+pub fn backup_project(root: &Path) -> Result<PathBuf, String> {
+    let dir = project_backups_dir(root);
+    fs::create_dir_all(&dir).map_err(|e| format!("создать {}: {e}", dir.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let mut out = dir.join(format!("project-{stamp}.zip"));
+    let mut suffix = 1u32;
+    while out.exists() {
+        out = dir.join(format!("project-{stamp}-{suffix}.zip"));
+        suffix += 1;
+    }
+    let file = fs::File::create(&out).map_err(|e| format!("создать {}: {e}", out.display()))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = fs::read_dir(&current).map_err(|e| format!("прочитать {}: {e}", current.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if matches!(name.as_str(), ".rde" | "exports" | ".git" | "__pycache__" | ".venv" | "node_modules") {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let relative = path.strip_prefix(root).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
+            zip.start_file(relative, options).map_err(|e| format!("zip {}: {e}", path.display()))?;
+            let mut source = fs::File::open(&path).map_err(|e| format!("открыть {}: {e}", path.display()))?;
+            std::io::copy(&mut source, &mut zip).map_err(|e| format!("zip {}: {e}", path.display()))?;
+        }
+    }
+    zip.finish().map_err(|e| format!("завершить zip: {e}"))?;
+    // Ротация: держим последние 10 бэкапов (R-VCS-04).
+    let mut backups = list_project_backups(root)?;
+    backups.sort();
+    while backups.len() > 10 {
+        let oldest = backups.remove(0);
+        let _ = fs::remove_file(oldest);
+    }
+    Ok(out)
+}
+
+/// Список бэкапов проекта (пути, от старых к новым).
+pub fn list_project_backups(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let dir = project_backups_dir(root);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<PathBuf> = fs::read_dir(&dir)
+        .map_err(|e| format!("прочитать {}: {e}", dir.display()))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("zip"))
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// Восстановить проект из zip-бэкапа: сначала бэкап текущего состояния, затем распаковка
+/// (служебные каталоги `.rde`/`exports` не перезаписываются).
+pub fn restore_project(root: &Path, archive: &Path) -> Result<usize, String> {
+    backup_project(root)?;
+    let file = fs::File::open(archive).map_err(|e| format!("открыть {}: {e}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("прочитать zip: {e}"))?;
+    let mut restored = 0usize;
+    for index in 0..zip.len() {
+        let mut entry = zip.by_index(index).map_err(|e| format!("zip-запись: {e}"))?;
+        let Some(relative) = entry.enclosed_name() else { continue };
+        if relative.components().any(|component| {
+            matches!(component.as_os_str().to_str(), Some(".rde") | Some("exports") | Some(".git"))
+        }) {
+            continue;
+        }
+        let target = root.join(&relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("создать {}: {e}", parent.display()))?;
+        }
+        let mut out = fs::File::create(&target).map_err(|e| format!("записать {}: {e}", target.display()))?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| format!("распаковать {}: {e}", target.display()))?;
+        restored += 1;
+    }
+    Ok(restored)
+}
+
 pub fn set_project_trusted(root: &Path, trusted: bool) -> Result<(), String> {
     let path = root.join("rde.toml");
     let text = fs::read_to_string(&path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
@@ -436,7 +532,7 @@ pub fn create_project(root: &Path, name: &str) -> Result<(), String> {
     }
     let id = new_id();
     let manifest = format!(
-        "schema = \"{}\"\nid = \"{id}\"\nname = {}\ndefault_rebuild = \"manual\"\ndefault_template = \"gost-7.32-2017\"\ntrusted = false\nnetwork_allow = false\n",
+        "schema = \"{}\"\nid = \"{id}\"\nname = {}\ndefault_rebuild = \"manual\"\ndefault_template = \"gost-7.32-2017\"\ntrusted = false\nnetwork_allow = false\ndocument_auto_update = false\n",
         crate::manifest::SCHEMA_PROJECT,
         toml_string(name)
     );

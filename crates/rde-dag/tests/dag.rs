@@ -9,6 +9,7 @@ use rde_store::Store;
 const STATS: &str = "01M5VJ1JG039MMV97SZGY6V9EQ";
 const REALIZATIONS: &str = "01M5VJ1JG0HD99FDTGJ8YEPFZX";
 const PLOT: &str = "01M5VJ1JG0QQJM2S6R76FQCZ25";
+const LINE: &str = "01M5VJ1JG07RAAH8W7QHC1VX6P";
 
 fn tmp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rde-dag-test-{}-{name}", std::process::id()));
@@ -65,9 +66,12 @@ fn update_runs_compute_chain_and_marks_fresh() {
 
     let report = update(&project, &mut store, &UpdateOptions::default()).unwrap();
     assert_eq!(report.failed(), 0, "ошибки: {:?}", report.errors);
-    assert_eq!(report.ran(), 2, "отчёт: {:?}", report.artifacts);
-    assert_eq!(report.artifacts[0].artifact_id, STATS, "топопорядок: статистики раньше графика");
-    assert_eq!(report.artifacts[1].artifact_id, PLOT);
+    assert_eq!(report.ran(), 3, "отчёт: {:?}", report.artifacts);
+    let order: Vec<&str> = report.artifacts.iter().map(|artifact| artifact.artifact_id.as_str()).collect();
+    let stats_pos = order.iter().position(|id| *id == STATS).expect("stats в отчёте");
+    let plot_pos = order.iter().position(|id| *id == PLOT).expect("plot в отчёте");
+    assert!(stats_pos < plot_pos, "топопорядок: статистики раньше графика: {order:?}");
+    assert!(order.iter().any(|id| *id == LINE), "линейный график тоже обновлён: {order:?}");
     assert!(artifact_dir(&project, STATS).join("out/stats.json").is_file());
     assert!(artifact_dir(&project, PLOT).join("out/plot.svg").is_file());
     assert!(store.stats().unwrap().blobs >= 2);
@@ -82,7 +86,7 @@ fn update_runs_compute_chain_and_marks_fresh() {
     let txs_before = store.stats().unwrap().txs;
     let report = update(&project, &mut store, &UpdateOptions::default()).unwrap();
     assert_eq!(report.ran(), 0, "{:?}", report.artifacts);
-    assert_eq!(report.skipped(), 2);
+    assert_eq!(report.skipped(), 3);
     assert_eq!(store.stats().unwrap().txs, txs_before, "не должно быть новых транзакций");
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -113,7 +117,7 @@ fn input_change_marks_downstream_stale_and_recomputes() {
 
     let report = update(&project, &mut store, &UpdateOptions::default()).unwrap();
     assert_eq!(report.failed(), 0, "{:?}", report.errors);
-    assert_eq!(report.ran(), 2, "stats и зависимый plot должны пересчитаться: {:?}", report.artifacts);
+    assert_eq!(report.ran(), 3, "stats и зависимые plot/line должны пересчитаться: {:?}", report.artifacts);
 
     let project = load_project(&root).unwrap();
     let statuses = evaluate(&project, &store).unwrap();
@@ -455,7 +459,7 @@ fn batch_update_commits_single_transaction_with_roots() {
     let options = UpdateOptions { batch: true, ..UpdateOptions::default() };
     let report = update(&project, &mut store, &options).unwrap();
     assert_eq!(report.failed(), 0, "{:?}", report.errors);
-    assert_eq!(report.ran(), 2);
+    assert_eq!(report.ran(), 3);
     assert_eq!(report.tx_ids.len(), 1, "пачка — одна транзакция: {:?}", report.tx_ids);
     let roots = store.current_roots().unwrap();
     assert!(roots.get(&format!("artifact/{STATS}")).is_some(), "корень stats: {:?}", roots.names().collect::<Vec<_>>());
@@ -526,7 +530,7 @@ fn rollback_before_first_run_resets_artifact() {
 
     let project = load_project(&root).unwrap();
     let outcome = rde_dag::rollback(&project, &mut store, None).unwrap().expect("откат первой пачки");
-    assert_eq!(outcome.reset.len(), 2, "{outcome:?}");
+    assert_eq!(outcome.reset.len(), 3, "{outcome:?}");
     assert!(!stats_out.exists(), "выходы удалены (артефакт ещё не запускался)");
     let manifest = std::fs::read_to_string(artifact_dir(&project, STATS).join("artifact.toml")).unwrap();
     assert!(!manifest.contains("out_hash"), "out_hash снят при откате к «не запускался»");
@@ -799,5 +803,36 @@ fn insert_targets_resolve_values_and_images() {
     assert!(rde_dag::resolve_insert_text(&project, &store, "rde://artifact/NOPE/out/x.json").is_err());
     assert!(rde_dag::resolve_insert_text(&project, &store, &format!("rde://artifact/{STATS}/out/stats.json#/nope")).is_err());
     assert!(rde_dag::parse_insert_target("bad-uri").is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolves_constants_and_csv_tables_for_inserts() {
+    if !python_available() {
+        return;
+    }
+    let (root, project) = demo_copy("resolve-inserts");
+    let mut store = Store::open(&root).unwrap();
+    update(&project, &mut store, &UpdateOptions { batch: true, ..UpdateOptions::default() }).unwrap();
+    let project = load_project(&root).unwrap();
+    let constants = project
+        .objects
+        .iter()
+        .find(|object| matches!(&object.data, rde_core::ObjectData::Artifact(artifact) if artifact.kind == "constants"))
+        .expect("константы в демо");
+    let uri = format!("rde://constants/{}/R_n", constants.id);
+    let (text, run_style, hash) = rde_dag::resolve_insert_constant(&project, &uri).unwrap();
+    assert_eq!(text, "R_н");
+    assert_eq!(run_style, "italic-subscript");
+    assert!(!hash.is_empty());
+    let stats = project
+        .objects
+        .iter()
+        .find(|object| matches!(&object.data, rde_core::ObjectData::Artifact(artifact) if artifact.title.contains("Статистики")))
+        .expect("статистики");
+    let table_uri = format!("rde://artifact/{}/out/summary.csv", stats.id);
+    let (rows, _hash) = rde_dag::resolve_insert_table(&project, &store, &table_uri).unwrap();
+    assert!(rows.len() >= 2, "строки CSV: {rows:?}");
+    assert!(rows[0].len() >= 2, "колонки CSV: {rows:?}");
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -5,6 +5,7 @@ default_rebuild = "manual"
 default_template = "free"
 trusted = true
 network_allow = false
+document_auto_update = false
 
 [[authors]]
 id = "01M5VJ1JG0YAJDSX5VK7TBXABK"

@@ -12,15 +12,15 @@ v0.10.0 (git-субмодуль).
 
 ## Вехи
 
-Текущая: **P6 «Доработки по обратной связи»** (после P5, прототип v0.1) — рисунки из SVG
-растеризуются для DocView, вставки получают стиль обычного текста шаблона и настраиваемый формат
-значения (`int/dec:N/sci:N/percent:N`), кнопка «Открыть» артефакта открывает рабочее место с
-разделами «Входные данные / Генерация / Результат генерации» (правка входов, скрипта, params,
-outputs; превью выходов, логи, provenance). Exit-критерий v0.1: [`docs/exit-v0.1.md`](docs/exit-v0.1.md).
+Текущая: **P7 «Демо-полигон и автоматизация»** (после P5, прототип v0.1) — все виды вставок
+R-DOC-11 в демо (значение/2 рисунка/таблица из CSV/константа с rich-форматом/перекрёстная
+ссылка/цитата/дата), автообновление артефактов и документа (R-DOC-12/R-ART-03), zip-бэкапы проекта
+и откат обновлений (R-VCS-04), панель документа RDE над DocView, редактор констант (R-ART-09).
+Exit-критерий v0.1: [`docs/exit-v0.1.md`](docs/exit-v0.1.md).
 Предыдущие: M1 (`m1-concept`), S5 (`s5-docview`), M2.1 (`m2.1-project-model`), M2.2 (`m2.2-store`),
 M2.3 (`m2.3-run-dag`), M2.4 (`m2.4-ui`), M3 (`m3-doc`), M4 (`m4-templates`), M5 (`m5-sources-review`),
 M6 (`ui-live`), P1 (`p1-artifacts`), P2 (`p2-store`), P3 (`p3-run-env`), P4 (`p4-doc-live`),
-P5 (`p5-gates`), P6 (`p6-feedback`).
+P5 (`p5-gates`), P6 (`p6-feedback`), P7 (`p7-feedback-fixes`, `p7-polygon`).
 История и критерии вех: [`docs/milestones.md`](docs/milestones.md).
 
 ## Что уже есть в прототипе
@@ -44,6 +44,7 @@ P5 (`p5-gates`), P6 (`p6-feedback`).
 | Документ (P4) | **работает**: §8.5 wiring (root-rels/tombstone/paraId), живые вставки значения/рисунка из артефакта в `w:sdt`, «Обновить документ» из выходов, транзакция + бэкапы + diff + откат |
 | VCS/настройки/гейты (P5) | **работает**: git init/status/commit/revert/log, `.gitignore`/`.gitattributes`, настройки приложения и авторы, i18n-каркас ru/en, экспорт диагностики, OPC-гейт, корпус docx, `xtask`/CI, перф 10k |
 | Артефакт как рабочее место (P6) | **работает**: входные данные (группы/входы), генерация (runtime/params/outputs/скрипт), результат (превью выходов, логи, provenance), кнопки обновления/отката; вставки в документ — стиль шаблона + формат значения |
+| Демо-полигон и автоматизация (P7) | **работает**: все виды вставок (включая таблицу из CSV, константы, ссылки, цитаты), панель документа в DocView, автообновление, zip-бэкапы/восстановление проекта, откат обновлений, редактор констант |
 | MCP-сервер, ACP-агент | **следующие итерации** (v0.3, см. `.agent/plan-v01.md`) |
 | S5 (чистый DocView) | ✅ первая версия: feature `rde-docview` в форк-ветке WordCraft; см. `docs/wordcraft-fork.md` |
 
@@ -54,7 +55,7 @@ P5 (`p5-gates`), P6 (`p6-feedback`).
 Тесты (включая автотест клавиатурного ввода в DocView и RDE-сохранения):
 
 ```bash
-cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-ui   # 141 тестов: модель, хеши (JCS/property), store (kill -9/транзакции/откат/GC), окружения, запуск (безопасность/provenance), DAG (property), .doc.rde (§8.5/вставки/транзакция), docx-гейты/OPC, ГОСТ, источники/PDF/OCR, VCS, настройки/i18n, UI
+cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-ui   # 145 тестов: модель, хеши (JCS/property), store (kill -9/транзакции/откат/GC), окружения, запуск (безопасность/provenance), DAG (property), .doc.rde (§8.5/вставки/транзакция), docx-гейты/OPC, ГОСТ, источники/PDF/OCR, VCS, настройки/i18n, UI
 ```
 
 ```bash

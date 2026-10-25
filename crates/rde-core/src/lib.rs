@@ -25,7 +25,7 @@ pub use manifest::{
 pub use ops::{
     CreateRequest, NewObjectKind, clear_artifact_out_hash, create_document_stub, create_object,
     create_project, delete_object, record_artifact_out_hash, rename_object, set_project_authors,
-    set_project_trusted, write_artifact_manifest,
+    backup_project, list_project_backups, restore_project, set_project_trusted, write_artifact_manifest,
 };
 pub use project::{
     Freshness, Group, Issue, Level, LogLine, Object, ObjectData, ObjectKind, Project, load_project,
@@ -73,14 +73,14 @@ mod tests {
     use super::*;
     use crate::manifest::{self, ManifestKind};
 
-    fn unique_tmp(name: &str) -> PathBuf {
+    pub(crate) fn unique_tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rde-core-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn copy_demo_without_generated_state(target: &std::path::Path) {
+    pub(crate) fn copy_demo_without_generated_state(target: &std::path::Path) {
         fn copy(src: &std::path::Path, dst: &std::path::Path) {
             std::fs::create_dir_all(dst).unwrap();
             for entry in std::fs::read_dir(src).unwrap().flatten() {
@@ -110,13 +110,13 @@ mod tests {
         assert!(project.issues.is_empty(), "issues: {:?}", project.issues);
         assert_eq!(
             project.object_count(),
-            10,
-            "демо-проект: 1 документ + 4 артефакта + 3 источника + 1 заметка + 1 репозиторий"
+            11,
+            "демо-проект: 1 документ + 5 артефактов + 4 источника + 1 заметка + 1 репозиторий"
         );
         // compute-артефакты без выходов честно «устарели»; данные/источники/заметки — актуальны/внешние.
-        assert_eq!(project.stale_count(), 2);
+        assert_eq!(project.stale_count(), 3);
         assert!(project.document_path().is_some_and(|p| p.is_file()));
-        assert_eq!(project.artifacts().count(), 4);
+        assert_eq!(project.artifacts().count(), 5);
         // Порядок артефактов топологический: realizations → stats → plot.
         let artifacts: Vec<&str> = project.artifacts().map(|a| a.title.as_str()).collect();
         let pos = |title: &str| artifacts.iter().position(|t| *t == title).unwrap();
@@ -139,7 +139,8 @@ mod tests {
         assert!(edges.contains(&(real_id, stats_id)));
         // Константа из artifact type=constants попадает в группу «Константы».
         assert!(project.groups.iter().any(|g| g.kind == ObjectKind::Constants && !g.objects.is_empty()));
-        assert_eq!(project.figures(), 1);
+        // В демо теперь несколько рисунков (миграция + гистограмма + линия).
+        assert!(project.figures() >= 2, "рисунков: {}", project.figures());
         assert!(!project.log.is_empty());
     }
 
@@ -315,6 +316,29 @@ mod tests {
         assert_eq!(manifest.hashed_inputs().next().unwrap().0.name, "consts");
         // Нет файла-входа — но константы есть, поэтому вход присутствует.
         assert_eq!(object.freshness, Freshness::Stale, "выходов нет — устарел");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+    use crate::tests::{copy_demo_without_generated_state, unique_tmp};
+
+    #[test]
+    fn project_backup_zip_roundtrip() {
+        let dir = unique_tmp("backup");
+        copy_demo_without_generated_state(&dir);
+        let archive = backup_project(&dir).expect("бэкап проекта");
+        assert!(archive.is_file(), "архив создан: {}", archive.display());
+        assert!(list_project_backups(&dir).unwrap().contains(&archive));
+        // Меняем файл, затем восстанавливаем из бэкапа.
+        let manifest = dir.join("rde.toml");
+        let original = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(&manifest, "schema = \"broken\"\n").unwrap();
+        let restored = restore_project(&dir, &archive).expect("восстановление");
+        assert!(restored > 0);
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), original, "rde.toml восстановлен");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

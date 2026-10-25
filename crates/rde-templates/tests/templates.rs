@@ -74,6 +74,7 @@ fn apply_gost_sets_page_margins_and_paragraph_styles() {
             heading_checked = true;
         } else if paragraph.objects.iter().any(|object| matches!(object, InlineObject::Image { .. }))
             || paragraph.text.trim_start().starts_with("Рисунок")
+            || paragraph.text.trim_start().starts_with("Таблица")
         {
             assert_eq!(paragraph.props.align, Some(Align::Center));
             if !paragraph.objects.iter().any(|object| matches!(object, InlineObject::Image { .. })) {

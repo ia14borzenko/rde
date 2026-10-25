@@ -1,5 +1,5 @@
 {
-  "source": "/tmp/rde-docx-example-258018/clean.docx",
+  "source": "/tmp/rde-docx-example-292133/clean.docx",
   "source_parts": 11,
   "roundtrip_parts": 11,
   "missing": [],
@@ -10,12 +10,12 @@
   ],
   "critical_missing": [],
   "media_preserved": true,
-  "paragraphs_source": 19,
-  "paragraphs_roundtrip": 19,
+  "paragraphs_source": 42,
+  "paragraphs_roundtrip": 42,
   "lo": {
     "available": true,
     "version": "LibreOffice 26.2.6.3 620(Build:3)",
-    "pdf_bytes": 130274,
+    "pdf_bytes": 152802,
     "pdf_is_valid": true,
     "error": null
   },
@@ -25,5 +25,5 @@
     "xml_parts": 8,
     "errors": []
   },
-  "generated_unix": 1792920629
+  "generated_unix": 1792923213
 }

@@ -1600,6 +1600,107 @@ pub fn resolve_insert_image(project: &Project, store: &Store, uri: &str) -> Resu
     Ok((path, ext, hash))
 }
 
+/// Разрешить вставку константы (`rde://constants/<object_id>/<key>`, R-ART-09/R-DOC-11):
+/// возвращает (текст для документа, подсказка rich-формата, hash значения).
+pub fn resolve_insert_constant(project: &Project, uri: &str) -> Result<(String, String, String), String> {
+    let rest = uri
+        .strip_prefix("rde://constants/")
+        .ok_or_else(|| format!("URI константы должен начинаться с rde://constants/: {uri}"))?;
+    let (object_id, key) = rest
+        .split_once('/')
+        .ok_or_else(|| format!("в URI константы нет ключа значения: {uri}"))?;
+    let object = project
+        .artifact_object(object_id)
+        .ok_or_else(|| format!("объект констант {object_id} не найден"))?;
+    let ObjectData::Artifact(manifest) = &object.data else {
+        return Err(format!("{object_id} — не артефакт констант"));
+    };
+    if manifest.kind != "constants" {
+        return Err(format!("{object_id} не является объектом констант (type = {})", manifest.kind));
+    }
+    let value = manifest
+        .values
+        .get(key)
+        .ok_or_else(|| format!("константа `{key}` не найдена в {}", manifest.title))?;
+    let text = if !value.display.is_empty() {
+        value.display.clone()
+    } else if value.unit.is_empty() {
+        rde_doc_format_number(value.value)
+    } else {
+        format!("{} {}", rde_doc_format_number(value.value), value.unit)
+    };
+    let hash = sha256(format!("{}|{}|{}|{}", value.value, value.unit, value.display, value.style).as_bytes()).hex();
+    Ok((text, value.style.clone(), hash))
+}
+
+/// Число для константы: целое без «.0», иначе до 4 знаков.
+fn rde_doc_format_number(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        let mut text = format!("{value:.4}");
+        while text.ends_with('0') && text.contains('.') {
+            text.pop();
+        }
+        text
+    }
+}
+
+/// Разрешить вставку таблицы (`rde://artifact/<id>@<out_hash>/<csv-путь>`): строки + hash данных.
+pub fn resolve_insert_table(project: &Project, store: &Store, uri: &str) -> Result<(Vec<Vec<String>>, String), String> {
+    let target = parse_insert_target(uri)?;
+    let object = project
+        .artifact_object(&target.artifact_id)
+        .ok_or_else(|| format!("артефакт {} не найден", target.artifact_id))?;
+    let file_part = target.selector.split('#').next().unwrap_or(&target.selector).to_owned();
+    let path = object.dir.join(&file_part);
+    let bytes = fs::read(&path).map_err(|e| format!("прочитать данные таблицы {}: {e}", path.display()))?;
+    let hash = target
+        .out_hash
+        .clone()
+        .or_else(|| artifact_out_hash(project, store, &target.artifact_id))
+        .unwrap_or_else(|| sha256(&bytes).hex());
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    Ok((parse_csv(&text), hash))
+}
+
+/// Простой CSV-парсер (запятая, кавычки, переносы строк) для таблиц из данных артефактов.
+pub fn parse_csv(text: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted => {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    quoted = false;
+                }
+            }
+            '"' if field.is_empty() && !quoted => quoted = true,
+            ',' if !quoted => row.push(std::mem::take(&mut field)),
+            '\r' if !quoted => {}
+            '\n' if !quoted => {
+                row.push(std::mem::take(&mut field));
+                if !(row.len() == 1 && row[0].is_empty()) {
+                    rows.push(std::mem::take(&mut row));
+                }
+                row.clear();
+            }
+            other => field.push(other),
+        }
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
 /// Удобный хелпер: идентификаторы устаревших compute-артефактов в топологическом порядке.
 pub fn stale_artifacts(project: &Project, store: &Store) -> Result<Vec<String>, String> {
     let statuses = evaluate(project, store)?;

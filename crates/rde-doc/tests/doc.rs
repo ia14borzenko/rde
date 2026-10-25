@@ -48,6 +48,7 @@ fn rde_doc_xml_roundtrip_handles_unicode_and_escapes() {
             para_id: Some("5E6F7A8B".into()),
             style: "Normal".into(),
             format: "dec:1".into(),
+            run_style: String::new(),
         }],
         review: RdeReview { open: 2, resolved: 5 },
         updated_unix: 42,
@@ -405,6 +406,7 @@ fn live_insert_value_is_sdt_and_updates() {
             caption: "Среднее x1".into(),
             style: "Normal".into(),
             format: "dec:1".into(),
+            run_style: String::new(),
         },
     )
     .unwrap();
@@ -486,6 +488,7 @@ fn sdt_and_figure_survive_document_update() {
             caption: "среднее".into(),
             style: String::new(),
             format: "auto".into(),
+            run_style: String::new(),
         },
     )
     .unwrap();
@@ -601,6 +604,7 @@ fn inserts_use_body_text_formatting_of_current_document() {
             caption: "Среднее x1".into(),
             style: String::new(),
             format: "dec:2".into(),
+            run_style: String::new(),
         },
     )
     .unwrap();
@@ -641,5 +645,124 @@ fn inserts_use_body_text_formatting_of_current_document() {
         assert!(paragraph.contains(&format!("w:pStyle w:val=\"{}\"", style.id)), "pStyle {style:?}: {paragraph}");
         assert!(paragraph.contains("w:rFonts"), "у run'ов есть шрифт: {paragraph}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn table_insert_update_and_crossref_numbering() {
+    let dir = tmp("table-insert");
+    let clean = dir.join("clean.docx");
+    copy_file(&demo_docx(), &clean);
+    let mut rde_doc = build_rde_doc(&clean, "01TESTDOC", "gost-7.32-2017").unwrap();
+    let package = dir.join("report.doc.rde");
+    write_package(&clean, &mut rde_doc, &package).unwrap();
+    // Таблица из данных артефакта (R-DOC-18).
+    let rows = vec![
+        vec!["величина".to_owned(), "среднее".to_owned()],
+        vec!["x1".to_owned(), "0.999".to_owned()],
+        vec!["x2".to_owned(), "1.200".to_owned()],
+    ];
+    let report = add_table_insert(
+        &package,
+        InsertRequest {
+            kind: "table".into(),
+            target: "rde://artifact/01A/out/summary.csv".into(),
+            selector: "out/summary.csv".into(),
+            value_kind: "table".into(),
+            cached: String::new(),
+            caption: "Сводные статистики".into(),
+            style: String::new(),
+            format: String::new(),
+            run_style: String::new(),
+        },
+        &rows,
+    )
+    .unwrap();
+    let table_id = report.insert.id.clone();
+    let read_document = || {
+        let file = std::fs::File::open(&package).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut part = zip.by_name("word/document.xml").unwrap();
+        let mut text = String::new();
+        use std::io::Read;
+        part.read_to_string(&mut text).unwrap();
+        text
+    };
+    let document = read_document();
+    assert_eq!(document.matches("<w:tbl>").count(), 1, "таблица записана в документ");
+    assert!(document.contains("0.999"), "данные таблицы: {document}");
+    assert!(document.contains("Сводные статистики"), "подпись таблицы: {document}");
+    // Обновление данных таблицы (новые строки заменяют старые).
+    let mut tables = std::collections::BTreeMap::new();
+    tables.insert(table_id.clone(), vec![vec!["итог".to_owned()], vec!["42".to_owned()]]);
+    update_table_inserts(&package, &tables).unwrap();
+    let document = read_document();
+    assert!(document.contains("42") && !document.contains("0.999"), "таблица обновлена: {document}");
+    // Перекрёстная ссылка на таблицу: номер по актуальной нумерации.
+    let crossref = add_insert(
+        &package,
+        InsertRequest {
+            kind: "crossref".into(),
+            target: format!("rde://insert/{table_id}"),
+            selector: String::new(),
+            value_kind: "text".into(),
+            cached: "Таблица 1".into(),
+            caption: "см. таблицу".into(),
+            style: String::new(),
+            format: "raw".into(),
+            run_style: String::new(),
+        },
+    )
+    .unwrap();
+    renumber_insert_captions(&package).unwrap();
+    let document = read_document();
+    assert!(document.contains("Таблица 1 — Сводные статистики"), "подпись перенумерована: {document}");
+    let rde_doc = load_rde_doc(&package).unwrap();
+    let crossref_insert = rde_doc.inserts.iter().find(|insert| insert.id == crossref.insert.id).unwrap();
+    assert_eq!(crossref_insert.cached, "Таблица 1", "ссылка на таблицу");
+    let document = read_document();
+    let tag = format!("<w:tag w:val=\"rde:{}\"", crossref.insert.id);
+    let index = document.find(&tag).unwrap();
+    let sdt_content = &document[index..document[index..].find("</w:sdtContent>").unwrap() + index];
+    assert!(sdt_content.contains("Таблица 1"), "текст ссылки в документе: {sdt_content}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn constant_insert_uses_rich_formatting() {
+    let dir = tmp("constant-insert");
+    let clean = dir.join("clean.docx");
+    copy_file(&demo_docx(), &clean);
+    let mut rde_doc = build_rde_doc(&clean, "01TESTDOC", "gost-7.32-2017").unwrap();
+    let package = dir.join("report.doc.rde");
+    write_package(&clean, &mut rde_doc, &package).unwrap();
+    let report = add_insert(
+        &package,
+        InsertRequest {
+            kind: "constant".into(),
+            target: "rde://constants/01C/R_n".into(),
+            selector: "R_n".into(),
+            value_kind: "text".into(),
+            cached: "R_н".into(),
+            caption: "Удельное сопротивление".into(),
+            style: String::new(),
+            format: "raw".into(),
+            run_style: "italic-subscript".into(),
+        },
+    )
+    .unwrap();
+    let file = std::fs::File::open(&package).unwrap();
+    let mut zip = zip::ZipArchive::new(file).unwrap();
+    let mut part = zip.by_name("word/document.xml").unwrap();
+    let mut document = String::new();
+    use std::io::Read;
+    part.read_to_string(&mut document).unwrap();
+    let tag = format!("<w:tag w:val=\"rde:{}\"", report.insert.id);
+    let index = document.find(&tag).unwrap();
+    let sdt = &document[index..document[index..].find("</w:sdt>").unwrap() + index];
+    assert!(sdt.contains("<w:i/>"), "курсив: {sdt}");
+    assert!(sdt.contains("w:vertAlign w:val=\"subscript\""), "подстрочный индекс: {sdt}");
+    // Значение — до «_» обычное, после — подстрочное.
+    assert!(sdt.contains(">R<") && sdt.contains(">н<"), "{sdt}");
     let _ = std::fs::remove_dir_all(&dir);
 }
