@@ -56,6 +56,13 @@ const LIGHT_GREEN: Color32 = Color32::from_rgb(0x1b, 0x6e, 0x3e);
 const LIGHT_AMBER: Color32 = Color32::from_rgb(0x8a, 0x58, 0x00);
 const LIGHT_RED: Color32 = Color32::from_rgb(0xb4, 0x34, 0x2a);
 
+// Заливки primary-кнопок (стиль 2): hover/active светлее/темнее ACCENT; текст на ACCENT
+// — тёмный BG в тёмной теме (5.7:1, белый давал 3.2:1), белый в светлой (6.2:1).
+const ACCENT_HOVER: Color32 = Color32::from_rgb(0x6a, 0x9c, 0xff);
+const ACCENT_ACTIVE: Color32 = Color32::from_rgb(0x4a, 0x84, 0xf2); // 5.1:1 с BG (тест primary_button_*)
+const LIGHT_ACCENT_HOVER: Color32 = Color32::from_rgb(0x3a, 0x6a, 0xd6);
+const LIGHT_ACCENT_ACTIVE: Color32 = Color32::from_rgb(0x23, 0x4e, 0xa8);
+
 /// Цветовые роли оболочки под текущую тему. Вся отрисовка берёт цвета отсюда
 /// через `theme_colors`, сырые константы палитр напрямую используют только
 /// `dark_visuals()` / `light_visuals()`.
@@ -71,6 +78,10 @@ struct ThemeColors {
     green: Color32,
     amber: Color32,
     red: Color32,
+    /// Текст поверх заливки ACCENT (primary-кнопки).
+    on_accent: Color32,
+    accent_hover: Color32,
+    accent_active: Color32,
 }
 
 /// Палитра под эффективную тему (`ctx.theme()` уже учитывает System:
@@ -88,6 +99,9 @@ fn theme_colors(theme: egui::Theme) -> ThemeColors {
             green: GREEN,
             amber: AMBER,
             red: RED,
+            on_accent: BG,
+            accent_hover: ACCENT_HOVER,
+            accent_active: ACCENT_ACTIVE,
         },
         egui::Theme::Light => ThemeColors {
             bg: LIGHT_BG,
@@ -100,6 +114,9 @@ fn theme_colors(theme: egui::Theme) -> ThemeColors {
             green: LIGHT_GREEN,
             amber: LIGHT_AMBER,
             red: LIGHT_RED,
+            on_accent: Color32::WHITE,
+            accent_hover: LIGHT_ACCENT_HOVER,
+            accent_active: LIGHT_ACCENT_ACTIVE,
         },
     }
 }
@@ -134,6 +151,42 @@ const FS_SMALL: f32 = 12.0; // второстепенный текст
 const FS_CAPTION: f32 = 11.0; // нижняя граница мелкого текста
 const FS_MONO: f32 = 11.5; // моноширинный текст
 
+// ── иконки (Phosphor, MIT; сабсет шрифта `fonts/RdeIcons.ttf`, см. PHOSPHOR-LICENSE.txt) ──
+// Глифы — обычный текст: цвет берётся от текста/состояния кнопки, размер — от FS_*.
+const IC_OPEN: &str = "\u{e256}"; // folder-open
+const IC_RENAME: &str = "\u{e3b4}"; // pencil-simple
+const IC_DELETE: &str = "\u{e4a6}"; // trash
+const IC_UPDATE: &str = "\u{e036}"; // arrow-clockwise
+const IC_SAVE: &str = "\u{e248}"; // floppy-disk
+const IC_EXPORT: &str = "\u{eaf0}"; // export
+const IC_SEARCH: &str = "\u{e30c}"; // magnifying-glass
+const IC_ADD: &str = "\u{e3d4}"; // plus
+const IC_DOC: &str = "\u{e23a}"; // file-text
+const IC_ARTIFACT: &str = "\u{e1da}"; // cube
+const IC_SOURCE: &str = "\u{e758}"; // books
+const IC_NOTE: &str = "\u{e34c}"; // note-pencil
+const IC_CONST: &str = "\u{ec80}"; // pi
+const IC_REPO: &str = "\u{e278}"; // git-branch
+const IC_FOLDER: &str = "\u{e24a}"; // folder
+const IC_CHECK: &str = "\u{e182}"; // check
+const IC_INSPECT: &str = "\u{ec24}"; // sidebar-simple
+const IC_CLOSE: &str = "\u{e4f6}"; // x
+const IC_TREE: &str = "\u{e67c}"; // tree-structure
+const IC_CODE: &str = "\u{e914}"; // file-code
+const IC_DOWNLOAD: &str = "\u{e1ac}"; // cloud-arrow-down
+
+/// Иконка строки дерева по типу объекта (вместо буквенной «аватарки» rde-core).
+fn kind_icon(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Document => IC_DOC,
+        ObjectKind::Artifact => IC_ARTIFACT,
+        ObjectKind::Constants => IC_CONST,
+        ObjectKind::Source => IC_SOURCE,
+        ObjectKind::Note => IC_NOTE,
+        ObjectKind::Repository => IC_REPO,
+    }
+}
+
 /// Вкладки центральной области.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -159,11 +212,11 @@ impl Tab {
 
     fn icon(self) -> &'static str {
         match self {
-            Tab::Document => "",
-            Tab::Structure => "",
-            Tab::Artifacts => "",
-            Tab::Source => "",
-            Tab::Code => "</>",
+            Tab::Document => IC_DOC,
+            Tab::Structure => IC_TREE,
+            Tab::Artifacts => IC_ARTIFACT,
+            Tab::Source => IC_SOURCE,
+            Tab::Code => IC_CODE,
         }
     }
 }
@@ -1847,6 +1900,15 @@ impl RdeApp {
             install_fonts(ui.ctx());
             self.fonts_installed = true;
         }
+        // Не в первом кадре: там `fonts()` ещё отдаёт дефолты egui, и наш set_fonts перебил бы
+        // установку выше (семья semibold пропала бы).
+        if self.ui_frames > 1 {
+            ensure_icon_fonts(ui.ctx());
+        }
+        // Со второго кадра шрифты оболочки действуют → можно звать `semibold` (bold_family).
+        if self.ui_frames > 1 {
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(FONTS_READY_ID), true));
+        }
         // Тема применяется каждый кадр: живой предпросмотр из открытого диалога
         // настроек + WordCraft перекрашивает глобальные visuals в своём `logic`,
         // поэтому оболочка восстанавливает свои после него.
@@ -2180,57 +2242,60 @@ impl RdeApp {
         let running = self.update_job.is_some();
         let running_secs = self.update_job.as_ref().map(|job| job.started.elapsed().as_secs_f32()).unwrap_or(0.0);
         egui::Panel::top("rde_toolbar")
-            .frame(egui::Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(12, 4)))
+            // Отступ 2 (не 4): кнопки 32 px должны влезать в фиксированные 36 px панели.
+            .frame(egui::Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(12, 2)))
             .exact_size(36.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            !running,
-                            egui::Button::new(RichText::new(tr(self.lang, "toolbar.update_all")).color(Color32::WHITE)).fill(pal.accent),
-                        )
-                        .on_hover_text("Реально пересчитать устаревшие артефакты (rde-dag: act_key/out_hash, транзакции)")
-                        .clicked()
-                    {
-                        update_all = true;
-                    }
-                    if running {
-                        ui.label(RichText::new(format!("● обновление… {running_secs:.0} с")).small().color(pal.amber));
-                        if ui
-                            .add(egui::Button::new(RichText::new("Отменить").color(pal.text)).fill(pal.panel_hi))
-                            .on_hover_text("Остановить текущий запуск (SIGTERM → grace → SIGKILL) и отменить обновление")
-                            .clicked()
-                        {
-                            cancel_update = true;
-                        }
-                    }
-                    if ui
-                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.export_docx")).color(pal.text)).fill(pal.panel_hi))
-                        .on_hover_text("Собрать чистый .docx из .doc.rde")
-                        .clicked()
-                    {
-                        export = true;
-                    }
-                    if ui
-                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.save_project")).color(pal.text)).fill(pal.panel_hi))
+                    // Группы: [Проект] | [Объект] | [Документ] | [Обновления] — разделители между ними.
+                    if btn(ui, Role::Secondary, Some(IC_SAVE), tr(self.lang, "toolbar.save_project"))
                         .on_hover_text("Записать документ в .doc.rde (RDE — владелец сохранения)")
                         .clicked()
                     {
                         save_project = true;
                     }
-                    if ui
-                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.update_document")).color(pal.text)).fill(pal.panel_hi))
+                    if btn(ui, Role::Ghost, Some(IC_EXPORT), tr(self.lang, "toolbar.export_docx"))
+                        .on_hover_text("Собрать чистый .docx из .doc.rde")
+                        .clicked()
+                    {
+                        export = true;
+                    }
+                    ui.separator();
+                    if btn(ui, Role::Secondary, Some(IC_ADD), tr(self.lang, "toolbar.new_object")).clicked() {
+                        new_object = true;
+                    }
+                    if btn(ui, Role::Ghost, Some(IC_SEARCH), tr(self.lang, "toolbar.search"))
+                        .on_hover_text("Поиск по объектам (Ctrl+F)")
+                        .clicked()
+                    {
+                        search_clicked = true;
+                    }
+                    ui.separator();
+                    if btn(ui, Role::Secondary, Some(IC_DOC), tr(self.lang, "toolbar.update_document"))
                         .on_hover_text("Перенумеровать подписи/обновить вставки и пересохранить .doc.rde")
                         .clicked()
                     {
                         update_document = true;
                     }
                     ui.separator();
-                    if ui.button(RichText::new(tr(self.lang, "toolbar.new_object")).size(FS_BODY)).clicked() {
-                        new_object = true;
+                    // Единственный primary в тулбаре: пересчёт устаревших артефактов.
+                    let update_resp = ui
+                        .add_enabled_ui(!running, |ui| {
+                            btn(ui, Role::Primary, Some(IC_UPDATE), tr(self.lang, "toolbar.update_all"))
+                                .on_hover_text("Реально пересчитать устаревшие артефакты (rde-dag: act_key/out_hash, транзакции)")
+                        })
+                        .inner;
+                    if update_resp.clicked() {
+                        update_all = true;
                     }
-                    if ui.button(RichText::new(tr(self.lang, "toolbar.search")).size(FS_BODY)).on_hover_text("Поиск по объектам (Ctrl+F)").clicked() {
-                        search_clicked = true;
+                    if running {
+                        ui.label(RichText::new(format!("● обновление… {running_secs:.0} с")).small().color(pal.amber));
+                        if btn(ui, Role::Danger, None, "Отменить")
+                            .on_hover_text("Остановить текущий запуск (SIGTERM → grace → SIGKILL) и отменить обновление")
+                            .clicked()
+                        {
+                            cancel_update = true;
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(format!("• {} устаревших объектов", self.project.stale_count())).small().color(pal.amber));
@@ -2422,7 +2487,7 @@ impl RdeApp {
             .frame(egui::Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("ПРОЕКТ").small().strong().color(pal.muted));
+                    section_caption(ui, "Проект");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("×").on_hover_text("Скрыть панель (вернуть — меню «Вид»)").clicked() {
                             hide_tree = true;
@@ -2443,7 +2508,7 @@ impl RdeApp {
                     self.tree_filter.clear();
                 }
                 ui.add_space(2.0);
-                if ui.add(egui::Button::new(RichText::new("+ Новый объект").size(FS_BUTTON)).fill(pal.panel_hi)).clicked() {
+                if btn(ui, Role::Secondary, Some(IC_ADD), "Новый объект").clicked() {
                     new_object = true;
                 }
                 ui.add_space(4.0);
@@ -2458,14 +2523,14 @@ impl RdeApp {
                         if visible.is_empty() {
                             continue;
                         }
-                        let header = RichText::new(format!("{}  {}  · {}", group.kind.icon(), group.title, visible.len())).strong().size(12.5).color(pal.text);
+                        let header = RichText::new(format!("{}  {}  · {}", kind_icon(group.kind), group.title, visible.len())).strong().size(12.5).color(pal.text);
                         egui::CollapsingHeader::new(header).default_open(true).show(ui, |ui| {
                             for obj in visible {
                                 let is_sel = selected.as_deref() == Some(obj.id.as_str());
                                 let resp = ui
                                     .horizontal(|ui| {
                                         ui.label(RichText::new("●").color(freshness_color(obj.freshness, pal)).size(FS_CAPTION));
-                                        ui.label(RichText::new(obj.kind.icon()).color(pal.muted).size(12.0));
+                                        ui.label(RichText::new(kind_icon(obj.kind)).color(pal.muted).size(FS_BODY));
                                         // Панель можно сузить: длинные названия обрезаются с «…»,
                                         // полное название — в подсказке и в инспекторе.
                                         ui.add(egui::Button::selectable(is_sel, RichText::new(&obj.title).size(FS_BODY)).truncate())
@@ -2548,7 +2613,9 @@ impl RdeApp {
                     }
                     ui.add_space(6.0);
                     if filter.is_empty() && groups.iter().all(|group| group.objects.is_empty()) {
-                        ui.label(RichText::new("В проекте пока нет объектов").small().color(pal.muted));
+                        if empty_state(ui, IC_FOLDER, "В проекте пока нет объектов", Some((IC_ADD, "Создать объект"))) {
+                            new_object = true;
+                        }
                     }
                     // Пустое место дерева: создание объекта.
                     let empty = ui.allocate_response(vec2(ui.available_width(), 18.0), Sense::click());
@@ -2678,16 +2745,16 @@ impl RdeApp {
                     ui.add_space(10.0);
                     ui.label(RichText::new("БЫСТРЫЕ ДЕЙСТВИЯ (без агента)").small().strong().color(pal.muted));
                     ui.add_space(4.0);
-                    if ui.add(egui::Button::new("Проверить проект").fill(pal.panel_hi)).clicked() {
+                    if btn(ui, Role::Secondary, Some(IC_CHECK), "Проверить проект").clicked() {
                         check = true;
                     }
-                    if ui.add(egui::Button::new("Обновить устаревшие артефакты").fill(pal.panel_hi)).clicked() {
+                    if btn(ui, Role::Secondary, Some(IC_UPDATE), "Обновить устаревшие артефакты").clicked() {
                         update = true;
                     }
-                    if ui.add(egui::Button::new("Оформить документ по ГОСТ").fill(pal.panel_hi)).clicked() {
+                    if btn(ui, Role::Secondary, Some(IC_DOC), "Оформить документ по ГОСТ").clicked() {
                         gost = true;
                     }
-                    if ui.add(egui::Button::new("Импорт ревью из exports").fill(pal.panel_hi)).clicked() {
+                    if btn(ui, Role::Secondary, Some(IC_DOWNLOAD), "Импорт ревью из exports").clicked() {
                         review = true;
                     }
                     ui.add_space(10.0);
@@ -2780,45 +2847,50 @@ impl RdeApp {
                 egui::ScrollArea::vertical().id_salt("rde_inspector_scroll").auto_shrink([false, false]).show(ui, |ui| {
                     let Some(object) = &object else {
                         ui.add_space(8.0);
-                        ui.label(RichText::new("Объект не выбран").color(pal.muted));
-                        ui.label(RichText::new("Выберите объект в дереве проекта").small().color(pal.muted));
+                        if empty_state(ui, IC_INSPECT, "Объект не выбран — выберите его в дереве", Some((IC_ADD, "Новый объект"))) {
+                            self.create_dialog = Some(CreateDialogState { kind: UiObjectKind::Core(NewObjectKind::ComputeArtifact), title: String::new() });
+                        }
                         return;
                     };
+                    card(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(object.kind.label_ru()).small().color(pal.muted));
+                        ui.label(RichText::new(format!("{}  {}", kind_icon(object.kind), object.kind.label_ru())).size(FS_CAPTION).color(pal.muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("×").on_hover_text("Скрыть инспектор").clicked() {
+                            if icon_button(ui, IC_CLOSE, "Скрыть инспектор").clicked() {
                                 self.show_inspector = false;
                             }
                         });
                     });
-                    ui.label(RichText::new(&object.title).size(FS_HEADING).strong().color(pal.text));
+                    ui.label(RichText::new(&object.title).size(FS_HEADING).family(bold_family(ui.ctx())).color(pal.text));
                     ui.add_space(1.0);
                     ui.label(RichText::new(fresh_label(object.freshness)).small().color(freshness_color(object.freshness, pal)));
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     field_row(ui, "id", &object.id, true);
                     field_row(ui, "каталог", &object.dir.display().to_string(), true);
                     field_row(ui, "детали", &object.detail, false);
                     ui.add_space(4.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         // Честная кнопка «Открыть»: у заметок и репозиториев центрального
                         // вьюера нет (их показывает только сам инспектор) — открывать нечего.
                         let can_open = Self::inspector_open_tab(object).is_some();
-                        if ui
-                            .add_enabled(can_open, egui::Button::new(RichText::new("Открыть").size(12.0)))
-                            .on_disabled_hover_text("нечего открывать")
-                            .clicked()
-                        {
+                        let open_resp = ui
+                            .add_enabled_ui(can_open, |ui| btn(ui, Role::Primary, Some(IC_OPEN), "Открыть"))
+                            .inner
+                            .on_disabled_hover_text("нечего открывать");
+                        if open_resp.clicked() {
                             open_clicked = true;
                         }
-                        if ui.button(RichText::new("Переименовать").size(12.0)).clicked() {
+                        if btn(ui, Role::Secondary, Some(IC_RENAME), "Переименовать").clicked() {
                             rename_clicked = true;
                         }
-                        if ui.button(RichText::new("Удалить").size(12.0)).clicked() {
+                        if btn(ui, Role::Danger, Some(IC_DELETE), "Удалить").clicked() {
                             delete_clicked = true;
                         }
                     });
+                    });
+                    ui.add_space(12.0);
                     ui.separator();
+                    ui.add_space(12.0);
                     match &object.data {
                         ObjectData::Artifact(artifact) => {
                             field_row(ui, "тип", &artifact.kind, false);
@@ -2886,8 +2958,8 @@ impl RdeApp {
                                     field_row(ui, "обновлён", &format!("unix {updated}"), false);
                                 }
                                 ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    if ui.button(RichText::new("Обновить артефакт").size(12.0)).clicked() {
+                                ui.horizontal_wrapped(|ui| {
+                                    if btn(ui, Role::Secondary, Some(IC_UPDATE), "Обновить артефакт").clicked() {
                                         update_clicked = true;
                                     }
                                     if ui.small_button("копировать act_key").clicked() {
@@ -2945,19 +3017,19 @@ impl RdeApp {
                                     field_row(ui, "описание", &template.description, false);
                                 }
                                 ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    if ui.button(RichText::new("Оформить по ГОСТ").size(12.0)).clicked() {
+                                ui.horizontal_wrapped(|ui| {
+                                    if btn(ui, Role::Primary, Some(IC_DOC), "Оформить по ГОСТ").clicked() {
                                         gost_clicked = true;
                                     }
-                                    if ui.button(RichText::new("Вставить библиографию").size(12.0)).clicked() {
+                                    if btn(ui, Role::Secondary, Some(IC_SOURCE), "Вставить библиографию").clicked() {
                                         bibliography_clicked = true;
                                     }
                                 });
-                                ui.horizontal(|ui| {
-                                    if ui.button(RichText::new("Открыть копию в Word").size(12.0)).clicked() {
+                                ui.horizontal_wrapped(|ui| {
+                                    if btn(ui, Role::Secondary, Some(IC_OPEN), "Открыть копию в Word").clicked() {
                                         word_copy_clicked = true;
                                     }
-                                    if ui.button(RichText::new("Импорт ревью из exports").size(12.0)).clicked() {
+                                    if btn(ui, Role::Secondary, Some(IC_DOWNLOAD), "Импорт ревью из exports").clicked() {
                                         review_import_clicked = true;
                                     }
                                 });
@@ -4378,13 +4450,22 @@ impl RdeApp {
             .frame(egui::Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    // Компактнее обычного: 5 табов с иконками должны влезать в центральную колонку.
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.spacing_mut().button_padding = vec2(8.0, 4.0);
                     for tab in Tab::ALL {
                         let sel = self.tab == tab;
-                        let text = RichText::new(format!("{} {}", tab.icon(), tab.title(self.lang))).size(FS_BODY).color(if sel { pal.text } else { pal.muted });
-                        if ui.add(egui::Button::new(text).fill(if sel { pal.panel_hi } else { Color32::TRANSPARENT })).clicked() {
+                        // Pill-таб: выбранный — заливка выделения, остальные — ghost без рамки.
+                        let text = RichText::new(format!("{}  {}", tab.icon(), tab.title(self.lang)))
+                            .size(FS_BODY)
+                            .color(if sel { pal.text } else { pal.muted });
+                        if ui
+                            .add(egui::Button::selectable(sel, text).corner_radius(8).min_size(vec2(0.0, 30.0)))
+                            .clicked()
+                        {
                             self.tab = tab;
                         }
-                        ui.add_space(2.0);
+                        ui.add_space(4.0);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let stale = self.project.stale_count();
@@ -4447,7 +4528,7 @@ impl RdeApp {
                     }
                 }
                 DocMode::Preview => {
-                    if ui.button(RichText::new("Обновить вставки").size(12.0)).clicked() {
+                    if btn(ui, Role::Secondary, Some(IC_UPDATE), "Обновить вставки").clicked() {
                         update_inserts = true;
                     }
                     ui.separator();
@@ -4496,7 +4577,7 @@ impl RdeApp {
                 insert_kind = Some("date");
             }
             ui.separator();
-            if ui.add(egui::Button::new(RichText::new("Обновить документ").size(12.0)).fill(pal.panel_hi)).clicked() {
+            if btn(ui, Role::Primary, Some(IC_UPDATE), "Обновить документ").clicked() {
                 update_inserts = true;
             }
             if ui.checkbox(&mut auto_update, RichText::new("Автообновление").size(12.0)).changed() {
@@ -4895,7 +4976,7 @@ impl RdeApp {
             ui.label(RichText::new("DAG артефактов").strong().color(pal.text));
             ui.label(RichText::new(format!("{} устаревших", stale.len())).small().color(pal.amber));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(RichText::new("Обновить связанные").size(12.0)).clicked() {
+                if icon_button(ui, IC_UPDATE, "Обновить связанные").clicked() {
                     refresh = true;
                 }
             });
@@ -5208,13 +5289,13 @@ impl RdeApp {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(RichText::new("Обновить связанные").size(12.0)).clicked() {
+                if icon_button(ui, IC_UPDATE, "Обновить связанные").clicked() {
                     self.request_update(Some(vec![object.id.clone()]), true);
                 }
-                if ui.button(RichText::new("Обновить артефакт").size(12.0)).clicked() {
+                if btn(ui, Role::Secondary, Some(IC_UPDATE), "Обновить артефакт").clicked() {
                     update_artifact = true;
                 }
-                if ui.button(RichText::new("Сохранить").size(12.0)).clicked() {
+                if btn(ui, Role::Primary, Some(IC_SAVE), "Сохранить").clicked() {
                     save_editor = true;
                 }
             });
@@ -5984,16 +6065,116 @@ fn set_manifest_string(path: &Path, key: &str, value: &str) -> Result<(), String
     set_manifest_value(path, key, value)
 }
 
-fn field_row(ui: &mut egui::Ui, label: &str, value: &str, monospace: bool) {
+/// Роль кнопки (стиль 2): primary — один главный CTA на вкладку, secondary — поверхность
+/// с рамкой, ghost — без рамки до hover, danger — деструктивное действие.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Primary,
+    Secondary,
+    Ghost,
+    Danger,
+}
+
+/// Кнопка с ролью и опциональной иконкой слева от подписи. Заливки состояний
+/// задаются локально (`ui.scope`), потому что `Button::fill` отключает hover-эффект.
+fn btn(ui: &mut egui::Ui, role: Role, icon: Option<&str>, label: &str) -> egui::Response {
+    let text = match icon {
+        Some(icon) => format!("{icon}  {label}"),
+        None => label.to_owned(),
+    };
+    styled_button(ui, role, RichText::new(text).size(FS_BUTTON), vec2(0.0, 32.0))
+}
+
+/// Иконка-only кнопка с подсказкой (компактные места: тулбар панелей, заголовки карточек).
+fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
     let pal = theme_colors(ui.ctx().theme());
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(label).small().color(pal.muted));
-        if monospace {
-            ui.label(RichText::new(value).monospace().size(10.5).color(pal.text));
-        } else {
-            ui.label(RichText::new(value).size(12.0).color(pal.text));
+    styled_button(ui, Role::Ghost, RichText::new(icon).size(FS_BODY + 1.0).color(pal.muted), vec2(28.0, 28.0))
+        .on_hover_text(tooltip)
+}
+
+fn styled_button(ui: &mut egui::Ui, role: Role, text: RichText, min_size: Vec2) -> egui::Response {
+    let pal = theme_colors(ui.ctx().theme());
+    let hover_fill = ui.visuals().widgets.hovered.bg_fill;
+    let active_fill = ui.visuals().widgets.active.bg_fill;
+    let (idle, hover, active, border, color) = match role {
+        Role::Primary => (pal.accent, pal.accent_hover, pal.accent_active, Color32::TRANSPARENT, pal.on_accent),
+        Role::Secondary => (pal.panel_hi, hover_fill, active_fill, pal.border, pal.text),
+        Role::Ghost => (Color32::TRANSPARENT, pal.panel_hi, hover_fill, Color32::TRANSPARENT, pal.text),
+        Role::Danger => (Color32::TRANSPARENT, pal.panel_hi, hover_fill, pal.red, pal.red),
+    };
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.weak_bg_fill = idle;
+        widgets.inactive.bg_fill = idle;
+        widgets.hovered.weak_bg_fill = hover;
+        widgets.hovered.bg_fill = hover;
+        widgets.active.weak_bg_fill = active;
+        widgets.active.bg_fill = active;
+        widgets.inactive.bg_stroke = Stroke::new(1.0, border);
+        widgets.hovered.bg_stroke = Stroke::new(1.0, if role == Role::Primary { Color32::TRANSPARENT } else { border });
+        widgets.active.bg_stroke = Stroke::new(1.0, border);
+        // Ghost без рамки в покое, но с фоном на hover/active (frame_when_inactive).
+        // Extend: кнопка целиком переносится на новую строку, а не ломает текст по буквам.
+        ui.add(
+            egui::Button::new(text.color(color))
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .frame_when_inactive(role != Role::Ghost)
+                .corner_radius(8)
+                .min_size(min_size),
+        )
+    })
+    .inner
+}
+
+/// Карточка инспектора: фон панели-приподнятой, рамка, скругление 10, padding 12.
+fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let pal = theme_colors(ui.ctx().theme());
+    egui::Frame::new()
+        .fill(pal.panel_hi)
+        .stroke(Stroke::new(1.0, pal.border))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(12))
+        .show(ui, add)
+        .inner
+}
+
+/// Капс-подпись секции: мелкий полужирный MUTED.
+fn section_caption(ui: &mut egui::Ui, text: &str) {
+    let pal = theme_colors(ui.ctx().theme());
+    ui.label(RichText::new(text.to_uppercase()).size(FS_CAPTION).family(bold_family(ui.ctx())).color(pal.muted));
+}
+
+/// Пустое состояние: крупная иконка, одна строка, опциональная CTA-кнопка.
+/// Возвращает `true`, если CTA нажата.
+fn empty_state(ui: &mut egui::Ui, icon: &str, text: &str, cta: Option<(&str, &str)>) -> bool {
+    let pal = theme_colors(ui.ctx().theme());
+    let mut clicked = false;
+    ui.vertical_centered(|ui| {
+        ui.add_space(16.0);
+        ui.label(RichText::new(icon).size(28.0).color(pal.muted));
+        ui.label(RichText::new(text).size(FS_BODY).color(pal.muted));
+        if let Some((cta_icon, cta_label)) = cta {
+            ui.add_space(8.0);
+            clicked = btn(ui, Role::Secondary, Some(cta_icon), cta_label).clicked();
         }
     });
+    clicked
+}
+
+/// Строка «подпись мелко сверху, значение крупнее» (вместо плоского «ключ — значение»).
+/// Моноширинный шрифт — только для id/путей/хешей (`monospace = true`).
+fn field_row(ui: &mut egui::Ui, label: &str, value: &str, monospace: bool) {
+    let pal = theme_colors(ui.ctx().theme());
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.label(RichText::new(label).size(FS_CAPTION).color(pal.muted));
+        if monospace {
+            ui.label(RichText::new(value).monospace().size(FS_MONO).color(pal.text));
+        } else {
+            ui.label(RichText::new(value).size(FS_BODY).color(pal.text));
+        }
+    });
+    ui.add_space(6.0);
 }
 
 /// Разобрать реальную структуру документа через модель WordCraft (M2.4): абзацы, стили,
@@ -6118,10 +6299,28 @@ fn arrow(painter: &egui::Painter, from: Rect, to: Rect, color: Color32) {
 /// Дефолтные шрифты egui остаются в цепочке как последний fallback.
 const VENDORED_SANS: &[u8] = include_bytes!("../fonts/DejaVuSans.ttf");
 const VENDORED_MONO: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
+/// Иконки Phosphor (сабсет, MIT) — fallback для глифов PUA в Proportional.
+const VENDORED_ICONS: &[u8] = include_bytes!("../fonts/RdeIcons.ttf");
+/// DejaVu Sans Bold (сабсет кириллица/латиница, Bitstream Vera) — семья `rde-bold`
+/// для заголовков секций инспектора.
+const VENDORED_BOLD: &[u8] = include_bytes!("../fonts/DejaVuSans-Bold-subset.ttf");
+
+/// Флаг «шрифты оболочки активны» (выставляется со второго кадра). `set_fonts` применяется
+/// в конце первого кадра, а `Name(..)`-семья до этого не привязана и паникует в epaint.
+const FONTS_READY_ID: &str = "rde_fonts_ready";
+
+/// Полужирная семья оболочки — `semibold`: DejaVu Sans Bold в нашей раскладке, Inter SemiBold
+/// у WordCraft (он подменяет определения своими, но `semibold` там есть всегда). До
+/// готовности шрифтов — обычный Proportional, без жирности.
+fn bold_family(ctx: &egui::Context) -> egui::FontFamily {
+    let ready = ctx.data(|data| data.get_temp::<bool>(egui::Id::new(FONTS_READY_ID))).unwrap_or(false);
+    if ready { egui::FontFamily::Name("semibold".into()) } else { egui::FontFamily::Proportional }
+}
 
 /// Определения шрифтов оболочки: `rde-sans` — первый в пропорциональной семье,
 /// `rde-mono` — первый в моноширинной. Именованные семьи WordCraft
-/// (`medium`/`semibold`) тоже привязаны к `rde-sans`: WordCraft ставит на
+/// (`medium`/`semibold`) тоже привязаны (`semibold` начинается с полужирного `rde-bold`,
+/// `medium` — с `rde-sans`; WordCraft ставит на
 /// `semibold` глобальный `TextStyle::Heading`, и без привязки заголовки наших
 /// `Window` паникуют, когда активны шрифты оболочки (а не его `set_fonts`).
 /// Чистая функция — покрыта тестом.
@@ -6133,11 +6332,23 @@ pub fn font_definitions() -> egui::FontDefinitions {
     fonts
         .font_data
         .insert("rde-mono".to_owned(), Arc::new(egui::FontData::from_owned(VENDORED_MONO.to_vec())));
+    fonts
+        .font_data
+        .insert("rde-icons".to_owned(), Arc::new(egui::FontData::from_owned(VENDORED_ICONS.to_vec())));
+    fonts
+        .font_data
+        .insert("rde-bold".to_owned(), Arc::new(egui::FontData::from_owned(VENDORED_BOLD.to_vec())));
     let mut proportional = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
     proportional.insert(0, "rde-sans".to_owned());
+    // Иконки — сразу после текста: глифы PUA в rde-sans отсутствуют, egui берёт их отсюда.
+    proportional.insert(1, "rde-icons".to_owned());
     fonts.families.insert(egui::FontFamily::Proportional, proportional.clone());
     fonts.families.insert(egui::FontFamily::Name("medium".into()), proportional.clone());
-    fonts.families.insert(egui::FontFamily::Name("semibold".into()), proportional);
+    // `semibold` — настоящее полужирное (DejaVu Sans Bold) + обычные fallback-и.
+    // WordCraft при старте подменит определения своими (Inter SemiBold), семья останется.
+    let mut semibold = vec!["rde-bold".to_owned()];
+    semibold.extend(proportional);
+    fonts.families.insert(egui::FontFamily::Name("semibold".into()), semibold);
     fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "rde-mono".to_owned());
     fonts
 }
@@ -6145,6 +6356,34 @@ pub fn font_definitions() -> egui::FontDefinitions {
 /// Подключить вендоренные шрифты с кириллицей (egui-дефолт может не покрывать всё).
 pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(font_definitions());
+}
+
+/// Иконки Phosphor должны пережить `set_fonts` WordCraft (он открывает редактор и заменяет
+/// все определения своими, без `rde-icons`: иконки становятся квадратами). Если шрифта
+/// нет в Proportional — дописываем его в конец семей. Вызывается каждый кадр: это только
+/// проверка; переустановка — лишь после подмены WordCraft (редкое событие).
+fn ensure_icon_fonts(ctx: &egui::Context) {
+    let present = ctx.fonts(|fonts| {
+        fonts
+            .definitions()
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .is_some_and(|list| list.iter().any(|name| name == "rde-icons"))
+    });
+    if present {
+        return;
+    }
+    let mut defs = ctx.fonts(|fonts| fonts.definitions().clone());
+    defs.font_data
+        .insert("rde-icons".to_owned(), Arc::new(egui::FontData::from_owned(VENDORED_ICONS.to_vec())));
+    // В начало, не в конец: fallback-шрифты WordCraft покрывают PUA и отдали бы свои глифы.
+    // В `rde-icons` только 21 иконка, поэтому обычный текст она не перехватывает.
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Name("medium".into()), egui::FontFamily::Name("semibold".into())] {
+        if let Some(list) = defs.families.get_mut(&family) {
+            list.insert(0, "rde-icons".to_owned());
+        }
+    }
+    ctx.set_fonts(defs);
 }
 
 /// Тёмная палитра оболочки как `egui::Visuals` (роли: panel/window, extreme,
@@ -6165,7 +6404,23 @@ fn dark_visuals() -> egui::Visuals {
     visuals.selection.stroke = Stroke::new(1.0, ACCENT);
     visuals.override_text_color = Some(TEXT);
     visuals.window_corner_radius = CornerRadius::same(8);
+    style_widgets(&mut visuals, BORDER, Color32::from_rgb(0x4a, 0x51, 0x5e));
     visuals
+}
+
+/// Общая геометрия виджетов обеих тем (стиль 2): скругление 8 px во всех состояниях,
+/// у поверхностей (кнопки, поля) — рамка `border`, на hover рамка светлеет до `hover_border`.
+/// Заливки состояний (ghost/secondary/primary) задаются в `action()` локально.
+fn style_widgets(visuals: &mut egui::Visuals, border: Color32, hover_border: Color32) {
+    let radius = CornerRadius::same(8);
+    visuals.widgets.noninteractive.corner_radius = radius;
+    visuals.widgets.inactive.corner_radius = radius;
+    visuals.widgets.hovered.corner_radius = radius;
+    visuals.widgets.active.corner_radius = radius;
+    visuals.widgets.open.corner_radius = radius;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, hover_border);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, hover_border);
 }
 
 /// Светлая палитра оболочки: тот же набор ролей поверх `Visuals::light()`.
@@ -6185,6 +6440,7 @@ fn light_visuals() -> egui::Visuals {
     visuals.selection.stroke = Stroke::new(1.0, LIGHT_ACCENT);
     visuals.override_text_color = Some(LIGHT_TEXT);
     visuals.window_corner_radius = CornerRadius::same(8);
+    style_widgets(&mut visuals, LIGHT_BORDER, Color32::from_rgb(0x9f, 0xa8, 0xb6));
     visuals
 }
 
@@ -6200,8 +6456,9 @@ fn apply_app_theme(ctx: &egui::Context, theme: &str, ui_scale: f32) {
     }
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = vec2(8.0, 8.0);
-        style.spacing.button_padding = vec2(8.0, 6.0);
-        style.spacing.interact_size.y = 28.0;
+        // Кнопки: высота 32 px, горизонтальный padding 12 px (стиль 2, сетка 8).
+        style.spacing.button_padding = vec2(12.0, 6.0);
+        style.spacing.interact_size.y = 32.0;
     });
 }
 
@@ -6282,6 +6539,53 @@ mod theme_tests {
         }
     }
 
+    /// Текст primary-кнопки (on_accent) читается на ACCENT и его hover/active (WCAG AA ≥ 4.5:1).
+    #[test]
+    fn primary_button_text_contrast_wcag_aa() {
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let pal = theme_colors(theme);
+            for (name, fill) in [("accent", pal.accent), ("hover", pal.accent_hover), ("active", pal.accent_active)] {
+                let ratio = contrast(pal.on_accent, fill);
+                assert!(ratio >= 4.5, "{theme:?} primary {name}: {ratio:.2}:1 < 4.5");
+            }
+        }
+    }
+
+    /// Иконочный шрифт (Phosphor) и полужирный DejaVu вендорены как TTF; семья `rde-bold`
+    /// начинается с собственного Bold, дефолтные fallback-и остаются.
+    #[test]
+    fn icon_and_bold_fonts_vendored() {
+        let fonts = super::font_definitions();
+        for name in ["rde-icons", "rde-bold"] {
+            let data = fonts.font_data.get(name).unwrap_or_else(|| panic!("нет шрифта {name}"));
+            assert_eq!(&data.font[..4], &[0x00, 0x01, 0x00, 0x00], "{name}: не TTF");
+        }
+        let bold = fonts.families.get(&egui::FontFamily::Name("semibold".into())).expect("семья semibold");
+        assert_eq!(bold.first().map(String::as_str), Some("rde-bold"));
+        assert!(bold.len() > 2, "fallback semibold пропал");
+    }
+
+    /// Иконки переживают чужой `set_fonts` (как у WordCraft при открытии редактора):
+    /// после подмены определений без `rde-icons` `ensure_icon_fonts` возвращает её в Proportional.
+    #[test]
+    fn icon_font_survives_foreign_set_fonts() {
+        let ctx = egui::Context::default();
+        super::install_fonts(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).drop_without_applying_deltas();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        ctx.run_ui(egui::RawInput::default(), |_| {}).drop_without_applying_deltas();
+        super::ensure_icon_fonts(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).drop_without_applying_deltas();
+        let present = ctx.fonts(|fonts| {
+            fonts
+                .definitions()
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .is_some_and(|list| list.iter().any(|name| name == "rde-icons"))
+        });
+        assert!(present, "rde-icons должна вернуться в Proportional после чужого set_fonts");
+    }
+
     /// Маппинг настройки темы; неизвестное → Dark (как `normalize()` в rde-core).
     #[test]
     fn theme_preference_mapping() {
@@ -6310,13 +6614,14 @@ mod theme_tests {
         assert_eq!(monospace.first().map(String::as_str), Some("rde-mono"));
         assert!(proportional.len() > 1, "дефолтный fallback пропал из Proportional");
         assert!(monospace.len() > 1, "дефолтный fallback пропал из Monospace");
-        // Именованные семьи WordCraft связаны с rde-sans (иначе паника заголовков Window).
-        for family in ["medium", "semibold"] {
+        // Именованные семьи привязаны (иначе паника заголовков Window): medium — rde-sans,
+        // semibold — настоящее полужирное rde-bold (стиль 2: заголовки секций инспектора).
+        for (family, first) in [("medium", "rde-sans"), ("semibold", "rde-bold")] {
             let list = fonts
                 .families
                 .get(&egui::FontFamily::Name(family.into()))
                 .unwrap_or_else(|| panic!("нет семьи {family}"));
-            assert_eq!(list.first().map(String::as_str), Some("rde-sans"), "{family}");
+            assert_eq!(list.first().map(String::as_str), Some(first), "{family}");
         }
     }
 

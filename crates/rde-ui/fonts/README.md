@@ -7,10 +7,19 @@
 |---|---|---|
 | `DejaVuSans.ttf` | `rde-sans` — пропорциональный, первый в `FontFamily::Proportional` | `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` |
 | `DejaVuSansMono.ttf` | `rde-mono` — моноширинный, первый в `FontFamily::Monospace` | `/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf` |
+| `RdeIcons.ttf` | `rde-icons` — сабсет 21 иконки Phosphor (PUA-кодпоинты `IC_*` в `src/lib.rs`); в Proportional/medium/semibold ставится первым (`ensure_icon_fonts`), т.к. WordCraft при открытии редактора подменяет шрифты | `@phosphor-icons/web@2.1.2` → `src/regular/Phosphor.ttf`, сабсет через `fontTools.subset`. Лицензия MIT, `PHOSPHOR-LICENSE.txt` (© 2023 Phosphor Icons) |
+| `DejaVuSans-Bold-subset.ttf` | полужирное начертание для семьи `semibold` (заголовки секций инспектора) | `/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf`, сабсет U+0020–007E, U+00A0–00FF, U+0400–04FF и знаки пунктуации (`fontTools.subset`). Лицензия та же, что у DejaVu |
 
-Именованные семьи WordCraft (`medium`/`semibold`) тоже привязаны к `rde-sans`:
-WordCraft ставит на `semibold` глобальный `TextStyle::Heading`, и без привязки
-заголовки окон RDE паникуют, когда активны шрифты оболочки.
+Иконки: Phosphor (MIT) — лицензия подтверждена по `LICENSE` в репозитории
+`phosphor-icons/core`. Вендорится только используемое (21 глиф, 488 КБ полного
+шрифта → ~5 КБ сабсета). Lucide (ISC) не вендорился: набор не нужен второй раз.
+
+Именованные семьи WordCraft (`medium`/`semibold`) тоже привязаны: `medium` начинается с
+`rde-sans`, `semibold` — с полужирного `rde-bold`. WordCraft ставит на `semibold`
+глобальный `TextStyle::Heading`, и без привязки заголовки окон RDE паникуют.
+Заголовки секций инспектора берут `semibold` через `bold_family(ctx)`: это делается
+только со второго кадра (флаг `FONTS_READY_ID`), потому что `set_fonts` применяется в
+конце первого кадра; в первом кадре — обычный Proportional.
 
 Покрытие кириллицы (проверено `fontTools`): оба файла содержат все 96
 символов U+0400–U+045F, включая Ё/ё.
