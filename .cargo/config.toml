@@ -1,0 +1,6 @@
+# Локальная машина: target вынесен на внешний ext4-диск, чтобы не забивать /home
+# (debug-сборка WordCraft+egui+wgpu занимает десятки ГБ).
+# На другой машине/в CI: переопределите CARGO_TARGET_DIR или удалите target-dir.
+[build]
+target-dir = "/srv/yocto/rde-target"
+incremental = false

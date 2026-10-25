@@ -3544,6 +3544,8 @@ dependencies = [
 name = "rde-docx"
 version = "0.1.0"
 dependencies = [
+ "rde-core",
+ "rde-doc",
  "rde-hash",
  "serde",
  "serde_json",
@@ -3571,6 +3573,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rde-sources"
+version = "0.1.0"
+dependencies = [
+ "rde-core",
+ "rde-doc",
+ "rde-docx",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rde-store"
 version = "0.1.0"
 dependencies = [
@@ -3582,6 +3595,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rde-templates"
+version = "0.1.0"
+dependencies = [
+ "rde-core",
+ "rde-doc",
+ "rde-docx",
+ "serde",
+ "toml",
+ "wordcraft-engine",
+]
+
+[[package]]
 name = "rde-ui"
 version = "0.1.0"
 dependencies = [
@@ -3589,7 +3614,11 @@ dependencies = [
  "egui_kittest",
  "rde-core",
  "rde-dag",
+ "rde-doc",
+ "rde-docx",
+ "rde-sources",
  "rde-store",
+ "rde-templates",
  "serde_json",
  "wordcraft-engine",
  "wordcraft-ui-egui",

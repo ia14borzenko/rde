@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/rde", "crates/rde-core", "crates/rde-dag", "crates/rde-doc", "crates/rde-docx", "crates/rde-hash", "crates/rde-run", "crates/rde-store", "crates/rde-ui"]
+members = ["apps/rde", "crates/rde-core", "crates/rde-dag", "crates/rde-doc", "crates/rde-docx", "crates/rde-hash", "crates/rde-run", "crates/rde-sources", "crates/rde-store", "crates/rde-templates", "crates/rde-ui"]
 # WordCraft vendored as a submodule keeps its own Cargo workspace (workspace-inherited
 # dependencies like `chrono = { workspace = true }`); the outer workspace must not
 # claim it, or those fields would inherit from RDE's manifest.
@@ -37,6 +37,8 @@ rde-core = { path = "crates/rde-core" }
 rde-dag = { path = "crates/rde-dag" }
 rde-doc = { path = "crates/rde-doc" }
 rde-docx = { path = "crates/rde-docx" }
+rde-templates = { path = "crates/rde-templates" }
+rde-sources = { path = "crates/rde-sources" }
 rde-hash = { path = "crates/rde-hash" }
 rde-run = { path = "crates/rde-run" }
 rde-store = { path = "crates/rde-store" }
@@ -47,3 +49,10 @@ wordcraft-engine = { path = "vendor/wordcraft/crates/engine" }
 # workspace do not apply when it is built as a path dependency, so RDE mirrors it.
 [patch.crates-io]
 krilla = { git = "https://github.com/storytold/craft-libs", rev = "c3487320b2d1de657b860b3c8abb44e1f2b32bd8" }
+
+# Экономия места: без полного debug-info (символы для backtrace остаются).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
