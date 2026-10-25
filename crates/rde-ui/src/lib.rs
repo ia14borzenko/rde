@@ -34,11 +34,22 @@ const PANEL: Color32 = Color32::from_rgb(0x1d, 0x1f, 0x24);
 const PANEL_HI: Color32 = Color32::from_rgb(0x25, 0x28, 0x30);
 const BORDER: Color32 = Color32::from_rgb(0x32, 0x36, 0x40);
 const TEXT: Color32 = Color32::from_rgb(0xd8, 0xdb, 0xe2);
-const MUTED: Color32 = Color32::from_rgb(0x8d, 0x93, 0xa0);
+const MUTED: Color32 = Color32::from_rgb(0x9a, 0xa1, 0xaf); // WCAG AA: 5.68:1 на PANEL_HI (было 4.78:1)
 const ACCENT: Color32 = Color32::from_rgb(0x51, 0x8c, 0xff);
 const GREEN: Color32 = Color32::from_rgb(0x52, 0xc4, 0x7d);
 const AMBER: Color32 = Color32::from_rgb(0xe3, 0xa7, 0x3e);
 const RED: Color32 = Color32::from_rgb(0xe0, 0x60, 0x60);
+// ACCENT проверен: 4.59:1 на PANEL_HI как текст (WCAG AA ≥ 4.5:1) — значение не меняем,
+// осветление уронило бы белый текст на ACCENT-заливках (3.21:1) ниже нормы.
+
+// ── типошкала (мелкий текст ≥ 11, шаг ~1.25 к крупным кеглям) ───────────────────
+const FS_DISPLAY: f32 = 18.0; // крупный заголовок просмотра
+const FS_HEADING: f32 = 16.0; // заголовок объекта
+const FS_BODY: f32 = 13.0; // основной текст, табы, тулбар
+const FS_BUTTON: f32 = 12.0; // кнопки и строки действий
+const FS_SMALL: f32 = 12.0; // второстепенный текст
+const FS_CAPTION: f32 = 11.0; // нижняя граница мелкого текста
+const FS_MONO: f32 = 11.5; // моноширинный текст
 
 /// Вкладки центральной области.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1824,7 +1835,7 @@ impl RdeApp {
         }
         let mut action: Option<MenuAction> = None;
         egui::Panel::top("rde_menu")
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 2)))
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 2)))
             .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button(tr(self.lang, "menu.file"), |ui| {
@@ -2057,7 +2068,7 @@ impl RdeApp {
         let running = self.update_job.is_some();
         let running_secs = self.update_job.as_ref().map(|job| job.started.elapsed().as_secs_f32()).unwrap_or(0.0);
         egui::Panel::top("rde_toolbar")
-            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(10, 4)))
+            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(12, 4)))
             .exact_size(36.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2103,10 +2114,10 @@ impl RdeApp {
                         update_document = true;
                     }
                     ui.separator();
-                    if ui.button(RichText::new(tr(self.lang, "toolbar.new_object")).size(13.0)).clicked() {
+                    if ui.button(RichText::new(tr(self.lang, "toolbar.new_object")).size(FS_BODY)).clicked() {
                         new_object = true;
                     }
-                    if ui.button(RichText::new(tr(self.lang, "toolbar.search")).size(13.0)).on_hover_text("Поиск по объектам (Ctrl+F)").clicked() {
+                    if ui.button(RichText::new(tr(self.lang, "toolbar.search")).size(FS_BODY)).on_hover_text("Поиск по объектам (Ctrl+F)").clicked() {
                         search_clicked = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2144,7 +2155,7 @@ impl RdeApp {
     // ── статус-бар ──────────────────────────────────────────────────────────
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("rde_status")
-            .frame(egui::Frame::new().fill(PANEL_HI).inner_margin(Margin::symmetric(10, 3)))
+            .frame(egui::Frame::new().fill(PANEL_HI).inner_margin(Margin::symmetric(12, 3)))
             .exact_size(24.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2186,7 +2197,7 @@ impl RdeApp {
             .resizable(true)
             .default_size(150.0)
             .min_size(56.0)
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 6)))
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("ПАНЕЛЬ").small().strong().color(MUTED));
@@ -2220,7 +2231,7 @@ impl RdeApp {
                                     ui.label(RichText::new("Пока нет запусков и транзакций — нажмите «Обновить всё»").small().color(MUTED));
                                 }
                                 for line in &tasks {
-                                    ui.label(RichText::new(line).monospace().size(11.5).color(TEXT));
+                                    ui.label(RichText::new(line).monospace().size(FS_MONO).color(TEXT));
                                 }
                                 ui.add_space(8.0);
                                 ui.label(RichText::new("ТРАНЗАКЦИИ ОБНОВЛЕНИЙ — ОТКАТ (O(1))").small().strong().color(MUTED));
@@ -2251,14 +2262,14 @@ impl RdeApp {
                             _ => {
                                 for line in &log {
                                     ui.horizontal(|ui| {
-                                        ui.label(RichText::new(line.time).monospace().size(10.5).color(MUTED));
+                                        ui.label(RichText::new(line.time).monospace().size(FS_MONO).color(MUTED));
                                         let color = match line.level {
                                             Level::Info => MUTED,
                                             Level::Ok => GREEN,
                                             Level::Warn => AMBER,
                                         };
                                         ui.label(RichText::new("•").color(color).size(11.0));
-                                        ui.label(RichText::new(&line.text).size(12.0).color(TEXT));
+                                        ui.label(RichText::new(&line.text).size(FS_SMALL).color(TEXT));
                                     });
                                 }
                             }
@@ -2293,7 +2304,7 @@ impl RdeApp {
             .resizable(true)
             .default_size(268.0)
             .min_size(120.0)
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(8, 8)))
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("ПРОЕКТ").small().strong().color(MUTED));
@@ -2317,7 +2328,7 @@ impl RdeApp {
                     self.tree_filter.clear();
                 }
                 ui.add_space(2.0);
-                if ui.add(egui::Button::new(RichText::new("+ Новый объект").size(12.0)).fill(PANEL_HI)).clicked() {
+                if ui.add(egui::Button::new(RichText::new("+ Новый объект").size(FS_BUTTON)).fill(PANEL_HI)).clicked() {
                     new_object = true;
                 }
                 ui.add_space(4.0);
@@ -2338,11 +2349,11 @@ impl RdeApp {
                                 let is_sel = selected.as_deref() == Some(obj.id.as_str());
                                 let resp = ui
                                     .horizontal(|ui| {
-                                        ui.label(RichText::new("●").color(freshness_color(obj.freshness)).size(9.0));
+                                        ui.label(RichText::new("●").color(freshness_color(obj.freshness)).size(FS_CAPTION));
                                         ui.label(RichText::new(obj.kind.icon()).color(MUTED).size(12.0));
                                         // Панель можно сузить: длинные названия обрезаются с «…»,
                                         // полное название — в подсказке и в инспекторе.
-                                        ui.add(egui::Button::selectable(is_sel, RichText::new(&obj.title).size(13.0)).truncate())
+                                        ui.add(egui::Button::selectable(is_sel, RichText::new(&obj.title).size(FS_BODY)).truncate())
                                             .on_hover_text(&obj.title)
                                     })
                                     .inner;
@@ -2523,7 +2534,7 @@ impl RdeApp {
             .resizable(true)
             .default_size(316.0)
             .min_size(180.0)
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 8)))
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("АГЕНТ").small().strong().color(MUTED));
@@ -2606,7 +2617,7 @@ impl RdeApp {
         let mut word_copy_clicked = false;
         let mut review_import_clicked = false;
         egui::Panel::right("rde_inspector")
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 8)))
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8)))
             .default_size(320.0)
             .resizable(false)
             .show(ui, |ui| {
@@ -2625,7 +2636,7 @@ impl RdeApp {
                             }
                         });
                     });
-                    ui.label(RichText::new(&object.title).size(16.0).strong().color(TEXT));
+                    ui.label(RichText::new(&object.title).size(FS_HEADING).strong().color(TEXT));
                     ui.add_space(1.0);
                     ui.label(RichText::new(fresh_label(object.freshness)).small().color(freshness_color(object.freshness)));
                     ui.add_space(6.0);
@@ -2793,7 +2804,7 @@ impl RdeApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("id").small().color(MUTED));
-                        ui.label(RichText::new(&object.id).monospace().size(10.5).color(MUTED));
+                        ui.label(RichText::new(&object.id).monospace().size(FS_CAPTION).color(MUTED));
                         if ui.small_button("копировать").clicked() {
                             ui.ctx().copy_text(object.id.clone());
                         }
@@ -4172,13 +4183,12 @@ impl RdeApp {
 
     fn central(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(0, 0)))
+            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(8.0);
                     for tab in Tab::ALL {
                         let sel = self.tab == tab;
-                        let text = RichText::new(format!("{} {}", tab.icon(), tab.title(self.lang))).size(13.0).color(if sel { TEXT } else { MUTED });
+                        let text = RichText::new(format!("{} {}", tab.icon(), tab.title(self.lang))).size(FS_BODY).color(if sel { TEXT } else { MUTED });
                         if ui.add(egui::Button::new(text).fill(if sel { PANEL_HI } else { Color32::TRANSPARENT })).clicked() {
                             self.tab = tab;
                         }
@@ -4216,7 +4226,6 @@ impl RdeApp {
             self.ensure_editor();
         }
         ui.horizontal(|ui| {
-            ui.add_space(8.0);
             for m in DocMode::ALL {
                 if ui.selectable_label(mode == m, RichText::new(m.label()).size(12.0)).clicked() {
                     mode = m;
@@ -4271,7 +4280,6 @@ impl RdeApp {
             .map(|doc| doc.inserts.len())
             .unwrap_or(0);
         ui.horizontal_wrapped(|ui| {
-            ui.add_space(8.0);
             ui.label(RichText::new("RDE").small().strong().color(ACCENT));
             if ui.small_button("Вставить значение…").clicked() {
                 insert_kind = Some("value");
@@ -4449,7 +4457,6 @@ impl RdeApp {
         let inserts_count = inserts.len();
         let mut clicked_block: Option<(usize, String)> = None;
         ui.horizontal(|ui| {
-            ui.add_space(8.0);
             ui.label(RichText::new("Блоки документа").strong().color(TEXT));
             if let Some(Ok((blocks, figures))) = &cache {
                 let headings = blocks.iter().filter(|block| matches!(block.kind, "H1" | "H2" | "H")).count();
@@ -4683,7 +4690,6 @@ impl RdeApp {
             .map(|o| (o.title.clone(), o.detail.clone()))
             .collect();
         ui.horizontal(|ui| {
-            ui.add_space(8.0);
             ui.label(RichText::new("DAG артефактов").strong().color(TEXT));
             ui.label(RichText::new(format!("{} устаревших", stale.len())).small().color(AMBER));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4950,7 +4956,6 @@ impl RdeApp {
             })
             .collect();
         ui.horizontal(|ui| {
-            ui.add_space(8.0);
             ui.label(RichText::new(format!("Артефакт: {}", object.title)).strong().color(TEXT));
             ui.label(RichText::new(format!("{} · {}", manifest.kind, object.detail)).small().color(MUTED));
             if let Some(status) = &status {
@@ -4973,7 +4978,6 @@ impl RdeApp {
             });
         });
         ui.horizontal(|ui| {
-            ui.add_space(8.0);
             for (value, label) in [
                 (ArtifactSection::Inputs, "Входные данные"),
                 (ArtifactSection::Generation, "Генерация"),
@@ -5400,7 +5404,7 @@ impl RdeApp {
                 .inner_margin(Margin::same(14))
                 .show(ui, |ui| {
                     ui.set_max_width(680.0);
-                    ui.label(RichText::new(format!("▣  {}", obj.title)).size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new(format!("▣  {}", obj.title)).size(FS_DISPLAY).strong().color(TEXT));
                     ui.add_space(2.0);
                     ui.label(
                         RichText::new(format!("Источник проекта · {}", fresh_label(obj.freshness))).small().color(MUTED),
@@ -5903,9 +5907,9 @@ fn install_style(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Dark, dark);
     ctx.set_theme(egui::ThemePreference::Dark);
     ctx.all_styles_mut(|style| {
-        style.spacing.item_spacing = vec2(8.0, 6.0);
-        style.spacing.button_padding = vec2(9.0, 3.0);
-        style.spacing.interact_size.y = 24.0;
+        style.spacing.item_spacing = vec2(8.0, 8.0);
+        style.spacing.button_padding = vec2(8.0, 6.0);
+        style.spacing.interact_size.y = 28.0;
     });
 }
 
