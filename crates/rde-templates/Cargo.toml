@@ -1,0 +1,16 @@
+[package]
+name = "rde-templates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDE templates (M4): ГОСТ 7.32-2017 / профили оформления, применение к документу, библиография ГОСТ 7.0.100"
+
+[dependencies]
+rde-core = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+wordcraft-engine = { workspace = true }
+
+[dev-dependencies]
+rde-doc = { workspace = true }
+rde-docx = { workspace = true }

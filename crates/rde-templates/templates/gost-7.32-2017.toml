@@ -1,0 +1,56 @@
+schema = "rde/template@1"
+id = "gost-7.32-2017"
+title = "ГОСТ 7.32-2017 — отчёт о НИР"
+description = "Базовые правила ГОСТ 7.32-2017: A4, поля 30/15/20/20 мм, Times New Roman 14 pt, 1.5 интервала, отступ 1.25 см, основной текст по ширине, структурные заголовки полужирные по центру, подписи рисунков по центру 12 pt."
+
+[page]
+page_w_mm = 210.0
+page_h_mm = 297.0
+margin_left_mm = 30.0
+margin_right_mm = 15.0
+margin_top_mm = 20.0
+margin_bottom_mm = 20.0
+header_mm = 10.0
+footer_mm = 10.0
+
+[body]
+font = "Times New Roman"
+size_pt = 14.0
+align = "justify"
+first_line_indent_cm = 1.25
+line_spacing = 1.5
+space_before_pt = 0.0
+space_after_pt = 0.0
+
+[heading1]
+font = "Times New Roman"
+size_pt = 14.0
+bold = true
+align = "center"
+first_line_indent_cm = 0.0
+line_spacing = 1.5
+space_before_pt = 12.0
+space_after_pt = 12.0
+
+[heading2]
+font = "Times New Roman"
+size_pt = 14.0
+bold = true
+align = "left"
+first_line_indent_cm = 0.0
+line_spacing = 1.5
+space_before_pt = 12.0
+space_after_pt = 6.0
+
+[caption]
+font = "Times New Roman"
+size_pt = 12.0
+align = "center"
+first_line_indent_cm = 0.0
+line_spacing = 1.5
+space_before_pt = 6.0
+space_after_pt = 12.0
+
+[bibliography]
+heading = "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ"
+format = "gost-7.0.100-2018"
