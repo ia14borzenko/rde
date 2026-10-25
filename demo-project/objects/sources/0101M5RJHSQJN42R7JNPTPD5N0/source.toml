@@ -1,0 +1,10 @@
+schema = "rde/source@1"
+id = "0101M5RJHSQJN42R7JNPTPD5N0"
+title = "Демо-отчёт (PDF, оформлен по ГОСТ 7.32-2017)"
+kind = "file"
+file = "files/report.pdf"
+
+[reference]
+title = "Отчёт по НИР (демо) — PDF-версия"
+year = 2026
+kind = "report"

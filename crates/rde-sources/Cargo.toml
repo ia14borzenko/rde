@@ -1,0 +1,15 @@
+[package]
+name = "rde-sources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDE sources (M5): импорт цитат (BibTeX/RIS/CSL-JSON), PDF-текст/рендер, OCR, веб-архив"
+
+[dependencies]
+rde-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rde-doc = { workspace = true }
+rde-docx = { workspace = true }
