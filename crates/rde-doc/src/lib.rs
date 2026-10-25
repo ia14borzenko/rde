@@ -297,8 +297,7 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                         seen_doc = true;
                         for attr in event.attributes().flatten() {
                             let key = local_name(attr.key.as_ref());
-                            let Ok(raw) = attr.unescape_value() else { continue };
-                            let value = unescape(&raw);
+                            let value = unescape(attr.value.as_ref());
                             match key.as_str() {
                                 "schema_version" => doc.schema_version = value,
                                 "doc_id" => doc.doc_id = value,
@@ -313,8 +312,7 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                         let mut block = RdeBlock { id: String::new(), path: String::new(), kind: "paragraph".into(), text: String::new() };
                         for attr in event.attributes().flatten() {
                             let key = local_name(attr.key.as_ref());
-                            let Ok(raw) = attr.unescape_value() else { continue };
-                            let value = unescape(&raw);
+                            let value = unescape(attr.value.as_ref());
                             match key.as_str() {
                                 "id" => block.id = value,
                                 "path" => block.path = value,
@@ -329,8 +327,7 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                         let mut insert = RdeInsert { id: String::new(), block: String::new(), kind: "figure".into(), target: String::new(), caption: String::new(), number: None, hash: None };
                         for attr in event.attributes().flatten() {
                             let key = local_name(attr.key.as_ref());
-                            let Ok(raw) = attr.unescape_value() else { continue };
-                            let value = unescape(&raw);
+                            let value = unescape(attr.value.as_ref());
                             match key.as_str() {
                                 "id" => insert.id = value,
                                 "block" => insert.block = value,
@@ -347,8 +344,7 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                     "review" => {
                         for attr in event.attributes().flatten() {
                             let key = local_name(attr.key.as_ref());
-                            let Ok(raw) = attr.unescape_value() else { continue };
-                            let value = unescape(&raw);
+                            let value = unescape(attr.value.as_ref());
                             match key.as_str() {
                                 "open" => doc.review.open = value.parse().unwrap_or(0),
                                 "resolved" => doc.review.resolved = value.parse().unwrap_or(0),
@@ -787,7 +783,131 @@ pub fn save_engine_document(editor_docx: &Path, package: &Path, doc_id_hint: &st
             ..RdeDoc::default()
         },
     };
+    if !template.is_empty() {
+        // Явно заданный шаблон (например, «Оформить по ГОСТ») важнее сохранённого в пакете.
+        rde_doc.template = template.to_owned();
+    }
     refresh_rde_doc(editor_docx, &mut rde_doc)?;
     write_package(editor_docx, &rde_doc, package)?;
     Ok(rde_doc)
+}
+
+// ── M5: ревью (комментарии Word, импорт внешнего ревью) ────────────────────────
+
+/// Комментарий Word из `word/comments.xml`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentInfo {
+    pub author: String,
+    pub initials: String,
+    pub date: String,
+    pub text: String,
+    pub resolved: bool,
+}
+
+/// Прочитать комментарии Word из `.docx` или `.doc.rde`.
+pub fn comments(path: &Path) -> Result<Vec<CommentInfo>, String> {
+    let (docx_path, temporary) = if is_rde_package(path) {
+        let temp = temp_docx_path("comments");
+        extract_docx(path, &temp)?;
+        (temp, true)
+    } else {
+        (path.to_path_buf(), false)
+    };
+    let result = (|| {
+        let entries = read_package(&docx_path)?.entries;
+        let Some(xml) = entries.get("word/comments.xml") else {
+            return Ok(Vec::new());
+        };
+        parse_comments_xml(&String::from_utf8_lossy(xml))
+    })();
+    if temporary {
+        let _ = fs::remove_file(&docx_path);
+    }
+    result
+}
+
+fn parse_comments_xml(xml: &str) -> Result<Vec<CommentInfo>, String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut comments = Vec::new();
+    let mut current: Option<CommentInfo> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) => {
+                let name = local_name(event.name().as_ref());
+                if name == "comment" {
+                    let mut info = CommentInfo { author: String::new(), initials: String::new(), date: String::new(), text: String::new(), resolved: false };
+                    for attr in event.attributes().flatten() {
+                        let key = local_name(attr.key.as_ref());
+                        let value = unescape(attr.value.as_ref());
+                        match key.as_str() {
+                            "author" => info.author = value,
+                            "initials" => info.initials = value,
+                            "date" => info.date = value,
+                            "done" | "resolved" => info.resolved = value == "1" || value.eq_ignore_ascii_case("true"),
+                            _ => {}
+                        }
+                    }
+                    current = Some(info);
+                }
+            }
+            Ok(Event::Text(text)) => {
+                if let Some(info) = current.as_mut() {
+                    let value = text.xml10_content().to_string();
+                    if !value.trim().is_empty() {
+                        if !info.text.is_empty() {
+                            info.text.push(' ');
+                        }
+                        info.text.push_str(value.trim());
+                    }
+                }
+            }
+            Ok(Event::End(event)) => {
+                if local_name(event.name().as_ref()) == "comment" {
+                    if let Some(info) = current.take() {
+                        comments.push(info);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(format!("comments.xml: {error}")),
+            _ => {}
+        }
+    }
+    Ok(comments)
+}
+
+/// Отчёт импорта внешнего ревью.
+#[derive(Clone, Debug)]
+pub struct ReviewImportReport {
+    pub comments_before: usize,
+    pub comments_after: usize,
+    pub external_edit: EditVerdict,
+    pub doc_id: String,
+    pub package: PackageInfo,
+}
+
+/// Импорт внешнего ревью: принять OOXML-файл (например, после правок в Word) как новую версию
+/// документа, сохранив RDE-метаданные (doc_id/шаблон/вставки) и обновив сводку ревью.
+pub fn import_external_review(package: &Path, external_docx: &Path) -> Result<ReviewImportReport, String> {
+    let mut rde_doc = load_rde_doc(package)?;
+    let comments_before = comments(package)?.len();
+    let external_info = package_info(external_docx)?;
+    if !external_info.has_part(DOCUMENT_XML) {
+        return Err(format!("{} не является .docx (нет word/document.xml)", external_docx.display()));
+    }
+    let comments_after = comments(external_docx)?.len();
+    let external_edit = check_external_edit(external_docx)
+        .map(|check| check.verdict)
+        .unwrap_or(EditVerdict::ExternalEdit);
+    refresh_rde_doc(external_docx, &mut rde_doc)?;
+    rde_doc.review = RdeReview { open: comments_after as u32, resolved: rde_doc.review.resolved };
+    let package_info = write_package(external_docx, &rde_doc, package)?;
+    Ok(ReviewImportReport {
+        comments_before,
+        comments_after,
+        external_edit,
+        doc_id: rde_doc.doc_id.clone(),
+        package: package_info,
+    })
 }

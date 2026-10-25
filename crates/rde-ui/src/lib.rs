@@ -113,8 +113,7 @@ impl DocPreview {
 
 /// Открыть `.docx`, разметить и растеризовать первые страницы через WordCraft.
 fn load_and_render(path: &Path, ctx: &egui::Context) -> Result<(Vec<egui::TextureHandle>, Vec2, usize), String> {
-    let region = wordcraft_engine::Region::from_tag("ru-RU");
-    let (doc, _encrypted) = wordcraft_engine::io::open_path_in(path, None, &region)?;
+    let (doc, _from_package) = rde_doc::open_document(path)?;
     let mut session = wordcraft_engine::Session::new(doc);
     let layout = session.layout();
     if layout.pages.is_empty() {
@@ -176,6 +175,13 @@ struct RenameDialogState {
     title: String,
 }
 
+/// Информация о PDF-источнике (M5): страницы и текстовый слой.
+#[derive(Clone, Debug)]
+struct PdfSourceInfo {
+    pages: u32,
+    text: String,
+}
+
 /// Реальный блок документа (из WordCraft-модели, а не mock).
 #[derive(Clone, Debug)]
 struct DocBlock {
@@ -219,6 +225,10 @@ pub struct RdeApp {
     delete_confirm: Option<String>,
     /// Кэш реальной структуры документа (WordCraft-модель).
     structure_cache: Option<Result<(Vec<DocBlock>, usize), String>>,
+    /// Кэш PDF-источника: путь → страницы/текст.
+    pdf_cache: Option<(String, Result<PdfSourceInfo, String>)>,
+    /// Кэш числа комментариев Word: ключ (путь+время) → количество.
+    comments_cache: Option<(String, usize)>,
 }
 
 impl RdeApp {
@@ -251,6 +261,8 @@ impl RdeApp {
             rename_dialog: None,
             delete_confirm: None,
             structure_cache: None,
+            pdf_cache: None,
+            comments_cache: None,
         };
         match Store::open(&app.project.root) {
             Ok(store) => {
@@ -259,7 +271,285 @@ impl RdeApp {
             }
             Err(error) => app.push_log(Level::Warn, format!("Хранилище проекта недоступно: {error}")),
         }
+        // M3: проверка «документ правили вне RDE?» по rde:doc/body_hash.
+        if let Some(path) = app.project.document_path() {
+            if rde_doc::is_rde_package(&path) {
+                match rde_doc::check_external_edit(&path) {
+                    Ok(check) if check.verdict != rde_doc::EditVerdict::NotModified => app.push_log(
+                        Level::Warn,
+                        match check.verdict {
+                            rde_doc::EditVerdict::MissingRdeDoc => "Документ пересохранён вне RDE: RDE-часть (customXml) потеряна — нужен импорт/сверка".to_owned(),
+                            _ => "Документ изменён вне RDE: body_hash не совпадает — проверьте правки".to_owned(),
+                        },
+                    ),
+                    Ok(_) => app.push_log(Level::Info, "Документ .doc.rde: RDE-часть на месте, внешних правок нет"),
+                    Err(error) => app.push_log(Level::Warn, format!("Проверка .doc.rde: {error}")),
+                }
+            }
+        }
         app
+    }
+
+    /// Сохранить документ в проект (`.doc.rde`) — RDE владелец сохранения.
+    pub fn save_project_document(&mut self) {
+        self.ensure_editor();
+        let Some(editor) = self.editor.as_ref() else {
+            self.push_log(Level::Warn, "Сохранить проект: редактор не открыт");
+            return;
+        };
+        let Some(document_object) = self.project.document_object().cloned() else {
+            self.push_log(Level::Warn, "Сохранить проект: в проекте нет документа");
+            return;
+        };
+        let ObjectData::Document(manifest) = &document_object.data else { return };
+        let old_path = document_object.dir.join(&manifest.file);
+        let package = if rde_doc::is_rde_package(&old_path) {
+            old_path.clone()
+        } else {
+            document_object.dir.join("report.doc.rde")
+        };
+        let temp = std::env::temp_dir().join(format!("rde-save-{}.docx", std::process::id()));
+        if let Err(error) = wordcraft_engine::io::save_path(&temp, &editor.app.session.doc) {
+            self.push_log(Level::Warn, format!("Сохранить проект: не удалось сохранить OOXML: {error}"));
+            return;
+        }
+        let template = manifest.template.clone();
+        let doc_id = manifest.id.clone();
+        match rde_doc::save_engine_document(&temp, &package, &doc_id, &template) {
+            Ok(rde_doc) => {
+                if package != old_path {
+                    let manifest_path = document_object.dir.join("document.toml");
+                    if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+                        let new_text = text.replace(&format!("file = \"{}\"", manifest.file), "file = \"report.doc.rde\"");
+                        let _ = std::fs::write(&manifest_path, new_text);
+                    }
+                }
+                self.structure_cache = None;
+                self.reload_project();
+                self.push_log(
+                    Level::Ok,
+                    format!(
+                        "Проект сохранён: {} ({} блоков, {} вставок, doc_id {})",
+                        package.display(),
+                        rde_doc.blocks.len(),
+                        rde_doc.inserts.len(),
+                        rde_doc.doc_id
+                    ),
+                );
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Сохранить проект: {error}")),
+        }
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    /// Оформить документ шаблоном (ГОСТ 7.32-2017) и/или вставить библиографию проекта.
+    /// Работает на извлечённой копии, результат сохраняется обратно в `.doc.rde`.
+    pub fn update_document_package(&mut self, apply_gost: bool, with_bibliography: bool) {
+        let Some(path) = self.project.document_path() else {
+            self.push_log(Level::Warn, "Оформление: в проекте нет документа");
+            return;
+        };
+        if !rde_doc::is_rde_package(&path) {
+            self.push_log(Level::Warn, "Оформление: документ ещё не в .doc.rde (сначала «Сохранить проект»)");
+            return;
+        }
+        if self.editor.is_some() {
+            self.save_project_document();
+        }
+        let Some(document_object) = self.project.document_object().cloned() else {
+            self.push_log(Level::Warn, "Оформление: объект документа не найден");
+            return;
+        };
+        let ObjectData::Document(manifest) = &document_object.data else { return };
+        let work = std::env::temp_dir().join(format!("rde-format-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        if let Err(error) = fs::create_dir_all(&work) {
+            self.push_log(Level::Warn, format!("Оформление: {error}"));
+            return;
+        }
+        let clean = work.join("clean.docx");
+        if let Err(error) = rde_doc::extract_docx(&path, &clean) {
+            self.push_log(Level::Warn, format!("Оформление: не удалось извлечь .docx: {error}"));
+            return;
+        }
+        let mut doc = match rde_doc::open_document(&clean) {
+            Ok((doc, _)) => doc,
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Оформление: не удалось открыть документ: {error}"));
+                return;
+            }
+        };
+        let mut logs = Vec::new();
+        let mut template_id = manifest.template.clone();
+        if apply_gost {
+            let Some(template) = rde_templates::template_by_id("gost-7.32-2017") else {
+                self.push_log(Level::Warn, "Оформление: шаблон ГОСТ не найден");
+                return;
+            };
+            let result = if with_bibliography {
+                rde_templates::apply_with_bibliography(template, &mut doc, &self.project)
+            } else {
+                Ok(rde_templates::apply(template, &mut doc))
+            };
+            match result {
+                Ok(applied) => {
+                    logs = applied;
+                    template_id = template.id.clone();
+                }
+                Err(error) => {
+                    self.push_log(Level::Warn, format!("Оформление: {error}"));
+                    return;
+                }
+            }
+        } else if with_bibliography {
+            let entries = rde_templates::bibliography_entries(&self.project);
+            let Some(template) = rde_templates::template_by_id(if template_id.is_empty() { "gost-7.32-2017" } else { &template_id }) else {
+                self.push_log(Level::Warn, "Оформление: шаблон не найден");
+                return;
+            };
+            match rde_templates::insert_bibliography(template, &mut doc, &entries) {
+                Ok(0) => logs.push("библиография уже присутствует в документе".to_owned()),
+                Ok(inserted) => logs.push(format!("библиография: добавлено {inserted} абзацев ({} источников)", entries.len())),
+                Err(error) => {
+                    self.push_log(Level::Warn, format!("Оформление: {error}"));
+                    return;
+                }
+            }
+        }
+        let formatted = work.join("formatted.docx");
+        if let Err(error) = wordcraft_engine::io::save_path(&formatted, &doc) {
+            self.push_log(Level::Warn, format!("Оформление: не удалось сохранить .docx: {error}"));
+            return;
+        }
+        match rde_doc::save_engine_document(&formatted, &path, &manifest.id, &template_id) {
+            Ok(rde_doc) => {
+                let manifest_path = document_object.dir.join("document.toml");
+                set_manifest_string(&manifest_path, "template", &template_id);
+                self.editor = None;
+                self.doc = DocPreview::new(self.project.document_path());
+                self.structure_cache = None;
+                self.reload_project();
+                self.push_log(
+                    Level::Ok,
+                    format!(
+                        "Документ оформлен: шаблон {}, блоков {}, вставок {}",
+                        template_id,
+                        rde_doc.blocks.len(),
+                        rde_doc.inserts.len()
+                    ),
+                );
+                for line in &logs {
+                    self.push_log(Level::Info, line.clone());
+                }
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Оформление: {error}")),
+        }
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// Открыть копию документа в Word: экспортировать чистый `.docx` в `exports/` и, если есть
+    /// графическая сессия, попробовать открыть системным обработчиком (headless — только путь).
+    pub fn export_word_copy(&mut self) {
+        let Some(package) = self.project.document_path() else {
+            self.push_log(Level::Warn, "Копия для Word: в проекте нет документа");
+            return;
+        };
+        let stem = package.file_stem().map(|stem| stem.to_string_lossy().to_string()).unwrap_or_else(|| "document".to_owned());
+        let out = self.export_dir.join(format!("{stem}-word.docx"));
+        let result = if rde_doc::is_rde_package(&package) {
+            rde_doc::extract_docx(&package, &out).map(|_| ())
+        } else {
+            std::fs::copy(&package, &out).map(|_| ()).map_err(|e| e.to_string())
+        };
+        match result {
+            Ok(()) => {
+                self.push_log(Level::Ok, format!("Копия для Word: {}", out.display()));
+                #[cfg(unix)]
+                if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                    let _ = std::process::Command::new("xdg-open").arg(&out).spawn();
+                }
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Копия для Word: {error}")),
+        }
+    }
+
+    /// Импорт внешнего ревью: взять самый свежий `.docx` из `exports/` (после правок в Word),
+    /// принять его как новую версию документа, сохранив RDE-метаданные.
+    pub fn import_review_from_exports(&mut self) {
+        let Some(package) = self.project.document_path() else {
+            self.push_log(Level::Warn, "Импорт ревью: в проекте нет документа");
+            return;
+        };
+        let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(&self.export_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let is_docx = path.extension().and_then(|ext| ext.to_str()) == Some("docx");
+                if !is_docx {
+                    return None;
+                }
+                let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+                Some((modified, path))
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        let Some((_, external)) = candidates.first() else {
+            self.push_log(Level::Warn, format!("Импорт ревью: в {} нет .docx", self.export_dir.display()));
+            return;
+        };
+        match rde_doc::import_external_review(&package, external) {
+            Ok(report) => {
+                self.comments_cache = None;
+                self.reload_project();
+                self.push_log(
+                    Level::Ok,
+                    format!(
+                        "Импорт ревью: {} (комментариев {} → {}, doc_id сохранён)",
+                        external.display(),
+                        report.comments_before,
+                        report.comments_after
+                    ),
+                );
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Импорт ревью: {error}")),
+        }
+    }
+
+    /// «Обновить документ»: перенумерация подписей + пересохранение `.doc.rde` под контролем RDE.
+    pub fn update_project_document(&mut self) {
+        let Some(path) = self.project.document_path() else {
+            self.push_log(Level::Warn, "Обновить документ: в проекте нет документа");
+            return;
+        };
+        if !rde_doc::is_rde_package(&path) {
+            self.push_log(Level::Warn, "Обновить документ: документ ещё не в .doc.rde (запустите миграцию/сохранение)");
+            return;
+        }
+        if self.editor.is_some() {
+            self.save_project_document();
+        }
+        match rde_doc::update_document_package(&path) {
+            Ok(report) => {
+                self.editor = None;
+                self.doc = DocPreview::new(self.project.document_path());
+                self.structure_cache = None;
+                self.reload_project();
+                self.push_log(
+                    Level::Ok,
+                    format!(
+                        "Документ обновлён: подписей изменено {}, вставок {}",
+                        report.changes.len(),
+                        report.rde_doc.as_ref().map(|doc| doc.inserts.len()).unwrap_or(0)
+                    ),
+                );
+                for change in &report.changes {
+                    self.push_log(Level::Info, format!("Подпись: «{}» → «{}»", change.old_text, change.new_text));
+                }
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Обновить документ: {error}")),
+        }
     }
 
     /// Пересчитать статусы артефактов из фактов (act_key/out_hash/выходы) и наложить на модель.
@@ -426,11 +716,15 @@ impl RdeApp {
             return;
         };
         let region = wordcraft_engine::Region::from_tag("ru-RU");
-        // Встроенный WordApp умеет сам сохранять документ (autosave/сохранение при выходе).
-        // Пока у RDE нет своего слоя сохранения проекта (rde:doc/транзакции — следующая веха),
-        // открываем временную копию: правки редактора не могут испортить файлы проекта.
-        let copy = std::env::temp_dir().join("rde-embedded-doc.docx");
-        if let Ok(bytes) = std::fs::read(&doc_path) {
+        // RDE — владелец сохранения: редактор работает с временной чистой копией, а запись в
+        // проект (.doc.rde) делает RDE по явной команде «Сохранить проект» (см. save_project_document).
+        let copy = std::env::temp_dir().join(format!("rde-embedded-doc-{}.docx", std::process::id()));
+        if rde_doc::is_rde_package(&doc_path) {
+            if let Err(error) = rde_doc::extract_docx(&doc_path, &copy) {
+                self.editor_error = Some(format!("не удалось извлечь .doc.rde: {error}"));
+                return;
+            }
+        } else if let Ok(bytes) = std::fs::read(&doc_path) {
             let _ = std::fs::write(&copy, bytes);
         }
         let edit_path = if copy.is_file() { copy } else { doc_path };
@@ -538,6 +832,8 @@ impl RdeApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let mut update_all = false;
         let mut export = false;
+        let mut save_project = false;
+        let mut update_document = false;
         let mut new_object = false;
         egui::Panel::top("rde_toolbar")
             .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(10, 4)))
@@ -558,6 +854,20 @@ impl RdeApp {
                     {
                         export = true;
                     }
+                    if ui
+                        .add(egui::Button::new(RichText::new("Сохранить проект").color(TEXT)).fill(PANEL_HI))
+                        .on_hover_text("Записать документ в .doc.rde (RDE — владелец сохранения)")
+                        .clicked()
+                    {
+                        save_project = true;
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("Обновить документ").color(TEXT)).fill(PANEL_HI))
+                        .on_hover_text("Перенумеровать подписи/обновить вставки и пересохранить .doc.rde")
+                        .clicked()
+                    {
+                        update_document = true;
+                    }
                     ui.separator();
                     if ui.button(RichText::new("+ Объект").size(13.0)).clicked() {
                         new_object = true;
@@ -576,6 +886,12 @@ impl RdeApp {
         if export {
             self.ensure_editor();
             self.save_editor_copy();
+        }
+        if save_project {
+            self.save_project_document();
+        }
+        if update_document {
+            self.update_project_document();
         }
         if new_object {
             self.create_dialog = Some(CreateDialogState { kind: NewObjectKind::ComputeArtifact, title: String::new() });
@@ -828,6 +1144,10 @@ impl RdeApp {
         let mut rename_clicked = false;
         let mut delete_clicked = false;
         let mut update_clicked = false;
+        let mut gost_clicked = false;
+        let mut bibliography_clicked = false;
+        let mut word_copy_clicked = false;
+        let mut review_import_clicked = false;
         egui::Panel::right("rde_inspector")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 8)))
             .default_size(320.0)
@@ -945,6 +1265,39 @@ impl RdeApp {
                         ObjectData::Document(document) => {
                             field_row(ui, "файл", &document.file, false);
                             field_row(ui, "шаблон", if document.template.is_empty() { "—" } else { &document.template }, false);
+                            if rde_doc::is_rde_package(&object.dir.join(&document.file)) {
+                                let package = object.dir.join(&document.file);
+                                let comments_key = format!("{}:{}", package.display(), fs::metadata(&package).and_then(|m| m.modified()).map(|t| format!("{t:?}")).unwrap_or_default());
+                                let fresh = self.comments_cache.as_ref().is_some_and(|(key, _)| key == &comments_key);
+                                if !fresh {
+                                    let count = rde_doc::comments(&package).map(|comments| comments.len()).unwrap_or(0);
+                                    self.comments_cache = Some((comments_key, count));
+                                }
+                                if let Some((_, count)) = &self.comments_cache {
+                                    field_row(ui, "комментариев Word", &count.to_string(), false);
+                                }
+                                let template = rde_templates::template_by_id(if document.template.is_empty() { "gost-7.32-2017" } else { &document.template });
+                                if let Some(template) = template {
+                                    field_row(ui, "описание", &template.description, false);
+                                }
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button(RichText::new("Оформить по ГОСТ").size(12.0)).clicked() {
+                                        gost_clicked = true;
+                                    }
+                                    if ui.button(RichText::new("Вставить библиографию").size(12.0)).clicked() {
+                                        bibliography_clicked = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button(RichText::new("Открыть копию в Word").size(12.0)).clicked() {
+                                        word_copy_clicked = true;
+                                    }
+                                    if ui.button(RichText::new("Импорт ревью из exports").size(12.0)).clicked() {
+                                        review_import_clicked = true;
+                                    }
+                                });
+                            }
                         }
                     }
                     ui.separator();
@@ -974,6 +1327,18 @@ impl RdeApp {
             }
             if update_clicked {
                 self.update_dependencies(Some(vec![object.id.clone()]));
+            }
+            if gost_clicked {
+                self.update_document_package(true, true);
+            }
+            if bibliography_clicked {
+                self.update_document_package(false, true);
+            }
+            if word_copy_clicked {
+                self.export_word_copy();
+            }
+            if review_import_clicked {
+                self.import_review_from_exports();
             }
         }
     }
@@ -1527,17 +1892,74 @@ impl RdeApp {
                     ui.add_space(6.0);
                     for line in [
                         "Метаданные загружены из source.toml.",
-                        "Извлечение текста (PDF/HTML), веб-архив и цитаты —",
-                        "следующая веха rde-sources (v0.2).",
+                        "PDF: текстовый слой и рендер (poppler), OCR (tesseract).",
+                        "Импорт цитат BibTeX/RIS/CSL-JSON — rde-sources.",
+                        "Веб-архив (monolith) — при наличии инструмента.",
                         "",
-                        "Пока источник виден в дереве и доступен агенту",
-                        "как объект проекта.",
+                        "Источник доступен агенту как объект проекта.",
                     ] {
                         ui.label(RichText::new(line).size(12.0).color(TEXT));
                     }
                 });
         });
+        // M5: PDF-источник — страницы, текстовый слой и OCR (poppler/tesseract).
+        if let Some(file) = src.file.clone() {
+            let path = obj.dir.join(&file);
+            let lower = file.to_ascii_lowercase();
+            if lower.ends_with(".pdf") {
+                let key = path.display().to_string();
+                let fresh = self.pdf_cache.as_ref().is_some_and(|(cached, _)| cached == &key);
+                if !fresh {
+                    let info = (|| -> Result<PdfSourceInfo, String> {
+                        let pages = rde_sources::pdf_page_count(&path)?;
+                        let text = rde_sources::pdf_text(&path).unwrap_or_default();
+                        Ok(PdfSourceInfo { pages, text })
+                    })();
+                    self.pdf_cache = Some((key, info));
+                }
+                if let Some((_, info)) = &self.pdf_cache {
+                    ui.add_space(6.0);
+                    match info {
+                        Ok(info) => {
+                            ui.label(RichText::new(format!("PDF · {} стр. · текстовый слой {} символов", info.pages, info.text.chars().count())).small().color(MUTED));
+                            let excerpt: String = info.text.chars().take(600).collect();
+                            egui::ScrollArea::vertical().id_salt("rde_pdf_text").max_height(160.0).show(ui, |ui| {
+                                ui.label(RichText::new(excerpt).monospace().size(11.0).color(TEXT));
+                            });
+                            if ui.button(RichText::new("OCR страницы 1").size(12.0)).clicked() {
+                                match rde_sources::ocr_pdf_page(&path, 1) {
+                                    Ok(text) => {
+                                        let _ = fs::write(obj.dir.join("ocr.txt"), &text);
+                                        let preview: String = text.chars().take(400).collect();
+                                        self.push_log(Level::Ok, format!("OCR PDF: распознано {} символов (ocr.txt)", text.chars().count()));
+                                        self.push_log(Level::Info, preview);
+                                    }
+                                    Err(error) => self.push_log(Level::Warn, format!("OCR: {error}")),
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            ui.label(RichText::new(format!("PDF: {error}")).small().color(AMBER));
+                        }
+                    }
+                }
+            } else if [".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"].iter().any(|ext| lower.ends_with(ext)) {
+                ui.add_space(6.0);
+                if ui.button(RichText::new("Распознать изображение (OCR)").size(12.0)).clicked() {
+                    match rde_sources::ocr_image(&path) {
+                        Ok(text) => {
+                            let _ = fs::write(obj.dir.join("ocr.txt"), &text);
+                            self.push_log(Level::Ok, format!("OCR изображения: {} символов (ocr.txt)", text.chars().count()));
+                            self.push_log(Level::Info, text.chars().take(400).collect::<String>());
+                        }
+                        Err(error) => self.push_log(Level::Warn, format!("OCR: {error}")),
+                    }
+                }
+            }
+        }
+
     }
+
 
     fn code_tab(&mut self, ui: &mut egui::Ui) {
         let object = self.selected_object();
@@ -1561,10 +1983,27 @@ impl RdeApp {
             if let ObjectData::Document(document) = &object.data {
                 let file = object.dir.join(&document.file);
                 let size = fs::metadata(&file).map(|metadata| metadata.len()).unwrap_or(0);
-                text.push_str(&format!(
-                    "\n# файл документа: {} ({size} байт)\n# пакет .doc.rde (customXml/rde:doc) и обновление вставок — M3\n",
-                    file.display()
-                ));
+                if rde_doc::is_rde_package(&file) {
+                    // M3: показываем реальную RDE-часть пакета (.doc.rde) + манифест.
+                    if let Ok(package_doc) = rde_doc::load_rde_doc(&file) {
+                        let xml = rde_doc::render_rde_doc(&package_doc);
+                        text = format!(
+                            "# .doc.rde: {}\n# RDE-часть customXml/item1.xml ({} блоков, {} вставок)\n\n{}\n# ───── document.toml ─────\n{}",
+                            file.display(),
+                            package_doc.blocks.len(),
+                            package_doc.inserts.len(),
+                            xml,
+                            text
+                        );
+                    } else {
+                        text = format!("# .doc.rde: {} ({size} байт)\n\n{text}", file.display());
+                    }
+                } else {
+                    text.push_str(&format!(
+                        "\n# файл документа: {} ({size} байт)\n# пакет .doc.rde (customXml/rde:doc) — появится после сохранения проекта\n",
+                        file.display()
+                    ));
+                }
             }
         }
         let path_label = if path.as_os_str().is_empty() { String::new() } else { path.display().to_string() };
@@ -1595,6 +2034,27 @@ impl RdeApp {
 
 // ── M2.4: данные инспектора/структуры ────────────────────────────────────────
 
+/// Записать/заменить строковое поле верхнего уровня в TOML-манифесте (без переформатирования файла).
+fn set_manifest_string(path: &Path, key: &str, value: &str) {
+    let Ok(text) = fs::read_to_string(path) else { return };
+    let mut out = String::with_capacity(text.len() + value.len() + 8);
+    let mut replaced = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !replaced && trimmed.starts_with(&format!("{key} =")) && !line.starts_with(' ') {
+            out.push_str(&format!("{key} = {value:?}\n"));
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !replaced {
+        out.push_str(&format!("{key} = {value:?}\n"));
+    }
+    let _ = fs::write(path, out);
+}
+
 fn field_row(ui: &mut egui::Ui, label: &str, value: &str, monospace: bool) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(label).small().color(MUTED));
@@ -1609,8 +2069,7 @@ fn field_row(ui: &mut egui::Ui, label: &str, value: &str, monospace: bool) {
 /// Разобрать реальную структуру документа через модель WordCraft (M2.4): абзацы, стили,
 /// рисунки, подписи. Никаких mock-блоков — используется настоящий `.docx` проекта.
 fn extract_document_structure(path: &Path) -> Result<(Vec<DocBlock>, usize), String> {
-    let region = wordcraft_engine::Region::from_tag("ru-RU");
-    let (doc, _encrypted) = wordcraft_engine::io::open_path_in(path, None, &region)?;
+    let (doc, _from_package) = rde_doc::open_document(path)?;
     let story = wordcraft_engine::doc::StoryRef::Body;
     let paths = doc.para_paths(story);
     let mut blocks = Vec::new();
@@ -1970,6 +2429,107 @@ mod docview_tests {
         assert!(figures >= 1, "рисунков: {figures}");
         assert!(blocks.iter().any(|block| block.kind == "FIG"), "должен быть блок-рисунок: {:?}", blocks.iter().map(|b| b.kind).collect::<Vec<_>>());
         assert!(blocks.iter().all(|block| block.number > 0));
+    }
+
+    #[test]
+    fn save_project_writes_doc_rde_and_update_document_works() {
+        let root = temp_demo_copy("doc-save");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        let package = app.project.document_path().expect("документ");
+        assert_eq!(package.extension().and_then(|ext| ext.to_str()), Some("rde"));
+
+        // Открыть редактор (он работает на извлечённой копии) и сохранить проект силами RDE.
+        app.ensure_editor();
+        assert!(app.editor.is_some(), "редактор должен открыть .doc.rde: {:?}", app.editor_error);
+        app.save_project_document();
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Проект сохранён")),
+            "нет записи о сохранении: {:?}",
+            app.project.log.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+        let check = rde_doc::check_external_edit(&package).unwrap();
+        assert_eq!(check.verdict, rde_doc::EditVerdict::NotModified, "{check:?}");
+        let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
+        assert!(rde_doc.blocks.len() >= 8);
+        assert!(rde_doc.inserts.iter().any(|insert| insert.kind == "figure" && !insert.target.is_empty()));
+
+        // «Обновить документ»: перенумерация подписей + пересохранение пакета под контролем RDE.
+        app.update_project_document();
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Документ обновлён")),
+            "нет записи об обновлении: {:?}",
+            app.project.log.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+        assert_eq!(rde_doc::check_external_edit(&package).unwrap().verdict, rde_doc::EditVerdict::NotModified);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gost_formatting_from_ui_persists_to_doc_rde() {
+        let root = temp_demo_copy("gost");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        let package = app.project.document_path().expect("документ");
+        app.update_document_package(true, true);
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Документ оформлен")),
+            "нет записи об оформлении: {:?}",
+            app.project.log.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+        // Манифест и пакет обновились согласованно.
+        let manifest = std::fs::read_to_string(app.project.document_object().unwrap().dir.join("document.toml")).unwrap();
+        assert!(manifest.contains("template = \"gost-7.32-2017\""), "{manifest}");
+        assert_eq!(rde_doc::check_external_edit(&package).unwrap().verdict, rde_doc::EditVerdict::NotModified);
+        let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
+        assert_eq!(rde_doc.template, "gost-7.32-2017");
+
+        // Чистый OOXML: поля ГОСТ и список источников на месте, LO-гейт проходит.
+        let work = std::env::temp_dir().join(format!("rde-ui-gost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let clean = work.join("clean.docx");
+        rde_doc::extract_docx(&package, &clean).unwrap();
+        let (doc, _) = rde_doc::open_document(&clean).unwrap();
+        let text = doc.plain_text(wordcraft_engine::doc::StoryRef::Body);
+        assert!(text.contains("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ"), "нет библиографии");
+        let sections = doc.sections();
+        let margin_left = sections.first().unwrap().1.margin_left;
+        assert!((margin_left - 30.0 * 72.0 / 25.4).abs() < 0.5, "margin_left={margin_left}");
+        let report = rde_docx::run_gate(&clean, &work.join("gate")).unwrap();
+        assert!(report.critical_missing.is_empty(), "{:?}", report.critical_missing);
+        if report.lo.available {
+            assert!(report.passed(), "{report:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn pdf_source_info_is_available() {
+        let project = rde_core::load_project(&rde_core::demo_project_dir()).unwrap();
+        assert!(project.issues.is_empty(), "{:?}", project.issues);
+        let pdf_source = project
+            .sources()
+            .find(|object| matches!(&object.data, rde_core::ObjectData::Source(source) if source.file.as_deref().is_some_and(|file| file.ends_with(".pdf"))))
+            .expect("в демо-проекте должен быть PDF-источник");
+        let rde_core::ObjectData::Source(source) = &pdf_source.data else { panic!() };
+        let path = pdf_source.dir.join(source.file.as_ref().unwrap());
+        assert!(path.is_file(), "PDF-файл источника: {}", path.display());
+        let pages = rde_sources::pdf_page_count(&path).expect("pdfinfo");
+        assert!(pages >= 1);
+        let text = rde_sources::pdf_text(&path).expect("pdftotext");
+        assert!(text.chars().count() > 100, "текстовый слой: {}", text.chars().count());
+    }
+
+    #[test]
+    fn structure_parser_reads_doc_rde_package() {
+        let project = rde_core::load_project(&rde_core::demo_project_dir()).unwrap();
+        let path = project.document_path().expect("документ");
+        assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("rde"));
+        let (blocks, figures) = super::extract_document_structure(&path).expect("разобрать .doc.rde");
+        assert!(blocks.len() >= 8, "блоков: {}", blocks.len());
+        assert!(figures >= 1);
     }
 
     #[test]

@@ -127,7 +127,7 @@ pub fn create_object(root: &Path, request: &CreateRequest) -> Result<PathBuf, St
                  name = \"inputs\"\n\
                  mode = \"hashed\"\n\
                  inputs = []\n"
-            ));
+            ))?;
             fs::write(
                 dir.join("script.py"),
                 format!(
@@ -154,7 +154,7 @@ pub fn create_object(root: &Path, request: &CreateRequest) -> Result<PathBuf, St
                  name = \"data\"\n\
                  mode = \"hashed\"\n\
                  inputs = [\n  {{ file = \"inputs/data.csv\" }},\n]\n"
-            ));
+            ))?;
             fs::create_dir_all(dir.join("inputs")).map_err(|e| format!("создать inputs: {e}"))?;
             fs::write(dir.join("inputs/data.csv"), "x,y\n1,2\n2,4\n").map_err(|e| format!("создать data.csv: {e}"))?;
             Ok(())

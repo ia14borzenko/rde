@@ -9,6 +9,9 @@ description = "RDE prototype UI shell: project tree, tabs, document preview (rea
 egui = { workspace = true }
 rde-core = { workspace = true }
 rde-dag = { workspace = true }
+rde-doc = { workspace = true }
+rde-templates = { workspace = true }
+rde-sources = { workspace = true }
 rde-store = { workspace = true }
 wordcraft-engine = { workspace = true }
 wordcraft-ui-egui = { path = "../../vendor/wordcraft/crates/ui-egui", features = ["rde-docview"] }
@@ -16,3 +19,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu"] }
+rde-docx = { workspace = true }

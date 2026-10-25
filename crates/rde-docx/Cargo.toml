@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "RDE docx fidelity gates (M3): part inventory, WordCraft roundtrip, LibreOffice oracle, JSON reports"
 
+[dev-dependencies]
+rde-core = { workspace = true }
+rde-doc = { workspace = true }
+
 [dependencies]
 rde-hash = { workspace = true }
 serde = { workspace = true }

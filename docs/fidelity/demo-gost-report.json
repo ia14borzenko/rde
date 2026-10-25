@@ -1,0 +1,20 @@
+{
+  "source": "demo-project/objects/documents/01M5VJ1JG04TFF59TDWH9EDD1R/report.doc.rde (извлечённый clean.docx)",
+  "source_parts": 10,
+  "roundtrip_parts": 10,
+  "missing": [],
+  "extra": [],
+  "changed": [],
+  "critical_missing": [],
+  "media_preserved": true,
+  "paragraphs_source": 16,
+  "paragraphs_roundtrip": 16,
+  "lo": {
+    "available": true,
+    "version": "LibreOffice 26.2.6.3 620(Build:3)",
+    "pdf_bytes": 121264,
+    "pdf_is_valid": true,
+    "error": null
+  },
+  "generated_unix": 1792899410
+}

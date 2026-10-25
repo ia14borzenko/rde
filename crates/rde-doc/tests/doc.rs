@@ -15,7 +15,14 @@ fn tmp(name: &str) -> PathBuf {
 
 fn demo_docx() -> PathBuf {
     let project = rde_core::load_project(&rde_core::demo_project_dir()).unwrap();
-    project.document_path().expect("документ демо-проекта")
+    let path = project.document_path().expect("документ демо-проекта");
+    if path.extension().and_then(|ext| ext.to_str()) == Some("rde") {
+        let out = std::env::temp_dir().join(format!("rde-doc-clean-{}.docx", std::process::id()));
+        extract_docx(&path, &out).expect("извлечь чистый .docx из .doc.rde");
+        out
+    } else {
+        path
+    }
 }
 
 fn copy_file(src: &Path, dst: &Path) {
@@ -208,10 +215,84 @@ fn save_engine_document_keeps_identity_and_inserts() {
     write_package(&clean, &rde_doc, &package).unwrap();
     let inserts_before = load_rde_doc(&package).unwrap().inserts.len();
 
-    let saved = save_engine_document(&clean, &package, "IGNORED", "ignored-template").unwrap();
+    // Пустой шаблон — сохраняем прежний; явный — переопределяем (сценарий «Оформить по ГОСТ»).
+    let saved = save_engine_document(&clean, &package, "IGNORED", "").unwrap();
     assert_eq!(saved.doc_id, "01TESTDOC", "doc_id должен сохраняться");
     assert_eq!(saved.template, "gost-7.32-2017");
     assert_eq!(saved.inserts.len(), inserts_before);
     assert_eq!(check_external_edit(&package).unwrap().verdict, EditVerdict::NotModified);
+
+    let saved = save_engine_document(&clean, &package, "IGNORED", "lab-report").unwrap();
+    assert_eq!(saved.template, "lab-report");
+    assert_eq!(saved.doc_id, "01TESTDOC");
+    assert_eq!(saved.inserts.len(), inserts_before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── M5: комментарии Word и импорт внешнего ревью ─────────────────────────────
+
+fn with_comments(input: &Path, out: &Path) -> PathBuf {
+    let file = std::fs::File::open(input).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().to_owned();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            writer.start_file(name, options).unwrap();
+            writer.write_all(&data).unwrap();
+        }
+        let comments = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1" w:author="Рецензент" w:initials="Р" w:date="2026-10-25T10:00:00Z"><w:p><w:r><w:t>Проверить рисунок 1</w:t></w:r></w:p></w:comment><w:comment w:id="2" w:author="Научрук" w:initials="Н" w:date="2026-10-25T11:00:00Z"><w:p><w:r><w:t>Добавить ссылку</w:t></w:r></w:p></w:comment></w:comments>"#;
+        writer.start_file("word/comments.xml", options).unwrap();
+        writer.write_all(comments.as_bytes()).unwrap();
+        writer.finish().unwrap();
+    }
+    std::fs::write(out, cursor.into_inner()).unwrap();
+    out.to_path_buf()
+}
+
+#[test]
+fn comments_are_read_from_docx_and_package() {
+    let dir = tmp("comments");
+    let clean = dir.join("clean.docx");
+    copy_file(&demo_docx(), &clean);
+    assert!(comments(&clean).unwrap().is_empty(), "у демо-документа нет комментариев");
+    let reviewed = with_comments(&clean, &dir.join("reviewed.docx"));
+    let parsed = comments(&reviewed).unwrap();
+    assert_eq!(parsed.len(), 2, "{parsed:?}");
+    assert_eq!(parsed[0].author, "Рецензент");
+    assert_eq!(parsed[0].text, "Проверить рисунок 1");
+    assert_eq!(parsed[1].author, "Научрук");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn import_external_review_preserves_rde_metadata() {
+    let dir = tmp("import-review");
+    let clean = dir.join("clean.docx");
+    copy_file(&demo_docx(), &clean);
+    let rde_doc = build_rde_doc(&clean, "01TESTDOC", "gost-7.32-2017").unwrap();
+    let package = dir.join("report.doc.rde");
+    write_package(&clean, &rde_doc, &package).unwrap();
+    let blocks_before = load_rde_doc(&package).unwrap().blocks.len();
+
+    let reviewed = with_comments(&clean, &dir.join("reviewed.docx"));
+    let report = import_external_review(&package, &reviewed).unwrap();
+    assert_eq!(report.comments_before, 0);
+    assert_eq!(report.comments_after, 2);
+    assert_eq!(report.doc_id, "01TESTDOC");
+    assert_eq!(report.external_edit, EditVerdict::MissingRdeDoc, "чистый .docx — внешний файл без RDE-части");
+    let after = load_rde_doc(&package).unwrap();
+    assert_eq!(after.doc_id, "01TESTDOC");
+    assert_eq!(after.template, "gost-7.32-2017");
+    assert_eq!(after.blocks.len(), blocks_before);
+    assert_eq!(after.review.open, 2);
+    assert_eq!(check_external_edit(&package).unwrap().verdict, EditVerdict::NotModified);
+    assert_eq!(comments(&package).unwrap().len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
