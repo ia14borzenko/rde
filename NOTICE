@@ -9,11 +9,17 @@ Third-party components referenced or used as dependencies (attribution):
   RDE embeds WordCraft's document engine and, via the fork branch `rde/main`
   (https://github.com/ia14borzenko/wordcraft-rde), a feature-gated chrome-less
   document view. See docs/wordcraft-fork.md for the change log.
-- egui / eframe / egui_dock — MIT OR Apache-2.0.
+- egui / eframe — MIT OR Apache-2.0 (докинг реализован собственным слоем, см. ADR-0003 §1).
 - xtask tooling and Cargo dependencies are attributed in Cargo.lock and their own licenses.
 - pdfium (https://github.com/chromium/pdfium) — BSD-3-Clause; pdfium-render — MIT/Apache-2.0.
 - monolith (https://github.com/Y2Z/monolith) — CC0-1.0.
-- Liberation fonts — SIL Open Font License 1.1 (not bundled in this prototype).
+- DejaVu Sans / DejaVu Sans Mono / DejaVu Sans Bold (subset) — bundled in `crates/rde-ui/fonts/`:
+  Copyright (c) 2003 by Bitstream, Inc.; DejaVu changes are public domain (Bitstream Vera license,
+  permissive, attribution required). Used for the RDE shell UI and bold section headings.
+- Phosphor Icons (subset of 21 glyphs, `crates/rde-ui/fonts/RdeIcons.ttf`) — MIT, Copyright (c) 2023
+  Phosphor Icons; full license text in `crates/rde-ui/fonts/PHOSPHOR-LICENSE.txt`.
+- Liberation fonts — SIL Open Font License 1.1. Planned OFL metric-compatible family per NFR-LIC-04;
+  not bundled in this prototype version (pending decision, see ADR-0003 §5).
 - ГОСТ standards texts are NOT distributed with this project; formatting rules are implemented
   as data/own wording with standard designations only.
 

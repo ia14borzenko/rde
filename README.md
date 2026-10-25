@@ -1,121 +1,198 @@
-# RDE — Research Development Environment (прототип)
+# RDE — Research Development Environment
 
-Среда разработки отчёта: документ — один из объектов проекта, а не единственный файл. Это первая
-итерация «общего вида концепции» поверх движка [WordCraft](https://github.com/storytold/wordcraft)
-v0.10.0 (git-субмодуль).
+Среда разработки отчёта: документ — один из объектов проекта, а не единственный файл. Прототип
+поверх движка [WordCraft](https://github.com/storytold/wordcraft) v0.10.0 (git-субмодуль):
+проект — каталог с TOML-манифестами, документ — `.doc.rde` (OOXML + `rde:doc`), артефакты —
+скрипты (Python в демо) с хешами/транзакциями, источники — PDF/OCR/ревью.
 
-![RDE M2.1 — проект на диске](docs/assets/m2.1-document.png)
+![RDE, P9: лента, тёмная тема, DocView](docs/fidelity/gui-p5-document-dark.png)
 
-> История: `concept-v0.1.png` — предпросмотр страниц; `concept-v0.2.png` — полный WordCraft
-> внутри панели; `concept-v0.3.png` — чистый DocView; `m2.1-*.png` — M2.1: дерево/статусы/журнал/
-> DAG/источники из реального проекта на диске
+*P9 «Интерфейс» (2026-10-25): лента из 9 вкладок, тёмная тема, DocView в центре, инспектор и
+честная панель агента справа. Ещё: [светлая тема](docs/fidelity/gui-p5-document-light.png),
+[артефакты и DAG](docs/fidelity/gui-p3-dark.png).*
 
-## Вехи
+## Состояние
 
-Текущая: **P7 «Демо-полигон и автоматизация»** (после P5, прототип v0.1) — все виды вставок
-R-DOC-11 в демо (значение/2 рисунка/таблица из CSV/константа с rich-форматом/перекрёстная
-ссылка/цитата/дата), автообновление артефактов и документа (R-DOC-12/R-ART-03), zip-бэкапы проекта
-и откат обновлений (R-VCS-04), панель документа RDE над DocView, редактор констант (R-ART-09).
-Exit-критерий v0.1: [`docs/exit-v0.1.md`](docs/exit-v0.1.md).
-Предыдущие: M1 (`m1-concept`), S5 (`s5-docview`), M2.1 (`m2.1-project-model`), M2.2 (`m2.2-store`),
-M2.3 (`m2.3-run-dag`), M2.4 (`m2.4-ui`), M3 (`m3-doc`), M4 (`m4-templates`), M5 (`m5-sources-review`),
-M6 (`ui-live`), P1 (`p1-artifacts`), P2 (`p2-store`), P3 (`p3-run-env`), P4 (`p4-doc-live`),
-P5 (`p5-gates`), P6 (`p6-feedback`), P7 (`p7-feedback-fixes`, `p7-polygon`).
-История и критерии вех: [`docs/milestones.md`](docs/milestones.md).
+Текущая веха — **P9 «Интерфейс»**: серия из 7 коммитов после P8 (тег ставит Lead при коммите).
+До неё прототип **v0.1** закрыт по [`docs/exit-v0.1.md`](docs/exit-v0.1.md) (P5, теги `p5-gates` /
+`v0.1-prototype`) и отполирован в P6–P8.
 
-## Что уже есть в прототипе
+- **173 теста** (`#[test]`) в 12 крейтах, 15 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
+- Демо-проект [`demo-project/`](demo-project): 11 объектов, документ с 9 живыми вставками,
+  Python-артефакты, PDF-источник, библиография.
+- Актуальные документы: ТЗ [`docs/tz-03.md`](docs/tz-03.md) (v03, канон; ведёт Lead), решения —
+  [`docs/adr/`](docs/adr/), история — [`CHANGELOG.md`](CHANGELOG.md).
+
+Вехи: M1 → S5 → M2.1–M2.4 → M3–M6 → P1–P8 → **P9**. Предыдущие теги: `m1-concept`, `s5-docview`,
+`m2.1-project-model`, `m2.2-store`, `m2.3-run-dag`, `m2.4-ui`, `m3-doc`, `m4-templates`,
+`m5-sources-review`, `ui-live`, `p1-artifacts`, `p2-store`, `p3-run-env`, `p4-doc-live`, `p5-gates`,
+`p6-feedback`, `p7-feedback-fixes`, `p7-polygon`, `p8-b0`, `p8-b1`, `p8-session-end`. Критерии и
+доказательства — [`docs/milestones.md`](docs/milestones.md).
+
+## Что уже есть
 
 | Часть | Состояние |
 |---|---|
-| Дерево проекта (документы, артефакты, константы, источники, заметки, репозитории) | **реальные объекты** из `demo-project/` (`rde.toml` + `objects/**`), статусы вычисляются из фактов на диске |
-| Центральные вкладки: Документ / Структура / Артефакты (DAG) / Источник / Код документа | UI готов |
-| **Документ** | три режима: **«Редактор RDE (DocView)»** — canvas WordCraft без его ribbon/titlebar (форк-патч `rde-docview`, feature-gate), ввод/вёрстка/undo как в WordCraft; **«Полный WordCraft»** — весь WordApp в панели (для сравнения); **«Предпросмотр страниц»** — растровые страницы |
-| Сохранение | **RDE — владелец сохранения**: «Сохранить проект» пишет `.doc.rde` (OOXML + `rde:doc`), «Экспорт .docx» — чистая копия в `exports/`; WordCraft-autosave отключён. Детект внешних правок по `rde:doc`/`body_hash` |
-| DAG артефактов | **реальный**: узлы/рёбра только по `hashed`-группам (ref — provenance/UI), статусы из `act_key`/`out_hash` (`rde-dag`), причины устаревания по компонентам (входы/скрипт/параметры/окружение/выходы), цикл-детект при загрузке |
-| Панель агента (ACP/DSH), предложения, tool-calls; вкладки «Структура»/«Код документа» | mock (следующие вехи) |
-| Панели (дерево, агент, журнал) | скрываются: × в заголовке панели или меню «Вид» |
-| Журнал | **реальный** журнал загрузки проекта + строки запусков артефактов с act_key |
-| Шаблоны/библиография | **работает**: ГОСТ 7.32-2017 (поля/шрифты/интервалы/заголовки/подписи), библиография ГОСТ 7.0.100 из источников проекта |
-| Источники/PDF/OCR/ревью | **работает**: импорт BibTeX/RIS/CSL-JSON, PDF-текст и OCR страницы, комментарии Word + импорт внешнего ревью; веб-архив — при наличии `monolith` |
-| Интерфейс (M6) | **рабочий**: меню/диалоги проектов и настроек, контекстное меню дерева, поиск Ctrl+F, «Проверить и починить», экспорт проекта, «Задачи» (история транзакций/запусков), быстрые действия без агента |
-| Артефакты (P1) | **нормативно**: JCS-хеши, `schema_version` в `act_key`, glob-селекторы (`out/*.csv`), входы-константы (`{ constants = "…" }`), «обновить артефакт» (force) и «обновить связанные», `out_hash` в манифесте для git |
-| Транзакции/откат (P2) | **работает**: транзакция «пачки» с переключением корней, откат O(1) (выходы восстанавливаются из CAS), панель «Задачи» → «Откатить», GC/pins, zstd, lock |
-| Окружения/запуск (P3) | **работает**: `rde-env` + `rde.lock`, согласие «проект доверенный», сеть запрещена best-effort, read-only входы, ошибка на лишние файлы, SIGTERM→grace, фоновое обновление с «Отменить», `provenance.json` |
-| Документ (P4) | **работает**: §8.5 wiring (root-rels/tombstone/paraId), живые вставки значения/рисунка из артефакта в `w:sdt`, «Обновить документ» из выходов, транзакция + бэкапы + diff + откат |
-| VCS/настройки/гейты (P5) | **работает**: git init/status/commit/revert/log, `.gitignore`/`.gitattributes`, настройки приложения и авторы, i18n-каркас ru/en, экспорт диагностики, OPC-гейт, корпус docx, `xtask`/CI, перф 10k |
-| Артефакт как рабочее место (P6) | **работает**: входные данные (группы/входы), генерация (runtime/params/outputs/скрипт), результат (превью выходов, логи, provenance), кнопки обновления/отката; вставки в документ — стиль шаблона + формат значения |
-| Демо-полигон и автоматизация (P7) | **работает**: все виды вставок (включая таблицу из CSV, константы, ссылки, цитаты), панель документа в DocView, автообновление, zip-бэкапы/восстановление проекта, откат обновлений, редактор констант |
-| MCP-сервер, ACP-агент | **следующие итерации** (v0.3, см. `.agent/plan-v01.md`) |
-| S5 (чистый DocView) | ✅ первая версия: feature `rde-docview` в форк-ветке WordCraft; см. `docs/wordcraft-fork.md` |
+| Проект, дерево, статусы | **реальные объекты** из `demo-project/` (`rde.toml` + `objects/**`), статусы — из DAG/фактов на диске |
+| Центральные вкладки | 5 вкладок: **Документ / Структура / Артефакты (DAG) / Источник / Код документа** — все на реальных данных |
+| Интерфейс (P9, M6) | **лента 9 вкладок** (Файл…Помощь) с группами, меню внутри ленты, контекстное меню дерева, диалоги проектов/настроек, поиск Ctrl+F, «Проверить и починить», «Задачи» |
+| Темы, шрифты, иконки | **Dark / Light / System** для оболочки и DocView; вендоренные DejaVu Sans/Mono с кириллицей; иконки Phosphor (сабсет 21 глифа, MIT) |
+| Документ | три режима: **«RDE»** — canvas WordCraft без его ribbon/titlebar (форк-патч `rde-docview`, feature-gate); **«WordCraft»** — весь WordApp в панели; **«Предпросмотр страниц»** — растровые страницы |
+| Сохранение | **RDE — владелец сохранения**: «Сохранить проект» пишет `.doc.rde`, «Экспорт .docx» — чистая копия в `exports/`; WordCraft-autosave отключён; внешние правки детектируются по `rde:doc`/`body_hash` |
+| DAG и обновление | **реальный**: узлы/рёбра по `hashed`-группам, статусы из `act_key`/`out_hash`, причины устаревания по компонентам, цикл-детект, «Обновить всё»/«Обновить связанные» |
+| Артефакты и store | JCS-хеши, `schema_version` в `act_key`, glob-селекторы, входы-константы, `out_hash` в манифесте; CAS, транзакции, откат O(1), GC/pins, zstd, lock |
+| Окружения и запуск | `rde-env` + `rde.lock`, согласие «проект доверенный», сеть запрещена best-effort, read-only входы, SIGTERM→grace, `provenance.json` |
+| Документ: вставки | `w:sdt`-вставки значения/рисунка из артефактов, обновление из выходов, бэкапы, diff, откат; все виды вставок в демо |
+| Шаблоны и библиография | ГОСТ 7.32-2017 (поля/шрифты/интервалы/заголовки/подписи), библиография ГОСТ 7.0.100 из источников |
+| Источники, PDF/OCR, ревью | импорт BibTeX/RIS/CSL-JSON, PDF-текст/рендер, OCR страницы, комментарии Word и импорт внешнего ревью; веб-архив — при наличии `monolith` |
+| VCS, настройки, гейты | git init/status/commit/revert/log, `.gitignore`/`.gitattributes`, настройки приложения и авторы, i18n-каркас ru/en, экспорт диагностики, OPC-гейт, корпус docx, `xtask`/CI, перф 10k |
+| Структура и Код документа | **реальные**: блоки/paraId/вставки из `.doc.rde`; манифест объекта + RDE-часть `customXml/item1.xml` |
+| Агент / MCP / ACP | **честная заглушка** «не подключён» + быстрые действия без агента; MCP-сервер и ACP-агент — v0.3 |
 
 ## Сборка и запуск
 
-Требования: Rust 1.99.x (пин в `rust-toolchain.toml`), Linux с X11/Wayland и GPU (wgpu).
-
-Тесты (включая автотест клавиатурного ввода в DocView и RDE-сохранения):
-
-```bash
-cargo test -p rde-core -p rde-hash -p rde-store -p rde-run -p rde-dag -p rde-doc -p rde-docx -p rde-templates -p rde-sources -p rde-ui   # 145 тестов: модель, хеши (JCS/property), store (kill -9/транзакции/откат/GC), окружения, запуск (безопасность/provenance), DAG (property), .doc.rde (§8.5/вставки/транзакция), docx-гейты/OPC, ГОСТ, источники/PDF/OCR, VCS, настройки/i18n, UI
-```
+Требования: Rust **1.99.1** (пин в `rust-toolchain.toml`), Linux с X11/Wayland и GPU (wgpu).
+Системные инструменты нужны только части гейтов: LibreOffice (fidelity), `poppler-utils` и
+`tesseract-ocr` + `tesseract-ocr-rus` (источники), `uv` (Python-артефакты), опционально `monolith`.
 
 ```bash
-git submodule update --init --recursive   # WordCraft v0.10.0 + форк-патч DocView (ветка rde/main)
-./scripts/build.sh build -p rde           # приложение (target на внешнем диске)
-./scripts/build.sh run -p rde             # окно RDE, демо-проект demo-project/
-./scripts/build.sh run -p rde -- --project <каталог>   # другой проект RDE
+# 1) WordCraft v0.10.0 + форк-патч DocView
+git submodule update --init --recursive
+# 2) сборка приложения (target вынесен на внешний ext4)
+./scripts/build.sh build -p rde
+
+# 3) запуск: по умолчанию демо-проект demo-project/
+./scripts/build.sh run -p rde
+
+#    после сборки бинарь лежит в $CARGO_TARGET_DIR/debug/rde
+#    (на стенде — /srv/yocto/rde-target/debug/rde)
+
+#    другой проект RDE:
+./scripts/build.sh run -p rde -- --project /путь/к/проекту
+RDE_PROJECT=/путь/к/проекту ./scripts/build.sh run -p rde
 ```
 
-Форк-ветка WordCraft: <https://github.com/ia14borzenko/wordcraft-rde> (ветка `rde/main`).
+Форк-ветка WordCraft: <https://github.com/ia14borzenko/wordcraft-rde> (ветка `rde/main`);
+журнал изменений — [`docs/wordcraft-fork.md`](docs/wordcraft-fork.md).
 
-Хранилище, обновление артефактов и docx-гейты — без окна:
+`scripts/build.sh` — обёртка над cargo: `CARGO_TARGET_DIR` (по умолчанию `/srv/yocto/rde-target`,
+то же в `.cargo/config.toml`), проверка свободного места, очистка incremental при нехватке.
+На другой машине переопределите `CARGO_TARGET_DIR` или удалите `target-dir` из `.cargo/config.toml`.
+Полная очистка — `./scripts/clean-build.sh`. Для сборки/тестов из каталога `rde/` можно и просто
+`cargo …`: target-dir уже прописан.
+
+`UV_CACHE_DIR` — если кэш `uv` вынесен из `~/.cache/uv`, экспортируйте его перед первым
+разрешением окружения (`export UV_CACHE_DIR=/path/to/uv-cache`); RDE вызывает системный `uv`
+(`rde-env`). Полезные переменные: `RDE_PROJECT` (путь к проекту), `RDE_PORTABLE` (portable-настройки),
+`RDE_PYTHON` (fallback-интерпретатор).
+
+### Тесты
 
 ```bash
-./scripts/build.sh run -p rde-store --example demo
-./scripts/build.sh run -p rde-dag --example update-demo      # второй запуск: «выполнено 0, пропущено 2»
-./scripts/build.sh run -p rde-docx --example fidelity -- <файл.docx> docs/fidelity/report.json
-./scripts/build.sh run -p rde-templates --example format-demo    # оформить демо-документ по ГОСТ + библиография
+./scripts/build.sh test --workspace   # 173 теста (#[test]) в 12 крейтах
 ```
 
-### Концепт-скриншот без видимого окна (headless)
+Разбивка: core 21, dag 25, ui 45, doc 21, run 14, hash 13, store 12, sources 6, docx 5,
+templates 5, env 4, vcs 2. Тесты, которым нужны внешние инструменты (LibreOffice, poppler,
+tesseract), проверяют наличие и пропускают проверку, если инструмента нет.
+
+### Headless-скриншоты (egui_kittest)
+
+Рендер идёт виртуально через `egui_kittest` + wgpu (offscreen): окна не открываются, дисплей не
+нужен.
 
 ```bash
-cargo run -p rde-ui --example screenshot -- /tmp/rde-concept.png [document|artifacts|source|structure|code]
+# документ (по умолчанию тёмная тема)
+./scripts/build.sh run -p rde-ui --example screenshot -- /tmp/rde-document.png document
+
+# артефакты/DAG, выбран объект по части названия
+./scripts/build.sh run -p rde-ui --example screenshot -- /tmp/rde-artifacts.png artifacts "Статистики"
+
+# светлая тема: аргументы out tab объект logs_tab action theme
+./scripts/build.sh run -p rde-ui --example screenshot -- /tmp/rde-light.png document "Отчёт по НИР" 0 "" light
 ```
 
-Рендер идёт виртуально через `egui_kittest` + wgpu (offscreen): окна не открываются, дисплей не нужен.
+Вкладки: `document | structure | artifacts | source | code`; 4-й аргумент — нижняя панель
+(0 журнал, 1 задачи, 2 агент), 5-й — действие (`update`, `insert-value`, `insert-figure`, …),
+6-й — тема (`dark | light | system`).
+
+### Гейты и проверки
+
+```bash
+./scripts/build.sh run -p xtask -- ci       # тесты ядра + docx-гейты + схемы
+./scripts/build.sh run -p xtask -- demo     # демо: обновление артефактов, вставки, fidelity
+./scripts/build.sh run -p xtask -- perf     # 10k объектов (docs/perf/10k.json)
+./scripts/build.sh run -p xtask -- fidelity # только fidelity демо-документа
+```
 
 ## Структура
 
 ```
 rde/
   apps/rde/            # eframe-приложение (окно)
-  crates/rde-core/     # модель проекта: манифесты, JSON Schema, загрузчик, статусы
-  crates/rde-hash/     # канонизация, Merkle-деревья, group/in/script/params/env → act_key (M2.2)
-  crates/rde-store/    # CAS, атомарная запись, журнал транзакций, пересборка индекса (M2.2)
-  crates/rde-run/      # исполнение скриптов артефактов: workdir, логи, timeout/cancel (M2.3)
-  crates/rde-dag/      # act_key/out_hash ledger, статусы, топологическое обновление (M2.3)
-  crates/rde-doc/      # .doc.rde: OOXML + rde:doc customXml, сохранение/извлечение, подписи (M3)
-  crates/rde-docx/     # docx fidelity-гейты: части, roundtrip WordCraft, LO-оракул (M3)
-  crates/rde-templates/# ГОСТ 7.32-2017 и профили, библиография ГОСТ 7.0.100 (M4)
-  crates/rde-sources/  # импорт цитат BibTeX/RIS/CSL-JSON, PDF-текст/рендер, OCR, веб-архив (M5)
-  crates/rde-ui/       # каркас UI + DocView WordCraft + панели на модели проекта
+  crates/rde-core/     # модель проекта: манифесты, JSON Schema, загрузчик, статусы, CRUD
+  crates/rde-hash/     # канонизация (JCS), Merkle, group/in/script/params/env → act_key
+  crates/rde-store/    # CAS, атомарная запись, журнал транзакций, откат, GC, индекс
+  crates/rde-run/      # исполнение скриптов артефактов: workdir, логи, timeout/cancel
+  crates/rde-env/      # окружения (uv/pixi/pnpm), rde.lock, digest → env_hash
+  crates/rde-dag/      # act_key/out_hash ledger, статусы, топологическое обновление
+  crates/rde-doc/      # .doc.rde: OOXML + rde:doc, вставки, сохранение, ревью, бэкапы
+  crates/rde-docx/     # docx fidelity-гейты: части, roundtrip, LO-оракул, OPC
+  crates/rde-templates/# ГОСТ 7.32-2017 и профили, библиография ГОСТ 7.0.100
+  crates/rde-sources/  # импорт цитат, PDF-текст/рендер, OCR, веб-архив
+  crates/rde-vcs/      # git init/status/commit/revert/log/diff, .gitignore/.gitattributes
+  crates/rde-ui/       # лента, панели, вкладки, DocView, темы, шрифты, иконки
   demo-project/        # демо-проект: rde.toml, objects/**; документ — .doc.rde
-  docs/schema/         # сгенерированные JSON Schema манифестов (rde-core examples/dump-schemas)
-  docs/fidelity/       # отчёты docx-гейтов (JSON)
-  scripts/build.sh     # cargo-обёртка: target на /srv/yocto/rde-target + защита от переполнения
-  .cargo/config.toml   # target-dir на внешний диск (на другой машине переопределите CARGO_TARGET_DIR)
-  vendor/wordcraft/    # git-субмодуль форка ia14borzenko/wordcraft-rde, ветка rde/main (DocView); журнал — docs/wordcraft-fork.md
-  patches/wordcraft/   # экспорт патчей форка (для bootstrap до публикации GitHub-форка)
-  docs/adr/            # архитектурные решения
-  docs/wordcraft-fork.md  # журнал любых изменений исходников WordCraft
+  docs/schema/         # сгенерированные JSON Schema манифестов
+  docs/fidelity/       # отчёты docx-гейтов и актуальные скриншоты интерфейса
+  docs/tz-03.md        # ТЗ v03 — канон (истина последней инстанции)
+  docs/adr/            # архитектурные решения (0001–0003)
+  scripts/build.sh     # cargo-обёртка: target на /srv/yocto/rde-target + guard
+  .cargo/config.toml   # target-dir на внешний диск
+  vendor/wordcraft/    # git-субмодуль форка ia14borzenko/wordcraft-rde, ветка rde/main
+  patches/wordcraft/   # экспорт патчей форка (bootstrap до публикации)
 ```
 
 ## Документация
 
-- [`docs/adr/0001-repo-layout-and-build.md`](docs/adr/0001-repo-layout-and-build.md) — решения по
-  репозиторию, вендорингу, CI, форк-политике.
-- [`docs/wordcraft-fork.md`](docs/wordcraft-fork.md) — журнал изменений WordCraft.
-- [`docs/state.md`](docs/state.md) — зафиксированное состояние проекта и форка (снимок 2026-10-24).
-- `.agent/tz-02.md` — ТЗ; `.agent/plan-v01.md` — детальный план; `refs/` — первоисточники (вне репо).
+- [`docs/tz-03.md`](docs/tz-03.md) — ТЗ v03 (канон): требования, статусы реализации, отклонения,
+  открытые решения.
+- [`docs/adr/`](docs/adr/) — архитектурные решения: [0001](docs/adr/0001-repo-layout-and-build.md)
+  (репозиторий/сборка/форк), [0002](docs/adr/0002-component-boundaries.md) (границы крейтов),
+  [0003](docs/adr/0003-deviations-from-tz02.md) (7 отклонений от ТЗ v02 и решения).
+- [`CHANGELOG.md`](CHANGELOG.md) — история вех M1–P9: что добавлено/изменено/исправлено.
+- [`docs/exit-v0.1.md`](docs/exit-v0.1.md) — exit-критерий v0.1 и что осталось за фазой.
+- [`docs/milestones.md`](docs/milestones.md) — критерии и доказательства вех.
+- [`docs/state.md`](docs/state.md) — снимки состояния проекта и форка.
+- [`docs/wordcraft-fork.md`](docs/wordcraft-fork.md) — журнал изменений WordCraft (форк-политика).
+- [`docs/fidelity/README.md`](docs/fidelity/README.md) — что проверяют docx-гейты.
 
-Лицензия: MIT OR Apache-2.0, атрибуция сторонних компонентов — в [NOTICE](NOTICE).
+## Честные ограничения
+
+- **PDF** — внешние CLI poppler (`pdftotext`/`pdfinfo`/`pdftoppm`), Linux-first; pdfium
+  (`pdfium-render`) и PDF-экспорт — v0.2, см. [ADR-0003](docs/adr/0003-deviations-from-tz02.md) §2.
+- **OCR** — только tesseract CLI; RapidOCR/PP-OCRv5 как дефолт, `OcrEngine` и CER-гейты — v0.2 (§3).
+- **Веб-архив** — работает только при установленном `monolith`; компонент не вендорен (§4).
+- **Шрифты** — вендорены DejaVu (Bitstream Vera), а не Liberation OFL; `NOTICE` требует обновления,
+  выбор — за владельцем (§5).
+- **Правка TOML** — `artifact.toml` перезаписывается из модели, комментарии/порядок теряются;
+  `toml_edit` — v0.2 (§6).
+- **Режимы обновления** — реализован только `manual`; `watch`/`strict` — v0.2 (§7).
+- **Формулы** (R-DOC-21/22) — не реализованы (отдельная работа, см. ТЗ v03 §19-9).
+- **MCP-сервер и ACP-агент** — v0.3: панель агента честно «не подключён», быстрые действия работают
+  без агента.
+- **За пределами v0.1** — `.rde`-пакет шаринга (R-ART-10), ГОСТ 2.105 (рамки/штампы) и вузовские
+  профили, OCR-гейты — v0.2; полная XSD-валидация ECMA-376 — v1.0.
+- **Word** — Microsoft Word/Word COM на стенде отсутствует: открываемость проверяется LO-оракулом
+  (LibreOffice → PDF) и OPC-валидацией, а не Word; Windows-CI — v1.0.
+- **Платформа** — Linux-first (X11; Wayland best-effort); GUI-job CI не блокирующий
+  (`continue-on-error`) до раннера с GPU.
+- **i18n** — каркас ru/en: меню/вкладки/панель действий переведены, диалоги и журнал — русские.
+- **P8** — B1.2/B2/B3 (reconcile `rde:doc` ↔ `document.xml`, hash/diff таблиц, kittest-матрица
+  действий) остаются в бэклоге.
+
+## Лицензия
+
+MIT OR Apache-2.0; атрибуция сторонних компонентов — в [NOTICE](NOTICE). Политика изменений
+WordCraft и форк-ветки — [`docs/wordcraft-fork.md`](docs/wordcraft-fork.md) и
+[ADR-0001](docs/adr/0001-repo-layout-and-build.md).
