@@ -3719,6 +3719,7 @@ dependencies = [
  "rde-templates",
  "rde-vcs",
  "serde_json",
+ "toml",
  "wordcraft-engine",
  "wordcraft-ui-egui",
  "zip",

@@ -668,7 +668,7 @@ impl RdeApp {
                     }
                 }
                 let manifest_path = document_object.dir.join("document.toml");
-                set_manifest_string(&manifest_path, "template", &template_id);
+                let _ = set_manifest_string(&manifest_path, "template", &template_id);
                 self.editor = None;
                 self.doc = DocPreview::new(self.project.document_path());
                 self.structure_cache = None;
@@ -1068,9 +1068,12 @@ impl RdeApp {
 
     /// Включить/выключить автообновление и сохранить режим в `rde.toml` (R-DOC-12).
     pub fn set_auto_update(&mut self, enabled: bool) {
-        self.auto_update = enabled;
         let path = self.project.root.join("rde.toml");
-        set_manifest_string(&path, "document_auto_update", if enabled { "true" } else { "false" });
+        if let Err(error) = set_manifest_value(&path, "document_auto_update", if enabled { "true" } else { "false" }) {
+            self.push_log(Level::Warn, format!("Автообновление: настройка не сохранена — {error}"));
+            return;
+        }
+        self.auto_update = enabled;
         self.push_log(
             Level::Info,
             if enabled {
@@ -2908,9 +2911,9 @@ impl RdeApp {
             return Err("название проекта не может быть пустым".to_owned());
         }
         let path = self.project.root.join("rde.toml");
-        set_manifest_string(&path, "name", name.trim());
-        set_manifest_string(&path, "default_template", template.trim());
-        set_manifest_string(&path, "default_rebuild", rebuild.trim());
+        let _ = set_manifest_string(&path, "name", name.trim());
+        let _ = set_manifest_string(&path, "default_template", template.trim());
+        let _ = set_manifest_string(&path, "default_rebuild", rebuild.trim());
         self.reload_project();
         self.push_log(Level::Ok, "Настройки проекта сохранены");
         Ok(())
@@ -5546,14 +5549,25 @@ fn today_iso_date() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn set_manifest_string(path: &Path, key: &str, value: &str) {
-    let Ok(text) = fs::read_to_string(path) else { return };
-    let mut out = String::with_capacity(text.len() + value.len() + 8);
+/// Записать типизированное значение в `rde.toml` с валидацией **до** замены файла (P8-B0).
+///
+/// Строки пишутся в кавычках, `true`/`false` и числа — как TOML-скаляры (раньше bool
+/// записывался как `"true"` и ломал JSON Schema проекта). Перед записью файл проверяется
+/// парсером `ProjectManifest`; при ошибке исходный файл не меняется.
+fn set_manifest_value(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
+    let rendered = match value {
+        "true" | "false" => value.to_owned(),
+        other if other.parse::<i64>().is_ok() => other.to_owned(),
+        other if other.parse::<f64>().is_ok() && !other.is_empty() => other.to_owned(),
+        other => format!("{other:?}"),
+    };
+    let mut out = String::with_capacity(text.len() + rendered.len() + key.len() + 8);
     let mut replaced = false;
     for line in text.lines() {
         let trimmed = line.trim_start();
         if !replaced && trimmed.starts_with(&format!("{key} =")) && !line.starts_with(' ') {
-            out.push_str(&format!("{key} = {value:?}\n"));
+            out.push_str(&format!("{key} = {rendered}\n"));
             replaced = true;
         } else {
             out.push_str(line);
@@ -5561,9 +5575,19 @@ fn set_manifest_string(path: &Path, key: &str, value: &str) {
         }
     }
     if !replaced {
-        out.push_str(&format!("{key} = {value:?}\n"));
+        out.push_str(&format!("{key} = {rendered}\n"));
     }
-    let _ = fs::write(path, out);
+    // Валидация до записи: TOML + типы ProjectManifest (в т.ч. document_auto_update: bool).
+    let _: toml::Value = toml::from_str(&out).map_err(|e| format!("rde.toml: {e}"))?;
+    let _: rde_core::ProjectManifest = toml::from_str(&out).map_err(|e| format!("rde.toml: {e}"))?;
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, out).map_err(|e| format!("записать {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| format!("заменить {}: {e}", path.display()))
+}
+
+/// Строковое значение в `rde.toml` (совместимость): ошибки возвращаются вызывающему.
+fn set_manifest_string(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    set_manifest_value(path, key, value)
 }
 
 fn field_row(ui: &mut egui::Ui, label: &str, value: &str, monospace: bool) {
@@ -6376,6 +6400,27 @@ mod docview_tests {
         // Пиксели могут совпасть, если выход артефакта не менялся — важен формат (PNG) и содержимое.
         assert!(media.len() > 1000, "рисунок содержит данные: {} байт", media.len());
         let _ = media_before;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P8-B0: целостность rde.toml (typed TOML + валидация до записи) ───────
+
+    #[test]
+    fn auto_update_toggle_writes_valid_typed_toml() {
+        let root = temp_demo_copy("auto-toggle");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        assert!(!app.project.manifest.document_auto_update);
+        app.set_auto_update(true);
+        // Проект должен перечитываться без ошибок схемы, а в файле — bool, не строка.
+        let reloaded = rde_core::load_project(&root).expect("rde.toml после тоггла валиден");
+        assert!(reloaded.manifest.document_auto_update, "auto=true");
+        let text = std::fs::read_to_string(root.join("rde.toml")).unwrap();
+        assert!(text.contains("document_auto_update = true"), "{text}");
+        assert!(!text.contains("document_auto_update = \"true\""), "bool не должен быть строкой: {text}");
+        app.set_auto_update(false);
+        let reloaded = rde_core::load_project(&root).expect("rde.toml после выключения валиден");
+        assert!(!reloaded.manifest.document_auto_update);
         let _ = std::fs::remove_dir_all(&root);
     }
 
