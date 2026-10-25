@@ -28,7 +28,8 @@ use rde_store::Store;
 
 pub const APP_TITLE: &str = "RDE — Research Development Environment";
 
-// ── палитра (тёмная тема, близкая к IDE) ─────────────────────────────────────
+// ── палитра ──────────────────────────────────────────────────────────────────
+// Тёмная тема (близкая к IDE; значения зафиксированы фазой 1 — не менять).
 const BG: Color32 = Color32::from_rgb(0x16, 0x17, 0x1b);
 const PANEL: Color32 = Color32::from_rgb(0x1d, 0x1f, 0x24);
 const PANEL_HI: Color32 = Color32::from_rgb(0x25, 0x28, 0x30);
@@ -38,9 +39,91 @@ const MUTED: Color32 = Color32::from_rgb(0x9a, 0xa1, 0xaf); // WCAG AA: 5.68:1 �
 const ACCENT: Color32 = Color32::from_rgb(0x51, 0x8c, 0xff);
 const GREEN: Color32 = Color32::from_rgb(0x52, 0xc4, 0x7d);
 const AMBER: Color32 = Color32::from_rgb(0xe3, 0xa7, 0x3e);
-const RED: Color32 = Color32::from_rgb(0xe0, 0x60, 0x60);
+const RED: Color32 = Color32::from_rgb(0xe8, 0x76, 0x76); // осветлён с e06060: 5.10:1 на PANEL_HI (WCAG AA, было 4.22:1)
 // ACCENT проверен: 4.59:1 на PANEL_HI как текст (WCAG AA ≥ 4.5:1) — значение не меняем,
 // осветление уронило бы белый текст на ACCENT-заливках (3.21:1) ниже нормы.
+
+// Светлая тема (GUI фаза 2): тот же набор ролей, что у тёмной. Контрасты текста
+// ≥ 4.5:1 (WCAG AA) на LIGHT_PANEL_HI проверяются тестом `theme_tests::text_contrast`.
+const LIGHT_BG: Color32 = Color32::from_rgb(0xe9, 0xec, 0xf1);
+const LIGHT_PANEL: Color32 = Color32::from_rgb(0xf7, 0xf8, 0xfa);
+const LIGHT_PANEL_HI: Color32 = Color32::from_rgb(0xe2, 0xe6, 0xeb);
+const LIGHT_BORDER: Color32 = Color32::from_rgb(0xc9, 0xcf, 0xd8);
+const LIGHT_TEXT: Color32 = Color32::from_rgb(0x1b, 0x1f, 0x26);
+const LIGHT_MUTED: Color32 = Color32::from_rgb(0x59, 0x61, 0x6e);
+const LIGHT_ACCENT: Color32 = Color32::from_rgb(0x2b, 0x5a, 0xc7);
+const LIGHT_GREEN: Color32 = Color32::from_rgb(0x1b, 0x6e, 0x3e);
+const LIGHT_AMBER: Color32 = Color32::from_rgb(0x8a, 0x58, 0x00);
+const LIGHT_RED: Color32 = Color32::from_rgb(0xb4, 0x34, 0x2a);
+
+/// Цветовые роли оболочки под текущую тему. Вся отрисовка берёт цвета отсюда
+/// через `theme_colors`, сырые константы палитр напрямую используют только
+/// `dark_visuals()` / `light_visuals()`.
+#[derive(Clone, Copy)]
+struct ThemeColors {
+    bg: Color32,
+    panel: Color32,
+    panel_hi: Color32,
+    border: Color32,
+    text: Color32,
+    muted: Color32,
+    accent: Color32,
+    green: Color32,
+    amber: Color32,
+    red: Color32,
+}
+
+/// Палитра под эффективную тему (`ctx.theme()` уже учитывает System:
+/// без данных от ОС — тёмная, см. `fallback_theme` в egui).
+fn theme_colors(theme: egui::Theme) -> ThemeColors {
+    match theme {
+        egui::Theme::Dark => ThemeColors {
+            bg: BG,
+            panel: PANEL,
+            panel_hi: PANEL_HI,
+            border: BORDER,
+            text: TEXT,
+            muted: MUTED,
+            accent: ACCENT,
+            green: GREEN,
+            amber: AMBER,
+            red: RED,
+        },
+        egui::Theme::Light => ThemeColors {
+            bg: LIGHT_BG,
+            panel: LIGHT_PANEL,
+            panel_hi: LIGHT_PANEL_HI,
+            border: LIGHT_BORDER,
+            text: LIGHT_TEXT,
+            muted: LIGHT_MUTED,
+            accent: LIGHT_ACCENT,
+            green: LIGHT_GREEN,
+            amber: LIGHT_AMBER,
+            red: LIGHT_RED,
+        },
+    }
+}
+
+/// Значение `settings.theme` → предпочтение egui. Неизвестное → Dark
+/// (совпадает с дефолтом `normalize()` в `rde_core::settings`).
+fn theme_preference_of(theme: &str) -> egui::ThemePreference {
+    match theme {
+        "light" => egui::ThemePreference::Light,
+        "system" => egui::ThemePreference::System,
+        _ => egui::ThemePreference::Dark,
+    }
+}
+
+/// Значение `settings.theme` → тема встроенного редактора WordCraft.
+/// Сам WordCraft (vendor) не трогаем — только просим его перерисоваться
+/// в соответствующей гамме.
+fn appearance_of(theme: &str) -> wordcraft_ui_egui::theme::Appearance {
+    match theme {
+        "light" => wordcraft_ui_egui::theme::Appearance::Light,
+        "system" => wordcraft_ui_egui::theme::Appearance::System,
+        _ => wordcraft_ui_egui::theme::Appearance::Dark,
+    }
+}
 
 // ── типошкала (мелкий текст ≥ 11, шаг ~1.25 к крупным кеглям) ───────────────────
 const FS_DISPLAY: f32 = 18.0; // крупный заголовок просмотра
@@ -349,6 +432,10 @@ pub struct RdeApp {
     selected: Option<String>,
     doc: DocPreview,
     zoom: f32,
+    /// Масштаб интерфейса оболочки (GUI фаза 2): множитель поверх зума документа.
+    /// Применяется через `ctx.set_zoom_factor`, живёт в сессии (в `AppSettings`
+    /// его нет — владение rde-core, вне scope фазы).
+    ui_scale: f32,
     logs_tab: usize,
     fonts_installed: bool,
     // видимость панелей (скрываются через меню «Вид» или кнопкой × в заголовке)
@@ -438,6 +525,7 @@ impl RdeApp {
             selected,
             doc,
             zoom: 0.72,
+            ui_scale: 1.0,
             logs_tab: 0,
             fonts_installed: false,
             show_tree: true,
@@ -1617,6 +1705,14 @@ impl RdeApp {
         self.app_settings_dialog = Some(self.app_settings.clone());
     }
 
+    /// Для демо/скриншотов и тестов: выбрать тему оболочки
+    /// (`dark` | `light` | `system`; прочее игнорируется).
+    pub fn demo_set_theme(&mut self, theme: &str) {
+        if matches!(theme, "dark" | "light" | "system") {
+            self.app_settings.theme = theme.to_owned();
+        }
+    }
+
     /// Для демо/скриншотов: открыть диалог вставки (`value` или `figure`).
     pub fn demo_open_insert_dialog(&mut self, kind: &str) {
         self.open_insert_dialog(kind);
@@ -1727,7 +1823,7 @@ impl RdeApp {
                 session.path = Some(edit_path.clone());
                 let mut app = wordcraft_ui_egui::WordApp::new(session, wordcraft_ui_egui::Services::default());
                 app.integrated_titlebar = false;
-                app.ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
+                app.ui.theme = appearance_of(&self.app_settings.theme);
                 // RDE owns saving: no WordCraft autosave recovery writes behind its back.
                 app.autosave = false;
                 let pages = app.session.layout().pages.len();
@@ -1743,14 +1839,16 @@ impl RdeApp {
         self.maybe_auto_boot_update();
         if !self.fonts_installed {
             install_fonts(ui.ctx());
-            install_style(ui.ctx());
             self.fonts_installed = true;
         }
-        if self.editor.is_some() {
-            // WordCraft's own UI applies its theme/fonts globally in `logic`; restore the
-            // RDE shell visuals each frame so the environment keeps a stable look. WordCraft
-            // draws itself from the effective dark palette (`Tokens::get`), so both match.
-            install_style(ui.ctx());
+        // Тема применяется каждый кадр: живой предпросмотр из открытого диалога
+        // настроек + WordCraft перекрашивает глобальные visuals в своём `logic`,
+        // поэтому оболочка восстанавливает свои после него.
+        let preview_theme = self.app_settings_dialog.as_ref().map(|dialog| dialog.theme.clone());
+        let theme = preview_theme.as_deref().unwrap_or(&self.app_settings.theme);
+        apply_app_theme(ui.ctx(), theme, self.ui_scale);
+        if let Some(editor) = &mut self.editor {
+            editor.app.ui.theme = appearance_of(theme);
         }
         // Горячие клавиши (Ctrl+F — поиск, Ctrl+S — сохранить проект, Ctrl+Z/Y — отмена/повтор в редакторе).
         let (find, save, undo, redo) = ui.input(|input| {
@@ -1800,6 +1898,7 @@ impl RdeApp {
 
     // ── верхнее меню ────────────────────────────────────────────────────────
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let project_name = self.project.name.clone();
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum MenuAction {
@@ -1835,7 +1934,7 @@ impl RdeApp {
         }
         let mut action: Option<MenuAction> = None;
         egui::Panel::top("rde_menu")
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 2)))
+            .frame(egui::Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(12, 2)))
             .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button(tr(self.lang, "menu.file"), |ui| {
@@ -1969,7 +2068,7 @@ impl RdeApp {
                         ui.checkbox(&mut self.show_inspector, "Инспектор объекта");
                     });
                     ui.menu_button(tr(self.lang, "menu.agent"), |ui| {
-                        ui.label(RichText::new("MCP/ACP — v0.3 (не подключён)").small().color(MUTED));
+                        ui.label(RichText::new("MCP/ACP — v0.3 (не подключён)").small().color(pal.muted));
                         if ui.button("Аудит действий…").clicked() {
                             action = Some(MenuAction::Audit);
                             ui.close();
@@ -1982,9 +2081,9 @@ impl RdeApp {
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new("RDE · прототип v0.1").small().color(MUTED));
+                        ui.label(RichText::new("RDE · прототип v0.1").small().color(pal.muted));
                         ui.add_space(6.0);
-                        ui.label(RichText::new(&project_name).small().color(TEXT));
+                        ui.label(RichText::new(&project_name).small().color(pal.text));
                     });
                 });
             });
@@ -2058,6 +2157,7 @@ impl RdeApp {
 
     // ── панель действий ─────────────────────────────────────────────────────
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let mut update_all = false;
         let mut export = false;
         let mut save_project = false;
@@ -2068,14 +2168,14 @@ impl RdeApp {
         let running = self.update_job.is_some();
         let running_secs = self.update_job.as_ref().map(|job| job.started.elapsed().as_secs_f32()).unwrap_or(0.0);
         egui::Panel::top("rde_toolbar")
-            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(12, 4)))
+            .frame(egui::Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(12, 4)))
             .exact_size(36.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
                             !running,
-                            egui::Button::new(RichText::new(tr(self.lang, "toolbar.update_all")).color(Color32::WHITE)).fill(ACCENT),
+                            egui::Button::new(RichText::new(tr(self.lang, "toolbar.update_all")).color(Color32::WHITE)).fill(pal.accent),
                         )
                         .on_hover_text("Реально пересчитать устаревшие артефакты (rde-dag: act_key/out_hash, транзакции)")
                         .clicked()
@@ -2083,9 +2183,9 @@ impl RdeApp {
                         update_all = true;
                     }
                     if running {
-                        ui.label(RichText::new(format!("● обновление… {running_secs:.0} с")).small().color(AMBER));
+                        ui.label(RichText::new(format!("● обновление… {running_secs:.0} с")).small().color(pal.amber));
                         if ui
-                            .add(egui::Button::new(RichText::new("Отменить").color(TEXT)).fill(PANEL_HI))
+                            .add(egui::Button::new(RichText::new("Отменить").color(pal.text)).fill(pal.panel_hi))
                             .on_hover_text("Остановить текущий запуск (SIGTERM → grace → SIGKILL) и отменить обновление")
                             .clicked()
                         {
@@ -2093,21 +2193,21 @@ impl RdeApp {
                         }
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.export_docx")).color(TEXT)).fill(PANEL_HI))
+                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.export_docx")).color(pal.text)).fill(pal.panel_hi))
                         .on_hover_text("Собрать чистый .docx из .doc.rde")
                         .clicked()
                     {
                         export = true;
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.save_project")).color(TEXT)).fill(PANEL_HI))
+                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.save_project")).color(pal.text)).fill(pal.panel_hi))
                         .on_hover_text("Записать документ в .doc.rde (RDE — владелец сохранения)")
                         .clicked()
                     {
                         save_project = true;
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.update_document")).color(TEXT)).fill(PANEL_HI))
+                        .add(egui::Button::new(RichText::new(tr(self.lang, "toolbar.update_document")).color(pal.text)).fill(pal.panel_hi))
                         .on_hover_text("Перенумеровать подписи/обновить вставки и пересохранить .doc.rde")
                         .clicked()
                     {
@@ -2121,9 +2221,9 @@ impl RdeApp {
                         search_clicked = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("• {} устаревших объектов", self.project.stale_count())).small().color(AMBER));
+                        ui.label(RichText::new(format!("• {} устаревших объектов", self.project.stale_count())).small().color(pal.amber));
                         ui.separator();
-                        ui.label(RichText::new("MCP: off").small().color(MUTED));
+                        ui.label(RichText::new("MCP: off").small().color(pal.muted));
                     });
                 });
             });
@@ -2154,31 +2254,32 @@ impl RdeApp {
 
     // ── статус-бар ──────────────────────────────────────────────────────────
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         egui::Panel::bottom("rde_status")
-            .frame(egui::Frame::new().fill(PANEL_HI).inner_margin(Margin::symmetric(12, 3)))
+            .frame(egui::Frame::new().fill(pal.panel_hi).inner_margin(Margin::symmetric(12, 3)))
             .exact_size(24.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("•  RDE").color(ACCENT).size(11.0));
-                    ui.label(RichText::new("прототип v0.1").small().color(MUTED));
+                    ui.label(RichText::new("•  RDE").color(pal.accent).size(11.0));
+                    ui.label(RichText::new("прототип v0.1").small().color(pal.muted));
                     ui.separator();
-                    ui.label(RichText::new(self.project.root.display().to_string()).small().color(MUTED));
+                    ui.label(RichText::new(self.project.root.display().to_string()).small().color(pal.muted));
                     ui.separator();
                     let git_summary = self
                         .git_status
                         .as_ref()
                         .map(rde_vcs::GitStatus::summary_ru)
                         .unwrap_or_else(|| "git: —".to_owned());
-                    let git_color = if self.git_status.as_ref().is_some_and(|status| status.is_dirty()) { AMBER } else { MUTED };
+                    let git_color = if self.git_status.as_ref().is_some_and(|status| status.is_dirty()) { pal.amber } else { pal.muted };
                     ui.label(RichText::new(git_summary).small().color(git_color));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new("A4 · ru-RU").small().color(MUTED));
+                        ui.label(RichText::new("A4 · ru-RU").small().color(pal.muted));
                         ui.separator();
-                        ui.label(RichText::new(format!("{} {}", self.project.object_count(), tr(self.lang, "status.objects"))).small().color(MUTED));
+                        ui.label(RichText::new(format!("{} {}", self.project.object_count(), tr(self.lang, "status.objects"))).small().color(pal.muted));
                         ui.separator();
-                        ui.label(RichText::new(format!("• {} {}", self.project.stale_count(), tr(self.lang, "status.stale"))).small().color(AMBER));
+                        ui.label(RichText::new(format!("• {} {}", self.project.stale_count(), tr(self.lang, "status.stale"))).small().color(pal.amber));
                         ui.separator();
-                        ui.label(RichText::new(tr(self.lang, "status.agent_offline")).small().color(MUTED));
+                        ui.label(RichText::new(tr(self.lang, "status.agent_offline")).small().color(pal.muted));
                     });
                 });
             });
@@ -2186,6 +2287,7 @@ impl RdeApp {
 
     // ── журнал / задачи ─────────────────────────────────────────────────────
     fn logs_panel(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let mut tab = self.logs_tab;
         let mut hide_logs = false;
         let mut clear = false;
@@ -2197,10 +2299,10 @@ impl RdeApp {
             .resizable(true)
             .default_size(150.0)
             .min_size(56.0)
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8)))
+            .frame(egui::Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("ПАНЕЛЬ").small().strong().color(MUTED));
+                    ui.label(RichText::new("ПАНЕЛЬ").small().strong().color(pal.muted));
                     ui.add_space(4.0);
                     for (i, name) in [tr(self.lang, "panel.journal"), tr(self.lang, "panel.tasks"), tr(self.lang, "panel.agent")].iter().enumerate() {
                         if ui.selectable_label(tab == i, RichText::new(*name).size(12.0)).clicked() {
@@ -2215,7 +2317,7 @@ impl RdeApp {
                             clear = true;
                         }
                         if tab == 1 {
-                            ui.label(RichText::new(format!("{} записей", tasks.len())).small().color(MUTED));
+                            ui.label(RichText::new(format!("{} записей", tasks.len())).small().color(pal.muted));
                         }
                     });
                 });
@@ -2228,15 +2330,15 @@ impl RdeApp {
                         match tab {
                             1 => {
                                 if tasks.is_empty() {
-                                    ui.label(RichText::new("Пока нет запусков и транзакций — нажмите «Обновить всё»").small().color(MUTED));
+                                    ui.label(RichText::new("Пока нет запусков и транзакций — нажмите «Обновить всё»").small().color(pal.muted));
                                 }
                                 for line in &tasks {
-                                    ui.label(RichText::new(line).monospace().size(FS_MONO).color(TEXT));
+                                    ui.label(RichText::new(line).monospace().size(FS_MONO).color(pal.text));
                                 }
                                 ui.add_space(8.0);
-                                ui.label(RichText::new("ТРАНЗАКЦИИ ОБНОВЛЕНИЙ — ОТКАТ (O(1))").small().strong().color(MUTED));
+                                ui.label(RichText::new("ТРАНЗАКЦИИ ОБНОВЛЕНИЙ — ОТКАТ (O(1))").small().strong().color(pal.muted));
                                 if rollback_candidates.is_empty() {
-                                    ui.label(RichText::new("Пока нет транзакций со снапшотом корней").small().color(MUTED));
+                                    ui.label(RichText::new("Пока нет транзакций со снапшотом корней").small().color(pal.muted));
                                 }
                                 for candidate in rollback_candidates.iter().take(8) {
                                     ui.horizontal(|ui| {
@@ -2244,9 +2346,9 @@ impl RdeApp {
                                             .updated_unix
                                             .map(|unix| format!("unix {unix}"))
                                             .unwrap_or_else(|| "—".to_owned());
-                                        ui.label(RichText::new(format!("{} · {stamp}", candidate.note)).size(11.5).color(TEXT));
+                                        ui.label(RichText::new(format!("{} · {stamp}", candidate.note)).size(11.5).color(pal.text));
                                         if candidate.rolled_back {
-                                            ui.label(RichText::new("откачено").small().color(MUTED));
+                                            ui.label(RichText::new("откачено").small().color(pal.muted));
                                         } else if ui.small_button("Откатить").on_hover_text("Переключить корни на предыдущие (O(1)) и восстановить выходы из CAS").clicked() {
                                             rollback_clicked = Some(candidate.txid.clone());
                                         }
@@ -2254,22 +2356,22 @@ impl RdeApp {
                                 }
                             }
                             2 => {
-                                ui.label(RichText::new("Агент не подключён (MCP/ACP — v0.3).").strong().color(TEXT));
-                                ui.label(RichText::new("Пока доступны быстрые действия без агента — они в правой панели «Агент».").small().color(MUTED));
+                                ui.label(RichText::new("Агент не подключён (MCP/ACP — v0.3).").strong().color(pal.text));
+                                ui.label(RichText::new("Пока доступны быстрые действия без агента — они в правой панели «Агент».").small().color(pal.muted));
                                 ui.add_space(4.0);
-                                ui.label(RichText::new("Когда появится: запуск артефактов и обновление вставок по запросу, проверка проекта, оформление по ГОСТ — с approvals и аудитом действий.").small().color(MUTED));
+                                ui.label(RichText::new("Когда появится: запуск артефактов и обновление вставок по запросу, проверка проекта, оформление по ГОСТ — с approvals и аудитом действий.").small().color(pal.muted));
                             }
                             _ => {
                                 for line in &log {
                                     ui.horizontal(|ui| {
-                                        ui.label(RichText::new(line.time).monospace().size(FS_MONO).color(MUTED));
+                                        ui.label(RichText::new(line.time).monospace().size(FS_MONO).color(pal.muted));
                                         let color = match line.level {
-                                            Level::Info => MUTED,
-                                            Level::Ok => GREEN,
-                                            Level::Warn => AMBER,
+                                            Level::Info => pal.muted,
+                                            Level::Ok => pal.green,
+                                            Level::Warn => pal.amber,
                                         };
                                         ui.label(RichText::new("•").color(color).size(11.0));
-                                        ui.label(RichText::new(&line.text).size(FS_SMALL).color(TEXT));
+                                        ui.label(RichText::new(&line.text).size(FS_SMALL).color(pal.text));
                                     });
                                 }
                             }
@@ -2290,6 +2392,7 @@ impl RdeApp {
 
     // ── дерево проекта ──────────────────────────────────────────────────────
     fn tree_panel(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let groups = self.project.groups.clone();
         let objects = self.project.objects.clone();
         let object_count = self.project.object_count();
@@ -2304,15 +2407,15 @@ impl RdeApp {
             .resizable(true)
             .default_size(268.0)
             .min_size(120.0)
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8)))
+            .frame(egui::Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("ПРОЕКТ").small().strong().color(MUTED));
+                    ui.label(RichText::new("ПРОЕКТ").small().strong().color(pal.muted));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("×").on_hover_text("Скрыть панель (вернуть — меню «Вид»)").clicked() {
                             hide_tree = true;
                         }
-                        ui.label(RichText::new(format!("{object_count} объектов")).small().color(MUTED));
+                        ui.label(RichText::new(format!("{object_count} объектов")).small().color(pal.muted));
                     });
                 });
                 let filter_response = ui.add(
@@ -2328,7 +2431,7 @@ impl RdeApp {
                     self.tree_filter.clear();
                 }
                 ui.add_space(2.0);
-                if ui.add(egui::Button::new(RichText::new("+ Новый объект").size(FS_BUTTON)).fill(PANEL_HI)).clicked() {
+                if ui.add(egui::Button::new(RichText::new("+ Новый объект").size(FS_BUTTON)).fill(pal.panel_hi)).clicked() {
                     new_object = true;
                 }
                 ui.add_space(4.0);
@@ -2343,14 +2446,14 @@ impl RdeApp {
                         if visible.is_empty() {
                             continue;
                         }
-                        let header = RichText::new(format!("{}  {}  · {}", group.kind.icon(), group.title, visible.len())).strong().size(12.5).color(TEXT);
+                        let header = RichText::new(format!("{}  {}  · {}", group.kind.icon(), group.title, visible.len())).strong().size(12.5).color(pal.text);
                         egui::CollapsingHeader::new(header).default_open(true).show(ui, |ui| {
                             for obj in visible {
                                 let is_sel = selected.as_deref() == Some(obj.id.as_str());
                                 let resp = ui
                                     .horizontal(|ui| {
-                                        ui.label(RichText::new("●").color(freshness_color(obj.freshness)).size(FS_CAPTION));
-                                        ui.label(RichText::new(obj.kind.icon()).color(MUTED).size(12.0));
+                                        ui.label(RichText::new("●").color(freshness_color(obj.freshness, pal)).size(FS_CAPTION));
+                                        ui.label(RichText::new(obj.kind.icon()).color(pal.muted).size(12.0));
                                         // Панель можно сузить: длинные названия обрезаются с «…»,
                                         // полное название — в подсказке и в инспекторе.
                                         ui.add(egui::Button::selectable(is_sel, RichText::new(&obj.title).size(FS_BODY)).truncate())
@@ -2433,7 +2536,7 @@ impl RdeApp {
                     }
                     ui.add_space(6.0);
                     if filter.is_empty() && groups.iter().all(|group| group.objects.is_empty()) {
-                        ui.label(RichText::new("В проекте пока нет объектов").small().color(MUTED));
+                        ui.label(RichText::new("В проекте пока нет объектов").small().color(pal.muted));
                     }
                     // Пустое место дерева: создание объекта.
                     let empty = ui.allocate_response(vec2(ui.available_width(), 18.0), Sense::click());
@@ -2525,6 +2628,7 @@ impl RdeApp {
 
     // ── панель агента ───────────────────────────────────────────────────────
     fn agent_panel(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let mut hide_agent = false;
         let mut check = false;
         let mut update = false;
@@ -2534,22 +2638,22 @@ impl RdeApp {
             .resizable(true)
             .default_size(316.0)
             .min_size(180.0)
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8)))
+            .frame(egui::Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("АГЕНТ").small().strong().color(MUTED));
-                    ui.label(RichText::new("• не подключён").small().color(AMBER));
+                    ui.label(RichText::new("АГЕНТ").small().strong().color(pal.muted));
+                    ui.label(RichText::new("• не подключён").small().color(pal.amber));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("×").on_hover_text("Скрыть панель (вернуть — меню «Вид»)").clicked() {
                             hide_agent = true;
                         }
-                        ui.label(RichText::new("v0.3 · MCP/ACP").small().color(MUTED));
+                        ui.label(RichText::new("v0.3 · MCP/ACP").small().color(pal.muted));
                     });
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().id_salt("rde_agent_scroll").auto_shrink([false, false]).show(ui, |ui| {
                     ui.add_space(4.0);
-                    ui.label(RichText::new("Встроенный агент появится в v0.3").strong().color(TEXT));
+                    ui.label(RichText::new("Встроенный агент появится в v0.3").strong().color(pal.text));
                     ui.label(
                         RichText::new(
                             "Планируется: MCP-сервер (инструменты, ресурсы, approvals) и ACP-агент, \
@@ -2557,25 +2661,25 @@ impl RdeApp {
                              и оформлять по ГОСТ — с аудитом и откатом.",
                         )
                         .small()
-                        .color(MUTED),
+                        .color(pal.muted),
                     );
                     ui.add_space(10.0);
-                    ui.label(RichText::new("БЫСТРЫЕ ДЕЙСТВИЯ (без агента)").small().strong().color(MUTED));
+                    ui.label(RichText::new("БЫСТРЫЕ ДЕЙСТВИЯ (без агента)").small().strong().color(pal.muted));
                     ui.add_space(4.0);
-                    if ui.add(egui::Button::new("Проверить проект").fill(PANEL_HI)).clicked() {
+                    if ui.add(egui::Button::new("Проверить проект").fill(pal.panel_hi)).clicked() {
                         check = true;
                     }
-                    if ui.add(egui::Button::new("Обновить устаревшие артефакты").fill(PANEL_HI)).clicked() {
+                    if ui.add(egui::Button::new("Обновить устаревшие артефакты").fill(pal.panel_hi)).clicked() {
                         update = true;
                     }
-                    if ui.add(egui::Button::new("Оформить документ по ГОСТ").fill(PANEL_HI)).clicked() {
+                    if ui.add(egui::Button::new("Оформить документ по ГОСТ").fill(pal.panel_hi)).clicked() {
                         gost = true;
                     }
-                    if ui.add(egui::Button::new("Импорт ревью из exports").fill(PANEL_HI)).clicked() {
+                    if ui.add(egui::Button::new("Импорт ревью из exports").fill(pal.panel_hi)).clicked() {
                         review = true;
                     }
                     ui.add_space(10.0);
-                    ui.label(RichText::new("Журнал и история запусков — в панели снизу («Задачи»).").small().color(MUTED));
+                    ui.label(RichText::new("Журнал и история запусков — в панели снизу («Задачи»).").small().color(pal.muted));
                 });
                 ui.add_space(4.0);
                 ui.add_enabled(
@@ -2646,6 +2750,7 @@ impl RdeApp {
     }
 
     fn inspector_panel(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let object = self.selected_object();
         let mut open_clicked = false;
         let mut rename_clicked = false;
@@ -2656,28 +2761,28 @@ impl RdeApp {
         let mut word_copy_clicked = false;
         let mut review_import_clicked = false;
         egui::Panel::right("rde_inspector")
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8)))
+            .frame(egui::Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(12, 8)))
             .default_size(320.0)
             .resizable(false)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("rde_inspector_scroll").auto_shrink([false, false]).show(ui, |ui| {
                     let Some(object) = &object else {
                         ui.add_space(8.0);
-                        ui.label(RichText::new("Объект не выбран").color(MUTED));
-                        ui.label(RichText::new("Выберите объект в дереве проекта").small().color(MUTED));
+                        ui.label(RichText::new("Объект не выбран").color(pal.muted));
+                        ui.label(RichText::new("Выберите объект в дереве проекта").small().color(pal.muted));
                         return;
                     };
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(object.kind.label_ru()).small().color(MUTED));
+                        ui.label(RichText::new(object.kind.label_ru()).small().color(pal.muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("×").on_hover_text("Скрыть инспектор").clicked() {
                                 self.show_inspector = false;
                             }
                         });
                     });
-                    ui.label(RichText::new(&object.title).size(FS_HEADING).strong().color(TEXT));
+                    ui.label(RichText::new(&object.title).size(FS_HEADING).strong().color(pal.text));
                     ui.add_space(1.0);
-                    ui.label(RichText::new(fresh_label(object.freshness)).small().color(freshness_color(object.freshness)));
+                    ui.label(RichText::new(fresh_label(object.freshness)).small().color(freshness_color(object.freshness, pal)));
                     ui.add_space(6.0);
                     field_row(ui, "id", &object.id, true);
                     field_row(ui, "каталог", &object.dir.display().to_string(), true);
@@ -2747,7 +2852,7 @@ impl RdeApp {
                             field_row(ui, "входы", &format!("{hashed} hashed · {refed} ref"), false);
                             if let Some(status) = self.dag_statuses.get(&object.id) {
                                 ui.add_space(6.0);
-                                ui.label(RichText::new("DAG / активация").small().color(MUTED));
+                                ui.label(RichText::new("DAG / активация").small().color(pal.muted));
                                 if let Some(act_key) = &status.act_key {
                                     field_row(ui, "act_key", &act_key.chars().take(20).collect::<String>(), true);
                                 }
@@ -2800,9 +2905,9 @@ impl RdeApp {
                             let path = object.dir.join(&note.file);
                             if let Ok(text) = std::fs::read_to_string(&path) {
                                 ui.add_space(4.0);
-                                ui.label(RichText::new("содержимое").small().color(MUTED));
+                                ui.label(RichText::new("содержимое").small().color(pal.muted));
                                 let preview: String = text.chars().take(400).collect();
-                                ui.label(RichText::new(preview).size(12.0).color(TEXT));
+                                ui.label(RichText::new(preview).size(12.0).color(pal.text));
                             }
                         }
                         ObjectData::Repository(repo) => {
@@ -2849,8 +2954,8 @@ impl RdeApp {
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("id").small().color(MUTED));
-                        ui.label(RichText::new(&object.id).monospace().size(FS_CAPTION).color(MUTED));
+                        ui.label(RichText::new("id").small().color(pal.muted));
+                        ui.label(RichText::new(&object.id).monospace().size(FS_CAPTION).color(pal.muted));
                         if ui.small_button("копировать").clicked() {
                             ui.ctx().copy_text(object.id.clone());
                         }
@@ -3352,6 +3457,7 @@ impl RdeApp {
 
     /// Дополнительные диалоги: проекты, настройки, проверка, аудит, «О прототипе».
     fn dialogs_extra(&mut self, ctx: &egui::Context) {
+        let pal = theme_colors(ctx.theme());
         if let Some(backups) = self.backup_dialog.take() {
             let mut restore: Option<PathBuf> = None;
             let mut close = false;
@@ -3365,18 +3471,18 @@ impl RdeApp {
                     ui.label(
                         RichText::new("zip-снапшоты проекта (без .rde/exports), хранится последние 10. Восстановление сначала делает бэкап текущего состояния.")
                             .small()
-                            .color(MUTED),
+                            .color(pal.muted),
                     );
                     ui.separator();
                     if backups.is_empty() {
-                        ui.label(RichText::new("Бэкапов пока нет").color(MUTED));
+                        ui.label(RichText::new("Бэкапов пока нет").color(pal.muted));
                     }
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                         for backup in &backups {
                             ui.horizontal(|ui| {
                                 let size = std::fs::metadata(backup).map(|meta| meta.len()).unwrap_or(0);
                                 ui.label(RichText::new(backup.file_name().and_then(|name| name.to_str()).unwrap_or("—")).monospace().size(11.5));
-                                ui.label(RichText::new(format!("{:.1} КБ", size as f64 / 1024.0)).small().color(MUTED));
+                                ui.label(RichText::new(format!("{:.1} КБ", size as f64 / 1024.0)).small().color(pal.muted));
                                 if ui.small_button("восстановить").clicked() {
                                     restore = Some(backup.clone());
                                 }
@@ -3422,7 +3528,7 @@ impl RdeApp {
                 .show(ctx, |ui| {
                     ui.set_min_width(520.0);
                     ui.add(egui::TextEdit::singleline(&mut path).hint_text("Путь к каталогу с rde.toml").desired_width(f32::INFINITY));
-                    ui.label(RichText::new("Нужен каталог, в котором есть rde.toml").small().color(MUTED));
+                    ui.label(RichText::new("Нужен каталог, в котором есть rde.toml").small().color(pal.muted));
                     ui.horizontal(|ui| {
                         if ui.button("Открыть").clicked() {
                             open = true;
@@ -3455,11 +3561,11 @@ impl RdeApp {
                 .show(ctx, |ui| {
                     ui.set_min_width(520.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Каталог").color(MUTED));
+                        ui.label(RichText::new("Каталог").color(pal.muted));
                         ui.add(egui::TextEdit::singleline(&mut path).desired_width(f32::INFINITY));
                     });
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Название").color(MUTED));
+                        ui.label(RichText::new("Название").color(pal.muted));
                         ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
                     });
                     ui.horizontal(|ui| {
@@ -3495,10 +3601,10 @@ impl RdeApp {
                 .show(ctx, |ui| {
                     ui.set_min_width(560.0);
                     egui::Grid::new("rde_settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                        ui.label(RichText::new("Название").color(MUTED));
+                        ui.label(RichText::new("Название").color(pal.muted));
                         ui.add(egui::TextEdit::singleline(&mut dialog.name).desired_width(360.0));
                         ui.end_row();
-                        ui.label(RichText::new("Шаблон по умолчанию").color(MUTED));
+                        ui.label(RichText::new("Шаблон по умолчанию").color(pal.muted));
                         egui::ComboBox::from_id_salt("rde_settings_template")
                             .selected_text(if dialog.template.is_empty() { "—" } else { &dialog.template })
                             .show_ui(ui, |ui| {
@@ -3507,7 +3613,7 @@ impl RdeApp {
                                 }
                             });
                         ui.end_row();
-                        ui.label(RichText::new("Пересборка").color(MUTED));
+                        ui.label(RichText::new("Пересборка").color(pal.muted));
                         egui::ComboBox::from_id_salt("rde_settings_rebuild")
                             .selected_text(if dialog.rebuild.is_empty() { "—" } else { &dialog.rebuild })
                             .show_ui(ui, |ui| {
@@ -3518,7 +3624,7 @@ impl RdeApp {
                         ui.end_row();
                     });
                     ui.separator();
-                    ui.label(RichText::new(tr(lang, "settings.authors")).strong().small().color(MUTED));
+                    ui.label(RichText::new(tr(lang, "settings.authors")).strong().small().color(pal.muted));
                     for (index, author) in dialog.authors.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut author.name).hint_text("Имя").desired_width(150.0));
@@ -3585,6 +3691,9 @@ impl RdeApp {
         if let Some(mut settings) = self.app_settings_dialog.take() {
             let mut save = false;
             let mut cancel = false;
+            // Масштаб интерфейса правится здесь же, но хранится в сессии RdeApp
+            // (в схеме AppSettings его нет — владение rde-core, вне scope фазы).
+            let mut ui_scale = self.ui_scale;
             egui::Window::new(tr(self.lang, "settings.app"))
                 .collapsible(false)
                 .resizable(false)
@@ -3592,7 +3701,7 @@ impl RdeApp {
                 .show(ctx, |ui| {
                     ui.set_min_width(480.0);
                     egui::Grid::new("rde_app_settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                        ui.label(RichText::new(tr(self.lang, "settings.language")).color(MUTED));
+                        ui.label(RichText::new(tr(self.lang, "settings.language")).color(pal.muted));
                         egui::ComboBox::from_id_salt("rde_lang")
                             .selected_text(settings.language.clone())
                             .show_ui(ui, |ui| {
@@ -3600,21 +3709,33 @@ impl RdeApp {
                                 ui.selectable_value(&mut settings.language, "en".to_owned(), "English");
                             });
                         ui.end_row();
-                        ui.label(RichText::new(tr(self.lang, "settings.theme")).color(MUTED));
+                        ui.label(RichText::new(tr(self.lang, "settings.theme")).color(pal.muted));
+                        let theme_label = match settings.theme.as_str() {
+                            "light" => tr(self.lang, "settings.theme_light"),
+                            "system" => tr(self.lang, "settings.theme_system"),
+                            _ => tr(self.lang, "settings.theme_dark"),
+                        };
                         egui::ComboBox::from_id_salt("rde_theme")
-                            .selected_text(settings.theme.clone())
+                            .selected_text(theme_label)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut settings.theme, "dark".to_owned(), "dark");
-                                ui.selectable_value(&mut settings.theme, "light".to_owned(), "light (позже)");
+                                ui.selectable_value(&mut settings.theme, "dark".to_owned(), tr(self.lang, "settings.theme_dark"));
+                                ui.selectable_value(&mut settings.theme, "light".to_owned(), tr(self.lang, "settings.theme_light"));
+                                ui.selectable_value(&mut settings.theme, "system".to_owned(), tr(self.lang, "settings.theme_system"));
                             });
                         ui.end_row();
-                        ui.label(RichText::new(tr(self.lang, "settings.keep_runs")).color(MUTED));
+                        ui.label(RichText::new(tr(self.lang, "settings.ui_scale")).color(pal.muted));
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Slider::new(&mut ui_scale, 0.85..=1.5).show_value(false));
+                            ui.label(RichText::new(format!("{:.0}%", ui_scale * 100.0)).color(pal.text));
+                        });
+                        ui.end_row();
+                        ui.label(RichText::new(tr(self.lang, "settings.keep_runs")).color(pal.muted));
                         ui.add(egui::DragValue::new(&mut settings.keep_runs).range(10..=10_000));
                         ui.end_row();
-                        ui.label(RichText::new(tr(self.lang, "settings.author_name")).color(MUTED));
+                        ui.label(RichText::new(tr(self.lang, "settings.author_name")).color(pal.muted));
                         ui.add(egui::TextEdit::singleline(&mut settings.author_name).desired_width(280.0));
                         ui.end_row();
-                        ui.label(RichText::new("email").color(MUTED));
+                        ui.label(RichText::new("email").color(pal.muted));
                         ui.add(egui::TextEdit::singleline(&mut settings.author_email).desired_width(280.0));
                         ui.end_row();
                     });
@@ -3628,11 +3749,22 @@ impl RdeApp {
                     });
                 });
             if save {
+                let want_system = settings.theme == "system";
                 settings.normalize();
                 match rde_core::settings::save(&settings) {
                     Ok(path) => {
                         self.lang = i18n::lang(&settings.language);
-                        self.app_settings = settings;
+                        if want_system {
+                            // normalize() (владение rde-core) знает только dark|light, поэтому
+                            // в файл ушёл dark, а сессия продолжает следовать системе.
+                            // Персистентность system — однострочный follow-up в rde-core.
+                            let mut applied = settings.clone();
+                            applied.theme = "system".to_owned();
+                            self.app_settings = applied;
+                        } else {
+                            self.app_settings = settings;
+                        }
+                        self.ui_scale = ui_scale.clamp(0.5, 2.5);
                         self.push_log(Level::Ok, format!("Настройки приложения сохранены: {}", path.display()));
                     }
                     Err(error) => self.push_log(Level::Warn, format!("Настройки приложения: {error}")),
@@ -3651,7 +3783,7 @@ impl RdeApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0))
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                        ui.label(RichText::new(text).monospace().size(11.5).color(TEXT));
+                        ui.label(RichText::new(text).monospace().size(11.5).color(pal.text));
                     });
                     if ui.button("Закрыть").clicked() {
                         close = true;
@@ -3671,7 +3803,7 @@ impl RdeApp {
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                         for line in &lines {
-                            ui.label(RichText::new(line).monospace().size(11.5).color(TEXT));
+                            ui.label(RichText::new(line).monospace().size(11.5).color(pal.text));
                         }
                     });
                     if ui.button("Закрыть").clicked() {
@@ -3691,11 +3823,11 @@ impl RdeApp {
                 .default_width(520.0)
                 .show(ctx, |ui| {
                     ui.label(RichText::new("RDE — Research Development Environment").strong().size(15.0));
-                    ui.label(RichText::new(format!("прототип v0.1 · сборка {}", env!("CARGO_PKG_VERSION"))).small().color(MUTED));
+                    ui.label(RichText::new(format!("прототип v0.1 · сборка {}", env!("CARGO_PKG_VERSION"))).small().color(pal.muted));
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Документ: .doc.rde (OOXML + rde:doc) · WordCraft DocView · ГОСТ 7.32-2017 · артефакты с act_key/out_hash · PDF/OCR · ревью Word.").small().color(TEXT));
+                    ui.label(RichText::new("Документ: .doc.rde (OOXML + rde:doc) · WordCraft DocView · ГОСТ 7.32-2017 · артефакты с act_key/out_hash · PDF/OCR · ревью Word.").small().color(pal.text));
                     ui.add_space(8.0);
-                    ui.label(RichText::new("Горячие клавиши").strong().small().color(MUTED));
+                    ui.label(RichText::new("Горячие клавиши").strong().small().color(pal.muted));
                     for (keys, action) in [
                         ("Ctrl+F", "поиск по объектам"),
                         ("Ctrl+S", "сохранить проект (.doc.rde)"),
@@ -3703,8 +3835,8 @@ impl RdeApp {
                         ("ПКМ по объекту", "контекстное меню действий"),
                     ] {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(keys).monospace().size(11.5).color(ACCENT));
-                            ui.label(RichText::new(action).small().color(TEXT));
+                            ui.label(RichText::new(keys).monospace().size(11.5).color(pal.accent));
+                            ui.label(RichText::new(action).small().color(pal.text));
                         });
                     }
                     ui.add_space(6.0);
@@ -3732,11 +3864,11 @@ impl RdeApp {
                     ui.label(
                         RichText::new("Проект содержит скрипты, которые будут выполнены на вашей машине.")
                             .strong()
-                            .color(TEXT),
+                            .color(pal.text),
                     );
                     ui.add_space(4.0);
-                    ui.label(RichText::new(format!("Проект: «{project_name}»")).small().color(TEXT));
-                    ui.label(RichText::new(format!("Каталог: {root}")).small().color(MUTED));
+                    ui.label(RichText::new(format!("Проект: «{project_name}»")).small().color(pal.text));
+                    ui.label(RichText::new(format!("Каталог: {root}")).small().color(pal.muted));
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new(
@@ -3745,12 +3877,12 @@ impl RdeApp {
                              а запуск и его provenance фиксируются в журнале. Доверяйте только своим проектам.",
                         )
                         .small()
-                        .color(MUTED),
+                        .color(pal.muted),
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add(egui::Button::new(RichText::new("Доверяю проекту и запустить").color(Color32::WHITE)).fill(ACCENT))
+                            .add(egui::Button::new(RichText::new("Доверяю проекту и запустить").color(Color32::WHITE)).fill(pal.accent))
                             .clicked()
                         {
                             confirm = true;
@@ -3890,7 +4022,7 @@ impl RdeApp {
                             });
                         }
                         "date" => {
-                            ui.label(RichText::new(format!("Будет вставлена дата: {}", today_iso_date())).small().color(MUTED));
+                            ui.label(RichText::new(format!("Будет вставлена дата: {}", today_iso_date())).small().color(pal.muted));
                         }
                         _ => {
                             let current_title = artifacts
@@ -3938,7 +4070,7 @@ impl RdeApp {
                             }
                             if dialog.kind == "value" {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new("JSON pointer").small().color(MUTED));
+                                    ui.label(RichText::new("JSON pointer").small().color(pal.muted));
                                     ui.add(
                                         egui::TextEdit::singleline(&mut dialog.pointer)
                                             .hint_text("#/stats/x1/mean (пусто — текст файла)")
@@ -3946,7 +4078,7 @@ impl RdeApp {
                                     );
                                 });
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new("формат").small().color(MUTED));
+                                    ui.label(RichText::new("формат").small().color(pal.muted));
                                     egui::ComboBox::from_id_salt("rde_insert_format")
                                         .selected_text(&dialog.format)
                                         .show_ui(ui, |ui| {
@@ -3962,7 +4094,7 @@ impl RdeApp {
                                             }
                                         });
                                     if matches!(dialog.format.as_str(), "dec" | "sci" | "percent") {
-                                        ui.label(RichText::new("знаков").small().color(MUTED));
+                                        ui.label(RichText::new("знаков").small().color(pal.muted));
                                         ui.add(egui::DragValue::new(&mut dialog.precision).range(0..=8));
                                     }
                                 });
@@ -3972,7 +4104,7 @@ impl RdeApp {
                     // Стиль обычного текста шаблона — можно сменить (R-DOC-25).
                     if dialog.kind != "date" {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("стиль").small().color(MUTED));
+                            ui.label(RichText::new("стиль").small().color(pal.muted));
                             egui::ComboBox::from_id_salt("rde_insert_style")
                                 .selected_text(if dialog.style.is_empty() { "обычный (по умолчанию)" } else { &dialog.style })
                                 .show_ui(ui, |ui| {
@@ -3984,7 +4116,7 @@ impl RdeApp {
                         });
                     }
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("подпись").small().color(MUTED));
+                        ui.label(RichText::new("подпись").small().color(pal.muted));
                         ui.add(egui::TextEdit::singleline(&mut dialog.caption).hint_text("например, «Среднее x1»").desired_width(360.0));
                     });
                     let uri = match dialog.kind.as_str() {
@@ -3994,7 +4126,7 @@ impl RdeApp {
                         "date" => "rde://date/iso".to_owned(),
                         _ => format!("rde://artifact/{}/{}", dialog.artifact_id, dialog.selector),
                     };
-                    ui.label(RichText::new(uri).monospace().small().color(ACCENT));
+                    ui.label(RichText::new(uri).monospace().small().color(pal.accent));
                     ui.add_space(6.0);
                     // Позиция вставки: каретка DocView / выбранный блок / конец документа.
                     ui.label(
@@ -4003,7 +4135,7 @@ impl RdeApp {
                             None => "позиция: в конец документа".to_owned(),
                         })
                         .small()
-                        .color(MUTED),
+                        .color(pal.muted),
                     );
                     // Валидация: для JSON-выхода нужен pointer, иначе вставится весь файл (P8-B1).
                     let needs_pointer = dialog.kind == "value"
@@ -4013,17 +4145,17 @@ impl RdeApp {
                         ui.label(
                             RichText::new("JSON-выход: укажите JSON pointer (например, #/stats/x1/mean) — иначе вставится весь файл")
                                 .small()
-                                .color(AMBER),
+                                .color(pal.amber),
                         );
                     }
                     if !dialog.error.is_empty() {
-                        ui.label(RichText::new(&dialog.error).small().color(RED));
+                        ui.label(RichText::new(&dialog.error).small().color(pal.red));
                     }
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(
                                 !needs_pointer,
-                                egui::Button::new(RichText::new("Вставить").color(Color32::WHITE)).fill(ACCENT),
+                                egui::Button::new(RichText::new("Вставить").color(Color32::WHITE)).fill(pal.accent),
                             )
                             .clicked()
                         {
@@ -4061,12 +4193,12 @@ impl RdeApp {
                             status.untracked.len()
                         ))
                         .small()
-                        .color(MUTED),
+                        .color(pal.muted),
                     );
                     ui.add(egui::TextEdit::multiline(&mut message).desired_rows(3).desired_width(f32::INFINITY));
-                    ui.label(RichText::new("Автор — первый human-автор из rde.toml (R-SET-01)").small().color(MUTED));
+                    ui.label(RichText::new("Автор — первый human-автор из rde.toml (R-SET-01)").small().color(pal.muted));
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(RichText::new("Закоммитить").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                        if ui.add(egui::Button::new(RichText::new("Закоммитить").color(Color32::WHITE)).fill(pal.accent)).clicked() {
                             confirm = true;
                         }
                         if ui.button("Отмена").clicked() {
@@ -4093,10 +4225,10 @@ impl RdeApp {
                     egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                         for entry in &entries {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(&entry.id).monospace().small().color(ACCENT));
-                                ui.label(RichText::new(&entry.time).small().color(MUTED));
-                                ui.label(RichText::new(&entry.summary).size(12.5).color(TEXT));
-                                ui.label(RichText::new(&entry.author).small().color(MUTED));
+                                ui.label(RichText::new(&entry.id).monospace().small().color(pal.accent));
+                                ui.label(RichText::new(&entry.time).small().color(pal.muted));
+                                ui.label(RichText::new(&entry.summary).size(12.5).color(pal.text));
+                                ui.label(RichText::new(&entry.author).small().color(pal.muted));
                             });
                         }
                     });
@@ -4112,6 +4244,7 @@ impl RdeApp {
 
     /// Окна диалогов создания/переименования/удаления.
     fn dialogs(&mut self, ctx: &egui::Context) {
+        let pal = theme_colors(ctx.theme());
         if let Some(mut dialog) = self.create_dialog.take() {
             let mut create = false;
             let mut cancel = false;
@@ -4123,7 +4256,7 @@ impl RdeApp {
                     ui.set_min_width(420.0);
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Тип").color(MUTED));
+                        ui.label(RichText::new("Тип").color(pal.muted));
                         egui::ComboBox::from_id_salt("rde_new_kind")
                             .selected_text(dialog.kind.label_ru())
                             .show_ui(ui, |ui| {
@@ -4138,7 +4271,7 @@ impl RdeApp {
                             .hint_text("Название объекта")
                             .desired_width(f32::INFINITY),
                     );
-                    ui.label(RichText::new("Документ создаётся пустым .doc.rde (WordCraft + rde:doc)").small().color(MUTED));
+                    ui.label(RichText::new("Документ создаётся пустым .doc.rde (WordCraft + rde:doc)").small().color(pal.muted));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button("Создать").clicked() {
@@ -4204,7 +4337,7 @@ impl RdeApp {
                 .show(ctx, |ui| {
                     ui.set_min_width(400.0);
                     ui.label(RichText::new(format!("«{title}»")).strong());
-                    ui.label(RichText::new("Объект будет перемещён в .rde/trash (безвозвратного удаления нет).").small().color(MUTED));
+                    ui.label(RichText::new("Объект будет перемещён в .rde/trash (безвозвратного удаления нет).").small().color(pal.muted));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button("Удалить").clicked() {
@@ -4228,14 +4361,15 @@ impl RdeApp {
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(12, 8)))
+            .frame(egui::Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for tab in Tab::ALL {
                         let sel = self.tab == tab;
-                        let text = RichText::new(format!("{} {}", tab.icon(), tab.title(self.lang))).size(FS_BODY).color(if sel { TEXT } else { MUTED });
-                        if ui.add(egui::Button::new(text).fill(if sel { PANEL_HI } else { Color32::TRANSPARENT })).clicked() {
+                        let text = RichText::new(format!("{} {}", tab.icon(), tab.title(self.lang))).size(FS_BODY).color(if sel { pal.text } else { pal.muted });
+                        if ui.add(egui::Button::new(text).fill(if sel { pal.panel_hi } else { Color32::TRANSPARENT })).clicked() {
                             self.tab = tab;
                         }
                         ui.add_space(2.0);
@@ -4243,12 +4377,12 @@ impl RdeApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let stale = self.project.stale_count();
                         if stale > 0 {
-                            ui.label(RichText::new(format!("• {stale} устаревших объектов")).small().color(AMBER));
+                            ui.label(RichText::new(format!("• {stale} устаревших объектов")).small().color(pal.amber));
                         } else {
-                            ui.label(RichText::new("• проект актуален").small().color(GREEN));
+                            ui.label(RichText::new("• проект актуален").small().color(pal.green));
                         }
                         if let Some(pages) = self.doc_pages() {
-                            ui.label(RichText::new(format!("{pages} стр. · A4")).small().color(MUTED));
+                            ui.label(RichText::new(format!("{pages} стр. · A4")).small().color(pal.muted));
                         }
                     });
                 });
@@ -4264,6 +4398,7 @@ impl RdeApp {
     }
 
     fn doc_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let mut mode = self.doc_mode;
         let mut caret_block: Option<usize> = None;
         let mut update_inserts = false;
@@ -4285,7 +4420,7 @@ impl RdeApp {
                             zoom_action = Some("view.zoomOut");
                         }
                         ui.label(
-                            RichText::new(format!("{:.0}%", ed.app.session.view.zoom * 100.0)).monospace().size(11.5).color(MUTED),
+                            RichText::new(format!("{:.0}%", ed.app.session.view.zoom * 100.0)).monospace().size(11.5).color(pal.muted),
                         );
                         if ui.small_button("+").on_hover_text("Увеличить масштаб").clicked() {
                             zoom_action = Some("view.zoomIn");
@@ -4304,7 +4439,7 @@ impl RdeApp {
                         update_inserts = true;
                     }
                     ui.separator();
-                    ui.label(RichText::new("Масштаб").small().color(MUTED));
+                    ui.label(RichText::new("Масштаб").small().color(pal.muted));
                     ui.add(egui::Slider::new(&mut self.zoom, 0.35..=1.5).show_value(false));
                     ui.separator();
                     let _ = ui.button(RichText::new("Открыть копию в Word").size(12.0));
@@ -4326,7 +4461,7 @@ impl RdeApp {
             .map(|doc| doc.inserts.len())
             .unwrap_or(0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("RDE").small().strong().color(ACCENT));
+            ui.label(RichText::new("RDE").small().strong().color(pal.accent));
             if ui.small_button("Вставить значение…").clicked() {
                 insert_kind = Some("value");
             }
@@ -4349,7 +4484,7 @@ impl RdeApp {
                 insert_kind = Some("date");
             }
             ui.separator();
-            if ui.add(egui::Button::new(RichText::new("Обновить документ").size(12.0)).fill(PANEL_HI)).clicked() {
+            if ui.add(egui::Button::new(RichText::new("Обновить документ").size(12.0)).fill(pal.panel_hi)).clicked() {
                 update_inserts = true;
             }
             if ui.checkbox(&mut auto_update, RichText::new("Автообновление").size(12.0)).changed() {
@@ -4366,11 +4501,11 @@ impl RdeApp {
                 Some(block) => format!("позиция: после блока {}", block + 1),
                 None => "позиция: в конец".to_owned(),
             };
-            ui.label(RichText::new(anchor_label).small().color(if self.insert_anchor_block.is_some() { ACCENT } else { MUTED }));
+            ui.label(RichText::new(anchor_label).small().color(if self.insert_anchor_block.is_some() { pal.accent } else { pal.muted }));
             if self.insert_anchor_block.is_some() && ui.small_button("сброс").clicked() {
                 self.insert_anchor_block = None;
             }
-            ui.label(RichText::new(format!("вставок: {inserts_count}")).small().color(MUTED));
+            ui.label(RichText::new(format!("вставок: {inserts_count}")).small().color(pal.muted));
         });
         if let Some(kind) = insert_kind {
             self.open_insert_dialog(kind);
@@ -4433,14 +4568,14 @@ impl RdeApp {
                         ui.vertical_centered(|ui| {
                             ui.add_space(60.0);
                             ui.spinner();
-                            ui.label(RichText::new("Рендеринг документа движком WordCraft…").color(MUTED));
+                            ui.label(RichText::new("Рендеринг документа движком WordCraft…").color(pal.muted));
                         });
                     }
                     DocState::Failed(e) => {
                         ui.vertical_centered(|ui| {
                             ui.add_space(60.0);
-                            ui.label(RichText::new("Не удалось открыть документ").color(RED).strong());
-                            ui.label(RichText::new(e).color(MUTED));
+                            ui.label(RichText::new("Не удалось открыть документ").color(pal.red).strong());
+                            ui.label(RichText::new(e).color(pal.muted));
                         });
                     }
                     DocState::Ready(doc) => {
@@ -4451,7 +4586,7 @@ impl RdeApp {
                                     let size = doc.page_pt * zoom;
                                     ui.image((tex.id(), size));
                                     ui.add_space(4.0);
-                                    ui.label(RichText::new(format!("Страница {} из {}", i + 1, doc.count)).small().color(MUTED));
+                                    ui.label(RichText::new(format!("Страница {} из {}", i + 1, doc.count)).small().color(pal.muted));
                                     ui.add_space(12.0);
                                 }
                             });
@@ -4470,16 +4605,18 @@ impl RdeApp {
 
     /// Сообщение, если встроенный редактор не удалось открыть.
     fn editor_error_ui(&self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         if let Some(err) = &self.editor_error {
             ui.vertical_centered(|ui| {
                 ui.add_space(50.0);
-                ui.label(RichText::new("Не удалось открыть редактор WordCraft").color(RED).strong());
-                ui.label(RichText::new(err).color(MUTED));
+                ui.label(RichText::new("Не удалось открыть редактор WordCraft").color(pal.red).strong());
+                ui.label(RichText::new(err).color(pal.muted));
             });
         }
     }
 
     fn structure_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         if self.structure_cache.is_none() {
             let path = self.project.document_path();
             self.structure_cache = Some(match path {
@@ -4503,17 +4640,17 @@ impl RdeApp {
         let inserts_count = inserts.len();
         let mut clicked_block: Option<(usize, String)> = None;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Блоки документа").strong().color(TEXT));
+            ui.label(RichText::new("Блоки документа").strong().color(pal.text));
             if let Some(Ok((blocks, figures))) = &cache {
                 let headings = blocks.iter().filter(|block| matches!(block.kind, "H1" | "H2" | "H")).count();
                 ui.label(
                     RichText::new(format!("{} блоков · {headings} заголовков · {figures} рисунков · {inserts_count} вставок rde:doc", blocks.len()))
                         .small()
-                        .color(MUTED),
+                        .color(pal.muted),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("клик по блоку — выбрать документ").small().color(MUTED));
+                ui.label(RichText::new("клик по блоку — выбрать документ").small().color(pal.muted));
             });
         });
         ui.separator();
@@ -4526,20 +4663,26 @@ impl RdeApp {
             match cache {
                 Some(Ok((blocks, _figures))) => {
                     egui::Grid::new("rde_blocks").num_columns(5).spacing([14.0, 5.0]).striped(true).show(ui, |ui| {
-                        ui.label(RichText::new("№").small().color(MUTED));
-                        ui.label(RichText::new("тип").small().color(MUTED));
-                        ui.label(RichText::new("стиль").small().color(MUTED));
-                        ui.label(RichText::new("путь (block)").small().color(MUTED));
-                        ui.label(RichText::new("содержимое").small().color(MUTED));
+                        ui.label(RichText::new("№").small().color(pal.muted));
+                        ui.label(RichText::new("тип").small().color(pal.muted));
+                        ui.label(RichText::new("стиль").small().color(pal.muted));
+                        ui.label(RichText::new("путь (block)").small().color(pal.muted));
+                        ui.label(RichText::new("содержимое").small().color(pal.muted));
                         ui.end_row();
                         for block in &blocks {
-                            ui.label(RichText::new(block.number.to_string()).monospace().size(11.0).color(MUTED));
+                            ui.label(RichText::new(block.number.to_string()).monospace().size(11.0).color(pal.muted));
+                            // H2/H — осветлённый синий читается только на тёмном;
+                            // на светлом берём акцент (контраст ≥ 4.5:1).
+                            let h2 = match ui.ctx().theme() {
+                                egui::Theme::Light => pal.accent,
+                                _ => Color32::from_rgb(0x7c, 0xa8, 0xff),
+                            };
                             let color = match block.kind {
-                                "H1" => ACCENT,
-                                "H2" | "H" => Color32::from_rgb(0x7c, 0xa8, 0xff),
-                                "FIG" => AMBER,
-                                "CAP" => GREEN,
-                                _ => MUTED,
+                                "H1" => pal.accent,
+                                "H2" | "H" => h2,
+                                "FIG" => pal.amber,
+                                "CAP" => pal.green,
+                                _ => pal.muted,
                             };
                             let kind_label = if block.images > 0 {
                                 format!("{}·{}", block.kind, block.images)
@@ -4547,9 +4690,9 @@ impl RdeApp {
                                 block.kind.to_owned()
                             };
                             ui.label(RichText::new(kind_label).monospace().size(11.0).color(color));
-                            ui.label(RichText::new(if block.style.is_empty() { "—" } else { &block.style }).monospace().size(10.5).color(MUTED));
-                            ui.label(RichText::new(&block.anchor).monospace().size(10.5).color(MUTED));
-                            let text_resp = ui.add(egui::Label::new(RichText::new(&block.text).size(12.0).color(TEXT)).sense(Sense::click()));
+                            ui.label(RichText::new(if block.style.is_empty() { "—" } else { &block.style }).monospace().size(10.5).color(pal.muted));
+                            ui.label(RichText::new(&block.anchor).monospace().size(10.5).color(pal.muted));
+                            let text_resp = ui.add(egui::Label::new(RichText::new(&block.text).size(12.0).color(pal.text)).sense(Sense::click()));
                             if text_resp.clicked() {
                                 clicked_block = Some((block.number, block.text.clone()));
                             }
@@ -4559,8 +4702,8 @@ impl RdeApp {
                 }
                 Some(Err(error)) => {
                     ui.add_space(12.0);
-                    ui.label(RichText::new("Не удалось разобрать документ").strong().color(RED));
-                    ui.label(RichText::new(error).small().color(MUTED));
+                    ui.label(RichText::new("Не удалось разобрать документ").strong().color(pal.red));
+                    ui.label(RichText::new(error).small().color(pal.muted));
                 }
                 None => {}
             }
@@ -4568,7 +4711,7 @@ impl RdeApp {
             if !inserts.is_empty() {
                 ui.add_space(10.0);
                 ui.separator();
-                ui.label(RichText::new("Вставки rde:doc (живые значения/рисунки из артефактов)").strong().color(TEXT));
+                ui.label(RichText::new("Вставки rde:doc (живые значения/рисунки из артефактов)").strong().color(pal.text));
                 let styles = self
                     .project
                     .document_path()
@@ -4576,18 +4719,18 @@ impl RdeApp {
                     .and_then(|path| rde_doc::list_document_styles(&path).ok())
                     .unwrap_or_default();
                 egui::Grid::new("rde_inserts").num_columns(6).spacing([12.0, 5.0]).striped(true).show(ui, |ui| {
-                    ui.label(RichText::new("id").small().color(MUTED));
-                    ui.label(RichText::new("вид").small().color(MUTED));
-                    ui.label(RichText::new("цель").small().color(MUTED));
-                    ui.label(RichText::new("стиль").small().color(MUTED));
-                    ui.label(RichText::new("формат").small().color(MUTED));
-                    ui.label(RichText::new("значение/действие").small().color(MUTED));
+                    ui.label(RichText::new("id").small().color(pal.muted));
+                    ui.label(RichText::new("вид").small().color(pal.muted));
+                    ui.label(RichText::new("цель").small().color(pal.muted));
+                    ui.label(RichText::new("стиль").small().color(pal.muted));
+                    ui.label(RichText::new("формат").small().color(pal.muted));
+                    ui.label(RichText::new("значение/действие").small().color(pal.muted));
                     ui.end_row();
                     for insert in &inserts {
-                        ui.label(RichText::new(&insert.id).monospace().size(11.0).color(ACCENT));
-                        ui.label(RichText::new(&insert.kind).monospace().size(11.0).color(MUTED));
+                        ui.label(RichText::new(&insert.id).monospace().size(11.0).color(pal.accent));
+                        ui.label(RichText::new(&insert.kind).monospace().size(11.0).color(pal.muted));
                         let target = insert.target.rsplit('/').next().unwrap_or(&insert.target);
-                        let target_resp = ui.label(RichText::new(target).monospace().size(10.5).color(MUTED)).on_hover_text(&insert.target);
+                        let target_resp = ui.label(RichText::new(target).monospace().size(10.5).color(pal.muted)).on_hover_text(&insert.target);
                         let insert_id = insert.id.clone();
                         let insert_target = insert.target.clone();
                         target_resp.context_menu(|ui| {
@@ -4639,7 +4782,7 @@ impl RdeApp {
                             pending_insert_edits.push((insert.id.clone(), style, format));
                         }
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(insert.cached.chars().take(28).collect::<String>()).size(11.5).color(TEXT));
+                            ui.label(RichText::new(insert.cached.chars().take(28).collect::<String>()).size(11.5).color(pal.text));
                             if ui.small_button("применить").on_hover_text("Перечитать значение из артефакта и применить стиль/формат").clicked() {
                                 pending_insert_updates.push(insert.id.clone());
                             }
@@ -4721,6 +4864,7 @@ impl RdeApp {
         }
     }
     fn artifacts_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let mut refresh = false;
         let artifacts: Vec<rde_core::Object> = self
             .project
@@ -4736,8 +4880,8 @@ impl RdeApp {
             .map(|o| (o.title.clone(), o.detail.clone()))
             .collect();
         ui.horizontal(|ui| {
-            ui.label(RichText::new("DAG артефактов").strong().color(TEXT));
-            ui.label(RichText::new(format!("{} устаревших", stale.len())).small().color(AMBER));
+            ui.label(RichText::new("DAG артефактов").strong().color(pal.text));
+            ui.label(RichText::new(format!("{} устаревших", stale.len())).small().color(pal.amber));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(RichText::new("Обновить связанные").size(12.0)).clicked() {
                     refresh = true;
@@ -4748,7 +4892,7 @@ impl RdeApp {
         if artifacts.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.label(RichText::new("В проекте нет артефактов").color(MUTED));
+                ui.label(RichText::new("В проекте нет артефактов").color(pal.muted));
             });
             return;
         }
@@ -4798,7 +4942,7 @@ impl RdeApp {
                 for (from, to) in &edges {
                     if let (Some(a), Some(b)) = (index_of(from), index_of(to)) {
                         if a < n && b < n {
-                            arrow(&painter, nodes[a], nodes[b], AMBER);
+                            arrow(&painter, nodes[a], nodes[b], pal.amber);
                         }
                     }
                 }
@@ -4817,10 +4961,11 @@ impl RdeApp {
                             ui.close();
                         }
                     });
-                    let color = freshness_color(object.freshness);
+                    let color = freshness_color(object.freshness, pal);
                     let selected = selected_id.as_deref() == Some(object.id.as_str());
                     draw_node(
                         &painter,
+                        pal,
                         nodes[i],
                         &object.title,
                         &object.detail,
@@ -4836,7 +4981,7 @@ impl RdeApp {
                         Align2::LEFT_TOP,
                         format!("• {title}: {detail}"),
                         FontId::proportional(12.0),
-                        AMBER,
+                        pal.amber,
                     );
                     line_y += 17.0;
                 }
@@ -4846,7 +4991,7 @@ impl RdeApp {
                         Align2::LEFT_TOP,
                         format!("…и ещё {} артефакт(ов)", artifacts.len() - n),
                         FontId::proportional(11.5),
-                        MUTED,
+                        pal.muted,
                     );
                 }
             });
@@ -4877,7 +5022,7 @@ impl RdeApp {
         let handle_rect = handle.rect;
         ui.painter().line_segment(
             [egui::pos2(handle_rect.left(), handle_rect.center().y), egui::pos2(handle_rect.right(), handle_rect.center().y)],
-            egui::Stroke::new(1.0, if handle.hovered() || handle.dragged() { ACCENT } else { PANEL_HI }),
+            egui::Stroke::new(1.0, if handle.hovered() || handle.dragged() { pal.accent } else { pal.panel_hi }),
         );
         self.artifact_workspace(ui);
     }
@@ -4990,6 +5135,7 @@ impl RdeApp {
 
     /// Рабочее место артефакта (R-ART-01/02/04): входные данные, генерация, результат генерации.
     fn artifact_workspace(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let selected = self.selected.clone();
         let artifact_object = self
             .project
@@ -5040,13 +5186,13 @@ impl RdeApp {
             })
             .collect();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("Артефакт: {}", object.title)).strong().color(TEXT));
-            ui.label(RichText::new(format!("{} · {}", manifest.kind, object.detail)).small().color(MUTED));
+            ui.label(RichText::new(format!("Артефакт: {}", object.title)).strong().color(pal.text));
+            ui.label(RichText::new(format!("{} · {}", manifest.kind, object.detail)).small().color(pal.muted));
             if let Some(status) = &status {
                 ui.label(
                     RichText::new(format!("{} {}", status.status.label_ru(), status.status.reason().unwrap_or_default()))
                         .small()
-                        .color(if matches!(status.status, rde_dag::LiveStatus::Fresh) { GREEN } else { AMBER }),
+                        .color(if matches!(status.status, rde_dag::LiveStatus::Fresh) { pal.green } else { pal.amber }),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5086,16 +5232,16 @@ impl RdeApp {
         let Some(editor_state) = editor.as_mut() else { return };
         if editor_state.manifest.kind == "constants" {
             // Редактор констант проекта (R-ART-09): значения + docx-совместимое форматирование.
-            ui.label(RichText::new("Константы проекта (R-ART-09): значение, единица, отображение, rich-стиль").small().color(MUTED));
+            ui.label(RichText::new("Константы проекта (R-ART-09): значение, единица, отображение, rich-стиль").small().color(pal.muted));
             egui::ScrollArea::vertical().id_salt("rde_constants_editor").auto_shrink([false, false]).show(ui, |ui| {
                 egui::Grid::new("rde_constants_grid").num_columns(6).spacing([10.0, 6.0]).striped(true).show(ui, |ui| {
                     for header in ["имя", "значение", "единица", "отображение", "стиль", ""] {
-                        ui.label(RichText::new(header).small().color(MUTED));
+                        ui.label(RichText::new(header).small().color(pal.muted));
                     }
                     ui.end_row();
                     let mut remove: Option<String> = None;
                     for (name, value) in editor_state.manifest.values.iter_mut() {
-                        ui.label(RichText::new(name.as_str()).monospace().size(12.0).color(ACCENT));
+                        ui.label(RichText::new(name.as_str()).monospace().size(12.0).color(pal.accent));
                         let mut number = value.value;
                         if ui.add(egui::DragValue::new(&mut number).speed(0.01).max_decimals(6)).changed() {
                             value.value = number;
@@ -5121,7 +5267,7 @@ impl RdeApp {
                 });
                 ui.add_space(8.0);
                 ui.separator();
-                ui.label(RichText::new("Добавить константу").small().strong().color(MUTED));
+                ui.label(RichText::new("Добавить константу").small().strong().color(pal.muted));
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut editor_state.new_constant_name).hint_text("R_н").desired_width(90.0));
                     ui.add(egui::TextEdit::singleline(&mut editor_state.new_constant_value).hint_text("12.4").desired_width(90.0));
@@ -5166,7 +5312,7 @@ impl RdeApp {
         egui::ScrollArea::vertical().id_salt("rde_artifact_workspace").auto_shrink([false, false]).show(ui, |ui| {
             match section {
                 ArtifactSection::Inputs => {
-                    ui.label(RichText::new("Группы зависимостей (hashed — влияют на хеш и каскад, ref — только provenance)").small().color(MUTED));
+                    ui.label(RichText::new("Группы зависимостей (hashed — влияют на хеш и каскад, ref — только provenance)").small().color(pal.muted));
                     let mut remove: Option<(usize, usize)> = None;
                     for (group_index, group) in editor_state.manifest.groups.iter_mut().enumerate() {
                         ui.add_space(4.0);
@@ -5179,7 +5325,7 @@ impl RdeApp {
                                     ui.selectable_value(&mut group.mode, "hashed".to_owned(), "hashed");
                                     ui.selectable_value(&mut group.mode, "ref".to_owned(), "ref");
                                 });
-                            ui.label(RichText::new(format!("входов: {}", group.inputs.len())).small().color(MUTED));
+                            ui.label(RichText::new(format!("входов: {}", group.inputs.len())).small().color(pal.muted));
                         });
                         for (input_index, input) in group.inputs.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
@@ -5187,21 +5333,21 @@ impl RdeApp {
                                 match input {
                                     rde_core::InputSpec::Artifact { artifact, selector } => {
                                         let title = self.project.object(artifact).map(|object| object.title.clone()).unwrap_or_else(|| artifact.clone());
-                                        ui.label(RichText::new(format!("артефакт: {title}")).size(12.0).color(TEXT));
+                                        ui.label(RichText::new(format!("артефакт: {title}")).size(12.0).color(pal.text));
                                         ui.add(egui::TextEdit::singleline(selector).hint_text("out/*.csv").desired_width(220.0));
                                     }
                                     rde_core::InputSpec::File { file } => {
-                                        ui.label(RichText::new("файл").size(12.0).color(TEXT));
+                                        ui.label(RichText::new("файл").size(12.0).color(pal.text));
                                         ui.add(egui::TextEdit::singleline(file).desired_width(260.0));
                                     }
                                     rde_core::InputSpec::Note { note } => {
-                                        ui.label(RichText::new(format!("заметка: {note}")).size(12.0).color(TEXT));
+                                        ui.label(RichText::new(format!("заметка: {note}")).size(12.0).color(pal.text));
                                     }
                                     rde_core::InputSpec::Source { source } => {
-                                        ui.label(RichText::new(format!("источник: {source}")).size(12.0).color(TEXT));
+                                        ui.label(RichText::new(format!("источник: {source}")).size(12.0).color(pal.text));
                                     }
                                     rde_core::InputSpec::Constants { constants, selector } => {
-                                        ui.label(RichText::new(format!("константы: {constants}")).size(12.0).color(TEXT));
+                                        ui.label(RichText::new(format!("константы: {constants}")).size(12.0).color(pal.text));
                                         ui.add(egui::TextEdit::singleline(selector).hint_text("R_n").desired_width(120.0));
                                     }
                                 }
@@ -5220,7 +5366,7 @@ impl RdeApp {
                     }
                     ui.add_space(8.0);
                     ui.separator();
-                    ui.label(RichText::new("Добавить вход").small().strong().color(MUTED));
+                    ui.label(RichText::new("Добавить вход").small().strong().color(pal.muted));
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("rde_new_input_artifact")
                             .selected_text(if editor_state.new_input_artifact.is_empty() {
@@ -5271,7 +5417,7 @@ impl RdeApp {
                 }
                 ArtifactSection::Generation => {
                     egui::Grid::new("rde_generation").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                        ui.label(RichText::new("runtime").color(MUTED));
+                        ui.label(RichText::new("runtime").color(pal.muted));
                         ui.horizontal(|ui| {
                             let runtime = editor_state.manifest.runtime.get_or_insert_with(|| rde_core::RuntimeManifest {
                                 kind: "python".to_owned(),
@@ -5298,19 +5444,19 @@ impl RdeApp {
                             ui.add(egui::TextEdit::singleline(&mut runtime.entry).hint_text("script.py").desired_width(160.0));
                         });
                         ui.end_row();
-                        ui.label(RichText::new("timeout, с").color(MUTED));
+                        ui.label(RichText::new("timeout, с").color(pal.muted));
                         ui.add(egui::TextEdit::singleline(&mut editor_state.timeout_text).desired_width(100.0));
                         ui.end_row();
-                        ui.label(RichText::new("сеть").color(MUTED));
+                        ui.label(RichText::new("сеть").color(pal.muted));
                         let mut network = editor_state.manifest.network_allow.unwrap_or(false);
                         if ui.checkbox(&mut network, "разрешить network_allow").changed() {
                             editor_state.manifest.network_allow = Some(network);
                         }
                         ui.end_row();
-                        ui.label(RichText::new("params (JSON)").color(MUTED));
+                        ui.label(RichText::new("params (JSON)").color(pal.muted));
                         ui.add(egui::TextEdit::multiline(&mut editor_state.params_text).desired_rows(4).desired_width(420.0));
                         ui.end_row();
-                        ui.label(RichText::new("outputs").color(MUTED));
+                        ui.label(RichText::new("outputs").color(pal.muted));
                         ui.add(
                             egui::TextEdit::multiline(&mut editor_state.outputs_text)
                                 .hint_text("out/stats.json — по одному пути на строку")
@@ -5320,7 +5466,7 @@ impl RdeApp {
                         ui.end_row();
                     });
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Скрипт артефакта").strong().small().color(MUTED));
+                    ui.label(RichText::new("Скрипт артефакта").strong().small().color(pal.muted));
                     ui.add(
                         egui::TextEdit::multiline(&mut editor_state.script_text)
                             .font(egui::TextStyle::Monospace)
@@ -5330,25 +5476,25 @@ impl RdeApp {
                     );
                 }
                 ArtifactSection::Result => {
-                    ui.label(RichText::new("Результат генерации (выходы артефакта)").strong().small().color(MUTED));
+                    ui.label(RichText::new("Результат генерации (выходы артефакта)").strong().small().color(pal.muted));
                     if let Some(status) = &status {
                         ui.horizontal_wrapped(|ui| {
                             if let Some(act_key) = &status.act_key {
-                                ui.label(RichText::new(format!("act_key {}", &act_key[..12.min(act_key.len())])).monospace().small().color(MUTED));
+                                ui.label(RichText::new(format!("act_key {}", &act_key[..12.min(act_key.len())])).monospace().small().color(pal.muted));
                             }
                             if let Some(out_hash) = &status.out_hash {
-                                ui.label(RichText::new(format!("out_hash {}", &out_hash[..12.min(out_hash.len())])).monospace().small().color(MUTED));
+                                ui.label(RichText::new(format!("out_hash {}", &out_hash[..12.min(out_hash.len())])).monospace().small().color(pal.muted));
                             }
                             if let Some(run_id) = &status.run_id {
-                                ui.label(RichText::new(format!("run {run_id}")).monospace().small().color(MUTED));
+                                ui.label(RichText::new(format!("run {run_id}")).monospace().small().color(pal.muted));
                             }
                             if let Some(updated) = status.updated_unix {
-                                ui.label(RichText::new(format!("обновлён unix {updated}")).small().color(MUTED));
+                                ui.label(RichText::new(format!("обновлён unix {updated}")).small().color(pal.muted));
                             }
                         });
                     }
                     if output_rows.is_empty() {
-                        ui.label(RichText::new("Объявленных выходов нет").small().color(MUTED));
+                        ui.label(RichText::new("Объявленных выходов нет").small().color(pal.muted));
                     }
                     for (rel, path, size, preview) in &output_rows {
                         let header = format!("{rel} · {} байт", size);
@@ -5370,7 +5516,7 @@ impl RdeApp {
                                 }
                             });
                             if !path.is_file() {
-                                ui.label(RichText::new("файл ещё не создан — обновите артефакт").small().color(AMBER));
+                                ui.label(RichText::new("файл ещё не создан — обновите артефакт").small().color(pal.amber));
                             } else if let Some(texture) = image_textures.get(rel) {
                                 // Нормальный просмотрщик изображения (SVG растеризован, PNG/JPEG декодированы).
                                 let texture_size = texture.size_vec2();
@@ -5384,7 +5530,7 @@ impl RdeApp {
                                         *size as f64 / 1024.0
                                     ))
                                     .small()
-                                    .color(MUTED),
+                                    .color(pal.muted),
                                 );
                             } else if let Some(preview) = preview {
                                 ui.add(
@@ -5395,7 +5541,7 @@ impl RdeApp {
                                         .interactive(false),
                                 );
                             } else {
-                                ui.label(RichText::new("предпросмотр недоступен (файл не читается или формат не поддержан)").small().color(AMBER));
+                                ui.label(RichText::new("предпросмотр недоступен (файл не читается или формат не поддержан)").small().color(pal.amber));
                             }
                         });
                     }
@@ -5450,6 +5596,7 @@ impl RdeApp {
     }
 
     fn source_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let selected = self.selected.clone();
         let is_source = |o: &&rde_core::Object| matches!(o.data, ObjectData::Source(_));
         let source = self
@@ -5463,7 +5610,7 @@ impl RdeApp {
         let Some(obj) = source else {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.label(RichText::new("В проекте нет источников").color(MUTED));
+                ui.label(RichText::new("В проекте нет источников").color(pal.muted));
             });
             return;
         };
@@ -5483,15 +5630,15 @@ impl RdeApp {
         ui.vertical(|ui| {
             ui.add_space(0.0);
             egui::Frame::new()
-                .fill(PANEL_HI)
+                .fill(pal.panel_hi)
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::same(14))
                 .show(ui, |ui| {
                     ui.set_max_width(680.0);
-                    ui.label(RichText::new(format!("▣  {}", obj.title)).size(FS_DISPLAY).strong().color(TEXT));
+                    ui.label(RichText::new(format!("▣  {}", obj.title)).size(FS_DISPLAY).strong().color(pal.text));
                     ui.add_space(2.0);
                     ui.label(
-                        RichText::new(format!("Источник проекта · {}", fresh_label(obj.freshness))).small().color(MUTED),
+                        RichText::new(format!("Источник проекта · {}", fresh_label(obj.freshness))).small().color(pal.muted),
                     );
                     ui.add_space(10.0);
                     let mut rows: Vec<(&str, String)> = vec![
@@ -5516,8 +5663,8 @@ impl RdeApp {
                     }
                     egui::Grid::new("rde_source_meta").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
                         for (k, v) in rows {
-                            ui.label(RichText::new(k).small().color(MUTED));
-                            ui.label(RichText::new(v).size(12.5).color(TEXT));
+                            ui.label(RichText::new(k).small().color(pal.muted));
+                            ui.label(RichText::new(v).size(12.5).color(pal.text));
                             ui.end_row();
                         }
                     });
@@ -5536,12 +5683,12 @@ impl RdeApp {
                 });
             ui.add_space(12.0);
             egui::Frame::new()
-                .fill(PANEL)
+                .fill(pal.panel)
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::same(14))
                 .show(ui, |ui| {
                     ui.set_max_width(680.0);
-                    ui.label(RichText::new("Текст источника").small().strong().color(MUTED));
+                    ui.label(RichText::new("Текст источника").small().strong().color(pal.muted));
                     ui.add_space(6.0);
                     for line in [
                         "Метаданные загружены из source.toml.",
@@ -5551,7 +5698,7 @@ impl RdeApp {
                         "",
                         "Источник доступен агенту как объект проекта.",
                     ] {
-                        ui.label(RichText::new(line).size(12.0).color(TEXT));
+                        ui.label(RichText::new(line).size(12.0).color(pal.text));
                     }
                 });
         });
@@ -5574,10 +5721,10 @@ impl RdeApp {
                     ui.add_space(6.0);
                     match info {
                         Ok(info) => {
-                            ui.label(RichText::new(format!("PDF · {} стр. · текстовый слой {} символов", info.pages, info.text.chars().count())).small().color(MUTED));
+                            ui.label(RichText::new(format!("PDF · {} стр. · текстовый слой {} символов", info.pages, info.text.chars().count())).small().color(pal.muted));
                             let excerpt: String = info.text.chars().take(600).collect();
                             egui::ScrollArea::vertical().id_salt("rde_pdf_text").max_height(160.0).show(ui, |ui| {
-                                ui.label(RichText::new(excerpt).monospace().size(11.0).color(TEXT));
+                                ui.label(RichText::new(excerpt).monospace().size(11.0).color(pal.text));
                             });
                             if ui.button(RichText::new("OCR страницы 1").size(12.0)).clicked() {
                                 match rde_sources::ocr_pdf_page(&path, 1) {
@@ -5592,7 +5739,7 @@ impl RdeApp {
                             }
                         }
                         Err(error) => {
-                            ui.label(RichText::new(format!("PDF: {error}")).small().color(AMBER));
+                            ui.label(RichText::new(format!("PDF: {error}")).small().color(pal.amber));
                         }
                     }
                 }
@@ -5640,6 +5787,7 @@ impl RdeApp {
     }
 
     fn code_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
         let object = self.selected_object();
         let (header, path, mut text) = match &object {
             Some(object) => {
@@ -5687,10 +5835,10 @@ impl RdeApp {
         let path_label = if path.as_os_str().is_empty() { String::new() } else { path.display().to_string() };
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(RichText::new("Манифест / код объекта").strong().color(TEXT));
-            ui.label(RichText::new(path_label).small().color(MUTED));
+            ui.label(RichText::new("Манифест / код объекта").strong().color(pal.text));
+            ui.label(RichText::new(path_label).small().color(pal.muted));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("read-only · источник истины — файлы проекта").small().color(MUTED));
+                ui.label(RichText::new("read-only · источник истины — файлы проекта").small().color(pal.muted));
             });
         });
         ui.separator();
@@ -5704,7 +5852,7 @@ impl RdeApp {
                     .interactive(false),
             );
             ui.add_space(4.0);
-            ui.label(RichText::new(header).small().color(MUTED));
+            ui.label(RichText::new(header).small().color(pal.muted));
         });
     }
 
@@ -5825,12 +5973,13 @@ fn set_manifest_string(path: &Path, key: &str, value: &str) -> Result<(), String
 }
 
 fn field_row(ui: &mut egui::Ui, label: &str, value: &str, monospace: bool) {
+    let pal = theme_colors(ui.ctx().theme());
     ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(label).small().color(MUTED));
+        ui.label(RichText::new(label).small().color(pal.muted));
         if monospace {
-            ui.label(RichText::new(value).monospace().size(10.5).color(TEXT));
+            ui.label(RichText::new(value).monospace().size(10.5).color(pal.text));
         } else {
-            ui.label(RichText::new(value).size(12.0).color(TEXT));
+            ui.label(RichText::new(value).size(12.0).color(pal.text));
         }
     });
 }
@@ -5893,17 +6042,18 @@ fn fresh_label(f: Freshness) -> &'static str {
     f.label_ru()
 }
 
-fn freshness_color(f: Freshness) -> Color32 {
+fn freshness_color(f: Freshness, pal: ThemeColors) -> Color32 {
     match f {
-        Freshness::UpToDate => GREEN,
-        Freshness::Stale => AMBER,
-        Freshness::Failed => RED,
-        Freshness::External => MUTED,
+        Freshness::UpToDate => pal.green,
+        Freshness::Stale => pal.amber,
+        Freshness::Failed => pal.red,
+        Freshness::External => pal.muted,
     }
 }
 
 fn draw_node(
     painter: &egui::Painter,
+    pal: ThemeColors,
     rect: Rect,
     title: &str,
     sub: &str,
@@ -5911,8 +6061,8 @@ fn draw_node(
     status: &str,
     selected: bool,
 ) {
-    painter.rect_filled(rect, CornerRadius::same(8), PANEL_HI);
-    let border = if selected { ACCENT } else { BORDER };
+    painter.rect_filled(rect, CornerRadius::same(8), pal.panel_hi);
+    let border = if selected { pal.accent } else { pal.border };
     painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(if selected { 1.6 } else { 1.0 }, border), egui::StrokeKind::Inside);
     painter.circle_filled(rect.left_top() + vec2(12.0, 14.0), 4.0, color);
     painter.text(
@@ -5920,14 +6070,14 @@ fn draw_node(
         Align2::LEFT_TOP,
         ellipsize(title, 21),
         FontId::proportional(13.0),
-        TEXT,
+        pal.text,
     );
     painter.text(
         rect.left_top() + vec2(12.0, 30.0),
         Align2::LEFT_TOP,
         ellipsize(sub, 26),
         FontId::proportional(11.0),
-        MUTED,
+        pal.muted,
     );
     painter.text(
         rect.left_bottom() + vec2(12.0, -16.0),
@@ -5950,51 +6100,212 @@ fn arrow(painter: &egui::Painter, from: Rect, to: Rect, color: Color32) {
     ));
 }
 
-// ── тема и шрифты ───────────────────────────────────────────────────────────
+// ── тема и шрифты (GUI фаза 2) ───────────────────────────────────────────────
 
-/// Подключить системный шрифт с кириллицей (egui-дефолт может не покрывать всё).
-pub fn install_fonts(ctx: &egui::Context) {
-    const CANDIDATES: [&str; 5] = [
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    ];
-    for path in CANDIDATES {
-        if let Ok(bytes) = fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert("rde-sans".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
-            fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "rde-sans".to_owned());
-            ctx.set_fonts(fonts);
-            break;
-        }
-    }
+/// Вендоренные шрифты с кириллицей (`crates/rde-ui/fonts`, DejaVu).
+/// Дефолтные шрифты egui остаются в цепочке как последний fallback.
+const VENDORED_SANS: &[u8] = include_bytes!("../fonts/DejaVuSans.ttf");
+const VENDORED_MONO: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
+
+/// Определения шрифтов оболочки: `rde-sans` — первый в пропорциональной семье,
+/// `rde-mono` — первый в моноширинной. Чистая функция — покрыта тестом.
+pub fn font_definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("rde-sans".to_owned(), Arc::new(egui::FontData::from_owned(VENDORED_SANS.to_vec())));
+    fonts
+        .font_data
+        .insert("rde-mono".to_owned(), Arc::new(egui::FontData::from_owned(VENDORED_MONO.to_vec())));
+    fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "rde-sans".to_owned());
+    fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "rde-mono".to_owned());
+    fonts
 }
 
-fn install_style(ctx: &egui::Context) {
-    let mut dark = egui::Visuals::dark();
-    dark.panel_fill = BG;
-    dark.window_fill = BG;
-    dark.extreme_bg_color = Color32::from_rgb(0x12, 0x13, 0x16);
-    dark.faint_bg_color = PANEL_HI;
-    dark.widgets.noninteractive.bg_fill = PANEL;
-    dark.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    dark.widgets.inactive.bg_fill = PANEL_HI;
-    dark.widgets.inactive.weak_bg_fill = PANEL_HI;
-    dark.widgets.hovered.bg_fill = Color32::from_rgb(0x2f, 0x34, 0x3e);
-    dark.widgets.active.bg_fill = Color32::from_rgb(0x36, 0x3c, 0x48);
-    dark.selection.bg_fill = Color32::from_rgb(0x2a, 0x3d, 0x66);
-    dark.selection.stroke = Stroke::new(1.0, ACCENT);
-    dark.override_text_color = Some(TEXT);
-    dark.window_corner_radius = CornerRadius::same(8);
-    ctx.set_visuals_of(egui::Theme::Dark, dark);
-    ctx.set_theme(egui::ThemePreference::Dark);
+/// Подключить вендоренные шрифты с кириллицей (egui-дефолт может не покрывать всё).
+pub fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(font_definitions());
+}
+
+/// Тёмная палитра оболочки как `egui::Visuals` (роли: panel/window, extreme,
+/// faint, selection, text; значения зафиксированы фазой 1).
+fn dark_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = BG;
+    visuals.window_fill = BG;
+    visuals.extreme_bg_color = Color32::from_rgb(0x12, 0x13, 0x16);
+    visuals.faint_bg_color = PANEL_HI;
+    visuals.widgets.noninteractive.bg_fill = PANEL;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.inactive.bg_fill = PANEL_HI;
+    visuals.widgets.inactive.weak_bg_fill = PANEL_HI;
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x2f, 0x34, 0x3e);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(0x36, 0x3c, 0x48);
+    visuals.selection.bg_fill = Color32::from_rgb(0x2a, 0x3d, 0x66);
+    visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    visuals.override_text_color = Some(TEXT);
+    visuals.window_corner_radius = CornerRadius::same(8);
+    visuals
+}
+
+/// Светлая палитра оболочки: тот же набор ролей поверх `Visuals::light()`.
+fn light_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::light();
+    visuals.panel_fill = LIGHT_PANEL;
+    visuals.window_fill = LIGHT_PANEL;
+    visuals.extreme_bg_color = Color32::WHITE;
+    visuals.faint_bg_color = LIGHT_PANEL_HI;
+    visuals.widgets.noninteractive.bg_fill = LIGHT_PANEL;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LIGHT_BORDER);
+    visuals.widgets.inactive.bg_fill = LIGHT_PANEL_HI;
+    visuals.widgets.inactive.weak_bg_fill = LIGHT_PANEL_HI;
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0xdc, 0xe1, 0xe8);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(0xcf, 0xd6, 0xdf);
+    visuals.selection.bg_fill = Color32::from_rgb(0xb9, 0xcf, 0xf5);
+    visuals.selection.stroke = Stroke::new(1.0, LIGHT_ACCENT);
+    visuals.override_text_color = Some(LIGHT_TEXT);
+    visuals.window_corner_radius = CornerRadius::same(8);
+    visuals
+}
+
+/// Применить тему оболочки: обе палитры — в `set_visuals_of`, предпочтение —
+/// из настроек (`dark` | `light` | `system`), масштаб интерфейса — поверх
+/// зума документа (через `zoom_factor`, дефолт 1.0 — no-op).
+fn apply_app_theme(ctx: &egui::Context, theme: &str, ui_scale: f32) {
+    ctx.set_visuals_of(egui::Theme::Dark, dark_visuals());
+    ctx.set_visuals_of(egui::Theme::Light, light_visuals());
+    ctx.set_theme(theme_preference_of(theme));
+    if (ctx.zoom_factor() - ui_scale).abs() > 0.001 {
+        ctx.set_zoom_factor(ui_scale.clamp(0.5, 2.5));
+    }
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = vec2(8.0, 8.0);
         style.spacing.button_padding = vec2(8.0, 6.0);
         style.spacing.interact_size.y = 28.0;
     });
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::{apply_app_theme, dark_visuals, font_definitions, light_visuals, theme_colors, theme_preference_of};
+
+    fn luminance(color: egui::Color32) -> f64 {
+        fn linear(unit: u8) -> f64 {
+            let value = f64::from(unit) / 255.0;
+            if value <= 0.03928 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+        }
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    }
+
+    fn contrast(first: egui::Color32, second: egui::Color32) -> f64 {
+        let (high, low) = if luminance(first) > luminance(second) {
+            (luminance(first), luminance(second))
+        } else {
+            (luminance(second), luminance(first))
+        };
+        (high + 0.05) / (low + 0.05)
+    }
+
+    /// Тёмная палитра держит роли фазы 1 (panel/window/extreme/faint/selection/text).
+    #[test]
+    fn dark_visuals_keep_phase1_roles() {
+        let visuals = dark_visuals();
+        assert_eq!(visuals.panel_fill, super::BG);
+        assert_eq!(visuals.window_fill, super::BG);
+        assert_eq!(visuals.extreme_bg_color, egui::Color32::from_rgb(0x12, 0x13, 0x16));
+        assert_eq!(visuals.faint_bg_color, super::PANEL_HI);
+        assert_eq!(visuals.selection.bg_fill, egui::Color32::from_rgb(0x2a, 0x3d, 0x66));
+        assert_eq!(visuals.selection.stroke.color, super::ACCENT);
+        assert_eq!(visuals.override_text_color, Some(super::TEXT));
+    }
+
+    /// Светлая палитра покрывает тот же набор ролей и отличается от тёмной.
+    #[test]
+    fn light_visuals_cover_same_roles() {
+        let light = light_visuals();
+        let dark = dark_visuals();
+        assert_eq!(light.panel_fill, super::LIGHT_PANEL);
+        assert_eq!(light.window_fill, super::LIGHT_PANEL);
+        assert_eq!(light.extreme_bg_color, egui::Color32::WHITE);
+        assert_eq!(light.faint_bg_color, super::LIGHT_PANEL_HI);
+        assert_eq!(light.override_text_color, Some(super::LIGHT_TEXT));
+        assert_ne!(light.panel_fill, dark.panel_fill);
+        assert_ne!(light.override_text_color, dark.override_text_color);
+        // Роли оболочки связаны с константами, а не со значениями по умолчанию egui.
+        assert_eq!(theme_colors(egui::Theme::Light).panel_hi, super::LIGHT_PANEL_HI);
+        assert_eq!(theme_colors(egui::Theme::Dark).panel_hi, super::PANEL_HI);
+    }
+
+    /// Текст/статусы читаются на поверхностях в обеих темах (WCAG AA ≥ 4.5:1),
+    /// включая выделенный текст на selection-заливке.
+    #[test]
+    fn text_contrast_wcag_aa_both_themes() {
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let pal = theme_colors(theme);
+            for (name, color) in [
+                ("text", pal.text),
+                ("muted", pal.muted),
+                ("accent", pal.accent),
+                ("green", pal.green),
+                ("amber", pal.amber),
+                ("red", pal.red),
+            ] {
+                let ratio = contrast(color, pal.panel_hi);
+                assert!(ratio >= 4.5, "{theme:?} {name}: {ratio:.2}:1 на panel_hi < 4.5");
+            }
+            let (visuals, ink) = match theme {
+                egui::Theme::Dark => (dark_visuals(), pal.text),
+                egui::Theme::Light => (light_visuals(), pal.text),
+            };
+            let selection = contrast(ink, visuals.selection.bg_fill);
+            assert!(selection >= 4.5, "{theme:?} selection: {selection:.2}:1 < 4.5");
+        }
+    }
+
+    /// Маппинг настройки темы; неизвестное → Dark (как `normalize()` в rde-core).
+    #[test]
+    fn theme_preference_mapping() {
+        assert_eq!(theme_preference_of("dark"), egui::ThemePreference::Dark);
+        assert_eq!(theme_preference_of("light"), egui::ThemePreference::Light);
+        assert_eq!(theme_preference_of("system"), egui::ThemePreference::System);
+        assert_eq!(theme_preference_of(""), egui::ThemePreference::Dark);
+        assert_eq!(theme_preference_of("light (позже)"), egui::ThemePreference::Dark);
+    }
+
+    /// Вендоренные шрифты — первые в цепочках семейств, TTF валиден,
+    /// дефолты egui остаются как fallback.
+    #[test]
+    fn font_definitions_fallback_chain() {
+        let fonts = font_definitions();
+        let sans = fonts.font_data.get("rde-sans").expect("rde-sans завендорен");
+        let mono = fonts.font_data.get("rde-mono").expect("rde-mono завендорен");
+        for (name, data) in [("rde-sans", sans), ("rde-mono", mono)] {
+            assert!(data.font.len() > 100_000, "подозрительно маленький {name}: {}", data.font.len());
+            // Магия TrueType: 0x00010000 (sfnt) — файл не обрезан/не подменён.
+            assert_eq!(&data.font[..4], &[0x00, 0x01, 0x00, 0x00], "{name}: не TTF");
+        }
+        let proportional = fonts.families.get(&egui::FontFamily::Proportional).expect("proportional");
+        let monospace = fonts.families.get(&egui::FontFamily::Monospace).expect("monospace");
+        assert_eq!(proportional.first().map(String::as_str), Some("rde-sans"));
+        assert_eq!(monospace.first().map(String::as_str), Some("rde-mono"));
+        assert!(proportional.len() > 1, "дефолтный fallback пропал из Proportional");
+        assert!(monospace.len() > 1, "дефолтный fallback пропал из Monospace");
+    }
+
+    /// Применение темы на headless-контексте: предпочтение вступает сразу;
+    /// System без данных ОС падает в Dark (дефолт egui `fallback_theme`).
+    #[test]
+    fn apply_app_theme_sets_preference_headless() {
+        for (setting, want) in [
+            ("dark", egui::Theme::Dark),
+            ("light", egui::Theme::Light),
+            ("system", egui::Theme::Dark),
+        ] {
+            let ctx = egui::Context::default();
+            apply_app_theme(&ctx, setting, 1.0);
+            assert_eq!(ctx.theme(), want, "setting={setting}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6937,6 +7248,48 @@ mod docview_tests {
         }
         // Неизвестный id — тоже false без паники.
         assert!(!app.open_inspector_object("нет-такого-объекта"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// GUI фаза 2: переключение dark/light/system не паникует и применяется —
+    /// прогоняем кадры на разных вкладках (документ/структура/артефакты/источник)
+    /// с увеличенным масштабом интерфейса.
+    ///
+    /// Bounded-кадры: `build_ui_state` внутри крутит `run_ok()` до стабилизации
+    /// repaint-запросов, а встроенный редактор документа при зуме ≠ 1.0 просит
+    /// перерисовку каждый кадр (стабилизации нет — висело >60с при капе 200_000),
+    /// поэтому кап шагов маленький, дальше — фиксированные 8 кадров на комбинацию.
+    #[test]
+    fn theme_switch_renders_dark_light_system() {
+        for (theme, tab) in [("dark", "document"), ("light", "artifacts"), ("system", "structure"), ("light", "source")] {
+            let root = temp_demo_copy(&format!("theme-{theme}-{tab}"));
+            let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+            app.demo_set_theme(theme);
+            app.demo_select_tab(tab);
+            app.ui_scale = 1.25;
+            assert_eq!(app.app_settings.theme, theme);
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1600.0, 1000.0))
+                // Кап вместо 200_000: run_ok() внутри build_ui_state (см. выше).
+                .with_max_steps(24)
+                .build_ui_state(
+                    |ui, app: &mut RdeApp| {
+                        app.ui(ui);
+                    },
+                    app,
+                );
+            for _ in 0..8 {
+                harness.step();
+            }
+            assert_eq!(harness.state().app_settings.theme, theme);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // Мусорное значение игнорируется, тема не меняется.
+        let root = temp_demo_copy("theme-bogus");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        app.demo_set_theme("dark");
+        app.demo_set_theme("light (позже)");
+        assert_eq!(app.app_settings.theme, "dark");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

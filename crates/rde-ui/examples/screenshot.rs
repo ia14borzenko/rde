@@ -37,6 +37,11 @@ fn main() {
         _ => {}
     }
 
+    // 6-й аргумент — тема оболочки: dark | light | system (GUI фаза 2).
+    if let Some(theme) = std::env::args().nth(6) {
+        state.demo_set_theme(&theme);
+    }
+
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::vec2(1600.0, 1000.0))
         .with_pixels_per_point(1.5)
