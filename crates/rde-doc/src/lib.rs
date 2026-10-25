@@ -1756,7 +1756,6 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
     let mut entries = read_package(package)?.entries;
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
     let document_source = entries.get(DOCUMENT_XML).map(|bytes| String::from_utf8_lossy(bytes).to_string()).unwrap_or_default();
-    let anchor_block = request.anchor_block;
     let id = next_insert_id(&rde_doc.inserts, &document_source);
     let para_id = para_id_for(&format!("{}:insert:{id}", rde_doc.doc_id), 0);
     // Пустой style = «обычный текст документа» (формат абзаца-образца из тела).
@@ -2027,7 +2026,6 @@ pub fn add_table_insert(package: &Path, request: InsertRequest, rows: &[Vec<Stri
     let mut entries = read_package(package)?.entries;
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
     let document_source = entries.get(DOCUMENT_XML).map(|bytes| String::from_utf8_lossy(bytes).to_string()).unwrap_or_default();
-    let anchor_block = request.anchor_block;
     let id = next_insert_id(&rde_doc.inserts, &document_source);
     let para_id = para_id_for(&format!("{}:table:{id}", rde_doc.doc_id), 0);
     let (paragraph_props, run_props) = insert_formatting(&entries, &request.style);
