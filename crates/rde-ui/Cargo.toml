@@ -12,6 +12,7 @@ rde-dag = { workspace = true }
 rde-doc = { workspace = true }
 rde-templates = { workspace = true }
 rde-sources = { workspace = true }
+zip = { workspace = true }
 rde-store = { workspace = true }
 wordcraft-engine = { workspace = true }
 wordcraft-ui-egui = { path = "../../vendor/wordcraft/crates/ui-egui", features = ["rde-docview"] }

@@ -555,7 +555,10 @@ pub fn is_rde_package(path: &Path) -> bool {
 }
 
 fn temp_docx_path(tag: &str) -> PathBuf {
-    let unique = format!("rde-doc-{tag}-{}-{}.docx", std::process::id(), now_unix());
+    // Уникальность обязательна: тесты идут параллельно и могут открывать пакеты одновременно.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let unique = format!("rde-doc-{tag}-{}-{}-{counter}.docx", std::process::id(), now_unix());
     std::env::temp_dir().join(unique)
 }
 

@@ -163,9 +163,53 @@ struct EmbeddedEditor {
     pages: usize,
 }
 
+/// Тип объекта в диалоге создания (документ создаётся силами UI: нужен WordCraft-движок).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UiObjectKind {
+    Core(NewObjectKind),
+    Document,
+}
+
+impl UiObjectKind {
+    const ALL: [UiObjectKind; 7] = [
+        UiObjectKind::Core(NewObjectKind::ComputeArtifact),
+        UiObjectKind::Core(NewObjectKind::DataArtifact),
+        UiObjectKind::Core(NewObjectKind::ConstantsArtifact),
+        UiObjectKind::Document,
+        UiObjectKind::Core(NewObjectKind::Source),
+        UiObjectKind::Core(NewObjectKind::Note),
+        UiObjectKind::Core(NewObjectKind::Repository),
+    ];
+
+    fn label_ru(self) -> &'static str {
+        match self {
+            UiObjectKind::Document => "Документ (.doc.rde)",
+            UiObjectKind::Core(kind) => kind.label_ru(),
+        }
+    }
+}
+
+/// Действие из контекстного меню дерева объектов.
+#[derive(Clone, Debug)]
+enum TreeAction {
+    Open(String),
+    Rename(String),
+    Delete(String),
+    CopyId(String),
+    Update(String),
+    UpdateDependents(String),
+    FormatGost(String),
+    InsertBibliography(String),
+    WordCopy,
+    ImportReview,
+    Ocr(String),
+    Reveal(String),
+    Inspect(String),
+}
+
 /// Состояние диалога создания объекта.
 struct CreateDialogState {
-    kind: NewObjectKind,
+    kind: UiObjectKind,
     title: String,
 }
 
@@ -201,8 +245,6 @@ pub struct RdeApp {
     selected: Option<String>,
     doc: DocPreview,
     zoom: f32,
-    agent_input: String,
-    suggestion_open: bool,
     logs_tab: usize,
     fonts_installed: bool,
     // видимость панелей (скрываются через меню «Вид» или кнопкой × в заголовке)
@@ -229,6 +271,16 @@ pub struct RdeApp {
     pdf_cache: Option<(String, Result<PdfSourceInfo, String>)>,
     /// Кэш числа комментариев Word: ключ (путь+время) → количество.
     comments_cache: Option<(String, usize)>,
+    /// Кэш числа вставок rde:doc для вкладки «Структура».
+    inserts_cache: Option<(String, usize)>,
+    /// Фокус на поиске объектов (кнопка «Поиск», меню «Найти», Ctrl+F).
+    search_focus: bool,
+    open_project_dialog: Option<String>,
+    new_project_dialog: Option<(String, String)>,
+    settings_dialog: Option<(String, String, String)>,
+    check_dialog: Option<String>,
+    audit_dialog: Option<Vec<String>>,
+    about_open: bool,
 }
 
 impl RdeApp {
@@ -243,8 +295,6 @@ impl RdeApp {
             selected,
             doc,
             zoom: 0.72,
-            agent_input: String::new(),
-            suggestion_open: true,
             logs_tab: 0,
             fonts_installed: false,
             show_tree: true,
@@ -263,6 +313,14 @@ impl RdeApp {
             structure_cache: None,
             pdf_cache: None,
             comments_cache: None,
+            inserts_cache: None,
+            search_focus: false,
+            open_project_dialog: None,
+            new_project_dialog: None,
+            settings_dialog: None,
+            check_dialog: None,
+            audit_dialog: None,
+            about_open: false,
         };
         match Store::open(&app.project.root) {
             Ok(store) => {
@@ -271,22 +329,7 @@ impl RdeApp {
             }
             Err(error) => app.push_log(Level::Warn, format!("Хранилище проекта недоступно: {error}")),
         }
-        // M3: проверка «документ правили вне RDE?» по rde:doc/body_hash.
-        if let Some(path) = app.project.document_path() {
-            if rde_doc::is_rde_package(&path) {
-                match rde_doc::check_external_edit(&path) {
-                    Ok(check) if check.verdict != rde_doc::EditVerdict::NotModified => app.push_log(
-                        Level::Warn,
-                        match check.verdict {
-                            rde_doc::EditVerdict::MissingRdeDoc => "Документ пересохранён вне RDE: RDE-часть (customXml) потеряна — нужен импорт/сверка".to_owned(),
-                            _ => "Документ изменён вне RDE: body_hash не совпадает — проверьте правки".to_owned(),
-                        },
-                    ),
-                    Ok(_) => app.push_log(Level::Info, "Документ .doc.rde: RDE-часть на месте, внешних правок нет"),
-                    Err(error) => app.push_log(Level::Warn, format!("Проверка .doc.rde: {error}")),
-                }
-            }
-        }
+        app.check_external_edit_on_startup();
         app
     }
 
@@ -757,6 +800,28 @@ impl RdeApp {
             // draws itself from the effective dark palette (`Tokens::get`), so both match.
             install_style(ui.ctx());
         }
+        // Горячие клавиши (Ctrl+F — поиск, Ctrl+S — сохранить проект, Ctrl+Z/Y — отмена/повтор в редакторе).
+        let (find, save, undo, redo) = ui.input(|input| {
+            (
+                input.modifiers.command && input.key_pressed(egui::Key::F),
+                input.modifiers.command && input.key_pressed(egui::Key::S),
+                input.modifiers.command && input.key_pressed(egui::Key::Z),
+                input.modifiers.command && input.key_pressed(egui::Key::Y),
+            )
+        });
+        if find {
+            self.show_tree = true;
+            self.search_focus = true;
+        }
+        if save {
+            self.save_project_document();
+        }
+        if undo && self.editor.is_some() {
+            self.undo_document(false);
+        }
+        if redo && self.editor.is_some() {
+            self.undo_document(true);
+        }
         self.menu_bar(ui);
         self.toolbar(ui);
         self.status_bar(ui);
@@ -774,6 +839,7 @@ impl RdeApp {
         }
         self.central(ui);
         self.dialogs(ui.ctx());
+        self.dialogs_extra(ui.ctx());
     }
 
     fn push_log(&mut self, level: Level, text: impl Into<String>) {
@@ -783,27 +849,75 @@ impl RdeApp {
     // ── верхнее меню ────────────────────────────────────────────────────────
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let project_name = self.project.name.clone();
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum MenuAction {
+            NewProject,
+            OpenProject,
+            ExportDocx,
+            ExportProject,
+            Undo,
+            Redo,
+            Find,
+            CheckProject,
+            UpdateAll,
+            Settings,
+            About,
+            Audit,
+        }
+        let mut action: Option<MenuAction> = None;
         egui::Panel::top("rde_menu")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 2)))
             .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button("Файл", |ui| {
-                        let _ = ui.button("Новый проект…");
-                        let _ = ui.button("Открыть проект…");
+                        if ui.button("Новый проект…").clicked() {
+                            action = Some(MenuAction::NewProject);
+                            ui.close();
+                        }
+                        if ui.button("Открыть проект…").clicked() {
+                            action = Some(MenuAction::OpenProject);
+                            ui.close();
+                        }
                         ui.separator();
-                        let _ = ui.button("Экспорт .docx");
-                        let _ = ui.button("Экспорт проекта (.rde)");
+                        if ui.button("Экспорт .docx").clicked() {
+                            action = Some(MenuAction::ExportDocx);
+                            ui.close();
+                        }
+                        if ui.button("Экспорт проекта (.rde.zip)").clicked() {
+                            action = Some(MenuAction::ExportProject);
+                            ui.close();
+                        }
                     });
                     ui.menu_button("Правка", |ui| {
-                        let _ = ui.button("Отменить");
-                        let _ = ui.button("Повторить");
+                        let can_undo = self.editor.as_ref().is_some_and(|editor| editor.app.session.can_undo());
+                        let can_redo = self.editor.as_ref().is_some_and(|editor| editor.app.session.can_redo());
+                        if ui.add_enabled(can_undo, egui::Button::new("Отменить")).clicked() {
+                            action = Some(MenuAction::Undo);
+                            ui.close();
+                        }
+                        if ui.add_enabled(can_redo, egui::Button::new("Повторить")).clicked() {
+                            action = Some(MenuAction::Redo);
+                            ui.close();
+                        }
                         ui.separator();
-                        let _ = ui.button("Найти в проекте…");
+                        if ui.button("Найти в проекте…").clicked() {
+                            action = Some(MenuAction::Find);
+                            ui.close();
+                        }
                     });
                     ui.menu_button("Проект", |ui| {
-                        let _ = ui.button("Проверить и починить…");
-                        let _ = ui.button("Обновить все артефакты");
-                        let _ = ui.button("Настройки проекта…");
+                        if ui.button("Проверить и починить…").clicked() {
+                            action = Some(MenuAction::CheckProject);
+                            ui.close();
+                        }
+                        if ui.button("Обновить все артефакты").clicked() {
+                            action = Some(MenuAction::UpdateAll);
+                            ui.close();
+                        }
+                        if ui.button("Настройки проекта…").clicked() {
+                            action = Some(MenuAction::Settings);
+                            ui.close();
+                        }
                     });
                     ui.menu_button("Вид", |ui| {
                         ui.checkbox(&mut self.show_tree, "Дерево проекта");
@@ -812,12 +926,17 @@ impl RdeApp {
                         ui.checkbox(&mut self.show_inspector, "Инспектор объекта");
                     });
                     ui.menu_button("Агент", |ui| {
-                        let _ = ui.button("Новая сессия");
-                        let _ = ui.button("Проверить подключение (ACP)");
-                        let _ = ui.button("Аудит действий…");
+                        ui.label(RichText::new("MCP/ACP — v0.3 (не подключён)").small().color(MUTED));
+                        if ui.button("Аудит действий…").clicked() {
+                            action = Some(MenuAction::Audit);
+                            ui.close();
+                        }
                     });
                     ui.menu_button("Помощь", |ui| {
-                        let _ = ui.button("О прототипе");
+                        if ui.button("О прототипе").clicked() {
+                            action = Some(MenuAction::About);
+                            ui.close();
+                        }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new("RDE · прототип v0.1").small().color(MUTED));
@@ -826,6 +945,38 @@ impl RdeApp {
                     });
                 });
             });
+        match action {
+            Some(MenuAction::NewProject) => {
+                let base = self.project.root.parent().map(|parent| parent.to_path_buf()).unwrap_or_else(|| self.project.root.clone());
+                self.new_project_dialog = Some((base.join("rde-project").display().to_string(), "Новый проект RDE".to_owned()));
+            }
+            Some(MenuAction::OpenProject) => self.open_project_dialog = Some(self.project.root.display().to_string()),
+            Some(MenuAction::ExportDocx) => {
+                self.ensure_editor();
+                self.save_editor_copy();
+            }
+            Some(MenuAction::ExportProject) => self.export_project_archive(),
+            Some(MenuAction::Undo) => self.undo_document(false),
+            Some(MenuAction::Redo) => self.undo_document(true),
+            Some(MenuAction::Find) => {
+                self.show_tree = true;
+                self.search_focus = true;
+            }
+            Some(MenuAction::CheckProject) => self.run_project_check(),
+            Some(MenuAction::UpdateAll) => {
+                self.update_dependencies(None);
+            }
+            Some(MenuAction::Settings) => {
+                self.settings_dialog = Some((
+                    self.project.manifest.name.clone(),
+                    self.project.manifest.default_template.clone(),
+                    self.project.manifest.default_rebuild.clone(),
+                ));
+            }
+            Some(MenuAction::About) => self.about_open = true,
+            Some(MenuAction::Audit) => self.audit_dialog = Some(self.audit_lines()),
+            None => {}
+        }
     }
 
     // ── панель действий ─────────────────────────────────────────────────────
@@ -835,6 +986,7 @@ impl RdeApp {
         let mut save_project = false;
         let mut update_document = false;
         let mut new_object = false;
+        let mut search_clicked = false;
         egui::Panel::top("rde_toolbar")
             .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(10, 4)))
             .exact_size(36.0)
@@ -872,7 +1024,9 @@ impl RdeApp {
                     if ui.button(RichText::new("+ Объект").size(13.0)).clicked() {
                         new_object = true;
                     }
-                    let _ = ui.button(RichText::new("Поиск").size(13.0));
+                    if ui.button(RichText::new("Поиск").size(13.0)).on_hover_text("Поиск по объектам (Ctrl+F)").clicked() {
+                        search_clicked = true;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(format!("• {} устаревших объектов", self.project.stale_count())).small().color(AMBER));
                         ui.separator();
@@ -894,7 +1048,11 @@ impl RdeApp {
             self.update_project_document();
         }
         if new_object {
-            self.create_dialog = Some(CreateDialogState { kind: NewObjectKind::ComputeArtifact, title: String::new() });
+            self.create_dialog = Some(CreateDialogState { kind: UiObjectKind::Core(NewObjectKind::ComputeArtifact), title: String::new() });
+        }
+        if search_clicked {
+            self.show_tree = true;
+            self.search_focus = true;
         }
     }
 
@@ -910,7 +1068,8 @@ impl RdeApp {
                     ui.separator();
                     ui.label(RichText::new(self.project.root.display().to_string()).small().color(MUTED));
                     ui.separator();
-                    ui.label(RichText::new(format!("git: {}", self.project.branch)).small().color(MUTED));
+                    let branch = if self.project.branch.trim().is_empty() { "—".to_owned() } else { self.project.branch.clone() };
+                    ui.label(RichText::new(format!("git: {branch}")).small().color(MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new("A4 · ru-RU").small().color(MUTED));
                         ui.separator();
@@ -918,7 +1077,7 @@ impl RdeApp {
                         ui.separator();
                         ui.label(RichText::new(format!("• {} устаревших", self.project.stale_count())).small().color(AMBER));
                         ui.separator();
-                        ui.label(RichText::new("Агент: ожидает").small().color(GREEN));
+                        ui.label(RichText::new("Агент: не подключён (v0.3)").small().color(MUTED));
                     });
                 });
             });
@@ -928,10 +1087,12 @@ impl RdeApp {
     fn logs_panel(&mut self, ui: &mut egui::Ui) {
         let mut tab = self.logs_tab;
         let mut hide_logs = false;
-        let log = &self.project.log;
+        let mut clear = false;
+        let log = self.project.log.clone();
+        let tasks = self.run_history_lines();
         egui::Panel::bottom("rde_logs")
             .resizable(true)
-            .default_size(142.0)
+            .default_size(150.0)
             .min_size(56.0)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 6)))
             .show(ui, |ui| {
@@ -947,7 +1108,12 @@ impl RdeApp {
                         if ui.small_button("×").on_hover_text("Скрыть панель (вернуть — меню «Вид»)").clicked() {
                             hide_logs = true;
                         }
-                        let _ = ui.small_button("очистить");
+                        if tab == 0 && ui.small_button("очистить").clicked() {
+                            clear = true;
+                        }
+                        if tab == 1 {
+                            ui.label(RichText::new(format!("{} записей", tasks.len())).small().color(MUTED));
+                        }
                     });
                 });
                 ui.separator();
@@ -956,23 +1122,44 @@ impl RdeApp {
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for line in log {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(line.time).monospace().size(10.5).color(MUTED));
-                                let color = match line.level {
-                                    Level::Info => MUTED,
-                                    Level::Ok => GREEN,
-                                    Level::Warn => AMBER,
-                                };
-                                ui.label(RichText::new("•").color(color).size(11.0));
-                                ui.label(RichText::new(&line.text).size(12.0).color(TEXT));
-                            });
+                        match tab {
+                            1 => {
+                                if tasks.is_empty() {
+                                    ui.label(RichText::new("Пока нет запусков и транзакций — нажмите «Обновить всё»").small().color(MUTED));
+                                }
+                                for line in &tasks {
+                                    ui.label(RichText::new(line).monospace().size(11.5).color(TEXT));
+                                }
+                            }
+                            2 => {
+                                ui.label(RichText::new("Агент не подключён (MCP/ACP — v0.3).").strong().color(TEXT));
+                                ui.label(RichText::new("Пока доступны быстрые действия без агента — они в правой панели «Агент».").small().color(MUTED));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Когда появится: запуск артефактов и обновление вставок по запросу, проверка проекта, оформление по ГОСТ — с approvals и аудитом действий.").small().color(MUTED));
+                            }
+                            _ => {
+                                for line in &log {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(line.time).monospace().size(10.5).color(MUTED));
+                                        let color = match line.level {
+                                            Level::Info => MUTED,
+                                            Level::Ok => GREEN,
+                                            Level::Warn => AMBER,
+                                        };
+                                        ui.label(RichText::new("•").color(color).size(11.0));
+                                        ui.label(RichText::new(&line.text).size(12.0).color(TEXT));
+                                    });
+                                }
+                            }
                         }
                     });
             });
         self.logs_tab = tab;
         if hide_logs {
             self.show_logs = false;
+        }
+        if clear {
+            self.project.log.clear();
         }
     }
 
@@ -984,8 +1171,10 @@ impl RdeApp {
         let filter = self.tree_filter.to_lowercase();
         let selected = self.selected.clone();
         let mut clicked: Option<String> = None;
+        let mut action: Option<TreeAction> = None;
         let mut new_object = false;
         let mut hide_tree = false;
+        let focus_filter = std::mem::take(&mut self.search_focus);
         egui::Panel::left("rde_tree")
             .resizable(true)
             .default_size(268.0)
@@ -1000,11 +1189,18 @@ impl RdeApp {
                         ui.label(RichText::new(format!("{object_count} объектов")).small().color(MUTED));
                     });
                 });
-                ui.add(
+                let filter_response = ui.add(
                     egui::TextEdit::singleline(&mut self.tree_filter)
-                        .hint_text("Поиск объектов…")
+                        .id(egui::Id::new("rde_tree_filter"))
+                        .hint_text("Поиск объектов… (Ctrl+F)")
                         .desired_width(f32::INFINITY),
                 );
+                if focus_filter {
+                    filter_response.request_focus();
+                }
+                if !self.tree_filter.is_empty() && ui.small_button("сбросить фильтр").clicked() {
+                    self.tree_filter.clear();
+                }
                 ui.add_space(2.0);
                 if ui.add(egui::Button::new(RichText::new("+ Новый объект").size(12.0)).fill(PANEL_HI)).clicked() {
                     new_object = true;
@@ -1012,35 +1208,119 @@ impl RdeApp {
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().id_salt("rde_tree_scroll").auto_shrink([false, false]).show(ui, |ui| {
                     for group in &groups {
-                        let header = RichText::new(format!("{}  {}", group.kind.icon(), group.title)).strong().size(12.5).color(TEXT);
+                        let visible: Vec<&rde_core::Object> = group
+                            .objects
+                            .iter()
+                            .filter_map(|&index| objects.get(index))
+                            .filter(|object| filter.is_empty() || object.title.to_lowercase().contains(&filter))
+                            .collect();
+                        if visible.is_empty() {
+                            continue;
+                        }
+                        let header = RichText::new(format!("{}  {}  · {}", group.kind.icon(), group.title, visible.len())).strong().size(12.5).color(TEXT);
                         egui::CollapsingHeader::new(header).default_open(true).show(ui, |ui| {
-                            for &idx in &group.objects {
-                                let Some(obj) = objects.get(idx) else {
-                                    continue;
-                                };
-                                if !filter.is_empty() && !obj.title.to_lowercase().contains(&filter) {
-                                    continue;
-                                }
+                            for obj in visible {
                                 let is_sel = selected.as_deref() == Some(obj.id.as_str());
                                 let resp = ui
                                     .horizontal(|ui| {
-                                        ui.label(RichText::new("•").color(freshness_color(obj.freshness)).size(13.0));
+                                        ui.label(RichText::new("●").color(freshness_color(obj.freshness)).size(9.0));
                                         ui.label(RichText::new(obj.kind.icon()).color(MUTED).size(12.0));
                                         ui.selectable_label(is_sel, RichText::new(&obj.title).size(13.0))
                                     })
                                     .inner;
-                                ui.label(RichText::new(&obj.detail).size(10.5).color(MUTED));
-                                ui.add_space(2.0);
+                                // M6: контекстное меню объекта (правая кнопка мыши).
+                                resp.context_menu(|ui| {
+                                    if ui.button("Открыть").clicked() {
+                                        action = Some(TreeAction::Open(obj.id.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button("Показать в инспекторе").clicked() {
+                                        action = Some(TreeAction::Inspect(obj.id.clone()));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    match &obj.data {
+                                        ObjectData::Artifact(artifact) if artifact.kind == "compute" => {
+                                            if ui.button("Обновить артефакт").clicked() {
+                                                action = Some(TreeAction::Update(obj.id.clone()));
+                                                ui.close();
+                                            }
+                                            if ui.button("Обновить связанные").clicked() {
+                                                action = Some(TreeAction::UpdateDependents(obj.id.clone()));
+                                                ui.close();
+                                            }
+                                        }
+                                        ObjectData::Document(_) => {
+                                            if ui.button("Оформить по ГОСТ + библиография").clicked() {
+                                                action = Some(TreeAction::FormatGost(obj.id.clone()));
+                                                ui.close();
+                                            }
+                                            if ui.button("Вставить библиографию").clicked() {
+                                                action = Some(TreeAction::InsertBibliography(obj.id.clone()));
+                                                ui.close();
+                                            }
+                                            if ui.button("Копия для Word").clicked() {
+                                                action = Some(TreeAction::WordCopy);
+                                                ui.close();
+                                            }
+                                            if ui.button("Импорт ревью из exports").clicked() {
+                                                action = Some(TreeAction::ImportReview);
+                                                ui.close();
+                                            }
+                                        }
+                                        ObjectData::Source(source) => {
+                                            let is_pdf = source.file.as_deref().is_some_and(|file| file.to_ascii_lowercase().ends_with(".pdf"));
+                                            if is_pdf && ui.button("OCR страницы 1").clicked() {
+                                                action = Some(TreeAction::Ocr(obj.id.clone()));
+                                                ui.close();
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    ui.separator();
+                                    if ui.button("Копировать id").clicked() {
+                                        action = Some(TreeAction::CopyId(obj.id.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button("Показать каталог").clicked() {
+                                        action = Some(TreeAction::Reveal(obj.dir.display().to_string()));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button("Переименовать…").clicked() {
+                                        action = Some(TreeAction::Rename(obj.id.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button("Удалить (в корзину)…").clicked() {
+                                        action = Some(TreeAction::Delete(obj.id.clone()));
+                                        ui.close();
+                                    }
+                                });
                                 if resp.clicked() {
                                     clicked = Some(obj.id.clone());
                                 }
                             }
                         });
                     }
+                    ui.add_space(6.0);
+                    if filter.is_empty() && groups.iter().all(|group| group.objects.is_empty()) {
+                        ui.label(RichText::new("В проекте пока нет объектов").small().color(MUTED));
+                    }
+                    // Пустое место дерева: создание объекта.
+                    let empty = ui.allocate_response(vec2(ui.available_width(), 18.0), Sense::click());
+                    empty.context_menu(|ui| {
+                        if ui.button("Создать объект…").clicked() {
+                            new_object = true;
+                            ui.close();
+                        }
+                    });
                 });
             });
         if hide_tree {
             self.show_tree = false;
+        }
+        if new_object {
+            self.create_dialog = Some(CreateDialogState { kind: UiObjectKind::Core(NewObjectKind::ComputeArtifact), title: String::new() });
         }
         if let Some(id) = clicked {
             if let Some(object) = self.project.object(&id) {
@@ -1053,17 +1333,68 @@ impl RdeApp {
             }
             self.selected = Some(id);
         }
-        if new_object {
-            self.push_log(Level::Info, "Создание объекта: мастер появится вместе с rde-store (M2.2)");
+        if let Some(action) = action {
+            self.apply_tree_action(action);
+        }
+    }
+
+    /// Выполнить действие из контекстного меню дерева.
+    fn apply_tree_action(&mut self, action: TreeAction) {
+        match action {
+            TreeAction::Open(id) | TreeAction::Inspect(id) => {
+                if let Some(object) = self.project.object(&id).cloned() {
+                    self.selected = Some(id);
+                    self.show_inspector = true;
+                    self.tab = match object.kind {
+                        ObjectKind::Document => Tab::Document,
+                        ObjectKind::Artifact | ObjectKind::Constants => Tab::Artifacts,
+                        ObjectKind::Source | ObjectKind::Note => Tab::Source,
+                        ObjectKind::Repository => Tab::Artifacts,
+                    };
+                }
+            }
+            TreeAction::Rename(id) => {
+                if let Some(object) = self.project.object(&id) {
+                    self.rename_dialog = Some(RenameDialogState { id: object.id.clone(), title: object.title.clone() });
+                }
+            }
+            TreeAction::Delete(id) => self.delete_confirm = Some(id),
+            TreeAction::CopyId(id) => self.push_log(Level::Info, format!("id объекта: {id}")),
+            TreeAction::Update(id) => {
+                self.update_dependencies(Some(vec![id]));
+            }
+            TreeAction::UpdateDependents(id) => {
+                self.update_dependencies(Some(vec![id]));
+            }
+            TreeAction::FormatGost(id) => {
+                self.selected = Some(id);
+                self.update_document_package(true, true);
+            }
+            TreeAction::InsertBibliography(id) => {
+                self.selected = Some(id);
+                self.update_document_package(false, true);
+            }
+            TreeAction::WordCopy => self.export_word_copy(),
+            TreeAction::ImportReview => self.import_review_from_exports(),
+            TreeAction::Ocr(id) => self.ocr_source(&id),
+            TreeAction::Reveal(path) => {
+                let path = PathBuf::from(path);
+                #[cfg(unix)]
+                if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                }
+                self.push_log(Level::Info, format!("Каталог: {}", path.display()));
+            }
         }
     }
 
     // ── панель агента ───────────────────────────────────────────────────────
     fn agent_panel(&mut self, ui: &mut egui::Ui) {
-        let mut send = false;
-        let mut accept = false;
-        let mut reject = false;
         let mut hide_agent = false;
+        let mut check = false;
+        let mut update = false;
+        let mut gost = false;
+        let mut review = false;
         egui::Panel::right("rde_agent")
             .resizable(true)
             .default_size(316.0)
@@ -1072,63 +1403,65 @@ impl RdeApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("АГЕНТ").small().strong().color(MUTED));
-                    ui.label(RichText::new("• DSH · deepseek-v4-flash").small().color(GREEN));
+                    ui.label(RichText::new("• не подключён").small().color(AMBER));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("×").on_hover_text("Скрыть панель (вернуть — меню «Вид»)").clicked() {
                             hide_agent = true;
                         }
-                        let _ = ui.small_button("…");
-                        ui.label(RichText::new("ACP").small().color(MUTED));
+                        ui.label(RichText::new("v0.3 · MCP/ACP").small().color(MUTED));
                     });
                 });
                 ui.separator();
-                let input_height = 38.0;
-                egui::ScrollArea::vertical()
-                    .id_salt("rde_agent_scroll")
-                    .auto_shrink([false, false])
-                    .max_height(ui.available_height() - input_height)
-                    .show(ui, |ui| {
-                        agent_bubble(ui, "Вы", "Проверь рисунок 1 и обнови подпись: у нас новый plot.svg", false);
-                        ui.label(RichText::new("rde://doc/01JB7Z6Q/rev/42#block/b12").monospace().size(10.0).color(ACCENT));
-                        ui.add_space(6.0);
-                        agent_bubble(ui, "RDE Agent", "Проверил вставку рисунка: act_key артефакта plot изменился, документ помечен устаревшим. Подпись обновлю после пересчёта.", true);
-                        ui.add_space(6.0);
-                        tool_card(ui, "artifact_run", "plot (compute) · OK · 1.2 s · out_hash 8f3a…");
-                        ui.add_space(6.0);
-                        if self.suggestion_open {
-                            suggestion_card(ui, &mut accept, &mut reject);
-                        }
-                        ui.add_space(6.0);
-                        agent_bubble(ui, "RDE Agent", "Готово: «Рисунок 1 — Статистическая обработка реализаций» (2 вставки обновлены). Добавить ссылку на источник [1] в абзац?", true);
-                    });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let width = ui.available_width() - 58.0;
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.agent_input)
-                            .hint_text("Спросить агента…")
-                            .desired_width(width),
+                egui::ScrollArea::vertical().id_salt("rde_agent_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Встроенный агент появится в v0.3").strong().color(TEXT));
+                    ui.label(
+                        RichText::new(
+                            "Планируется: MCP-сервер (инструменты, ресурсы, approvals) и ACP-агент, \
+                             который сможет запускать артефакты, обновлять вставки документа, проверять проект \
+                             и оформлять по ГОСТ — с аудитом и откатом.",
+                        )
+                        .small()
+                        .color(MUTED),
                     );
-                    send = ui.add(egui::Button::new(RichText::new("Отпр.").size(11.5).color(Color32::WHITE)).fill(ACCENT)).clicked();
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        send = true;
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("БЫСТРЫЕ ДЕЙСТВИЯ (без агента)").small().strong().color(MUTED));
+                    ui.add_space(4.0);
+                    if ui.add(egui::Button::new("Проверить проект").fill(PANEL_HI)).clicked() {
+                        check = true;
                     }
+                    if ui.add(egui::Button::new("Обновить устаревшие артефакты").fill(PANEL_HI)).clicked() {
+                        update = true;
+                    }
+                    if ui.add(egui::Button::new("Оформить документ по ГОСТ").fill(PANEL_HI)).clicked() {
+                        gost = true;
+                    }
+                    if ui.add(egui::Button::new("Импорт ревью из exports").fill(PANEL_HI)).clicked() {
+                        review = true;
+                    }
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Журнал и история запусков — в панели снизу («Задачи»).").small().color(MUTED));
                 });
+                ui.add_space(4.0);
+                ui.add_enabled(
+                    false,
+                    egui::TextEdit::singleline(&mut String::new()).hint_text("Чат с агентом — появится в v0.3").desired_width(f32::INFINITY),
+                );
             });
         if hide_agent {
             self.show_agent = false;
         }
-        if send {
-            let text = std::mem::take(&mut self.agent_input);
-            let text = if text.trim().is_empty() { "Продолжай".to_owned() } else { text };
-            self.push_log(Level::Info, format!("Агент (mock): запрос — {text}"));
+        if check {
+            self.run_project_check();
         }
-        if accept || reject {
-            self.suggestion_open = false;
-            self.push_log(
-                Level::Ok,
-                if accept { "Предложение агента принято (mock): вставка рисунка 1 обновлена" } else { "Предложение агента отклонено (mock)" },
-            );
+        if update {
+            self.update_dependencies(None);
+        }
+        if gost {
+            self.update_document_package(true, true);
+        }
+        if review {
+            self.import_review_from_exports();
         }
     }
 
@@ -1343,11 +1676,48 @@ impl RdeApp {
         }
     }
 
-    fn create_object_action(&mut self, kind: NewObjectKind, title: &str) -> Result<(), String> {
+    fn create_object_action(&mut self, kind: UiObjectKind, title: &str) -> Result<(), String> {
+        if kind == UiObjectKind::Document {
+            return self.create_document_action(title);
+        }
+        let UiObjectKind::Core(kind) = kind else { unreachable!() };
         let dir = rde_core::create_object(&self.project.root, &CreateRequest { kind, title: title.to_owned() })?;
         self.reload_project();
         self.selected = self.project.objects.iter().find(|object| object.dir == dir).map(|object| object.id.clone());
         self.push_log(Level::Ok, format!("Создан объект «{}» ({})", title.trim(), kind.label_ru()));
+        Ok(())
+    }
+
+    /// Создать новый документ: `document.toml` + пустой OOXML → `.doc.rde` (WordCraft + rde:doc).
+    fn create_document_action(&mut self, title: &str) -> Result<(), String> {
+        let dir = rde_core::create_document_stub(&self.project.root, title)?;
+        let temp = std::env::temp_dir().join(format!("rde-new-doc-{}.docx", std::process::id()));
+        let doc = wordcraft_engine::doc::Document::default();
+        if let Err(error) = wordcraft_engine::io::save_path(&temp, &doc) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(format!("сохранить пустой .docx: {error}"));
+        }
+        let project = rde_core::load_project(&self.project.root)?;
+        let Some(object) = project.objects.iter().find(|object| object.dir == dir).cloned() else {
+            let _ = fs::remove_file(&temp);
+            return Err("новый документ не загрузился".to_owned());
+        };
+        let ObjectData::Document(manifest) = &object.data else {
+            let _ = fs::remove_file(&temp);
+            return Err("новый объект не является документом".to_owned());
+        };
+        let package = dir.join("report.doc.rde");
+        let result = rde_doc::build_rde_doc(&temp, &manifest.id, &manifest.template)
+            .and_then(|rde_doc| rde_doc::write_package(&temp, &rde_doc, &package).map(|_| ()));
+        let _ = fs::remove_file(&temp);
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(error);
+        }
+        self.reload_project();
+        self.selected = self.project.objects.iter().find(|object| object.dir == dir).map(|object| object.id.clone());
+        self.tab = Tab::Document;
+        self.push_log(Level::Ok, format!("Создан документ «{}» (.doc.rde)", title.trim()));
         Ok(())
     }
 
@@ -1368,6 +1738,460 @@ impl RdeApp {
         Ok(())
     }
 
+    /// Проверка внешних правок документа при открытии проекта (M3/M5).
+    fn check_external_edit_on_startup(&mut self) {
+        if let Some(path) = self.project.document_path() {
+            if rde_doc::is_rde_package(&path) {
+                match rde_doc::check_external_edit(&path) {
+                    Ok(check) if check.verdict != rde_doc::EditVerdict::NotModified => self.push_log(
+                        Level::Warn,
+                        match check.verdict {
+                            rde_doc::EditVerdict::MissingRdeDoc => "Документ пересохранён вне RDE: RDE-часть (customXml) потеряна — нужен импорт/сверка".to_owned(),
+                            _ => "Документ изменён вне RDE: body_hash не совпадает — проверьте правки".to_owned(),
+                        },
+                    ),
+                    Ok(_) => self.push_log(Level::Info, "Документ .doc.rde: RDE-часть на месте, внешних правок нет"),
+                    Err(error) => self.push_log(Level::Warn, format!("Проверка .doc.rde: {error}")),
+                }
+            }
+        }
+    }
+
+    /// Открыть проект по пути: перезагрузить модель, хранилище, документ и статусы.
+    pub fn open_project(&mut self, root: &Path) {
+        match rde_core::load_project(root) {
+            Ok(project) => {
+                self.project = project;
+                self.selected = self
+                    .project
+                    .document_object()
+                    .map(|object| object.id.clone())
+                    .or_else(|| self.project.objects.first().map(|object| object.id.clone()));
+                self.doc = DocPreview::new(self.project.document_path());
+                self.editor = None;
+                self.editor_error = None;
+                self.structure_cache = None;
+                self.pdf_cache = None;
+                self.comments_cache = None;
+                self.inserts_cache = None;
+                self.tab = Tab::Document;
+                self.store = Store::open(&self.project.root).ok();
+                self.refresh_dag_statuses();
+                self.push_log(Level::Ok, format!("Проект открыт: {} ({} объектов)", self.project.name, self.project.object_count()));
+                self.check_external_edit_on_startup();
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Не удалось открыть проект {}: {error}", root.display())),
+        }
+    }
+
+    /// Создать новый проект и открыть его.
+    pub fn create_project_ui(&mut self, root: &Path, name: &str) -> Result<(), String> {
+        rde_core::create_project(root, name)?;
+        self.open_project(root);
+        self.push_log(Level::Ok, format!("Создан проект «{}»: {}", name.trim(), root.display()));
+        Ok(())
+    }
+
+    /// Сохранить настройки проекта (`rde.toml`) и перезагрузить модель.
+    pub fn save_project_settings(&mut self, name: &str, template: &str, rebuild: &str) -> Result<(), String> {
+        if name.trim().is_empty() {
+            return Err("название проекта не может быть пустым".to_owned());
+        }
+        let path = self.project.root.join("rde.toml");
+        set_manifest_string(&path, "name", name.trim());
+        set_manifest_string(&path, "default_template", template.trim());
+        set_manifest_string(&path, "default_rebuild", rebuild.trim());
+        self.reload_project();
+        self.push_log(Level::Ok, "Настройки проекта сохранены");
+        Ok(())
+    }
+
+    /// «Проверить и починить»: целостность CAS/индекса, статусы артефактов, документ, issues.
+    pub fn run_project_check(&mut self) {
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(store) = self.store.as_mut() {
+            match store.rebuild_index() {
+                Ok(report) => {
+                    lines.push(format!(
+                        "Хранилище: {} блобов, {} деревьев, {} транзакций; повреждено {}",
+                        report.blobs,
+                        report.trees,
+                        report.txs,
+                        report.mismatched.len()
+                    ));
+                    if !report.mismatched.is_empty() {
+                        lines.push(format!("Повреждённые части: {:?}", report.mismatched));
+                    }
+                }
+                Err(error) => lines.push(format!("Индекс: ошибка — {error}")),
+            }
+            match rde_dag::evaluate(&self.project, store) {
+                Ok(statuses) => {
+                    let stale: Vec<&rde_dag::ArtifactStatus> = statuses
+                        .values()
+                        .filter(|status| !matches!(status.status, rde_dag::LiveStatus::Fresh))
+                        .collect();
+                    lines.push(format!("Артефакты: {} (неактуальных {})", statuses.len(), stale.len()));
+                    for status in stale {
+                        lines.push(format!(
+                            "  {}: {}{}",
+                            status.title,
+                            status.status.label_ru(),
+                            status.status.reason().map(|reason| format!(" — {reason}")).unwrap_or_default()
+                        ));
+                    }
+                }
+                Err(error) => lines.push(format!("Статусы: ошибка — {error}")),
+            }
+            match store.incomplete_txs() {
+                Ok(ids) if !ids.is_empty() => lines.push(format!("Незавершённые транзакции: {}", ids.len())),
+                Ok(_) => lines.push("Незавершённых транзакций нет".to_owned()),
+                Err(error) => lines.push(format!("Журнал: ошибка — {error}")),
+            }
+        } else {
+            lines.push("Хранилище проекта не открыто".to_owned());
+        }
+        if let Some(path) = self.project.document_path() {
+            if rde_doc::is_rde_package(&path) {
+                match rde_doc::check_external_edit(&path) {
+                    Ok(check) => {
+                        lines.push(format!(
+                            "Документ .doc.rde: {}",
+                            match check.verdict {
+                                rde_doc::EditVerdict::NotModified => "внешних правок нет",
+                                rde_doc::EditVerdict::ExternalEdit => "изменён вне RDE (body_hash не совпал)",
+                                rde_doc::EditVerdict::MissingRdeDoc => "RDE-часть потеряна (пересохранён вне RDE)",
+                            }
+                        ));
+                    }
+                    Err(error) => lines.push(format!("Документ: ошибка — {error}")),
+                }
+                if let Ok(comments) = rde_doc::comments(&path) {
+                    lines.push(format!("Комментариев Word: {}", comments.len()));
+                }
+            }
+        }
+        lines.push(format!("Проблемы загрузки проекта: {}", self.project.issues.len()));
+        for issue in &self.project.issues {
+            lines.push(format!("  {}: {}", issue.path.display(), issue.message));
+        }
+        self.check_dialog = Some(lines.join("\n"));
+        self.push_log(Level::Ok, "Проверка проекта завершена — отчёт в диалоге");
+    }
+
+    /// Экспорт проекта в zip (`<имя>.rde.zip`): rde.toml + objects/** без сгенерированных данных.
+    pub fn export_project_archive(&mut self) {
+        let name = self.project.name.chars().map(|ch| if ch.is_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' }).collect::<String>();
+        let out = self.export_dir.join(format!("{name}.rde.zip"));
+        match write_project_zip(&self.project.root, &out) {
+            Ok(files) => self.push_log(Level::Ok, format!("Экспорт проекта: {} ({files} файлов)", out.display())),
+            Err(error) => self.push_log(Level::Warn, format!("Экспорт проекта: {error}")),
+        }
+    }
+
+    /// Отмена/повтор в документе (история WordCraft-сессии).
+    pub fn undo_document(&mut self, redo: bool) {
+        self.ensure_editor();
+        let Some(editor) = self.editor.as_mut() else {
+            self.push_log(Level::Warn, "Отмена: редактор не открыт");
+            return;
+        };
+        let label = if redo {
+            editor.app.session.redo_label().map(|label| label.to_owned())
+        } else {
+            editor.app.session.undo_label().map(|label| label.to_owned())
+        };
+        let done = if redo { editor.app.session.redo() } else { editor.app.session.undo() };
+        if done {
+            self.push_log(Level::Info, format!("{}: {}", if redo { "Повтор" } else { "Отмена" }, label.unwrap_or_default()));
+        } else {
+            self.push_log(Level::Info, if redo { "Повторять нечего" } else { "Отменять нечего" });
+        }
+    }
+
+    /// Аудит действий: журнал транзакций хранилища.
+    fn audit_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        match &self.store {
+            Some(store) => match store.list_txs() {
+                Ok(txs) => {
+                    lines.push(format!("Транзакции хранилища: {}", txs.len()));
+                    for tx in txs.iter().take(60) {
+                        lines.push(format!("{}  {:?}  {}", tx.started_unix, tx.status, tx.note));
+                    }
+                    if txs.is_empty() {
+                        lines.push("Транзакций пока нет".to_owned());
+                    }
+                }
+                Err(error) => lines.push(format!("Журнал: ошибка — {error}")),
+            },
+            None => lines.push("Хранилище проекта не открыто".to_owned()),
+        }
+        lines
+    }
+
+    /// История запусков/транзакций для вкладки «Задачи».
+    fn run_history_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(store) = &self.store {
+            if let Ok(txs) = store.list_txs() {
+                for tx in txs.iter().rev().take(30) {
+                    lines.push(format!("[{}] {:?} · {}", tx.id.chars().take(8).collect::<String>(), tx.status, tx.note));
+                }
+            }
+        }
+        let runs = self.project.root.join(".rde/runs");
+        if let Ok(entries) = fs::read_dir(&runs) {
+            let mut dirs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).filter(|path| path.is_dir()).collect();
+            dirs.sort();
+            dirs.reverse();
+            for dir in dirs.into_iter().take(20) {
+                if let Ok(text) = fs::read_to_string(dir.join("run.json")) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        lines.push(format!(
+                            "run {} · {} · {} мс · выходов {}",
+                            dir.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default(),
+                            value.get("status").and_then(|value| value.as_str()).unwrap_or("?"),
+                            value.get("duration_ms").and_then(|value| value.as_u64()).unwrap_or(0),
+                            value.get("outputs").and_then(|value| value.as_array()).map(|items| items.len()).unwrap_or(0)
+                        ));
+                    }
+                }
+            }
+        }
+        if lines.is_empty() {
+            lines.push("Пока нет запусков и транзакций — нажмите «Обновить всё»".to_owned());
+        }
+        lines
+    }
+
+    /// OCR источника (PDF-страница или изображение) с записью `ocr.txt` рядом с источником.
+    pub fn ocr_source(&mut self, id: &str) {
+        let Some(object) = self.project.object(id).cloned() else { return };
+        let ObjectData::Source(source) = &object.data else {
+            self.push_log(Level::Warn, "OCR: выбранный объект — не источник");
+            return;
+        };
+        let Some(file) = source.file.clone() else {
+            self.push_log(Level::Warn, "OCR: у источника нет файла (URL)");
+            return;
+        };
+        let path = object.dir.join(&file);
+        let lower = file.to_ascii_lowercase();
+        let result = if lower.ends_with(".pdf") {
+            rde_sources::ocr_pdf_page(&path, 1)
+        } else {
+            rde_sources::ocr_image(&path)
+        };
+        match result {
+            Ok(text) => {
+                let _ = fs::write(object.dir.join("ocr.txt"), &text);
+                self.push_log(Level::Ok, format!("OCR «{}»: {} символов (ocr.txt)", object.title, text.chars().count()));
+                self.push_log(Level::Info, text.chars().take(300).collect::<String>());
+            }
+            Err(error) => self.push_log(Level::Warn, format!("OCR: {error}")),
+        }
+    }
+
+    /// Дополнительные диалоги: проекты, настройки, проверка, аудит, «О прототипе».
+    fn dialogs_extra(&mut self, ctx: &egui::Context) {
+        if let Some(mut path) = self.open_project_dialog.take() {
+            let mut open = false;
+            let mut cancel = false;
+            egui::Window::new("Открыть проект")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(520.0);
+                    ui.add(egui::TextEdit::singleline(&mut path).hint_text("Путь к каталогу с rde.toml").desired_width(f32::INFINITY));
+                    ui.label(RichText::new("Нужен каталог, в котором есть rde.toml").small().color(MUTED));
+                    ui.horizontal(|ui| {
+                        if ui.button("Открыть").clicked() {
+                            open = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if open {
+                let root = PathBuf::from(path.trim());
+                if root.join("rde.toml").is_file() {
+                    self.open_project(&root);
+                } else {
+                    self.push_log(Level::Warn, format!("Открыть проект: в {} нет rde.toml", root.display()));
+                }
+            }
+            if !open && !cancel {
+                self.open_project_dialog = Some(path);
+            }
+        }
+
+        if let Some((mut path, mut name)) = self.new_project_dialog.take() {
+            let mut create = false;
+            let mut cancel = false;
+            egui::Window::new("Новый проект")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(520.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Каталог").color(MUTED));
+                        ui.add(egui::TextEdit::singleline(&mut path).desired_width(f32::INFINITY));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Название").color(MUTED));
+                        ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Создать").clicked() {
+                            create = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if create {
+                let root = PathBuf::from(path.trim());
+                if let Err(error) = self.create_project_ui(&root, &name) {
+                    self.push_log(Level::Warn, format!("Новый проект: {error}"));
+                }
+            }
+            if !create && !cancel {
+                self.new_project_dialog = Some((path, name));
+            }
+        }
+
+        if let Some((mut name, mut template, mut rebuild)) = self.settings_dialog.take() {
+            let mut save = false;
+            let mut cancel = false;
+            egui::Window::new("Настройки проекта")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(460.0);
+                    egui::Grid::new("rde_settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label(RichText::new("Название").color(MUTED));
+                        ui.add(egui::TextEdit::singleline(&mut name).desired_width(300.0));
+                        ui.end_row();
+                        ui.label(RichText::new("Шаблон по умолчанию").color(MUTED));
+                        egui::ComboBox::from_id_salt("rde_settings_template")
+                            .selected_text(if template.is_empty() { "—" } else { &template })
+                            .show_ui(ui, |ui| {
+                                for builtin in rde_templates::builtin_templates() {
+                                    ui.selectable_value(&mut template, builtin.id.clone(), builtin.title.clone());
+                                }
+                            });
+                        ui.end_row();
+                        ui.label(RichText::new("Пересборка").color(MUTED));
+                        egui::ComboBox::from_id_salt("rde_settings_rebuild")
+                            .selected_text(if rebuild.is_empty() { "—" } else { &rebuild })
+                            .show_ui(ui, |ui| {
+                                for value in ["manual", "auto"] {
+                                    ui.selectable_value(&mut rebuild, value.to_owned(), value);
+                                }
+                            });
+                        ui.end_row();
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Сохранить").clicked() {
+                            save = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if save {
+                if let Err(error) = self.save_project_settings(&name, &template, &rebuild) {
+                    self.push_log(Level::Warn, format!("Настройки: {error}"));
+                }
+            }
+            if !save && !cancel {
+                self.settings_dialog = Some((name, template, rebuild));
+            }
+        }
+
+        if let Some(text) = self.check_dialog.clone() {
+            let mut close = false;
+            egui::Window::new("Проверка проекта")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(620.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        ui.label(RichText::new(text).monospace().size(11.5).color(TEXT));
+                    });
+                    if ui.button("Закрыть").clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.check_dialog = None;
+            }
+        }
+
+        if let Some(lines) = self.audit_dialog.clone() {
+            let mut close = false;
+            egui::Window::new("Аудит действий")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(620.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for line in &lines {
+                            ui.label(RichText::new(line).monospace().size(11.5).color(TEXT));
+                        }
+                    });
+                    if ui.button("Закрыть").clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.audit_dialog = None;
+            }
+        }
+
+        if self.about_open {
+            let mut close = false;
+            egui::Window::new("О прототипе RDE")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(520.0)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new("RDE — Research Development Environment").strong().size(15.0));
+                    ui.label(RichText::new(format!("прототип v0.1 · сборка {}", env!("CARGO_PKG_VERSION"))).small().color(MUTED));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Документ: .doc.rde (OOXML + rde:doc) · WordCraft DocView · ГОСТ 7.32-2017 · артефакты с act_key/out_hash · PDF/OCR · ревью Word.").small().color(TEXT));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Горячие клавиши").strong().small().color(MUTED));
+                    for (keys, action) in [
+                        ("Ctrl+F", "поиск по объектам"),
+                        ("Ctrl+S", "сохранить проект (.doc.rde)"),
+                        ("Ctrl+Z / Ctrl+Y", "отмена/повтор в редакторе"),
+                        ("ПКМ по объекту", "контекстное меню действий"),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(keys).monospace().size(11.5).color(ACCENT));
+                            ui.label(RichText::new(action).small().color(TEXT));
+                        });
+                    }
+                    ui.add_space(6.0);
+                    if ui.button("Закрыть").clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.about_open = false;
+            }
+        }
+    }
+
     /// Окна диалогов создания/переименования/удаления.
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(mut dialog) = self.create_dialog.take() {
@@ -1385,7 +2209,7 @@ impl RdeApp {
                         egui::ComboBox::from_id_salt("rde_new_kind")
                             .selected_text(dialog.kind.label_ru())
                             .show_ui(ui, |ui| {
-                                for kind in NewObjectKind::ALL {
+                                for kind in UiObjectKind::ALL {
                                     ui.selectable_value(&mut dialog.kind, kind, kind.label_ru());
                                 }
                             });
@@ -1396,7 +2220,7 @@ impl RdeApp {
                             .hint_text("Название объекта")
                             .desired_width(f32::INFINITY),
                     );
-                    ui.label(RichText::new("Документы создаются в M3 (нужен .doc.rde)").small().color(MUTED));
+                    ui.label(RichText::new("Документ создаётся пустым .doc.rde (WordCraft + rde:doc)").small().color(MUTED));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button("Создать").clicked() {
@@ -1582,7 +2406,9 @@ impl RdeApp {
                     ed.app.logic(&ctx);
                     // The WordCraft canvas paints across its whole area; give it a clipped
                     // child Ui so it can never draw over the RDE side panels.
-                    let rect = ui.available_rect_before_wrap();
+                    // WordCraft рисует canvas по available_rect, игнорируя clip_rect: ограничиваем
+                    // его пересечением с реальной видимой областью, иначе он заезжает на панели.
+                    let rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
                     let mut child = ui.new_child(
                         egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)),
                     );
@@ -1661,19 +2487,32 @@ impl RdeApp {
             });
         }
         let cache = self.structure_cache.clone();
+        // Число вставок из rde:doc (кэш по пути пакета).
+        let package_key = self.project.document_path().map(|path| path.display().to_string()).unwrap_or_default();
+        if self.inserts_cache.as_ref().map(|(key, _)| key != &package_key).unwrap_or(true) {
+            let count = self
+                .project
+                .document_path()
+                .and_then(|path| rde_doc::load_rde_doc(&path).ok())
+                .map(|rde_doc| rde_doc.inserts.len())
+                .unwrap_or(0);
+            self.inserts_cache = Some((package_key.clone(), count));
+        }
+        let inserts_count = self.inserts_cache.as_ref().map(|(_, count)| *count).unwrap_or(0);
+        let mut clicked_block: Option<(usize, String)> = None;
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.label(RichText::new("Блоки документа").strong().color(TEXT));
             if let Some(Ok((blocks, figures))) = &cache {
                 let headings = blocks.iter().filter(|block| matches!(block.kind, "H1" | "H2" | "H")).count();
                 ui.label(
-                    RichText::new(format!("{} блоков · {headings} заголовков · {figures} рисунков · из модели WordCraft", blocks.len()))
+                    RichText::new(format!("{} блоков · {headings} заголовков · {figures} рисунков · {inserts_count} вставок rde:doc", blocks.len()))
                         .small()
                         .color(MUTED),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("вставки rde:doc — M3").small().color(MUTED));
+                ui.label(RichText::new("клик по блоку — выбрать документ").small().color(MUTED));
             });
         });
         ui.separator();
@@ -1704,7 +2543,10 @@ impl RdeApp {
                             ui.label(RichText::new(kind_label).monospace().size(11.0).color(color));
                             ui.label(RichText::new(if block.style.is_empty() { "—" } else { &block.style }).monospace().size(10.5).color(MUTED));
                             ui.label(RichText::new(&block.anchor).monospace().size(10.5).color(MUTED));
-                            ui.label(RichText::new(&block.text).size(12.0).color(TEXT));
+                            let text_resp = ui.add(egui::Label::new(RichText::new(&block.text).size(12.0).color(TEXT)).sense(Sense::click()));
+                            if text_resp.clicked() {
+                                clicked_block = Some((block.number, block.text.clone()));
+                            }
                             ui.end_row();
                         }
                     });
@@ -1717,6 +2559,12 @@ impl RdeApp {
                 None => {}
             }
         });
+        if let Some((number, text)) = clicked_block {
+            if let Some(document) = self.project.document_object() {
+                self.selected = Some(document.id.clone());
+            }
+            self.push_log(Level::Info, format!("Блок {number}: {text}"));
+        }
     }
 
     fn artifacts_tab(&mut self, ui: &mut egui::Ui) {
@@ -1765,7 +2613,21 @@ impl RdeApp {
             .collect();
         let index_of = |id: &str| artifacts.iter().position(|o| o.id == id);
         let selected_id = self.selected.clone();
+        let mut clicked_node: Option<String> = None;
         for (i, object) in artifacts.iter().take(n).enumerate() {
+            let node_response = ui.interact(nodes[i], ui.id().with(("rde_dag_node", i)), Sense::click());
+            if node_response.clicked() {
+                clicked_node = Some(object.id.clone());
+            }
+            if node_response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            node_response.context_menu(|ui| {
+                if ui.button("Открыть в инспекторе").clicked() {
+                    clicked_node = Some(object.id.clone());
+                    ui.close();
+                }
+            });
             let color = freshness_color(object.freshness);
             let selected = selected_id.as_deref() == Some(object.id.as_str());
             draw_node(&painter, nodes[i], &object.title, &object.detail, color, object.freshness.label_ru(), selected);
@@ -1796,6 +2658,13 @@ impl RdeApp {
                 FontId::proportional(11.5),
                 MUTED,
             );
+        }
+        if let Some(id) = clicked_node {
+            self.selected = Some(id.clone());
+            self.show_inspector = true;
+            if let Some(object) = self.project.object(&id) {
+                self.push_log(Level::Info, format!("Выбран артефакт: {} ({})", object.title, object.detail));
+            }
         }
         if refresh {
             let targets = self.selected.as_ref().and_then(|id| {
@@ -1829,6 +2698,12 @@ impl RdeApp {
         let ObjectData::Source(src) = &obj.data else {
             return;
         };
+        let source_file = src.file.clone();
+        let source_url = src.url.clone();
+        let source_id = obj.id.clone();
+        let mut open_source = false;
+        let mut copy_locator = false;
+        let mut show_in_tree = false;
         let locator = src.file.clone().or_else(|| src.url.clone()).unwrap_or_default();
         let retrieved = src.retrieved_at.clone().unwrap_or_else(|| "—".to_owned());
         let reference = src.reference.clone();
@@ -1876,9 +2751,15 @@ impl RdeApp {
                     });
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        let _ = ui.button(RichText::new("Открыть источник").size(12.0));
-                        let _ = ui.button(RichText::new("Ссылка в чат агента").size(12.0));
-                        let _ = ui.button(RichText::new("Показать в дереве").size(12.0));
+                        if ui.button(RichText::new("Открыть источник").size(12.0)).clicked() {
+                            open_source = true;
+                        }
+                        if ui.button(RichText::new("Копировать локатор").size(12.0)).clicked() {
+                            copy_locator = true;
+                        }
+                        if ui.button(RichText::new("Показать в дереве").size(12.0)).clicked() {
+                            show_in_tree = true;
+                        }
                     });
                 });
             ui.add_space(12.0);
@@ -1958,8 +2839,33 @@ impl RdeApp {
             }
         }
 
-    }
+        // M6: действия вкладки «Источник» (реальные: файл/URL, выбор в дереве, копирование).
+        if open_source {
+            let target = source_file.as_ref().map(|file| obj.dir.join(file)).or_else(|| source_url.clone().map(PathBuf::from));
+            match target {
+                Some(path) if path.exists() => {
+                    #[cfg(unix)]
+                    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                        let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                    }
+                    self.push_log(Level::Info, format!("Источник открыт: {}", path.display()));
+                }
+                Some(path) => self.push_log(Level::Info, format!("Источник: {}", path.display())),
+                None => self.push_log(Level::Warn, "У источника нет файла/URL"),
+            }
+        }
+        if copy_locator {
+            let locator = source_file.clone().or(source_url.clone()).unwrap_or_default();
+            ui.ctx().copy_text(locator.clone());
+            self.push_log(Level::Info, format!("Локатор скопирован: {locator}"));
+        }
+        if show_in_tree {
+            self.selected = Some(source_id);
+            self.show_tree = true;
+            self.push_log(Level::Info, "Источник выбран в дереве проекта");
+        }
 
+    }
 
     fn code_tab(&mut self, ui: &mut egui::Ui) {
         let object = self.selected_object();
@@ -2033,6 +2939,43 @@ impl RdeApp {
 }
 
 // ── M2.4: данные инспектора/структуры ────────────────────────────────────────
+
+/// Экспорт проекта в zip: rde.toml + objects/** (без .rde/exports/out/__pycache__).
+fn write_project_zip(root: &Path, out: &Path) -> Result<usize, String> {
+    use std::io::Write;
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("создать {}: {e}", parent.display()))?;
+    }
+    let file = fs::File::create(out).map_err(|e| format!("создать {}: {e}", out.display()))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut count = 0usize;
+    fn walk(root: &Path, dir: &Path, zip: &mut zip::ZipWriter<std::fs::File>, options: zip::write::SimpleFileOptions, count: &mut usize) -> Result<(), String> {
+        let Ok(entries) = fs::read_dir(dir) else { return Ok(()) };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if matches!(name.as_str(), ".rde" | "exports" | "target" | "__pycache__" | "out") {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, zip, options, count)?;
+            } else if let Ok(relative) = path.strip_prefix(root) {
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                zip.start_file(relative, options).map_err(|e| e.to_string())?;
+                let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                zip.write_all(&bytes).map_err(|e| e.to_string())?;
+                *count += 1;
+            }
+        }
+        Ok(())
+    }
+    walk(root, root, &mut zip, options, &mut count)?;
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(count)
+}
 
 /// Записать/заменить строковое поле верхнего уровня в TOML-манифесте (без переформатирования файла).
 fn set_manifest_string(path: &Path, key: &str, value: &str) {
@@ -2131,60 +3074,6 @@ fn freshness_color(f: Freshness) -> Color32 {
         Freshness::Failed => RED,
         Freshness::External => MUTED,
     }
-}
-
-fn agent_bubble(ui: &mut egui::Ui, from: &str, text: &str, is_agent: bool) {
-    egui::Frame::new()
-        .fill(if is_agent { PANEL_HI } else { Color32::from_rgb(0x24, 0x30, 0x49) })
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(9))
-        .show(ui, |ui| {
-            ui.set_max_width(ui.available_width());
-            ui.label(RichText::new(from).small().strong().color(if is_agent { GREEN } else { ACCENT }));
-            ui.label(RichText::new(text).size(12.5).color(TEXT));
-        });
-    ui.add_space(2.0);
-}
-
-fn tool_card(ui: &mut egui::Ui, tool: &str, detail: &str) {
-    egui::Frame::new()
-        .fill(BG)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(Margin::same(9))
-        .show(ui, |ui| {
-            ui.set_max_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(">").color(ACCENT).monospace());
-                ui.label(RichText::new(tool).monospace().size(12.0).strong().color(TEXT));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("approval: auto").small().color(MUTED));
-                });
-            });
-            ui.label(RichText::new(detail).monospace().size(11.0).color(MUTED));
-        });
-}
-
-fn suggestion_card(ui: &mut egui::Ui, accept: &mut bool, reject: &mut bool) {
-    egui::Frame::new()
-        .fill(Color32::from_rgb(0x25, 0x2c, 0x22))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(0x46, 0x5a, 0x3c)))
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(Margin::same(9))
-        .show(ui, |ui| {
-            ui.set_max_width(ui.available_width());
-            ui.label(RichText::new("ПРЕДЛОЖЕНИЕ АГЕНТА").small().strong().color(GREEN));
-            ui.label(RichText::new("Заменить подпись рисунка 1 на актуальную из кэша вставки").size(12.0).color(TEXT));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(RichText::new("Принять").size(12.0).color(Color32::WHITE)).fill(Color32::from_rgb(0x3c, 0x7a, 0x4f))).clicked() {
-                    *accept = true;
-                }
-                if ui.button(RichText::new("Отклонить").size(12.0)).clicked() {
-                    *reject = true;
-                }
-            });
-        });
 }
 
 fn draw_node(
@@ -2533,6 +3422,76 @@ mod docview_tests {
     }
 
     #[test]
+    fn project_create_open_check_and_export_from_ui() {
+        let parent = std::env::temp_dir().join(format!("rde-ui-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = parent.join("new-project");
+        let mut app = RdeApp::new(rde_core::demo());
+
+        app.create_project_ui(&root, "UI-проект").expect("создать проект");
+        assert_eq!(app.project.root, root);
+        assert_eq!(app.project.object_count(), 0);
+        assert!(app.store.is_some(), "хранилище нового проекта должно открыться");
+
+        app.create_document_action("Новый отчёт").expect("создать документ");
+        assert_eq!(app.project.object_count(), 1);
+        let package = app.project.document_path().expect("документ");
+        assert_eq!(package.extension().and_then(|ext| ext.to_str()), Some("rde"));
+        let rde_doc = rde_doc::load_rde_doc(&package).expect("пакет .doc.rde");
+        assert_eq!(rde_doc.doc_id, app.project.document().unwrap().id);
+
+        app.save_project_settings("UI-проект 2", "gost-7.32-2017", "manual").expect("настройки");
+        assert_eq!(app.project.manifest.name, "UI-проект 2");
+
+        app.run_project_check();
+        let report = app.check_dialog.clone().expect("отчёт проверки");
+        assert!(report.contains("Хранилище"), "{report}");
+        assert!(report.contains("Документ .doc.rde"), "{report}");
+
+        app.export_dir = parent.join("exports");
+        app.export_project_archive();
+        let archive = app.export_dir.join("UI-проект-2.rde.zip");
+        assert!(archive.is_file(), "архив проекта: {}", archive.display());
+        let file = std::fs::File::open(&archive).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..zip.len()).map(|index| zip.by_index(index).unwrap().name().to_owned()).collect();
+        assert!(names.contains(&"rde.toml".to_owned()), "{names:?}");
+        assert!(names.iter().any(|name| name.ends_with("document.toml")), "{names:?}");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn tree_actions_and_undo_are_wired() {
+        let root = temp_demo_copy("tree-actions");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        let note = app
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(&object.data, rde_core::ObjectData::Note(_)))
+            .map(|object| object.id.clone())
+            .expect("заметка в демо-проекте");
+        // «Показать в инспекторе» выбирает объект и открывает панель.
+        app.show_inspector = false;
+        app.apply_tree_action(super::TreeAction::Inspect(note.clone()));
+        assert_eq!(app.selected.as_deref(), Some(note.as_str()));
+        assert!(app.show_inspector);
+        // «Копировать id» и «Показать каталог» не паникуют и пишут в журнал.
+        app.apply_tree_action(super::TreeAction::CopyId(note.clone()));
+        let object = app.project.object(&note).unwrap().clone();
+        app.apply_tree_action(super::TreeAction::Reveal(object.dir.display().to_string()));
+        assert!(app.project.log.iter().any(|line| line.text.contains("id объекта")));
+        // «Переименовать…» открывает диалог с текущим названием.
+        app.apply_tree_action(super::TreeAction::Rename(note.clone()));
+        assert_eq!(app.rename_dialog.as_ref().map(|dialog| dialog.id.clone()), Some(note));
+        // Undo без открытого редактора не паникует.
+        app.undo_document(false);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn object_crud_from_ui_actions() {
         let root = std::env::temp_dir().join(format!("rde-ui-crud-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -2545,7 +3504,7 @@ mod docview_tests {
         let project = rde_core::load_project(&root).unwrap();
         let mut app = RdeApp::new(project);
 
-        app.create_object_action(rde_core::NewObjectKind::ComputeArtifact, "Новый расчёт").expect("создать");
+        app.create_object_action(super::UiObjectKind::Core(rde_core::NewObjectKind::ComputeArtifact), "Новый расчёт").expect("создать");
         assert_eq!(app.project.object_count(), 1);
         let id = app.selected.clone().expect("новый объект выбран");
         assert_eq!(app.project.object(&id).unwrap().title, "Новый расчёт");

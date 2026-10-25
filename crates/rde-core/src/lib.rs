@@ -20,7 +20,7 @@ pub use manifest::{
     ManifestKind, NoteManifest, ProjectManifest, ReferenceManifest, RepositoryManifest,
     RuntimeManifest, SourceManifest,
 };
-pub use ops::{CreateRequest, NewObjectKind, create_object, delete_object, rename_object};
+pub use ops::{CreateRequest, NewObjectKind, create_document_stub, create_object, create_project, delete_object, rename_object};
 pub use project::{
     Freshness, Group, Issue, Level, LogLine, Object, ObjectData, ObjectKind, Project, load_project,
 };

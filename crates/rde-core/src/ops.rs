@@ -219,6 +219,53 @@ pub fn create_object(root: &Path, request: &CreateRequest) -> Result<PathBuf, St
     Ok(dir)
 }
 
+/// Создать минимальный проект RDE (rde.toml + каталоги objects/**).
+pub fn create_project(root: &Path, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("название проекта не может быть пустым".to_owned());
+    }
+    if root.join("rde.toml").exists() {
+        return Err(format!("в {} уже есть rde.toml", root.display()));
+    }
+    fs::create_dir_all(root).map_err(|e| format!("создать {}: {e}", root.display()))?;
+    for dir in ["artifacts", "documents", "sources", "notes", "repos"] {
+        fs::create_dir_all(root.join("objects").join(dir)).map_err(|e| format!("создать objects/{dir}: {e}"))?;
+    }
+    let id = new_id();
+    let manifest = format!(
+        "schema = \"{}\"\nid = \"{id}\"\nname = {}\ndefault_rebuild = \"manual\"\ndefault_template = \"gost-7.32-2017\"\n",
+        crate::manifest::SCHEMA_PROJECT,
+        toml_string(name)
+    );
+    fs::write(root.join("rde.toml"), manifest).map_err(|e| format!("записать rde.toml: {e}"))?;
+    Ok(())
+}
+
+/// Создать каталог документа и `document.toml` (без OOXML-пакета: пакет собирает вызывающий слой,
+/// у которого есть движок WordCraft — см. `RdeApp::create_document_action`).
+pub fn create_document_stub(root: &Path, title: &str) -> Result<PathBuf, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("название документа не может быть пустым".to_owned());
+    }
+    let id = new_id();
+    let dir = root.join("objects/documents").join(&id);
+    fs::create_dir_all(&dir).map_err(|e| format!("создать каталог документа: {e}"))?;
+    let manifest = format!(
+        "schema = \"{}\"\nid = \"{id}\"\ntitle = {}\ntemplate = \"gost-7.32-2017\"\nfile = \"report.doc.rde\"\n",
+        crate::manifest::SCHEMA_DOCUMENT,
+        toml_string(title)
+    );
+    let path = dir.join("document.toml");
+    fs::write(&path, manifest).map_err(|e| format!("записать document.toml: {e}"))?;
+    if let Err(error) = validate_manifest(ManifestKind::Document, &path) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(error);
+    }
+    Ok(dir)
+}
+
 fn write_artifact(dir: &Path, id: &str, _title: &str, kind: &str, manifest: &str) -> Result<(), String> {
     debug_assert!(kind == "compute" || kind == "data" || kind == "constants");
     let path = dir.join("artifact.toml");
@@ -363,6 +410,26 @@ mod tests {
         assert_eq!(project.objects[0].id, id);
         assert_eq!(project.objects[0].dir, dir);
         assert!(rename_object(&project, &id, "  ").is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_project_and_document_stub() {
+        let root = std::env::temp_dir().join(format!("rde-core-project-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        create_project(&root, "Новый проект").unwrap();
+        let project = load_project(&root).unwrap();
+        assert_eq!(project.name, "Новый проект");
+        assert_eq!(project.object_count(), 0);
+        assert!(root.join("objects/artifacts").is_dir());
+
+        let dir = create_document_stub(&root, "Новый отчёт").unwrap();
+        assert!(dir.join("document.toml").is_file());
+        let project = load_project(&root).unwrap();
+        assert_eq!(project.object_count(), 1);
+        assert_eq!(project.document().unwrap().title, "Новый отчёт");
+        assert!(project.issues.is_empty(), "{:?}", project.issues);
+        assert!(create_project(&root, "Ещё один").is_err(), "повторный create_project должен падать");
         let _ = fs::remove_dir_all(&root);
     }
 

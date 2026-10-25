@@ -3622,6 +3622,7 @@ dependencies = [
  "serde_json",
  "wordcraft-engine",
  "wordcraft-ui-egui",
+ "zip",
 ]
 
 [[package]]
