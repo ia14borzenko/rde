@@ -242,6 +242,20 @@ fn constants_value(manifest: &rde_core::ArtifactManifest, selector: &str) -> Res
     }
 }
 
+/// Дополнительные файлы скрипта (`script_files`): путь → хеш блоба; отсутствующий файл
+/// получает sentinel-хеш (изменение manifest-файла меняет `script_hash`, §7.2).
+fn script_extra_files(artifact_dir: &Path, files: &[String]) -> Vec<(String, Hash)> {
+    files
+        .iter()
+        .map(|rel| {
+            let hash = fs::read(artifact_dir.join(rel))
+                .map(|bytes| sha256(&bytes))
+                .unwrap_or_else(|_| missing_hash(&format!("script:{rel}")));
+            (rel.clone(), hash)
+        })
+        .collect()
+}
+
 /// Вычислить `act_key` артефакта (compute). Data/constants не активируются.
 pub fn activation(
     project: &Project,
@@ -283,10 +297,12 @@ pub fn activation(
     let in_hash = in_hash(&groups);
 
     let script_path = artifact_dir.join(&runtime.entry);
-    let script = Some(script_hash(&runtime.kind, &runtime.entry, &fs::read(&script_path).unwrap_or_default()));
+    let script_bytes = fs::read(&script_path).unwrap_or_default();
+    let extra_files = script_extra_files(&artifact_dir, &artifact.script_files);
+    let script = Some(script_hash(&runtime.kind, &runtime.entry, &script_bytes, &extra_files));
     let params = params_hash(&artifact.params)?;
     let env = env_hash(&runtime.kind, &platform(), None, &BTreeMap::new());
-    let key = act_key(&artifact.kind, in_hash, script, params, env);
+    let key = act_key(&artifact.kind, &artifact.schema, in_hash, script, params, env);
     Ok(Activation { artifact_id: artifact.id.clone(), act_key: key, in_hash, script_hash: script, params_hash: params, env_hash: env })
 }
 

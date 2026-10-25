@@ -9,10 +9,11 @@
 //! (u64 LE длина + байты), а строки внутри — через канонический JSON/UTF-8. Это исключает
 //! неоднозначность склейки `a|b` vs `a|bc`; доменный префикс (`rde:*:1`) входит в хеш первым.
 //!
-//! `params_hash` использует канонический JSON: ключи объектов сортируются, массивы сохраняют
-//! порядок, числа сериализуются `serde_json` (для используемых в манифестах типов это
-//! детерминированно; полный RFC 8785/JCS — при появлении дробных чисел с неоднозначным
-//! представлением, см. M2.3).
+//! `params_hash` использует канонический JSON по RFC 8785 (JCS): ключи объектов сортируются
+//! по UTF-16 code units, строки экранируются по ECMAScript, числа печатаются по
+//! ECMAScript `Number::toString` (кратчайшее round-trip представление, экспонента при
+//! |x| ≥ 1e21 или < 1e-6); `NaN`/`Infinity` запрещены. Это делает `params_hash` и хеши
+//! констант воспроизводимыми между платформами и версиями RDE.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -121,7 +122,8 @@ impl Canonical {
     }
 }
 
-/// Каноническое JSON-представление: ключи объектов сортируются, массивы — по порядку.
+/// Каноническое JSON-представление по RFC 8785 (JCS): детерминированная сериализация,
+/// пригодная для хеширования. `NaN`/`Infinity` — ошибка (JSON их не допускает).
 pub fn canonical_json(value: &serde_json::Value) -> Result<String, String> {
     let mut out = String::new();
     write_canonical(value, &mut out)?;
@@ -132,7 +134,7 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) -> Result<(), St
     match value {
         serde_json::Value::Null => out.push_str("null"),
         serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::Number(n) => out.push_str(&jcs_number(n)?),
         serde_json::Value::String(s) => {
             out.push_str(&serde_json::to_string(s).map_err(|e| e.to_string())?);
         }
@@ -148,8 +150,9 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) -> Result<(), St
         }
         serde_json::Value::Object(map) => {
             out.push('{');
+            // JCS: ключи сортируются по возрастанию UTF-16 code units (RFC 8785 §3.2.3).
             let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
+            keys.sort_by(|a, b| cmp_utf16(a, b));
             for (i, key) in keys.into_iter().enumerate() {
                 if i > 0 {
                     out.push(',');
@@ -162,6 +165,81 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) -> Result<(), St
         }
     }
     Ok(())
+}
+
+/// Сравнение строк по UTF-16 code units (порядок ключей JCS).
+fn cmp_utf16(a: &str, b: &str) -> std::cmp::Ordering {
+    a.encode_utf16().cmp(b.encode_utf16())
+}
+
+/// JCS-сериализация числа: целые — как есть, дробные — по ECMAScript `Number::toString`.
+fn jcs_number(number: &serde_json::Number) -> Result<String, String> {
+    if let Some(value) = number.as_i64() {
+        return Ok(value.to_string());
+    }
+    if let Some(value) = number.as_u64() {
+        return Ok(value.to_string());
+    }
+    let value = number.as_f64().ok_or_else(|| format!("не число: {number}"))?;
+    jcs_f64(value)
+}
+
+/// ECMAScript `Number::toString` (RFC 8785 §3.2.2.3) для конечных f64.
+///
+/// Использует кратчайшее round-trip представление Rust (`{:e}`), затем переформатирует его
+/// по правилам ES6: десятичная запись при 1e-6 ≤ |x| < 1e21, иначе экспоненциальная.
+pub fn jcs_f64(value: f64) -> Result<String, String> {
+    if !value.is_finite() {
+        return Err(format!("JCS не допускает {value} (NaN/Infinity)"));
+    }
+    if value == 0.0 {
+        return Ok("0".to_owned());
+    }
+    let negative = value < 0.0;
+    let sci = format!("{:e}", value.abs());
+    let (mantissa, exponent) = sci
+        .split_once('e')
+        .ok_or_else(|| format!("не удалось разобрать экспоненциальную запись `{sci}`"))?;
+    let exponent: i32 = exponent.parse().map_err(|e| format!("экспонента `{sci}`: {e}"))?;
+    let mut digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    let k = digits.len() as i32;
+    let n = exponent + 1; // положение десятичной точки: value = 0.digits × 10^n
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if k <= n && n <= 21 {
+        out.push_str(&digits);
+        for _ in 0..(n - k) {
+            out.push('0');
+        }
+    } else if 0 < n && n <= 21 {
+        out.push_str(&digits[..n as usize]);
+        out.push('.');
+        out.push_str(&digits[n as usize..]);
+    } else if -6 < n && n <= 0 {
+        out.push_str("0.");
+        for _ in 0..(-n) {
+            out.push('0');
+        }
+        out.push_str(&digits);
+    } else {
+        out.push_str(&digits[..1]);
+        if k > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        let exp = n - 1;
+        if exp >= 0 {
+            out.push('+');
+        }
+        out.push_str(&exp.to_string());
+    }
+    Ok(out)
 }
 
 /// Элемент Merkle-дерева версии файлов: относительный путь, режим, хеш содержимого.
@@ -253,12 +331,23 @@ pub fn in_hash(groups: &[InGroup]) -> Hash {
     canon.finish()
 }
 
-/// `script_hash` — исполняемый файл артефакта + runtime.
-pub fn script_hash(runtime: &str, entry: &str, bytes: &[u8]) -> Hash {
+/// `script_hash` — исполняемый файл артефакта + runtime + дополнительные файлы скрипта.
+///
+/// Формула §7.2: `H("rde:script:1" | runtime_id | entry_relpath | H(script_bytes) |
+/// sorted[extra_script_files])`. Дополнительные файлы кодируются парой (путь, хеш блоба),
+/// сортируются по пути; их отсутствие фиксируется sentinel-хешем на стороне DAG.
+pub fn script_hash(runtime: &str, entry: &str, bytes: &[u8], extra_files: &[(String, Hash)]) -> Hash {
     let mut canon = Canonical::new("rde:script:1");
     canon.str(runtime);
     canon.str(entry);
-    canon.write_bytes(bytes);
+    canon.hash(sha256(bytes));
+    let mut sorted: Vec<&(String, Hash)> = extra_files.iter().collect();
+    sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    canon.u32(sorted.len() as u32);
+    for (rel, blob) in sorted {
+        canon.str(rel);
+        canon.hash(*blob);
+    }
     canon.finish()
 }
 
@@ -284,10 +373,21 @@ pub fn env_hash(runtime: &str, platform: &str, lockfile: Option<Hash>, vars: &BT
     canon.finish()
 }
 
-/// `act_key` — ключ активации артефакта. `None`-компоненты (например, `ref`-группы) кодируются флагом.
-pub fn act_key(kind: &str, in_hash: Hash, script_hash: Option<Hash>, params_hash: Hash, env_hash: Hash) -> Hash {
+/// `act_key` — ключ активации артефакта (§7.2).
+///
+/// `H("rde:act:1" | type | schema_version | in_hash | script_hash | params_hash | env_hash)`.
+/// `script_hash = None` (нет скрипта) кодируется флагом, чтобы не смешиваться с хешем пустого скрипта.
+pub fn act_key(
+    kind: &str,
+    schema_version: &str,
+    in_hash: Hash,
+    script_hash: Option<Hash>,
+    params_hash: Hash,
+    env_hash: Hash,
+) -> Hash {
     let mut canon = Canonical::new("rde:act:1");
     canon.str(kind);
+    canon.str(schema_version);
     canon.hash(in_hash);
     canon.optional_hash(script_hash);
     canon.hash(params_hash);
@@ -307,12 +407,124 @@ mod tests {
             .collect()
     }
 
+    /// Детерминированный ГПСЧ для property-тестов (xorshift64*), без внешних зависимостей.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn bytes(&mut self, max: usize) -> Vec<u8> {
+            let len = self.below(max as u64 + 1) as usize;
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+        fn json(&mut self, depth: u32) -> serde_json::Value {
+            self.json_with(depth, true)
+        }
+        fn json_with(&mut self, depth: u32, floats: bool) -> serde_json::Value {
+            if floats {
+                match self.below(if depth == 0 { 5 } else { 7 }) {
+                    0 => json!(null),
+                    1 => json!(self.next() % 2 == 0),
+                    2 => json!(self.next() as i64 - 1_000_000),
+                    3 => self.random_string(),
+                    4 => self.random_float(),
+                    5 => self.random_array(depth, floats),
+                    _ => self.random_object(depth, floats),
+                }
+            } else {
+                match self.below(if depth == 0 { 4 } else { 6 }) {
+                    0 => json!(null),
+                    1 => json!(self.next() % 2 == 0),
+                    2 => json!(self.next() as i64 - 1_000_000),
+                    3 => self.random_string(),
+                    4 => self.random_array(depth, floats),
+                    _ => self.random_object(depth, floats),
+                }
+            }
+        }
+        fn random_string(&mut self) -> serde_json::Value {
+            let mut text = String::new();
+            for _ in 0..self.below(6) {
+                text.push(char::from(b'a' + (self.next() % 26) as u8));
+            }
+            json!(text)
+        }
+        fn random_float(&mut self) -> serde_json::Value {
+            // Краевые для JCS значения: экспоненциальная запись, -0, длинная мантисса.
+            let candidates = [
+                0.0, -0.0, 1.5, 0.1 + 0.2, 1e21, 1e-7, 1e-6, 123.456, 1e20, -2.5e-10,
+                1.2345678901234567e300,
+            ];
+            json!(candidates[(self.next() % candidates.len() as u64) as usize])
+        }
+        fn random_array(&mut self, depth: u32, floats: bool) -> serde_json::Value {
+            let len = self.below(4) as usize;
+            serde_json::Value::Array((0..len).map(|_| self.json_with(depth - 1, floats)).collect())
+        }
+        fn random_object(&mut self, depth: u32, floats: bool) -> serde_json::Value {
+            let len = self.below(4) as usize;
+            let mut map = serde_json::Map::new();
+            for _ in 0..len {
+                let key: String = (0..1 + self.below(4))
+                    .map(|_| char::from(b'a' + (self.next() % 26) as u8))
+                    .collect();
+                map.insert(key, self.json_with(depth - 1, floats));
+            }
+            serde_json::Value::Object(map)
+        }
+    }
+
     #[test]
-    fn canonical_json_sorts_keys_and_keeps_arrays() {
+    fn jcs_numbers_follow_ecmascript() {
+        // RFC 8785 §3.2.2.3: те же примеры, что в спецификации ECMAScript Number::toString.
+        let cases: [(f64, &str); 16] = [
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1.0, "1"),
+            (-1.0, "-1"),
+            (1.5, "1.5"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1e21, "1e+21"),
+            (1e20, "100000000000000000000"),
+            (1e-6, "0.000001"),
+            (1e-7, "1e-7"),
+            (123.456, "123.456"),
+            (2.5e-10, "2.5e-10"),
+            (1.2345678901234567e300, "1.2345678901234567e+300"),
+            (-1e-7, "-1e-7"),
+            (1000.0, "1000"),
+            (9.999999999999999e20, "999999999999999900000"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(jcs_f64(value).unwrap(), expected, "f64 {value:?}");
+        }
+        assert!(jcs_f64(f64::NAN).is_err());
+        assert!(jcs_f64(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_by_utf16_and_keeps_arrays() {
         let a = canonical_json(&json!({"b": 1, "a": {"z": [3, 1], "y": "ы"}})).unwrap();
         let b = canonical_json(&json!({"a": {"y": "ы", "z": [3, 1]}, "b": 1})).unwrap();
         assert_eq!(a, b);
         assert_eq!(a, r#"{"a":{"y":"ы","z":[3,1]},"b":1}"#);
+        // UTF-16 code units: U+1F600 (суррогаты D83D DE00) < U+FFFF, хотя по code point — наоборот.
+        let keys = json!({"\u{FFFF}": 1, "\u{1F600}": 2});
+        assert_eq!(canonical_json(&keys).unwrap(), "{\"😀\":2,\"￿\":1}");
+        // Управляющие символы экранируются по ECMAScript.
+        assert_eq!(canonical_json(&json!("\u{1}\u{1f}\n")).unwrap(), "\"\\u0001\\u001f\\n\"");
     }
 
     #[test]
@@ -353,29 +565,54 @@ mod tests {
             InGroup { name: "ref".into(), mode: "ref".into(), grp_hash: sha256(b"ref") },
         ]);
         assert_eq!(i1, i_with_ref);
-        // порядок членов группы не влияет на group_hash, порядок групп — на in_hash по его составу.
         assert_ne!(g1, group_hash("g", "hashed", &[m1]));
     }
 
     #[test]
     fn act_key_is_sensitive_to_every_component() {
         let in_h = in_hash(&[InGroup { name: "g".into(), mode: "hashed".into(), grp_hash: sha256(b"g") }]);
-        let script = Some(script_hash("python", "script.py", b"print(1)"));
+        let script = Some(script_hash("python", "script.py", b"print(1)", &[]));
         let params = params_hash(&json!({"window": 128, "method": "welch"})).unwrap();
         let env = env_hash("python", "linux-x86_64", Some(sha256(b"lock")), &BTreeMap::new());
-        let base = act_key("compute", in_h, script, params, env);
+        let schema = "rde/artifact@1";
+        let base = act_key("compute", schema, in_h, script, params, env);
 
         let other_in = in_hash(&[InGroup { name: "g".into(), mode: "hashed".into(), grp_hash: sha256(b"g2") }]);
-        assert_ne!(base, act_key("compute", other_in, script, params, env));
-        assert_ne!(base, act_key("data", in_h, script, params, env));
-        assert_ne!(base, act_key("compute", in_h, None, params, env));
+        assert_ne!(base, act_key("compute", schema, other_in, script, params, env));
+        assert_ne!(base, act_key("data", schema, in_h, script, params, env));
+        assert_ne!(base, act_key("compute", "rde/artifact@2", in_h, script, params, env));
+        assert_ne!(base, act_key("compute", schema, in_h, None, params, env));
         let other_params = params_hash(&json!({"window": 256, "method": "welch"})).unwrap();
-        assert_ne!(base, act_key("compute", in_h, script, other_params, env));
+        assert_ne!(base, act_key("compute", schema, in_h, script, other_params, env));
         let other_env = env_hash("python", "linux-x86_64", None, &BTreeMap::new());
-        assert_ne!(base, act_key("compute", in_h, script, params, other_env));
-        // params_hash чувствителен к порядку ключей? нет — канонизация делает его нечувствительным.
+        assert_ne!(base, act_key("compute", schema, in_h, script, params, other_env));
+        // params_hash нечувствителен к порядку ключей (канонизация).
         let params2 = params_hash(&json!({"method": "welch", "window": 128})).unwrap();
         assert_eq!(params, params2);
+    }
+
+    #[test]
+    fn script_hash_includes_extra_files_and_nested_bytes() {
+        let base = script_hash("python", "script.py", b"print(1)", &[]);
+        let with_extra = script_hash(
+            "python",
+            "script.py",
+            b"print(1)",
+            &[("lib/util.py".into(), sha256(b"x = 1")), ("lib/a.py".into(), sha256(b"y = 2"))],
+        );
+        assert_ne!(base, with_extra);
+        // Порядок extra-файлов не важен.
+        let reordered = script_hash(
+            "python",
+            "script.py",
+            b"print(1)",
+            &[("lib/a.py".into(), sha256(b"y = 2")), ("lib/util.py".into(), sha256(b"x = 1"))],
+        );
+        assert_eq!(with_extra, reordered);
+        // Меняется любой компонент: runtime, entry, байты, extra-файл.
+        assert_ne!(base, script_hash("shell", "script.py", b"print(1)", &[]));
+        assert_ne!(base, script_hash("python", "main.py", b"print(1)", &[]));
+        assert_ne!(base, script_hash("python", "script.py", b"print(2)", &[]));
     }
 
     #[test]
@@ -385,6 +622,116 @@ mod tests {
         assert_eq!(h.short(8).len(), 8);
         assert_eq!(h, sha256(b"rde"));
         assert_ne!(h, sha256(b"rde2"));
+        assert_eq!(Hash::from_hex(&h.hex()).unwrap(), h);
+        assert!(Hash::from_hex("xyz").is_err());
+    }
+
+    // ── property-тесты (детерминированный ГПСЧ, 200 итераций) ────────────────
+
+    #[test]
+    fn property_canonical_json_is_idempotent() {
+        // Без float: `serde_json` парсит редкие f64 не с корректным округлением (fast path),
+        // поэтому идемпотентность проверяем на структуре, а числа — отдельным property-тестом
+        // через корректно округляющий std-парсер (`property_jcs_f64_roundtrips`).
+        let mut rng = Rng::new(0x5EED_1);
+        for _ in 0..200 {
+            let value = rng.json_with(3, false);
+            let once = canonical_json(&value).expect("канонизация");
+            let parsed: serde_json::Value = serde_json::from_str(&once).expect("канонический JSON парсится");
+            let twice = canonical_json(&parsed).expect("повторная канонизация");
+            assert_eq!(once, twice, "JCS не идемпотентен для {value}");
+        }
+    }
+
+    #[test]
+    fn property_jcs_f64_roundtrips() {
+        // Кратчайшее представление должно читаться обратно в тот же f64 (std-парсер корректен)
+        // и канонизироваться в ту же строку — это и есть требование ECMAScript Number::toString.
+        let mut rng = Rng::new(0x5EED_5);
+        for _ in 0..500 {
+            let mantissa = rng.next() as f64 / 1e19;
+            let exponent = rng.below(40) as i32 - 20;
+            let value = mantissa * 10f64.powi(exponent);
+            if !value.is_finite() {
+                continue;
+            }
+            let text = jcs_f64(value).expect("конечное число");
+            let parsed: f64 = text.parse().expect("std-парсер");
+            assert_eq!(parsed, value, "jcs_f64({value:?}) = {text} не round-trip");
+            assert_eq!(jcs_f64(parsed).unwrap(), text, "канонизация нестабильна для {value:?}");
+        }
+        // Краевые значения: поднормали, границы экспоненциальной записи.
+        for value in [f64::MIN_POSITIVE, f64::MAX, 1e-6, 1e21, 5e-324, 0.0, -0.0] {
+            let text = jcs_f64(value).unwrap();
+            let parsed: f64 = text.parse().unwrap();
+            if value == 0.0 {
+                // JCS: и +0.0, и −0.0 канонизируются в "0" (знак нуля теряется по спецификации).
+                assert_eq!(text, "0");
+            } else {
+                assert_eq!(parsed.to_bits(), value.to_bits(), "{value:?} → {text}");
+            }
+            assert_eq!(jcs_f64(parsed).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn property_tree_hash_permutation_invariant() {
+        let mut rng = Rng::new(0x5EED_2);
+        for _ in 0..100 {
+            let count = 1 + rng.below(5) as usize;
+            let entries: Vec<TreeEntry> = (0..count)
+                .map(|index| TreeEntry::new(format!("out/f{index}.bin"), 0o644, sha256(rng.bytes(8))))
+                .collect();
+            let mut shuffled = entries.clone();
+            for i in (1..shuffled.len()).rev() {
+                shuffled.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            assert_eq!(tree_hash(&entries), tree_hash(&shuffled), "порядок файлов не должен влиять");
+        }
+    }
+
+    #[test]
+    fn property_act_key_sensitive_to_mutations() {
+        let mut rng = Rng::new(0x5EED_3);
+        let schema = "rde/artifact@1";
+        for _ in 0..100 {
+            let in_h = in_hash(&[InGroup {
+                name: "g".into(),
+                mode: "hashed".into(),
+                grp_hash: sha256(rng.bytes(8)),
+            }]);
+            let params = params_hash(&json!({"k": rng.next() as u32})).unwrap();
+            let env = env_hash("python", "linux-x86_64", None, &BTreeMap::new());
+            let script = Some(script_hash("python", "script.py", &rng.bytes(8), &[]));
+            let key = act_key("compute", schema, in_h, script, params, env);
+            let other = act_key("compute", schema, in_h, script, params_hash(&json!({"k": 7u32})).unwrap(), env);
+            assert_ne!(key, other, "изменение параметров меняет act_key");
+            let other = act_key("compute", schema, in_h, None, params, env);
+            assert_ne!(key, other, "изменение скрипта меняет act_key");
+        }
+    }
+
+    #[test]
+    fn property_in_hash_ignores_ref_groups() {
+        let mut rng = Rng::new(0x5EED_4);
+        for _ in 0..100 {
+            let count = rng.below(4) as usize;
+            let hashed: Vec<InGroup> = (0..count)
+                .map(|i| InGroup {
+                    name: format!("g{i}"),
+                    mode: "hashed".into(),
+                    grp_hash: sha256(rng.bytes(4)),
+                })
+                .collect();
+            let base = in_hash(&hashed);
+            let mut with_ref = hashed.clone();
+            with_ref.push(InGroup {
+                name: "ref".into(),
+                mode: "ref".into(),
+                grp_hash: sha256(rng.bytes(4)),
+            });
+            assert_eq!(base, in_hash(&with_ref));
+        }
     }
 
     #[test]
@@ -393,12 +740,12 @@ mod tests {
         let in_h = in_hash(&[InGroup { name: "g".into(), mode: "hashed".into(), grp_hash: group_hash("g", "hashed", &[]) }]);
         let params = params_hash(&json!({"window": 128, "method": "welch"})).unwrap();
         let env = env_hash("python", "linux-x86_64", None, &BTreeMap::new());
-        let script = script_hash("python", "script.py", b"print(1)");
-        let key = act_key("compute", in_h, Some(script), params, env);
+        let script = script_hash("python", "script.py", b"print(1)", &[]);
+        let key = act_key("compute", "rde/artifact@1", in_h, Some(script), params, env);
         assert_eq!(in_h.hex(), "9c6f4bedc2c1de53b61711cc59ce8665fbddce4abdc00ad144a1ba2f5e69fea4");
         assert_eq!(params.hex(), "7de5e854d5c238b16b7fd6437605e367b63c4e958d5c7000e552911ee44c6523");
         assert_eq!(env.hex(), "d8560e3c36d5e08bba444207382e2f2cd2f94a4d27168406d8db843338a9a9ab");
-        assert_eq!(script.hex(), "92ac5907bcf8189dcbfde7341cdc8edc5bd1deb3c2e9eeb29c705c975b9db61d");
-        assert_eq!(key.hex(), "2cdf3a6a0d04223b525ae225e9f8271606e1cf9b594aa31a0fc29a6ba5c62494");
+        assert_eq!(script.hex(), "ca76cf7fe5778ffaeebcfa62dcddfa5352e686ead44b4fdf9032253f358c17cf");
+        assert_eq!(key.hex(), "0edbfde5cb6e6f6ed7e9d4ed580e58f072e41d23f4f7abb37dabb5b196af6d5f");
     }
 }
