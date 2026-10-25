@@ -380,3 +380,56 @@ CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/.build/rde-target \
 
 - Установлен Rust 1.99.1; собрана native WordCraft v0.10.0 (см. `.agent/build-report-01.md`).
 - Создан продуктовый репозиторий `rde/`, политика форка и ADR-0001.
+
+---
+
+## P1 — «Нормативные исправления артефактов» — ✅ достигнута 2026-10-25, тег `p1-artifacts`
+
+**Главный вывод:** артефактная часть приведена к нормативной модели §7 ТЗ-02 без залезания в
+чужие подсистемы (store/run/env/doc/vcs — это P2–P5, см. ADR-0002). Каждый пункт подтверждён
+тестом, хеш-формат зафиксирован golden-векторами.
+
+### Что проверено
+1. **`hashed`/`ref`-семантика** (§7.3 п.1/п.4): `Project::dag_edges` и топосортировка используют
+   только `hashed`-группы; `ref`-рёбра не дают каскада и не участвуют в порядке (тесты:
+   `ref_groups_do_not_create_dag_edges`, `ref_edge_does_not_cascade_and_ref_cycle_is_not_a_dag_cycle`).
+2. **Циклы** (§7.3 п.3): DFS-раскраска при загрузке проекта с цепочкой («A → B → A»), устойчивый
+   топопорядок (Кан); property-тест на 30 случайных графах с гарантированным циклом.
+3. **Формулы §7.2**: `canonical_json` — RFC 8785 (JCS: ключи по UTF-16, ECMAScript-числа),
+   `script_hash = H(runtime|entry|H(bytes)|sorted[extra_script_files])`, `act_key` включает
+   `schema_version`; golden-векторы обновлены осознанно. Property-тесты: идемпотентность JCS,
+   round-trip f64, перестановки Merkle-дерева, чувствительность `act_key`, ref-группы в `in_hash`.
+4. **Причины устаревания по компонентам** (§7.3 п.2): `StaleReason::{InputsChanged, ScriptChanged,
+   ParamsChanged, EnvChanged, SchemaChanged, OutputsMissing, OutputsModified, StateIncomplete}`;
+   состояние хранит компоненты `act_key` (старые записи ledger честно помечаются `StateIncomplete`).
+5. **Входы**: glob-селекторы (`out/*.csv`, `out/**/*.dat`) с единой семантикой загрузки/DAG/запуска;
+   входы-константы `{ constants = "<id>", selector = "R_n" }` материализуются в
+   `inputs/constants.json`/`inputs/constant-<имя>.json`, их хеш входит в `in_hash` (end-to-end тесты).
+6. **Обновление**: «обновить артефакт» — только цель, принудительно (`force`); «обновить связанные» —
+   цель + транзитивно зависимые; `dependents_closure` — публичный API для UI/MCP.
+7. **`out_hash` в манифесте** (R-VCS-02, §7.3 п.10): после успешного обновления пишется в
+   `artifact.toml` без потери комментариев (идентичность выходов для git-диффа).
+8. **Scaffold артефакта** (R-ART-01): при создании — `readme.md`, `.gitignore` (выходы не коммитятся),
+   `out/.gitignore`; `rde-run` умеет сгенерированные входы (`InputFile::from_bytes`).
+
+### Подтверждение
+- Тесты: **90** (было 67), из них новые — 7 в `rde-core`, 7 в `rde-hash` (включая property),
+  6 в `rde-dag` (интеграционные) + 3 property (`tests/properties.rs`); `cargo test --workspace` зелёный.
+- Headless-скриншоты: [`docs/assets/p1-artifacts.png`](assets/p1-artifacts.png) — всё актуально
+  (`act_key`/`out_hash`/run в инспекторе); [`docs/assets/p1-stale-reasons.png`](assets/p1-stale-reasons.png) —
+  после правки скрипта причина «изменился скрипт», зависимый остаётся актуальным.
+- `docs/schema/*.json` перегенерированы (`artifact.schema.json` — `script_files`, `out_hash`,
+  вход `constants`).
+
+### Известные ограничения (уходят в следующие шаги)
+- Откат обновлений O(1), roots/snapshots, GC/pins — **P2 (rde-store)**, не в DAG.
+- `env_hash` пока без digest lock-файла (даст `rde-env` в P3); trust/network deny, read-only входы,
+  ошибка на лишние выходы, SIGTERM→grace — P3 (rde-run).
+- Живые вставки артефакт→документ и транзакция обновления документа — P4 (rde-doc).
+- `toml_edit` (сохранение комментариев при правке манифестов) — отложено до P5; сейчас `out_hash`
+  пишется точечной текстовой вставкой.
+
+### Следующий шаг
+**P2 — транзакционное ядро `rde-store`**: `current.toml`/roots, `snapshots/<txid>`, `rollback(txid)`
+(O(1)), GC/pins, lock-файл, zstd, расширение индекса. Только после него — транзакция «пачки»
+обновлений и кнопка «Откатить» (dag вызывает API store).

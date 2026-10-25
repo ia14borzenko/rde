@@ -52,6 +52,7 @@
     "InputSpec": {
       "anyOf": [
         {
+          "description": "Выход другого артефакта; `selector` — относительный путь или glob (`out/*.csv`).",
           "properties": {
             "artifact": {
               "type": "string"
@@ -67,6 +68,7 @@
           "type": "object"
         },
         {
+          "description": "Файл данных внутри каталога артефакта (`inputs/data.csv`).",
           "properties": {
             "file": {
               "type": "string"
@@ -98,9 +100,25 @@
             "source"
           ],
           "type": "object"
+        },
+        {
+          "description": "Типизированные константы проекта (артефакт `type = \"constants\"`).\n`selector` — имя конкретной величины; пусто — весь набор значений.",
+          "properties": {
+            "constants": {
+              "type": "string"
+            },
+            "selector": {
+              "default": "",
+              "type": "string"
+            }
+          },
+          "required": [
+            "constants"
+          ],
+          "type": "object"
         }
       ],
-      "description": "Вход артефакта: ссылка на выход другого артефакта, файл, заметка или источник."
+      "description": "Вход артефакта: ссылка на выход другого артефакта, файл, заметка, источник или константы."
     },
     "RuntimeManifest": {
       "description": "Окружение исполнения скрипта артефакта.",
@@ -145,8 +163,16 @@
         "null"
       ]
     },
+    "out_hash": {
+      "description": "`out_hash` последнего успешного обновления (идентичность выходов, tz-02 §7.3 п.10).\nПишется RDE после успешного обновления; отсутствует до первого запуска.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "outputs": {
       "default": [],
+      "description": "Объявленные выходы (относительные пути/glob внутри каталога артефакта).",
       "items": {
         "type": "string"
       },
@@ -154,7 +180,7 @@
     },
     "params": {
       "default": null,
-      "description": "Произвольные параметры запуска (входят в `params_hash` в M2.3)."
+      "description": "Произвольные параметры запуска (входят в `params_hash`)."
     },
     "rebuild": {
       "default": "",
@@ -173,6 +199,14 @@
     },
     "schema": {
       "type": "string"
+    },
+    "script_files": {
+      "default": [],
+      "description": "Дополнительные файлы скрипта, входящие в `script_hash` (tz-02 §7.2, `extra_script_files`).\nПути относительно каталога артефакта; читаются вместе с `runtime.entry`.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "timeout_s": {
       "default": null,

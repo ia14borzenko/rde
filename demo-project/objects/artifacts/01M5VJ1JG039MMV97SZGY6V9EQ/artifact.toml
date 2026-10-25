@@ -8,6 +8,7 @@ network_allow = false
 
 outputs = ["out/stats.json"]
 
+out_hash = "4997acb6e936860aa5374d2cffc3b109d7480a6f5747512bbcbf2c31ed0cdc7e"
 [runtime]
 kind = "python"
 env = "project"

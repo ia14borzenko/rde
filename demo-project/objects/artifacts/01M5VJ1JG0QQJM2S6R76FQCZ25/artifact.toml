@@ -7,6 +7,7 @@ timeout_s = 120
 
 outputs = ["out/plot.svg"]
 
+out_hash = "4f1a0b388c68aa0677697fcfdb569df1913c305c670a29a74a3b45f47f0d6311"
 [runtime]
 kind = "python"
 env = "project"
