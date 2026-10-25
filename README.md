@@ -65,7 +65,7 @@ git submodule update --init --recursive
 ./scripts/build.sh run -p rde
 
 #    после сборки бинарь лежит в $CARGO_TARGET_DIR/debug/rde
-#    (на стенде — /srv/yocto/rde-target/debug/rde)
+#    (на стенде 2026-10-25 — `rde/target/debug/rde`, см. примечание ниже)
 
 #    другой проект RDE:
 ./scripts/build.sh run -p rde -- --project /путь/к/проекту
@@ -78,6 +78,10 @@ RDE_PROJECT=/путь/к/проекту ./scripts/build.sh run -p rde
 `scripts/build.sh` — обёртка над cargo: `CARGO_TARGET_DIR` (по умолчанию `/srv/yocto/rde-target`,
 то же в `.cargo/config.toml`), проверка свободного места, очистка incremental при нехватке.
 На другой машине переопределите `CARGO_TARGET_DIR` или удалите `target-dir` из `.cargo/config.toml`.
+
+> **Стенд 2026-10-25:** `/srv/yocto` смонтирован **read-only** — сборка идёт с явным локальным
+> target: `export CARGO_TARGET_DIR=$PWD/target`; для `uv` — `export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache`.
+> Когда диск вернётся в rw, достаточно убрать `export` — `.cargo/config.toml` снова направит target на `/srv/yocto`.
 Полная очистка — `./scripts/clean-build.sh`. Для сборки/тестов из каталога `rde/` можно и просто
 `cargo …`: target-dir уже прописан.
 
