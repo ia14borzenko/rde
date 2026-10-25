@@ -4707,65 +4707,103 @@ impl RdeApp {
             return;
         }
         let dag_height = self.dag_height.clamp(80.0, 700.0);
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), dag_height), Sense::hover());
-        let painter = ui.painter_at(rect);
         let n = artifacts.len().min(4);
-        let nw = 178.0;
+        let mut nw = 178.0;
         let nh = 62.0;
         let margin = 26.0;
-        let step = if n > 1 { (rect.width() - 2.0 * margin - nw) / (n as f32 - 1.0) } else { 0.0 };
-        let y = rect.top() + 46.0;
-        let nodes: Vec<Rect> = (0..n)
-            .map(|i| Rect::from_min_size(pos2(rect.left() + margin + step * i as f32, y), vec2(nw, nh)))
-            .collect();
+        let gap = 16.0;
+        let avail_w = ui.available_width();
+        // Зазор между карточками не меньше gap: step >= nw + gap.
+        let mut step = if n > 1 {
+            ((avail_w - 2.0 * margin - nw) / (n as f32 - 1.0)).max(nw + gap)
+        } else {
+            0.0
+        };
+        if n > 0 && 2.0 * margin + nw + step * (n as f32 - 1.0) > avail_w {
+            // Пропорционально сузить карточки до минимума 140.
+            nw = ((avail_w - 2.0 * margin - (n as f32 - 1.0) * gap) / n as f32).clamp(140.0, 178.0);
+            step = if n > 1 {
+                ((avail_w - 2.0 * margin - nw) / (n as f32 - 1.0)).max(nw + gap)
+            } else {
+                0.0
+            };
+        }
+        let content_w = if n > 0 {
+            (2.0 * margin + nw + step * (n as f32 - 1.0)).max(avail_w)
+        } else {
+            avail_w
+        };
         let index_of = |id: &str| artifacts.iter().position(|o| o.id == id);
         let selected_id = self.selected.clone();
         let mut clicked_node: Option<String> = None;
-        for (i, object) in artifacts.iter().take(n).enumerate() {
-            let node_response = ui.interact(nodes[i], ui.id().with(("rde_dag_node", i)), Sense::click());
-            if node_response.clicked() {
-                clicked_node = Some(object.id.clone());
-            }
-            if node_response.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            node_response.context_menu(|ui| {
-                if ui.button("Открыть в инспекторе").clicked() {
-                    clicked_node = Some(object.id.clone());
-                    ui.close();
+        egui::ScrollArea::horizontal()
+            .id_salt("rde_dag_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(content_w, dag_height), Sense::hover());
+                let painter = ui.painter_at(rect);
+                let y = rect.top() + 46.0;
+                let nodes: Vec<Rect> = (0..n)
+                    .map(|i| {
+                        Rect::from_min_size(pos2(rect.left() + margin + step * i as f32, y), vec2(nw, nh))
+                    })
+                    .collect();
+                // Рёбра — ДО узлов, чтобы линии не лежали поверх карточек.
+                for (from, to) in &edges {
+                    if let (Some(a), Some(b)) = (index_of(from), index_of(to)) {
+                        if a < n && b < n {
+                            arrow(&painter, nodes[a], nodes[b], AMBER);
+                        }
+                    }
+                }
+                for (i, object) in artifacts.iter().take(n).enumerate() {
+                    let node_response =
+                        ui.interact(nodes[i], ui.id().with(("rde_dag_node", i)), Sense::click());
+                    if node_response.clicked() {
+                        clicked_node = Some(object.id.clone());
+                    }
+                    if node_response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    node_response.context_menu(|ui| {
+                        if ui.button("Открыть в инспекторе").clicked() {
+                            clicked_node = Some(object.id.clone());
+                            ui.close();
+                        }
+                    });
+                    let color = freshness_color(object.freshness);
+                    let selected = selected_id.as_deref() == Some(object.id.as_str());
+                    draw_node(
+                        &painter,
+                        nodes[i],
+                        &object.title,
+                        &object.detail,
+                        color,
+                        object.freshness.label_ru(),
+                        selected,
+                    );
+                }
+                let mut line_y = rect.bottom() - 70.0;
+                for (title, detail) in &stale {
+                    painter.text(
+                        pos2(rect.left() + margin, line_y),
+                        Align2::LEFT_TOP,
+                        format!("• {title}: {detail}"),
+                        FontId::proportional(12.0),
+                        AMBER,
+                    );
+                    line_y += 17.0;
+                }
+                if artifacts.len() > n {
+                    painter.text(
+                        pos2(rect.left() + margin, rect.bottom() - 22.0),
+                        Align2::LEFT_TOP,
+                        format!("…и ещё {} артефакт(ов)", artifacts.len() - n),
+                        FontId::proportional(11.5),
+                        MUTED,
+                    );
                 }
             });
-            let color = freshness_color(object.freshness);
-            let selected = selected_id.as_deref() == Some(object.id.as_str());
-            draw_node(&painter, nodes[i], &object.title, &object.detail, color, object.freshness.label_ru(), selected);
-        }
-        for (from, to) in &edges {
-            if let (Some(a), Some(b)) = (index_of(from), index_of(to)) {
-                if a < n && b < n {
-                    arrow(&painter, nodes[a], nodes[b], AMBER);
-                }
-            }
-        }
-        let mut line_y = rect.bottom() - 70.0;
-        for (title, detail) in &stale {
-            painter.text(
-                pos2(rect.left() + margin, line_y),
-                Align2::LEFT_TOP,
-                format!("• {title}: {detail}"),
-                FontId::proportional(12.0),
-                AMBER,
-            );
-            line_y += 17.0;
-        }
-        if artifacts.len() > n {
-            painter.text(
-                pos2(rect.left() + margin, rect.bottom() - 22.0),
-                Align2::LEFT_TOP,
-                format!("…и ещё {} артефакт(ов)", artifacts.len() - n),
-                FontId::proportional(11.5),
-                MUTED,
-            );
-        }
         if let Some(id) = clicked_node {
             self.selected = Some(id.clone());
             self.show_inspector = true;
