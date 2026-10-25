@@ -407,6 +407,7 @@ fn live_insert_value_is_sdt_and_updates() {
             style: "Normal".into(),
             format: "dec:1".into(),
             run_style: String::new(),
+            anchor_block: None,
         },
     )
     .unwrap();
@@ -475,7 +476,7 @@ fn sdt_and_figure_survive_document_update() {
     let package = dir.join("report.doc.rde");
     write_package(&clean, &mut rde_doc, &package).unwrap();
     // Рисунок-вставка из «выхода артефакта» (для теста — копия демо-рисунка из docx).
-    let figure = add_figure_insert(&package, &clean, "rde://artifact/01A/out/plot.svg".into(), "Рисунок — тест".into(), "aa".into());
+    let figure = add_figure_insert(&package, &clean, "rde://artifact/01A/out/plot.svg".into(), "Рисунок — тест".into(), "aa".into(), None);
     assert!(figure.is_ok(), "{figure:?}");
     add_insert(
         &package,
@@ -489,6 +490,7 @@ fn sdt_and_figure_survive_document_update() {
             style: String::new(),
             format: "auto".into(),
             run_style: String::new(),
+            anchor_block: None,
         },
     )
     .unwrap();
@@ -530,7 +532,7 @@ fn svg_figure_is_rasterized_for_docview() {
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60"><rect width="120" height="60" fill="#3366cc"/><text x="10" y="35" font-size="14">test</text></svg>"##,
     )
     .unwrap();
-    add_figure_insert(&package, &svg, "rde://artifact/01A/out/plot.svg".into(), "Рисунок — SVG".into(), "aa".into()).unwrap();
+    add_figure_insert(&package, &svg, "rde://artifact/01A/out/plot.svg".into(), "Рисунок — SVG".into(), "aa".into(), None).unwrap();
     // Медиа-часть — PNG (DocView WordCraft не рендерит SVG), а не исходный SVG.
     let (media_name, media) = {
         let file = std::fs::File::open(&package).unwrap();
@@ -605,6 +607,7 @@ fn inserts_use_body_text_formatting_of_current_document() {
             style: String::new(),
             format: "dec:2".into(),
             run_style: String::new(),
+            anchor_block: None,
         },
     )
     .unwrap();
@@ -674,6 +677,7 @@ fn table_insert_update_and_crossref_numbering() {
             style: String::new(),
             format: String::new(),
             run_style: String::new(),
+            anchor_block: None,
         },
         &rows,
     )
@@ -711,6 +715,7 @@ fn table_insert_update_and_crossref_numbering() {
             style: String::new(),
             format: "raw".into(),
             run_style: String::new(),
+            anchor_block: None,
         },
     )
     .unwrap();
@@ -748,6 +753,7 @@ fn constant_insert_uses_rich_formatting() {
             style: String::new(),
             format: "raw".into(),
             run_style: "italic-subscript".into(),
+            anchor_block: None,
         },
     )
     .unwrap();
@@ -764,5 +770,116 @@ fn constant_insert_uses_rich_formatting() {
     assert!(sdt.contains("w:vertAlign w:val=\"subscript\""), "подстрочный индекс: {sdt}");
     // Значение — до «_» обычное, после — подстрочное.
     assert!(sdt.contains(">R<") && sdt.contains(">н<"), "{sdt}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 1x1 PNG (валидный, для тестов media-частей).
+const PNG_1PX: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+fn package_document(package: &std::path::Path) -> String {
+    let file = std::fs::File::open(package).unwrap();
+    let mut zip = zip::ZipArchive::new(file).unwrap();
+    let mut part = zip.by_name("word/document.xml").unwrap();
+    let mut text = String::new();
+    use std::io::Read;
+    part.read_to_string(&mut text).unwrap();
+    text
+}
+
+#[test]
+fn two_figures_get_unique_media_parts_and_embeds() {
+    let dir = tmp("two-figures");
+    let clean = dir.join("clean.docx");
+    copy_file(&demo_docx(), &clean);
+    let mut rde_doc = build_rde_doc(&clean, "01TESTDOC", "gost-7.32-2017").unwrap();
+    let package = dir.join("report.doc.rde");
+    write_package(&clean, &mut rde_doc, &package).unwrap();
+    let image_a = dir.join("a.png");
+    let image_b = dir.join("b.png");
+    std::fs::write(&image_a, PNG_1PX).unwrap();
+    std::fs::write(&image_b, PNG_1PX).unwrap();
+    let first = add_figure_insert(&package, &image_a, "rde://artifact/01A/out/a.png".into(), "Рисунок A".into(), "aa".into(), None).unwrap();
+    let second = add_figure_insert(&package, &image_b, "rde://artifact/01B/out/b.png".into(), "Рисунок B".into(), "bb".into(), None).unwrap();
+    let document = package_document(&package);
+    // У каждой вставки свой r:embed и своя media-часть (P8, DOC-02).
+    let embed_of = |id: &str| {
+        let index = document.find(&format!("<w:tag w:val=\"rde:{id}\"")).unwrap();
+        let sdt = &document[index..document[index..].find("</w:sdtContent>").unwrap() + index];
+        sdt.split("r:embed=\"").nth(1).unwrap().split('"').next().unwrap().to_owned()
+    };
+    assert_ne!(embed_of(&first.insert.id), embed_of(&second.insert.id), "разные relationship");
+    let file = std::fs::File::open(&package).unwrap();
+    let zip = zip::ZipArchive::new(file).unwrap();
+    let media: Vec<String> = zip.file_names().filter(|name| name.starts_with("word/media/rde-figure-")).map(str::to_owned).collect();
+    assert_eq!(media.len(), 2, "две media-части: {media:?}");
+    assert!(media.iter().any(|name| name.contains(&first.insert.id)));
+    assert!(media.iter().any(|name| name.contains(&second.insert.id)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_style_survives_rde_doc_roundtrip() {
+    let dir = tmp("run-style");
+    let clean = dir.join("clean.docx");
+    copy_file(&demo_docx(), &clean);
+    let mut rde_doc = build_rde_doc(&clean, "01TESTDOC", "gost-7.32-2017").unwrap();
+    let package = dir.join("report.doc.rde");
+    write_package(&clean, &mut rde_doc, &package).unwrap();
+    let report = add_insert(
+        &package,
+        InsertRequest {
+            kind: "constant".into(),
+            target: "rde://constants/01C/R_n".into(),
+            selector: "R_n".into(),
+            value_kind: "text".into(),
+            cached: "R_н".into(),
+            caption: "Сопротивление".into(),
+            style: String::new(),
+            format: "raw".into(),
+            run_style: "italic-subscript".into(),
+            anchor_block: None,
+        },
+    )
+    .unwrap();
+    let loaded = load_rde_doc(&package).unwrap();
+    let insert = loaded.inserts.iter().find(|insert| insert.id == report.insert.id).unwrap();
+    assert_eq!(insert.run_style, "italic-subscript", "run_style в rde:doc (P8, DOC-09)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn insert_with_anchor_block_lands_after_selected_block() {
+    let dir = tmp("anchor-insert");
+    let clean = dir.join("clean.docx");
+    copy_file(&demo_docx(), &clean);
+    let mut rde_doc = build_rde_doc(&clean, "01TESTDOC", "gost-7.32-2017").unwrap();
+    let package = dir.join("report.doc.rde");
+    write_package(&clean, &mut rde_doc, &package).unwrap();
+    let report = add_insert(
+        &package,
+        InsertRequest {
+            kind: "value".into(),
+            target: "rde://artifact/01A/out/stats.json#/mean".into(),
+            selector: "#/mean".into(),
+            value_kind: "number".into(),
+            cached: "1.23".into(),
+            caption: "Среднее".into(),
+            style: String::new(),
+            format: "auto".into(),
+            run_style: String::new(),
+            anchor_block: Some(1),
+        },
+    )
+    .unwrap();
+    let document = package_document(&package);
+    let tag_index = document.find(&format!("<w:tag w:val=\"rde:{}\"", report.insert.id)).unwrap();
+    let later = document.find("2 Экспериментальная").expect("заголовок главы 2");
+    assert!(tag_index < later, "вставка после выбранного блока, до конца документа");
     let _ = std::fs::remove_dir_all(&dir);
 }

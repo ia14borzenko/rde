@@ -1,7 +1,7 @@
 {
-  "source": "/tmp/rde-docx-example-292133/clean.docx",
-  "source_parts": 11,
-  "roundtrip_parts": 11,
+  "source": "/tmp/rde-docx-example-322120/clean.docx",
+  "source_parts": 12,
+  "roundtrip_parts": 12,
   "missing": [],
   "extra": [],
   "changed": [
@@ -15,15 +15,15 @@
   "lo": {
     "available": true,
     "version": "LibreOffice 26.2.6.3 620(Build:3)",
-    "pdf_bytes": 152802,
+    "pdf_bytes": 161540,
     "pdf_is_valid": true,
     "error": null
   },
   "opc": {
     "ok": true,
-    "parts": 11,
+    "parts": 12,
     "xml_parts": 8,
     "errors": []
   },
-  "generated_unix": 1792923213
+  "generated_unix": 1792927749
 }

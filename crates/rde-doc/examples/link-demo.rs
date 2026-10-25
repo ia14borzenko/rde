@@ -166,6 +166,7 @@ fn upsert_value(
             style: String::new(),
             format: format.to_owned(),
             run_style: run_style.to_owned(),
+            anchor_block: None,
         },
     )?;
     Ok(report.insert.id)
@@ -183,7 +184,7 @@ fn upsert_figure(project: &rde_core::Project, store: &rde_store::Store, package:
         rde_doc::update_figure_images(package, &images, &hashes)?;
         return Ok(insert.id);
     }
-    let report = add_figure_insert(package, &path, uri.to_owned(), caption.to_owned(), hash)?;
+    let report = add_figure_insert(package, &path, uri.to_owned(), caption.to_owned(), hash, None)?;
     Ok(report.insert.id)
 }
 
@@ -208,6 +209,7 @@ fn upsert_table(project: &rde_core::Project, store: &rde_store::Store, package: 
             style: String::new(),
             format: String::new(),
             run_style: String::new(),
+            anchor_block: None,
         },
         &rows,
     )?;
@@ -235,6 +237,7 @@ fn upsert_text(package: &Path, kind: &str, target: &str, cached: &str, caption: 
             style: String::new(),
             format: "raw".to_owned(),
             run_style: run_style.to_owned(),
+            anchor_block: None,
         },
     )?;
     Ok(report.insert.id)

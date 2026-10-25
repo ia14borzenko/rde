@@ -302,6 +302,9 @@ pub fn render_rde_doc(doc: &RdeDoc) -> String {
         if !insert.format.is_empty() {
             out.push_str(&format!(" format=\"{}\"", escape_attr(&insert.format)));
         }
+        if !insert.run_style.is_empty() {
+            out.push_str(&format!(" run_style=\"{}\"", escape_attr(&insert.run_style)));
+        }
         out.push_str("/>\n");
     }
     out.push_str("  </rde:inserts>\n");
@@ -412,6 +415,7 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                                 "para_id" => insert.para_id = Some(value),
                                 "style" => insert.style = value,
                                 "format" => insert.format = value,
+                                "run_style" => insert.run_style = value,
                                 _ => {}
                             }
                         }
@@ -880,12 +884,22 @@ fn extract_attr(xml: &str, element: &str, attr: &str) -> Option<String> {
 
 /// Форматирование вставки: явный стиль пользователя (pStyle + его rPr) или обычный текст документа.
 /// Следующий свободный id вставки (`v3`, `v4`, …) — не переиспользуем номера после удалений.
-fn next_insert_id(inserts: &[RdeInsert]) -> String {
+fn next_insert_id(inserts: &[RdeInsert], document_xml: &str) -> String {
     let mut max = 0u32;
     for insert in inserts {
         if let Some(number) = insert.id.strip_prefix('v').and_then(|rest| rest.parse::<u32>().ok()) {
             max = max.max(number);
         }
+    }
+    // В теле могут остаться w:sdt с rde:<id> после удаления записей — их id тоже заняты.
+    let mut rest = document_xml;
+    while let Some(index) = rest.find("w:tag w:val=\"rde:v") {
+        let after = &rest[index + "w:tag w:val=\"rde:v".len()..];
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(number) = digits.parse::<u32>() {
+            max = max.max(number);
+        }
+        rest = after;
     }
     format!("v{}", max + 1)
 }
@@ -1244,6 +1258,52 @@ fn replace_sdt_text(xml: &str, insert: &RdeInsert, value: &str) -> Option<String
     out.push_str(&replacement);
     out.push_str(&xml[content_end..]);
     Some(out)
+}
+
+/// Вставить фрагмент после блока `anchor_block` (0-based индекс блока тела) или в конец.
+fn insert_fragment(xml: &str, fragment: &str, anchor_block: Option<usize>) -> String {
+    match anchor_block {
+        Some(index) => insert_after_block(xml, fragment, index),
+        None => append_paragraph(xml, fragment),
+    }
+}
+
+/// Вставить фрагмент после N-го блока тела (абзацы/таблицы/content-control на верхнем уровне).
+fn insert_after_block(xml: &str, fragment: &str, index: usize) -> String {
+    let Some(body_open) = xml.find("<w:body>") else { return append_paragraph(xml, fragment) };
+    let mut depth = 1usize;
+    let mut block = 0usize;
+    let mut pos = body_open + "<w:body>".len();
+    while pos < xml.len() {
+        let Some(rel) = xml[pos..].find('<') else { break };
+        let start = pos + rel;
+        let Some(rel_end) = xml[start..].find('>') else { break };
+        let end = start + rel_end;
+        let tag = &xml[start + 1..end];
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+            pos = end + 1;
+            continue;
+        }
+        let self_closing = tag.ends_with('/');
+        let declaration = tag.starts_with('?') || tag.starts_with('!');
+        let name = tag.trim_start_matches('/').split([' ', '\t', '\n', '/']).next().unwrap_or("");
+        if depth == 1 && !self_closing && !declaration && matches!(name, "w:p" | "w:tbl" | "w:sdt" | "w:customXml") {
+            if block == index + 1 {
+                let mut out = String::with_capacity(xml.len() + fragment.len());
+                out.push_str(&xml[..start]);
+                out.push_str(fragment);
+                out.push_str(&xml[start..]);
+                return out;
+            }
+            block += 1;
+        }
+        if !self_closing && !declaration {
+            depth += 1;
+        }
+        pos = end + 1;
+    }
+    append_paragraph(xml, fragment)
 }
 
 /// Вставить новый абзац в конец тела документа, но **перед** `w:sectPr` (он обязан быть
@@ -1679,6 +1739,8 @@ pub struct InsertRequest {
     pub format: String,
     /// Подсказка rich-форматирования значения (`italic`, `italic-subscript`), R-ART-09.
     pub run_style: String,
+    /// Блок-якорь вставки (индекс блока тела, 0-based); `None` — в конец документа (P8-B1).
+    pub anchor_block: Option<usize>,
 }
 
 /// Результат добавления вставки.
@@ -1693,7 +1755,9 @@ pub struct InsertReport {
 pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport, String> {
     let mut entries = read_package(package)?.entries;
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
-    let id = next_insert_id(&rde_doc.inserts);
+    let document_source = entries.get(DOCUMENT_XML).map(|bytes| String::from_utf8_lossy(bytes).to_string()).unwrap_or_default();
+    let anchor_block = request.anchor_block;
+    let id = next_insert_id(&rde_doc.inserts, &document_source);
     let para_id = para_id_for(&format!("{}:insert:{id}", rde_doc.doc_id), 0);
     // Пустой style = «обычный текст документа» (формат абзаца-образца из тела).
     let style = request.style.clone();
@@ -1718,7 +1782,7 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
     let document_xml = String::from_utf8_lossy(document).to_string();
     let paragraph = sdt_paragraph_xml(&insert, &paragraph_props, &run_props)
         .replacen("<w:p>", &format!("<w:p w14:paraId=\"{para_id}\">"), 1);
-    let document_xml = append_paragraph(&document_xml, &paragraph);
+    let document_xml = insert_fragment(&document_xml, &paragraph, anchor_block);
     rde_doc.inserts.push(insert.clone());
     rde_doc.updated_unix = now_unix();
     rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
@@ -1962,7 +2026,9 @@ fn table_xml(rows: &[Vec<String>], run_props: &str) -> String {
 pub fn add_table_insert(package: &Path, request: InsertRequest, rows: &[Vec<String>]) -> Result<InsertReport, String> {
     let mut entries = read_package(package)?.entries;
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
-    let id = next_insert_id(&rde_doc.inserts);
+    let document_source = entries.get(DOCUMENT_XML).map(|bytes| String::from_utf8_lossy(bytes).to_string()).unwrap_or_default();
+    let anchor_block = request.anchor_block;
+    let id = next_insert_id(&rde_doc.inserts, &document_source);
     let para_id = para_id_for(&format!("{}:table:{id}", rde_doc.doc_id), 0);
     let (paragraph_props, run_props) = insert_formatting(&entries, &request.style);
     let caption = if request.caption.is_empty() { "Таблица".to_owned() } else { request.caption.clone() };
@@ -1991,8 +2057,9 @@ pub fn add_table_insert(package: &Path, request: InsertRequest, rows: &[Vec<Stri
         "<w:p w14:paraId=\"{para_id}\">{paragraph_props}<w:r>{run_props}<w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
         escape_attr(&caption)
     );
-    document_xml = append_paragraph(&document_xml, &caption_paragraph);
-    document_xml = append_paragraph(&document_xml, &table_xml(rows, &run_props));
+    let mut fragment = caption_paragraph;
+    fragment.push_str(&table_xml(rows, &run_props));
+    document_xml = insert_fragment(&document_xml, &fragment, request.anchor_block);
     rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
     entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
     entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
@@ -2206,6 +2273,7 @@ pub fn add_figure_insert(
     target: String,
     caption: String,
     out_hash: String,
+    anchor_block: Option<usize>,
 ) -> Result<InsertReport, String> {
     let ext = image
         .extension()
@@ -2217,10 +2285,17 @@ pub fn add_figure_insert(
     let mut entries = read_package(package)?.entries;
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
     let index = rde_doc.inserts.iter().filter(|insert| insert.kind == "figure").count() + 1;
-    let id = next_insert_id(&rde_doc.inserts);
+    let id = next_insert_id(&rde_doc.inserts, &String::from_utf8_lossy(entries.get(DOCUMENT_XML).map(Vec::as_slice).unwrap_or(&[])));
     let para_id = para_id_for(&format!("{}:figure:{id}", rde_doc.doc_id), index);
-    let media_name = format!("word/media/rde-figure-{index}.{ext}");
-    let media_target = format!("media/rde-figure-{index}.{ext}");
+    // Уникальная media-часть по id вставки (не по счётчику): счётчик мог совпасть с занятым
+    // именем и молча перезаписать рисунок другой вставки (P8, DOC-02).
+    let mut media_name = format!("word/media/rde-figure-{id}.{ext}");
+    let mut suffix = 1u32;
+    while entries.contains_key(&media_name) {
+        media_name = format!("word/media/rde-figure-{id}-{suffix}.{ext}");
+        suffix += 1;
+    }
+    let media_target = media_name.trim_start_matches("word/").to_owned();
     let rels = entries
         .get(rels_path_for_document())
         .map(|bytes| String::from_utf8_lossy(bytes).to_string())
@@ -2249,7 +2324,7 @@ pub fn add_figure_insert(
     let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
     let document_xml = String::from_utf8_lossy(document).to_string();
     let paragraph = drawing_paragraph_xml(&insert, &rel_id, cx, cy, &para_id);
-    let mut document_xml = append_paragraph(&document_xml, &paragraph);
+    let mut fragment = paragraph;
     // Подпись — отдельный абзац после рисунка (номер присвоит перенумерация).
     let caption_para_id = para_id_for(&format!("{}:caption:{id}", rde_doc.doc_id), index);
     if !insert.cached.is_empty() {
@@ -2260,8 +2335,9 @@ pub fn add_figure_insert(
             "<w:p w14:paraId=\"{caption_para_id}\">{caption_ppr}<w:r>{caption_rpr}<w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
             escape_attr(&caption_text)
         );
-        document_xml = append_paragraph(&document_xml, &caption_paragraph);
+        fragment.push_str(&caption_paragraph);
     }
+    let document_xml = insert_fragment(&document_xml, &fragment, anchor_block);
     rde_doc.inserts.push(insert.clone());
     rde_doc.updated_unix = now_unix();
     rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
@@ -2294,11 +2370,31 @@ pub fn update_figure_images(
         let document_xml = String::from_utf8_lossy(document).to_string();
         let Some(media_part) = figure_media_part(&document_xml, &entries, &insert.id) else { continue };
         let ext = ext.to_ascii_lowercase();
-        let new_part = media_part
+        let mut new_part = media_part
             .rsplit_once('.')
             .map(|(stem, _)| format!("{stem}.{ext}"))
             .unwrap_or_else(|| format!("{media_part}.{ext}"));
-        if new_part != media_part {
+        // Имя media-части должно быть привязано к id вставки: старые имена по счётчику
+        // могли совпадать у разных вставок (P8, DOC-02).
+        let desired_part = format!("word/media/rde-figure-{}.{}", insert.id, ext);
+        if new_part != desired_part {
+            if new_part != media_part {
+                entries.remove(&media_part);
+                ensure_default_content_type(&mut entries, &ext);
+                replace_relationship_target(&mut entries, &media_part, &new_part);
+            }
+            let mut target = desired_part.clone();
+            let mut suffix = 1u32;
+            while entries.contains_key(&target) && target != new_part {
+                target = format!("word/media/rde-figure-{}-{suffix}.{}", insert.id, ext);
+                suffix += 1;
+            }
+            if target != new_part {
+                replace_relationship_target(&mut entries, &new_part, &target);
+                entries.remove(&new_part);
+                new_part = target;
+            }
+        } else if new_part != media_part {
             entries.remove(&media_part);
             ensure_default_content_type(&mut entries, &ext);
             replace_relationship_target(&mut entries, &media_part, &new_part);
@@ -2323,7 +2419,11 @@ fn figure_media_part(
 ) -> Option<String> {
     let tag = format!("<w:tag w:val=\"{INSERT_TAG_PREFIX}{insert_id}\"");
     let tag_index = document_xml.find(&tag)?;
-    let window = &document_xml[tag_index..document_xml.len().min(tag_index + 6000)];
+    // Границы content-control: не выходим за </w:sdt>, иначе можно захватить чужой рисунок.
+    let sdt_start = document_xml[..tag_index].rfind("<w:sdt>")?;
+    let content_start = document_xml[sdt_start..].find("<w:sdtContent>")? + sdt_start;
+    let content_end = document_xml[content_start..].find("</w:sdtContent>")? + content_start;
+    let window = &document_xml[content_start..content_end];
     let embed_index = window.find("r:embed=\"")?;
     let rest = &window[embed_index + "r:embed=\"".len()..];
     let end = rest.find('"')?;

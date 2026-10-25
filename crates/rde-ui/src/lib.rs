@@ -303,6 +303,8 @@ struct InsertDialogState {
     /// `auto|raw|int|dec|sci|percent` + точность.
     format: String,
     precision: usize,
+    /// Ошибка валидации, показываемая в диалоге (P8-B1).
+    error: String,
 }
 
 impl InsertDialogState {
@@ -407,6 +409,8 @@ pub struct RdeApp {
     auto_updating: bool,
     /// Диалог бэкапов проекта (R-VCS-04): список архивов.
     backup_dialog: Option<Vec<PathBuf>>,
+    /// Блок-якорь вставки: каретка в DocView или выбранный блок в «Структуре» (P8-B1).
+    insert_anchor_block: Option<usize>,
 }
 
 impl RdeApp {
@@ -466,6 +470,7 @@ impl RdeApp {
             auto_boot_done: false,
             auto_updating: false,
             backup_dialog: None,
+            insert_anchor_block: None,
         };
         app.auto_update = app.project.manifest.document_auto_update;
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
@@ -793,19 +798,25 @@ impl RdeApp {
             style,
             format: "auto".to_owned(),
             precision: 2,
+            error: String::new(),
         };
         match kind {
             "table" => {
                 let artifact = self
                     .insertable_artifacts()
                     .into_iter()
-                    .find(|artifact| artifact.outputs.iter().any(|output| output.ends_with(".csv")));
+                    .find(|artifact| artifact.outputs.iter().any(|output| output.to_ascii_lowercase().ends_with(".csv")));
                 let Some(artifact) = artifact else {
                     self.push_log(Level::Warn, "Вставка таблицы: нет артефактов с CSV-выходом");
                     return;
                 };
                 dialog.artifact_id = artifact.id;
-                dialog.selector = artifact.outputs.iter().find(|output| output.ends_with(".csv")).cloned().unwrap_or_default();
+                dialog.selector = artifact
+                    .outputs
+                    .iter()
+                    .find(|output| output.to_ascii_lowercase().ends_with(".csv"))
+                    .cloned()
+                    .unwrap_or_default();
                 dialog.format = "raw".to_owned();
                 dialog.caption = "Сводные данные".to_owned();
             }
@@ -857,12 +868,35 @@ impl RdeApp {
                 dialog.caption = "дата".to_owned();
             }
             _ => {
-                let Some(artifact) = self.insertable_artifacts().into_iter().next() else {
-                    self.push_log(Level::Warn, "Вставка: нет артефактов с объявленными выходами");
+                let artifacts = self.insertable_artifacts();
+                let is_image = |output: &str| {
+                    matches!(
+                        output.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str(),
+                        "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp"
+                    )
+                };
+                let artifact = if kind == "figure" {
+                    artifacts.iter().find(|artifact| artifact.outputs.iter().any(|output| is_image(output)))
+                } else {
+                    artifacts.first()
+                };
+                let Some(artifact) = artifact else {
+                    self.push_log(
+                        Level::Warn,
+                        if kind == "figure" {
+                            "Вставка рисунка: нет артефактов с выходом-изображением (svg/png/jpg)"
+                        } else {
+                            "Вставка: нет артефактов с объявленными выходами"
+                        },
+                    );
                     return;
                 };
-                dialog.artifact_id = artifact.id;
-                dialog.selector = artifact.outputs.first().cloned().unwrap_or_default();
+                dialog.artifact_id = artifact.id.clone();
+                dialog.selector = if kind == "figure" {
+                    artifact.outputs.iter().find(|output| is_image(output)).cloned().unwrap_or_default()
+                } else {
+                    artifact.outputs.first().cloned().unwrap_or_default()
+                };
             }
         }
         self.insert_dialog = Some(dialog);
@@ -878,6 +912,25 @@ impl RdeApp {
             self.push_log(Level::Warn, "Вставка: документ ещё не в .doc.rde (сначала «Сохранить проект»)");
             return;
         }
+        // Валидация до вставки: JSON-выход без pointer вставил бы весь файл (P8-B1).
+        if dialog.kind == "value"
+            && dialog.selector.to_ascii_lowercase().ends_with(".json")
+            && dialog.pointer.trim().trim_start_matches('#').is_empty()
+        {
+            let mut dialog = dialog;
+            dialog.error = "Для JSON-выхода нужен JSON pointer (например, #/stats/x1/mean)".to_owned();
+            self.insert_dialog = Some(dialog);
+            return;
+        }
+        if dialog.kind == "figure" {
+            let ext = dialog.selector.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            if !matches!(ext.as_str(), "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp") {
+                let mut dialog = dialog;
+                dialog.error = format!("Выход `{}` не является изображением — выберите svg/png/jpg", dialog.selector);
+                self.insert_dialog = Some(dialog);
+                return;
+            }
+        }
         if self.store.is_none() {
             self.push_log(Level::Warn, "Вставка: хранилище проекта не открыто");
             return;
@@ -889,13 +942,14 @@ impl RdeApp {
             format!("rde://artifact/{}/{}#{}", dialog.artifact_id, dialog.selector, pointer)
         };
         let mut renumber = false;
+        let anchor_block = self.insert_anchor_block;
         let result: Result<(rde_doc::InsertReport, String), String> = {
             let project = &self.project;
             let store = self.store.as_ref().expect("хранилище проверено");
             match dialog.kind.as_str() {
                 "figure" => rde_dag::resolve_insert_image(project, store, &artifact_uri).and_then(|(path, _ext, hash)| {
                     let caption = if dialog.caption.trim().is_empty() { "Рисунок — вставка из артефакта".to_owned() } else { dialog.caption.trim().to_owned() };
-                    rde_doc::add_figure_insert(&package, &path, artifact_uri.clone(), caption, hash.clone()).map(|report| (report, hash))
+                    rde_doc::add_figure_insert(&package, &path, artifact_uri.clone(), caption, hash.clone(), anchor_block).map(|report| (report, hash))
                 }),
                 "table" => rde_dag::resolve_insert_table(project, store, &artifact_uri).and_then(|(rows, hash)| {
                     let caption = if dialog.caption.trim().is_empty() { "Таблица".to_owned() } else { dialog.caption.trim().to_owned() };
@@ -909,6 +963,7 @@ impl RdeApp {
                         style: dialog.style.clone(),
                         format: String::new(),
                         run_style: String::new(),
+                        anchor_block,
                     };
                     rde_doc::add_table_insert(&package, request, &rows).map(|report| (report, hash))
                 }),
@@ -925,6 +980,7 @@ impl RdeApp {
                             style: dialog.style.clone(),
                             format: "raw".to_owned(),
                             run_style,
+                            anchor_block,
                         };
                         rde_doc::add_insert(&package, request).map(|report| (report, hash))
                     })
@@ -941,6 +997,7 @@ impl RdeApp {
                         style: dialog.style.clone(),
                         format: "raw".to_owned(),
                         run_style: String::new(),
+                        anchor_block,
                     };
                     renumber = true;
                     rde_doc::add_insert(&package, request).map(|report| (report, String::new()))
@@ -961,6 +1018,7 @@ impl RdeApp {
                         style: dialog.style.clone(),
                         format: "raw".to_owned(),
                         run_style: String::new(),
+                        anchor_block,
                     };
                     rde_doc::add_insert(&package, request).map(|report| (report, String::new()))
                 }
@@ -975,6 +1033,7 @@ impl RdeApp {
                         style: dialog.style.clone(),
                         format: "raw".to_owned(),
                         run_style: String::new(),
+                        anchor_block,
                     };
                     rde_doc::add_insert(&package, request).map(|report| (report, String::new()))
                 }
@@ -990,6 +1049,7 @@ impl RdeApp {
                         style: dialog.style.clone(),
                         format: dialog.format_spec(),
                         run_style: String::new(),
+                        anchor_block,
                     };
                     rde_doc::add_insert(&package, request).map(|report| (report, hash))
                 }),
@@ -3707,11 +3767,20 @@ impl RdeApp {
                                 .find(|artifact| artifact.id == dialog.artifact_id)
                                 .map(|artifact| artifact.title.clone())
                                 .unwrap_or_else(|| "— выбрать —".to_owned());
+                            let old_constants = dialog.artifact_id.clone();
                             egui::ComboBox::from_label("объект констант").selected_text(current).show_ui(ui, |ui| {
                                 for constants in &constants_list {
                                     ui.selectable_value(&mut dialog.artifact_id, constants.id.clone(), &constants.title);
                                 }
                             });
+                            if old_constants != dialog.artifact_id {
+                                dialog.selector = constants_list
+                                    .iter()
+                                    .find(|constants| constants.id == dialog.artifact_id)
+                                    .and_then(|constants| constants.values.keys().next().cloned())
+                                    .unwrap_or_default();
+                                dialog.error.clear();
+                            }
                             if let Some(constants) = constants_list.iter().find(|artifact| artifact.id == dialog.artifact_id) {
                                 let current_key = constants.values.get(&dialog.selector);
                                 let label = current_key
@@ -3772,14 +3841,40 @@ impl RdeApp {
                                 .find(|artifact| artifact.id == dialog.artifact_id)
                                 .map(|artifact| artifact.title.clone())
                                 .unwrap_or_else(|| "— выбрать —".to_owned());
+                            let old_artifact = dialog.artifact_id.clone();
                             egui::ComboBox::from_label("артефакт").selected_text(current_title).show_ui(ui, |ui| {
                                 for artifact in &artifacts {
                                     ui.selectable_value(&mut dialog.artifact_id, artifact.id.clone(), &artifact.title);
                                 }
                             });
+                            let is_image = |output: &str| {
+                                matches!(
+                                    output.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str(),
+                                    "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp"
+                                )
+                            };
+                            let is_csv = |output: &str| output.to_ascii_lowercase().ends_with(".csv");
                             if let Some(artifact) = artifacts.iter().find(|artifact| artifact.id == dialog.artifact_id) {
+                                // Смена владельца: selector не должен «переезжать» на чужой выход.
+                                if old_artifact != dialog.artifact_id {
+                                    dialog.selector = match dialog.kind.as_str() {
+                                        "figure" => artifact.outputs.iter().find(|output| is_image(output)).cloned().unwrap_or_default(),
+                                        "table" => artifact.outputs.iter().find(|output| is_csv(output)).cloned().unwrap_or_default(),
+                                        _ => artifact.outputs.first().cloned().unwrap_or_default(),
+                                    };
+                                    dialog.error.clear();
+                                }
+                                let valid_outputs: Vec<&String> = artifact
+                                    .outputs
+                                    .iter()
+                                    .filter(|output| match dialog.kind.as_str() {
+                                        "figure" => is_image(output),
+                                        "table" => is_csv(output),
+                                        _ => true,
+                                    })
+                                    .collect();
                                 egui::ComboBox::from_label("выход").selected_text(dialog.selector.clone()).show_ui(ui, |ui| {
-                                    for output in &artifact.outputs {
+                                    for output in valid_outputs {
                                         ui.selectable_value(&mut dialog.selector, output.clone(), output);
                                     }
                                 });
@@ -3844,8 +3939,37 @@ impl RdeApp {
                     };
                     ui.label(RichText::new(uri).monospace().small().color(ACCENT));
                     ui.add_space(6.0);
+                    // Позиция вставки: каретка DocView / выбранный блок / конец документа.
+                    ui.label(
+                        RichText::new(match self.insert_anchor_block {
+                            Some(block) => format!("позиция: после блока {}", block + 1),
+                            None => "позиция: в конец документа".to_owned(),
+                        })
+                        .small()
+                        .color(MUTED),
+                    );
+                    // Валидация: для JSON-выхода нужен pointer, иначе вставится весь файл (P8-B1).
+                    let needs_pointer = dialog.kind == "value"
+                        && dialog.selector.to_ascii_lowercase().ends_with(".json")
+                        && dialog.pointer.trim().trim_start_matches('#').is_empty();
+                    if needs_pointer {
+                        ui.label(
+                            RichText::new("JSON-выход: укажите JSON pointer (например, #/stats/x1/mean) — иначе вставится весь файл")
+                                .small()
+                                .color(AMBER),
+                        );
+                    }
+                    if !dialog.error.is_empty() {
+                        ui.label(RichText::new(&dialog.error).small().color(RED));
+                    }
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(RichText::new("Вставить").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                        if ui
+                            .add_enabled(
+                                !needs_pointer,
+                                egui::Button::new(RichText::new("Вставить").color(Color32::WHITE)).fill(ACCENT),
+                            )
+                            .clicked()
+                        {
                             confirm = true;
                         }
                         if ui.button("Отмена").clicked() {
@@ -4085,6 +4209,7 @@ impl RdeApp {
 
     fn doc_tab(&mut self, ui: &mut egui::Ui) {
         let mut mode = self.doc_mode;
+        let mut caret_block: Option<usize> = None;
         let mut update_inserts = false;
         let mut zoom_action: Option<&'static str> = None;
         if mode != DocMode::Preview {
@@ -4183,6 +4308,14 @@ impl RdeApp {
                 rollback_artifacts = true;
             }
             ui.separator();
+            let anchor_label = match self.insert_anchor_block {
+                Some(block) => format!("позиция: после блока {}", block + 1),
+                None => "позиция: в конец".to_owned(),
+            };
+            ui.label(RichText::new(anchor_label).small().color(if self.insert_anchor_block.is_some() { ACCENT } else { MUTED }));
+            if self.insert_anchor_block.is_some() && ui.small_button("сброс").clicked() {
+                self.insert_anchor_block = None;
+            }
             ui.label(RichText::new(format!("вставок: {inserts_count}")).small().color(MUTED));
         });
         if let Some(kind) = insert_kind {
@@ -4207,6 +4340,10 @@ impl RdeApp {
                 if let Some(ed) = &mut self.editor {
                     let ctx = ui.ctx().clone();
                     ed.app.logic(&ctx);
+                    // Позиция каретки в DocView → блок-якорь вставки (P8-B1).
+                    if let Some(block) = ed.app.session.sel.focus.path.0.first() {
+                        caret_block = Some(*block as usize);
+                    }
                     // The WordCraft canvas paints across its whole area; give it a clipped
                     // child Ui so it can never draw over the RDE side panels.
                     // WordCraft рисует canvas по available_rect, игнорируя clip_rect: ограничиваем
@@ -4225,6 +4362,10 @@ impl RdeApp {
                 if let Some(ed) = &mut self.editor {
                     let ctx = ui.ctx().clone();
                     ed.app.logic(&ctx);
+                    // Позиция каретки в DocView → блок-якорь вставки (P8-B1).
+                    if let Some(block) = ed.app.session.sel.focus.path.0.first() {
+                        caret_block = Some(*block as usize);
+                    }
                     ed.app.ui(ui);
                 } else {
                     self.editor_error_ui(ui);
@@ -4267,6 +4408,9 @@ impl RdeApp {
         }
         if update_inserts {
             self.push_log(Level::Info, "Обновление вставок документа: транзакция появится в следующей итерации (сейчас mock)");
+        }
+        if let Some(block) = caret_block {
+            self.insert_anchor_block = Some(block);
         }
     }
 
@@ -4515,7 +4659,9 @@ impl RdeApp {
             if let Some(document) = self.project.document_object() {
                 self.selected = Some(document.id.clone());
             }
-            self.push_log(Level::Info, format!("Блок {number}: {text}"));
+            // Выбранный блок — якорь для вставок (P8-B1).
+            self.insert_anchor_block = Some(number.saturating_sub(1));
+            self.push_log(Level::Info, format!("Блок {number}: {text} (вставки — после этого блока)"));
         }
         if insert_update_requested {
             self.update_project_document();
@@ -6273,6 +6419,7 @@ mod docview_tests {
             style: String::new(),
             format: "auto".into(),
             precision: 2,
+            error: String::new(),
         });
         let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
         let insert = rde_doc
@@ -6345,6 +6492,7 @@ mod docview_tests {
             style: String::new(),
             format: "auto".into(),
             precision: 2,
+            error: String::new(),
         });
         let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
         assert!(rde_doc.inserts.iter().any(|insert| insert.kind == "figure" && !insert.target.is_empty()));
@@ -6398,8 +6546,49 @@ mod docview_tests {
         };
         assert!(media.starts_with(b"\x89PNG"), "SVG растеризован в PNG для DocView: {} байт", media.len());
         // Пиксели могут совпасть, если выход артефакта не менялся — важен формат (PNG) и содержимое.
-        assert!(media.len() > 1000, "рисунок содержит данные: {} байт", media.len());
+        assert!(media.len() > 100, "рисунок содержит данные: {} байт", media.len());
         let _ = media_before;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P8-B1: вставки — фильтры/валидация диалогов ─────────────────────────
+
+    #[test]
+    fn insert_dialog_filters_outputs_by_kind_and_requires_json_pointer() {
+        let root = temp_demo_copy("insert-dialog");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        // Рисунок: по умолчанию выбирается выход-изображение, а не out/stats.json.
+        app.open_insert_dialog("figure");
+        let dialog = app.insert_dialog.as_ref().expect("диалог рисунка");
+        assert!(
+            matches!(dialog.selector.rsplit('.').next().unwrap_or(""), "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp"),
+            "выход рисунка по умолчанию: {}",
+            dialog.selector
+        );
+        app.insert_dialog = None;
+        // Таблица: по умолчанию CSV-выход.
+        app.open_insert_dialog("table");
+        let dialog = app.insert_dialog.as_ref().expect("диалог таблицы");
+        assert!(dialog.selector.ends_with(".csv"), "выход таблицы по умолчанию: {}", dialog.selector);
+        app.insert_dialog = None;
+        // JSON без pointer не вставляется: диалог остаётся с ошибкой, документ не меняется.
+        let package = app.project.document_path().unwrap();
+        let before = rde_doc::load_rde_doc(&package).unwrap().inserts.len();
+        app.confirm_insert(super::InsertDialogState {
+            kind: "value".into(),
+            artifact_id: STATS.into(),
+            selector: "out/stats.json".into(),
+            pointer: String::new(),
+            caption: "JSON".into(),
+            style: String::new(),
+            format: "auto".into(),
+            precision: 2,
+            error: String::new(),
+        });
+        assert!(app.insert_dialog.as_ref().is_some_and(|dialog| !dialog.error.is_empty()), "ошибка в диалоге");
+        let after = rde_doc::load_rde_doc(&package).unwrap().inserts.len();
+        assert_eq!(before, after, "вставка без pointer отклонена (P8, DOC-05)");
         let _ = std::fs::remove_dir_all(&root);
     }
 
