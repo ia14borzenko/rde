@@ -3720,6 +3720,7 @@ dependencies = [
  "rde-vcs",
  "serde_json",
  "toml",
+ "ttf-parser",
  "wordcraft-engine",
  "wordcraft-ui-egui",
  "zip",

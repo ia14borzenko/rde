@@ -33,3 +33,10 @@ DejaVu — public domain; распространение (включая вен�
 Шрифты документа (Aptos/TNR) живут в WordCraft-DocView — здесь не дублируются.
 Типошкала оболочки (фаза 1): FS_DISPLAY 18 / HEADING 16 / BODY 13 /
 BUTTON 12 / SMALL 12 / CAPTION 11 / MONO 11.5.
+
+Глифы строк таблиц (P4): U+FFFC (OBJECT REPLACEMENT CHARACTER, якорь inline-объекта
+WordCraft) не печатается — в таблицах структуры и вставок он удаляется функцией
+`display_text` (только при показе, данные не меняются). После открытия редактора WordCraft
+подменяет шрифты оболочки на Inter/Source*, а в них U+FFFC нет → квадрат. Все остальные
+символы строк формата вставок (`·`, `—`, `σ`, кириллица) покрыты и DejaVu, и Inter.
+Проверка: тест `structure_and_insert_strings_have_glyphs` (rde-ui, ttf-parser).

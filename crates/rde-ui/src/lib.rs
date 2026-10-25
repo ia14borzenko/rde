@@ -300,8 +300,8 @@ impl DocMode {
 
     fn label(self) -> &'static str {
         match self {
-            DocMode::DocView => "Редактор RDE (DocView)",
-            DocMode::Full => "Полный WordCraft",
+            DocMode::DocView => "RDE",
+            DocMode::Full => "WordCraft",
             DocMode::Preview => "Предпросмотр страниц",
         }
     }
@@ -1940,8 +1940,9 @@ impl RdeApp {
         if redo && self.editor.is_some() {
             self.undo_document(true);
         }
-        self.menu_bar(ui);
-        self.toolbar(ui);
+        // Верхней панели каркаса больше нет: меню, «Сохранить проект», «Экспорт .docx», «+ Объект»,
+        // «Поиск», «Обновить документ» — в RDE-панели документа (menu_bar/doc_tab, только DocView);
+        // «Обновить всё» и отмена — в шапке центральной области (update_all_controls).
         self.status_bar(ui);
         if self.show_logs {
             self.logs_panel(ui);
@@ -1973,7 +1974,6 @@ impl RdeApp {
     // ── верхнее меню ────────────────────────────────────────────────────────
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let pal = theme_colors(ui.ctx().theme());
-        let project_name = self.project.name.clone();
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum MenuAction {
             NewProject,
@@ -2007,8 +2007,11 @@ impl RdeApp {
             ExportDiagnostics,
         }
         let mut action: Option<MenuAction> = None;
-        egui::Panel::top("rde_menu")
-            .frame(egui::Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(12, 2)))
+        // Меню живёт внутри RDE-панели документа (только режим DocView), а не отдельной
+        // панелью окна: см. `doc_tab` → `rde_panel`.
+        egui::Frame::new()
+            .fill(pal.panel)
+            .inner_margin(Margin::symmetric(8, 2))
             .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button(tr(self.lang, "menu.file"), |ui| {
@@ -2154,11 +2157,8 @@ impl RdeApp {
                             ui.close();
                         }
                     });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new("RDE · прототип v0.1").small().color(pal.muted));
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(&project_name).small().color(pal.text));
-                    });
+                    // Название проекта и «RDE · прототип» — в строке статуса: здесь они перекрывали
+                    // «Помощь» в узкой центральной колонке (клик уходил в подпись).
                 });
             });
         match action {
@@ -2229,103 +2229,39 @@ impl RdeApp {
         }
     }
 
-    // ── панель действий ─────────────────────────────────────────────────────
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
+    // ── «Обновить всё» и отмена фонового обновления ─────────────────────────
+    /// Бывшая верхняя панель: «Обновить всё» и отмена живут в строке статуса (видна всегда,
+    /// на любой вкладке и в любом режиме документа).
+    fn update_all_controls(&mut self, ui: &mut egui::Ui) {
         let pal = theme_colors(ui.ctx().theme());
         let mut update_all = false;
-        let mut export = false;
-        let mut save_project = false;
-        let mut update_document = false;
-        let mut new_object = false;
-        let mut search_clicked = false;
         let mut cancel_update = false;
         let running = self.update_job.is_some();
         let running_secs = self.update_job.as_ref().map(|job| job.started.elapsed().as_secs_f32()).unwrap_or(0.0);
-        egui::Panel::top("rde_toolbar")
-            // Отступ 2 (не 4): кнопки 32 px должны влезать в фиксированные 36 px панели.
-            .frame(egui::Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(12, 2)))
-            .exact_size(36.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // Группы: [Проект] | [Объект] | [Документ] | [Обновления] — разделители между ними.
-                    if btn(ui, Role::Secondary, Some(IC_SAVE), tr(self.lang, "toolbar.save_project"))
-                        .on_hover_text("Записать документ в .doc.rde (RDE — владелец сохранения)")
-                        .clicked()
-                    {
-                        save_project = true;
-                    }
-                    if btn(ui, Role::Ghost, Some(IC_EXPORT), tr(self.lang, "toolbar.export_docx"))
-                        .on_hover_text("Собрать чистый .docx из .doc.rde")
-                        .clicked()
-                    {
-                        export = true;
-                    }
-                    ui.separator();
-                    if btn(ui, Role::Secondary, Some(IC_ADD), tr(self.lang, "toolbar.new_object")).clicked() {
-                        new_object = true;
-                    }
-                    if btn(ui, Role::Ghost, Some(IC_SEARCH), tr(self.lang, "toolbar.search"))
-                        .on_hover_text("Поиск по объектам (Ctrl+F)")
-                        .clicked()
-                    {
-                        search_clicked = true;
-                    }
-                    ui.separator();
-                    if btn(ui, Role::Secondary, Some(IC_DOC), tr(self.lang, "toolbar.update_document"))
-                        .on_hover_text("Перенумеровать подписи/обновить вставки и пересохранить .doc.rde")
-                        .clicked()
-                    {
-                        update_document = true;
-                    }
-                    ui.separator();
-                    // Единственный primary в тулбаре: пересчёт устаревших артефактов.
-                    let update_resp = ui
-                        .add_enabled_ui(!running, |ui| {
-                            btn(ui, Role::Primary, Some(IC_UPDATE), tr(self.lang, "toolbar.update_all"))
-                                .on_hover_text("Реально пересчитать устаревшие артефакты (rde-dag: act_key/out_hash, транзакции)")
-                        })
-                        .inner;
-                    if update_resp.clicked() {
-                        update_all = true;
-                    }
-                    if running {
-                        ui.label(RichText::new(format!("● обновление… {running_secs:.0} с")).small().color(pal.amber));
-                        if btn(ui, Role::Danger, None, "Отменить")
-                            .on_hover_text("Остановить текущий запуск (SIGTERM → grace → SIGKILL) и отменить обновление")
-                            .clicked()
-                        {
-                            cancel_update = true;
-                        }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("• {} устаревших объектов", self.project.stale_count())).small().color(pal.amber));
-                        ui.separator();
-                        ui.label(RichText::new("MCP: off").small().color(pal.muted));
-                    });
-                });
-            });
+        // Единственный primary в строке статуса: пересчёт устаревших артефактов.
+        let update_resp = ui
+            .add_enabled_ui(!running, |ui| {
+                btn_bar(ui, Role::Primary, Some(IC_UPDATE), tr(self.lang, "toolbar.update_all"))
+                    .on_hover_text("Реально пересчитать устаревшие артефакты (rde-dag: act_key/out_hash, транзакции)")
+            })
+            .inner;
+        if update_resp.clicked() {
+            update_all = true;
+        }
+        if running {
+            ui.label(RichText::new(format!("● обновление… {running_secs:.0} с")).small().color(pal.amber));
+            if btn_bar(ui, Role::Danger, None, "Отменить")
+                .on_hover_text("Остановить текущий запуск (SIGTERM → grace → SIGKILL) и отменить обновление")
+                .clicked()
+            {
+                cancel_update = true;
+            }
+        }
         if cancel_update {
             self.cancel_update();
         }
         if update_all {
             self.request_update(None, true);
-        }
-        if export {
-            self.ensure_editor();
-            self.save_editor_copy();
-        }
-        if save_project {
-            self.save_project_document();
-        }
-        if update_document {
-            self.update_project_document();
-        }
-        if new_object {
-            self.create_dialog = Some(CreateDialogState { kind: UiObjectKind::Core(NewObjectKind::ComputeArtifact), title: String::new() });
-        }
-        if search_clicked {
-            self.show_tree = true;
-            self.search_focus = true;
         }
     }
 
@@ -2351,12 +2287,22 @@ impl RdeApp {
                     ui.label(RichText::new(git_summary).small().color(git_color));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new("A4 · ru-RU").small().color(pal.muted));
+                        if let Some(pages) = self.doc_pages() {
+                            ui.separator();
+                            ui.label(RichText::new(format!("{pages} стр.")).small().color(pal.muted));
+                        }
                         ui.separator();
                         ui.label(RichText::new(format!("{} {}", self.project.object_count(), tr(self.lang, "status.objects"))).small().color(pal.muted));
                         ui.separator();
                         ui.label(RichText::new(format!("• {} {}", self.project.stale_count(), tr(self.lang, "status.stale"))).small().color(pal.amber));
                         ui.separator();
                         ui.label(RichText::new(tr(self.lang, "status.agent_offline")).small().color(pal.muted));
+                        ui.separator();
+                        ui.label(RichText::new("MCP: off").small().color(pal.muted));
+                        ui.separator();
+                        // «Обновить всё» — в строке статуса: видна на всех вкладках и в любом режиме,
+                        // не конкурирует с вкладками центральной области за ширину.
+                        self.update_all_controls(ui);
                     });
                 });
             });
@@ -2410,7 +2356,8 @@ impl RdeApp {
                                     ui.label(RichText::new("Пока нет запусков и транзакций — нажмите «Обновить всё»").small().color(pal.muted));
                                 }
                                 for line in &tasks {
-                                    ui.label(RichText::new(line).monospace().size(FS_MONO).color(pal.text));
+                                    // Строки списка — с тем же внутренним отступом, что и ячейки таблиц.
+                                    pad_cell(ui, |ui| ui.label(RichText::new(line).monospace().size(FS_MONO).color(pal.text)));
                                 }
                                 ui.add_space(8.0);
                                 ui.label(RichText::new("ТРАНЗАКЦИИ ОБНОВЛЕНИЙ — ОТКАТ (O(1))").small().strong().color(pal.muted));
@@ -2441,6 +2388,7 @@ impl RdeApp {
                             _ => {
                                 for line in &log {
                                     ui.horizontal(|ui| {
+                                        ui.add_space(8.0); // внутренний отступ слева, как в таблицах
                                         ui.label(RichText::new(line.time).monospace().size(FS_MONO).color(pal.muted));
                                         let color = match line.level {
                                             Level::Info => pal.muted,
@@ -2868,23 +2816,23 @@ impl RdeApp {
                     field_row(ui, "id", &object.id, true);
                     field_row(ui, "каталог", &object.dir.display().to_string(), true);
                     field_row(ui, "детали", &object.detail, false);
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
+                    ui.add_space(6.0);
+                    // Основные действия объекта — ряд из двух кнопок равной ширины.
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let w = grid_column_width(ui, 2);
                         // Честная кнопка «Открыть»: у заметок и репозиториев центрального
                         // вьюера нет (их показывает только сам инспектор) — открывать нечего.
                         let can_open = Self::inspector_open_tab(object).is_some();
                         let open_resp = ui
-                            .add_enabled_ui(can_open, |ui| btn(ui, Role::Primary, Some(IC_OPEN), "Открыть"))
+                            .add_enabled_ui(can_open, |ui| btn_w(ui, Role::Primary, Some(IC_OPEN), "Открыть", w))
                             .inner
                             .on_disabled_hover_text("нечего открывать");
                         if open_resp.clicked() {
                             open_clicked = true;
                         }
-                        if btn(ui, Role::Secondary, Some(IC_RENAME), "Переименовать").clicked() {
+                        if btn_w(ui, Role::Secondary, Some(IC_RENAME), "Переименовать", w).clicked() {
                             rename_clicked = true;
-                        }
-                        if btn(ui, Role::Danger, Some(IC_DELETE), "Удалить").clicked() {
-                            delete_clicked = true;
                         }
                     });
                     });
@@ -2958,11 +2906,13 @@ impl RdeApp {
                                     field_row(ui, "обновлён", &format!("unix {updated}"), false);
                                 }
                                 ui.add_space(4.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    if btn(ui, Role::Secondary, Some(IC_UPDATE), "Обновить артефакт").clicked() {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let w = grid_column_width(ui, 2);
+                                    if btn_w(ui, Role::Secondary, Some(IC_UPDATE), "Обновить артефакт", w).clicked() {
                                         update_clicked = true;
                                     }
-                                    if ui.small_button("копировать act_key").clicked() {
+                                    if btn_w(ui, Role::Ghost, None, "копировать act_key", w).clicked() {
                                         if let Some(act_key) = &status.act_key {
                                             ui.ctx().copy_text(act_key.clone());
                                         }
@@ -3017,19 +2967,26 @@ impl RdeApp {
                                     field_row(ui, "описание", &template.description, false);
                                 }
                                 ui.add_space(4.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    if btn(ui, Role::Primary, Some(IC_DOC), "Оформить по ГОСТ").clicked() {
+                                section_caption(ui, "оформление");
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let w = grid_column_width(ui, 2);
+                                    if btn_w(ui, Role::Primary, Some(IC_DOC), "Оформить по ГОСТ", w).clicked() {
                                         gost_clicked = true;
                                     }
-                                    if btn(ui, Role::Secondary, Some(IC_SOURCE), "Вставить библиографию").clicked() {
+                                    if btn_w(ui, Role::Secondary, Some(IC_SOURCE), "Вставить библиографию", w).clicked() {
                                         bibliography_clicked = true;
                                     }
                                 });
-                                ui.horizontal_wrapped(|ui| {
-                                    if btn(ui, Role::Secondary, Some(IC_OPEN), "Открыть копию в Word").clicked() {
+                                ui.add_space(4.0);
+                                section_caption(ui, "обмен с Word");
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let w = grid_column_width(ui, 2);
+                                    if btn_w(ui, Role::Secondary, Some(IC_OPEN), "Открыть копию в Word", w).clicked() {
                                         word_copy_clicked = true;
                                     }
-                                    if btn(ui, Role::Secondary, Some(IC_DOWNLOAD), "Импорт ревью из exports").clicked() {
+                                    if btn_w(ui, Role::Secondary, Some(IC_DOWNLOAD), "Импорт ревью из exports", w).clicked() {
                                         review_import_clicked = true;
                                     }
                                 });
@@ -3044,6 +3001,14 @@ impl RdeApp {
                             ui.ctx().copy_text(object.id.clone());
                         }
                     });
+                    // Опасная группа — отдельно от основных действий, на всю ширину.
+                    ui.add_space(14.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    section_caption(ui, "опасная зона");
+                    if btn_w(ui, Role::Danger, Some(IC_DELETE), "Удалить объект", grid_column_width(ui, 1)).clicked() {
+                        delete_clicked = true;
+                    }
                 });
             });
         if let Some(object) = &object {
@@ -4467,17 +4432,6 @@ impl RdeApp {
                         }
                         ui.add_space(4.0);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let stale = self.project.stale_count();
-                        if stale > 0 {
-                            ui.label(RichText::new(format!("• {stale} устаревших объектов")).small().color(pal.amber));
-                        } else {
-                            ui.label(RichText::new("• проект актуален").small().color(pal.green));
-                        }
-                        if let Some(pages) = self.doc_pages() {
-                            ui.label(RichText::new(format!("{pages} стр. · A4")).small().color(pal.muted));
-                        }
-                    });
                 });
                 ui.separator();
                 match self.tab {
@@ -4500,8 +4454,12 @@ impl RdeApp {
             self.ensure_editor();
         }
         ui.horizontal(|ui| {
+            // Переключатель режимов — pill-вкладки, как у вкладок центральной области.
+            ui.spacing_mut().item_spacing.x = 2.0;
             for m in DocMode::ALL {
-                if ui.selectable_label(mode == m, RichText::new(m.label()).size(12.0)).clicked() {
+                let sel = mode == m;
+                let text = RichText::new(m.label()).size(FS_BODY).color(if sel { pal.text } else { pal.muted });
+                if ui.add(egui::Button::selectable(sel, text).corner_radius(8).min_size(vec2(0.0, 28.0))).clicked() {
                     mode = m;
                 }
             }
@@ -4553,53 +4511,124 @@ impl RdeApp {
             .and_then(|path| rde_doc::load_rde_doc(&path).ok())
             .map(|doc| doc.inserts.len())
             .unwrap_or(0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("RDE").small().strong().color(pal.accent));
-            if ui.small_button("Вставить значение…").clicked() {
-                insert_kind = Some("value");
-            }
-            if ui.small_button("рисунок…").clicked() {
-                insert_kind = Some("figure");
-            }
-            if ui.small_button("таблицу…").clicked() {
-                insert_kind = Some("table");
-            }
-            if ui.small_button("константу…").clicked() {
-                insert_kind = Some("constant");
-            }
-            if ui.small_button("ссылку…").clicked() {
-                insert_kind = Some("crossref");
-            }
-            if ui.small_button("цитату…").clicked() {
-                insert_kind = Some("citation");
-            }
-            if ui.small_button("дату…").clicked() {
-                insert_kind = Some("date");
-            }
-            ui.separator();
-            if btn(ui, Role::Primary, Some(IC_UPDATE), "Обновить документ").clicked() {
-                update_inserts = true;
-            }
-            if ui.checkbox(&mut auto_update, RichText::new("Автообновление").size(12.0)).changed() {
-                toggle_auto = Some(auto_update);
-            }
-            if ui.small_button("Отменить обновление документа").clicked() {
-                rollback_doc = true;
-            }
-            if ui.small_button("Отменить обновление артефактов").clicked() {
-                rollback_artifacts = true;
-            }
-            ui.separator();
-            let anchor_label = match self.insert_anchor_block {
-                Some(block) => format!("позиция: после блока {}", block + 1),
-                None => "позиция: в конец".to_owned(),
-            };
-            ui.label(RichText::new(anchor_label).small().color(if self.insert_anchor_block.is_some() { pal.accent } else { pal.muted }));
-            if self.insert_anchor_block.is_some() && ui.small_button("сброс").clicked() {
-                self.insert_anchor_block = None;
-            }
-            ui.label(RichText::new(format!("вставок: {inserts_count}")).small().color(pal.muted));
-        });
+        // Кнопки проекта и документа, которые раньше стояли в верхней панели каркаса.
+        let mut save_project = false;
+        let mut export = false;
+        let mut new_object = false;
+        let mut search_clicked = false;
+        let mut update_document = false;
+        if mode == DocMode::DocView {
+            egui::Frame::new()
+                .fill(pal.panel)
+                .corner_radius(CornerRadius::same(8))
+                .stroke(Stroke::new(1.0, pal.border))
+                .inner_margin(Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    // Ширина содержимого = ширина колонки: иначе ряды кнопок не переносятся и
+                    // уходят под инспектор.
+                    ui.set_max_width(ui.available_width());
+                    // Меню окна: только в DocView (принятое ограничение владельца).
+                    self.menu_bar(ui);
+                    ui.add_space(2.0);
+                    // Строки по группам: каждая умещается в колонку центральной области (~560 pt при
+                    // открытом инспекторе), поэтому переноса внутри строки не требуется.
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("RDE").strong().color(pal.accent));
+                        ui.separator();
+                        // Группа «Документ»: сохранение/экспорт в .docx.
+                        if btn_compact(ui, Role::Secondary, Some(IC_SAVE), tr(self.lang, "toolbar.save_project"))
+                            .on_hover_text("Записать документ в .doc.rde (RDE — владелец сохранения)")
+                            .clicked()
+                        {
+                            save_project = true;
+                        }
+                        if btn_compact(ui, Role::Ghost, Some(IC_EXPORT), tr(self.lang, "toolbar.export_docx"))
+                            .on_hover_text("Собрать чистый .docx из .doc.rde")
+                            .clicked()
+                        {
+                            export = true;
+                        }
+                        ui.separator();
+                        // Группа «Проект»: новый объект и поиск.
+                        if btn_compact(ui, Role::Secondary, Some(IC_ADD), tr(self.lang, "toolbar.new_object")).clicked() {
+                            new_object = true;
+                        }
+                        if btn_compact(ui, Role::Ghost, Some(IC_SEARCH), tr(self.lang, "toolbar.search"))
+                            .on_hover_text("Поиск по объектам (Ctrl+F)")
+                            .clicked()
+                        {
+                            search_clicked = true;
+                        }
+                    });
+                    // Группа «Обновление»: пересчёт вставок и подписей, автообновление, откаты.
+                    ui.horizontal(|ui| {
+                        if btn_compact(ui, Role::Primary, Some(IC_UPDATE), tr(self.lang, "toolbar.update_document"))
+                            .on_hover_text("Перенумеровать подписи/обновить вставки и пересохранить .doc.rde")
+                            .clicked()
+                        {
+                            update_document = true;
+                        }
+                        if ui.checkbox(&mut auto_update, RichText::new("Автообновление").size(FS_SMALL)).changed() {
+                            toggle_auto = Some(auto_update);
+                        }
+                        if btn_compact(ui, Role::Ghost, None, "Отменить обновление документа").clicked() {
+                            rollback_doc = true;
+                        }
+                    });
+                    // Группа «Вставка»: иконки видов вставок (подписи — во всплывающей подсказке),
+                    // откат артефактов и позиция, куда ляжет следующая вставка.
+                    ui.horizontal(|ui| {
+                        if btn_compact(ui, Role::Ghost, None, "Отменить обновление артефактов").clicked() {
+                            rollback_artifacts = true;
+                        }
+                        ui.separator();
+                        for (kind, tooltip, icon) in [
+                            ("value", "Вставить значение артефакта…", IC_ARTIFACT),
+                            ("figure", "Вставить рисунок из артефакта…", IC_DOC),
+                            ("table", "Вставить таблицу из CSV-выхода…", IC_TREE),
+                            ("constant", "Вставить константу проекта…", IC_CONST),
+                            ("crossref", "Вставить перекрёстную ссылку…", IC_CODE),
+                            ("citation", "Вставить цитату на источник…", IC_SOURCE),
+                            ("date", "Вставить дату…", IC_NOTE),
+                        ] {
+                            if icon_button(ui, icon, tooltip).clicked() {
+                                insert_kind = Some(kind);
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Вставить:").small().color(pal.muted));
+                        let anchor_label = match self.insert_anchor_block {
+                            Some(block) => format!("позиция: после блока {}", block + 1),
+                            None => "позиция: в конец".to_owned(),
+                        };
+                        ui.label(RichText::new(anchor_label).small().color(if self.insert_anchor_block.is_some() { pal.accent } else { pal.muted }));
+                        if self.insert_anchor_block.is_some() && ui.small_button("сброс").clicked() {
+                            self.insert_anchor_block = None;
+                        }
+                        ui.label(RichText::new(format!("вставок: {inserts_count}")).small().color(pal.muted));
+                    });
+                });
+            ui.add_space(4.0);
+        }
+        if save_project {
+            self.save_project_document();
+        }
+        if export {
+            self.ensure_editor();
+            self.save_editor_copy();
+        }
+        if new_object {
+            self.create_dialog = Some(CreateDialogState { kind: UiObjectKind::Core(NewObjectKind::ComputeArtifact), title: String::new() });
+        }
+        if search_clicked {
+            self.show_tree = true;
+            self.search_focus = true;
+        }
+        if update_document {
+            self.update_project_document();
+        }
         if let Some(kind) = insert_kind {
             self.open_insert_dialog(kind);
         }
@@ -4755,15 +4784,15 @@ impl RdeApp {
         egui::ScrollArea::both().id_salt("rde_struct_scroll").auto_shrink([false, false]).show(ui, |ui| {
             match cache {
                 Some(Ok((blocks, _figures))) => {
-                    egui::Grid::new("rde_blocks").num_columns(5).spacing([14.0, 5.0]).striped(true).show(ui, |ui| {
-                        ui.label(RichText::new("№").small().color(pal.muted));
-                        ui.label(RichText::new("тип").small().color(pal.muted));
-                        ui.label(RichText::new("стиль").small().color(pal.muted));
-                        ui.label(RichText::new("путь (block)").small().color(pal.muted));
-                        ui.label(RichText::new("содержимое").small().color(pal.muted));
+                    egui::Grid::new("rde_blocks").num_columns(5).spacing([4.0, 2.0]).striped(true).show(ui, |ui| {
+                        pad_cell(ui, |ui| ui.label(RichText::new("№").small().color(pal.muted)));
+                        pad_cell(ui, |ui| ui.label(RichText::new("тип").small().color(pal.muted)));
+                        pad_cell(ui, |ui| ui.label(RichText::new("стиль").small().color(pal.muted)));
+                        pad_cell(ui, |ui| ui.label(RichText::new("путь (block)").small().color(pal.muted)));
+                        pad_cell(ui, |ui| ui.label(RichText::new("содержимое").small().color(pal.muted)));
                         ui.end_row();
                         for block in &blocks {
-                            ui.label(RichText::new(block.number.to_string()).monospace().size(11.0).color(pal.muted));
+                            pad_cell(ui, |ui| ui.label(RichText::new(block.number.to_string()).monospace().size(11.0).color(pal.muted)));
                             // H2/H — осветлённый синий читается только на тёмном;
                             // на светлом берём акцент (контраст ≥ 4.5:1).
                             let h2 = match ui.ctx().theme() {
@@ -4782,10 +4811,10 @@ impl RdeApp {
                             } else {
                                 block.kind.to_owned()
                             };
-                            ui.label(RichText::new(kind_label).monospace().size(11.0).color(color));
-                            ui.label(RichText::new(if block.style.is_empty() { "—" } else { &block.style }).monospace().size(10.5).color(pal.muted));
-                            ui.label(RichText::new(&block.anchor).monospace().size(10.5).color(pal.muted));
-                            let text_resp = ui.add(egui::Label::new(RichText::new(&block.text).size(12.0).color(pal.text)).sense(Sense::click()));
+                            pad_cell(ui, |ui| ui.label(RichText::new(kind_label).monospace().size(11.0).color(color)));
+                            pad_cell(ui, |ui| ui.label(RichText::new(if block.style.is_empty() { "—" } else { &block.style }).monospace().size(10.5).color(pal.muted)));
+                            pad_cell(ui, |ui| ui.label(RichText::new(&block.anchor).monospace().size(10.5).color(pal.muted)));
+                            let text_resp = pad_cell(ui, |ui| ui.add(egui::Label::new(RichText::new(display_text(&block.text)).size(12.0).color(pal.text)).sense(Sense::click())));
                             if text_resp.clicked() {
                                 clicked_block = Some((block.number, block.text.clone()));
                             }
@@ -4811,19 +4840,19 @@ impl RdeApp {
                     .filter(|path| rde_doc::is_rde_package(path))
                     .and_then(|path| rde_doc::list_document_styles(&path).ok())
                     .unwrap_or_default();
-                egui::Grid::new("rde_inserts").num_columns(6).spacing([12.0, 5.0]).striped(true).show(ui, |ui| {
-                    ui.label(RichText::new("id").small().color(pal.muted));
-                    ui.label(RichText::new("вид").small().color(pal.muted));
-                    ui.label(RichText::new("цель").small().color(pal.muted));
-                    ui.label(RichText::new("стиль").small().color(pal.muted));
-                    ui.label(RichText::new("формат").small().color(pal.muted));
-                    ui.label(RichText::new("значение/действие").small().color(pal.muted));
+                egui::Grid::new("rde_inserts").num_columns(6).spacing([4.0, 2.0]).striped(true).show(ui, |ui| {
+                    pad_cell(ui, |ui| ui.label(RichText::new("id").small().color(pal.muted)));
+                    pad_cell(ui, |ui| ui.label(RichText::new("вид").small().color(pal.muted)));
+                    pad_cell(ui, |ui| ui.label(RichText::new("цель").small().color(pal.muted)));
+                    pad_cell(ui, |ui| ui.label(RichText::new("стиль").small().color(pal.muted)));
+                    pad_cell(ui, |ui| ui.label(RichText::new("формат").small().color(pal.muted)));
+                    pad_cell(ui, |ui| ui.label(RichText::new("значение/действие").small().color(pal.muted)));
                     ui.end_row();
                     for insert in &inserts {
-                        ui.label(RichText::new(&insert.id).monospace().size(11.0).color(pal.accent));
-                        ui.label(RichText::new(&insert.kind).monospace().size(11.0).color(pal.muted));
+                        pad_cell(ui, |ui| ui.label(RichText::new(&insert.id).monospace().size(11.0).color(pal.accent)));
+                        pad_cell(ui, |ui| ui.label(RichText::new(&insert.kind).monospace().size(11.0).color(pal.muted)));
                         let target = insert.target.rsplit('/').next().unwrap_or(&insert.target);
-                        let target_resp = ui.label(RichText::new(target).monospace().size(10.5).color(pal.muted)).on_hover_text(&insert.target);
+                        let target_resp = pad_cell(ui, |ui| ui.label(RichText::new(target).monospace().size(10.5).color(pal.muted)).on_hover_text(&insert.target));
                         let insert_id = insert.id.clone();
                         let insert_target = insert.target.clone();
                         target_resp.context_menu(|ui| {
@@ -4846,39 +4875,45 @@ impl RdeApp {
                         });
                         let mut style = insert.style.clone();
                         let mut format = if insert.format.is_empty() { "auto".to_owned() } else { insert.format.clone() };
-                        egui::ComboBox::from_id_salt(format!("rde_insert_style_{}", insert.id))
-                            .selected_text(if style.is_empty() { "(обычный)".to_owned() } else { style.clone() })
-                            .width(130.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut style, String::new(), "(обычный)");
-                                for style_info in styles.iter().filter(|style_info| style_info.kind == "paragraph") {
-                                    ui.selectable_value(&mut style, style_info.id.clone(), format!("{} ({})", style_info.name, style_info.id));
-                                }
-                            });
-                        egui::ComboBox::from_id_salt(format!("rde_insert_format_{}", insert.id))
-                            .selected_text(format.clone())
-                            .width(150.0)
-                            .show_ui(ui, |ui| {
-                                for (value, label) in [
-                                    ("auto", "авто"),
-                                    ("raw", "как в артефакте"),
-                                    ("int", "целое"),
-                                    ("dec:2", "дробь 2"),
-                                    ("dec:4", "дробь 4"),
-                                    ("sci:3", "стандартный вид"),
-                                    ("percent:1", "проценты"),
-                                ] {
-                                    ui.selectable_value(&mut format, value.to_owned(), label);
-                                }
-                            });
+                        pad_cell(ui, |ui| {
+                            egui::ComboBox::from_id_salt(format!("rde_insert_style_{}", insert.id))
+                                .selected_text(if style.is_empty() { "(обычный)".to_owned() } else { style.clone() })
+                                .width(130.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut style, String::new(), "(обычный)");
+                                    for style_info in styles.iter().filter(|style_info| style_info.kind == "paragraph") {
+                                        ui.selectable_value(&mut style, style_info.id.clone(), format!("{} ({})", style_info.name, style_info.id));
+                                    }
+                                });
+                        });
+                        pad_cell(ui, |ui| {
+                            egui::ComboBox::from_id_salt(format!("rde_insert_format_{}", insert.id))
+                                .selected_text(format.clone())
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for (value, label) in [
+                                        ("auto", "авто"),
+                                        ("raw", "как в артефакте"),
+                                        ("int", "целое"),
+                                        ("dec:2", "дробь 2"),
+                                        ("dec:4", "дробь 4"),
+                                        ("sci:3", "стандартный вид"),
+                                        ("percent:1", "проценты"),
+                                    ] {
+                                        ui.selectable_value(&mut format, value.to_owned(), label);
+                                    }
+                                });
+                        });
                         if style != insert.style || format != (if insert.format.is_empty() { "auto".to_owned() } else { insert.format.clone() }) {
                             pending_insert_edits.push((insert.id.clone(), style, format));
                         }
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(insert.cached.chars().take(28).collect::<String>()).size(11.5).color(pal.text));
-                            if ui.small_button("применить").on_hover_text("Перечитать значение из артефакта и применить стиль/формат").clicked() {
-                                pending_insert_updates.push(insert.id.clone());
-                            }
+                        pad_cell(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(display_text(&insert.cached).chars().take(28).collect::<String>()).size(11.5).color(pal.text));
+                                if ui.small_button("применить").on_hover_text("Перечитать значение из артефакта и применить стиль/формат").clicked() {
+                                    pending_insert_updates.push(insert.id.clone());
+                                }
+                            });
                         });
                         ui.end_row();
                     }
@@ -6085,6 +6120,39 @@ fn btn(ui: &mut egui::Ui, role: Role, icon: Option<&str>, label: &str) -> egui::
     styled_button(ui, role, RichText::new(text).size(FS_BUTTON), vec2(0.0, 32.0))
 }
 
+/// Кнопка 32 px заданной ширины — для сеток инспектора (кнопки одной группы — равной ширины).
+fn btn_w(ui: &mut egui::Ui, role: Role, icon: Option<&str>, label: &str, width: f32) -> egui::Response {
+    let text = match icon {
+        Some(icon) => format!("{icon}  {label}"),
+        None => label.to_owned(),
+    };
+    styled_button(ui, role, RichText::new(text).size(FS_BUTTON), vec2(width, 32.0))
+}
+
+/// Ширина одной колонки сетки из `n` кнопок с зазором 8 px (делит доступную ширину поровну).
+fn grid_column_width(ui: &egui::Ui, n: usize) -> f32 {
+    let gaps = 8.0 * n.saturating_sub(1) as f32;
+    ((ui.available_width() - gaps) / n.max(1) as f32).max(40.0)
+}
+
+/// Компактная кнопка 28 px для строк-панелей (RDE-панель документа, шапка центральной области).
+fn btn_compact(ui: &mut egui::Ui, role: Role, icon: Option<&str>, label: &str) -> egui::Response {
+    let text = match icon {
+        Some(icon) => format!("{icon}  {label}"),
+        None => label.to_owned(),
+    };
+    styled_button(ui, role, RichText::new(text).size(FS_SMALL), vec2(0.0, 28.0))
+}
+
+/// Кнопка строки статуса (24 px, внутренний отступ 3 px): 18 px по высоте, подпись мелкая.
+fn btn_bar(ui: &mut egui::Ui, role: Role, icon: Option<&str>, label: &str) -> egui::Response {
+    let text = match icon {
+        Some(icon) => format!("{icon}  {label}"),
+        None => label.to_owned(),
+    };
+    styled_button(ui, role, RichText::new(text).size(FS_CAPTION), vec2(0.0, 18.0))
+}
+
 /// Иконка-only кнопка с подсказкой (компактные места: тулбар панелей, заголовки карточек).
 fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
     let pal = theme_colors(ui.ctx().theme());
@@ -6221,6 +6289,19 @@ fn extract_document_structure(path: &Path) -> Result<(Vec<DocBlock>, usize), Str
 }
 
 // ── вспомогательная отрисовка ────────────────────────────────────────────────
+
+/// Текст для показа в таблицах структуры: U+FFFC (OBJECT REPLACEMENT CHARACTER) — якорь
+/// inline-объекта WordCraft, а не печатный символ. Ни один шрифт WordCraft (Inter, Source*)
+/// его не содержит, и egui рисует квадратик. Удаляется только при отображении: данные
+/// документа и `cached` вставок не меняются.
+fn display_text(s: &str) -> String {
+    s.replace('\u{FFFC}', "")
+}
+
+/// Внутренний отступ ячейки таблицы: текст не прилипает к левой границе строки/полосы.
+fn pad_cell<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new().inner_margin(Margin { left: 8, right: 8, top: 4, bottom: 4 }).show(ui, add).inner
+}
 
 /// Обрезать строку до `max` символов, добавив многоточие.
 fn ellipsize(s: &str, max: usize) -> String {
@@ -7656,5 +7737,177 @@ mod docview_tests {
         app.demo_set_theme("light (позже)");
         assert_eq!(app.app_settings.theme, "dark");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Инварианты оболочки после переноса кнопок и меню (фаза P4, дефекты оформления):
+/// RDE-панель и меню только в DocView, все пункты меню доступны, «Обновить всё» — на всех
+/// вкладках, и строки таблиц структуры/вставок покрыты шрифтами.
+#[cfg(test)]
+mod shell_tests {
+    use super::{DocMode, RdeApp, Tab};
+    use egui_kittest::kittest::Queryable;
+
+    /// Вьюер-харнесс без wgpu: достаточно дерева доступности (подписи, меню).
+    fn render(app: RdeApp) -> egui_kittest::Harness<'static, RdeApp> {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness
+    }
+
+    /// Пункты меню → подписи (как в `menu_bar`). Меню «Файл/Правка/…» открывается кликом.
+    const MENUS: &[(&str, &[&str])] = &[
+        ("Файл", &["Новый проект…", "Открыть проект…", "Экспорт .docx", "Экспорт проекта (.rde.zip)"]),
+        ("Правка", &["Отменить", "Повторить", "Найти в проекте…"]),
+        (
+            "Документ",
+            &[
+                "Вставить значение артефакта…",
+                "Вставить рисунок из артефакта…",
+                "Вставить таблицу из CSV-выхода…",
+                "Вставить константу проекта…",
+                "Вставить перекрёстную ссылку на рисунок/таблицу…",
+                "Вставить цитату на источник…",
+                "Вставить дату…",
+                "Обновить документ (вставки/подписи, транзакция)",
+                "Откатить обновление документа",
+            ],
+        ),
+        (
+            "Проект",
+            &[
+                "Проверить и починить…",
+                "Обновить все артефакты",
+                "Настройки проекта…",
+                "Настройки приложения…",
+                "Экспорт диагностики…",
+                "Git: инициализировать репозиторий",
+                "Git: закоммитить изменения…",
+                "Git: история…",
+                "Сделать бэкап проекта (zip)",
+                "Бэкапы проекта: список/восстановить…",
+                "Откатить последнее обновление артефактов",
+            ],
+        ),
+        ("Вид", &["Дерево проекта", "Панель агента", "Журнал и задачи", "Инспектор объекта"]),
+        ("Агент", &["Аудит действий…"]),
+        ("Помощь", &["О прототипе"]),
+    ];
+
+    #[test]
+    fn rde_panel_and_menu_only_in_docview() {
+        for (mode, expect) in [(DocMode::DocView, true), (DocMode::Full, false), (DocMode::Preview, false)] {
+            let mut app = RdeApp::new(rde_core::demo());
+            app.doc_mode = mode;
+            app.tab = Tab::Document;
+            let harness = render(app);
+            let menu = harness.query_by_label("Файл").is_some();
+            let panel = harness.query_by_label_contains("Сохранить проект").is_some();
+            assert_eq!(menu, expect, "меню «Файл» видно только в DocView");
+            assert_eq!(panel, expect, "кнопки RDE-панели видны только в DocView");
+        }
+    }
+
+    #[test]
+    fn docview_menu_exposes_every_item() {
+        let mut app = RdeApp::new(rde_core::demo());
+        app.doc_mode = DocMode::DocView;
+        app.tab = Tab::Document;
+        let mut harness = render(app);
+        for (title, items) in MENUS {
+            // Подпись может совпадать с вкладкой журнала («Агент»): открываем кнопку меню,
+            // т.е. первый узел, после клика которого появляются пункты.
+            let candidates = harness.query_all_by_label(title).count();
+            assert!(candidates >= 1, "меню «{title}» не найдено");
+            'nodes: for index in 0..candidates {
+                // Две попытки: первый клик может лишь закрыть предыдущее открытое меню.
+                for _attempt in 0..2 {
+                    harness.query_all_by_label(title).nth(index).expect("узел меню").click();
+                    for _ in 0..3 {
+                        harness.step();
+                    }
+                    if items.iter().all(|item| harness.query_by_label(item).is_some()) {
+                        break 'nodes;
+                    }
+                    harness.key_press(egui::Key::Escape);
+                    harness.step();
+                }
+            }
+            for item in items.iter() {
+                assert!(harness.query_by_label(item).is_some(), "пункт меню «{title}» не найден: {item}");
+            }
+        }
+    }
+
+    #[test]
+    fn update_all_is_available_on_every_tab() {
+        for tab in Tab::ALL {
+            let mut app = RdeApp::new(rde_core::demo());
+            app.tab = tab;
+            app.doc_mode = DocMode::Preview;
+            let harness = render(app);
+            assert!(harness.query_by_label_contains("Обновить всё").is_some(), "«Обновить всё» отсутствует на вкладке");
+        }
+    }
+
+    /// Эталон WordCraft (им подменяются шрифты оболочки после открытия редактора).
+    static WORDCRAFT_INTER: &[u8] = include_bytes!("../../../vendor/wordcraft/assets/fonts/Inter-Regular.ttf");
+
+    fn missing_glyphs(text: &str, data: &[u8]) -> Vec<char> {
+        let face = ttf_parser::Face::parse(data, 0).expect("шрифт разбирается");
+        let mut missing: Vec<char> = text.chars().filter(|c| !c.is_whitespace() && face.glyph_index(*c).is_none()).collect();
+        missing.sort_unstable();
+        missing.dedup();
+        missing
+    }
+
+    /// Все строки таблиц структуры и формата вставок должны рисоваться без «квадратиков»:
+    /// каждый символ есть и в шрифтах RDE, и в WordCraft-эталоне (Inter).
+    #[test]
+    fn structure_and_insert_strings_have_glyphs() {
+        let mut strings: Vec<String> = Vec::new();
+        // Форматы вставок (R-DOC-11) × типичные значения.
+        for format in ["auto", "raw", "int", "dec:2", "dec:4", "sci:3", "percent:1"] {
+            for raw in ["-7.598e-4", "1234.5", "0.5", "2.5e10", "0"] {
+                strings.push(rde_doc::format_value(raw, format));
+            }
+        }
+        // Подписи таблиц структуры (заголовки и метки типов).
+        for text in ["№", "тип", "стиль", "путь (block)", "содержимое", "Блоки документа", "FIG·1", "CAP", "H1", "—", "клик по блоку — выбрать документ"] {
+            strings.push(text.to_owned());
+        }
+        // Реальные строки демо-документа: блоки и живые вставки.
+        let project = rde_core::load_project(&rde_core::demo_project_dir()).unwrap();
+        let path = project.document_path().expect("документ");
+        let (blocks, _) = super::extract_document_structure(&path).expect("разобрать .doc.rde");
+        for block in &blocks {
+            strings.push(super::display_text(&block.text));
+            strings.push(super::display_text(&block.style));
+        }
+        let inserts = rde_doc::load_rde_doc(&path).expect("rde:doc").inserts;
+        assert!(!inserts.is_empty(), "в демо-документе должны быть вставки");
+        for insert in &inserts {
+            strings.push(super::display_text(&insert.cached));
+        }
+        for text in &strings {
+            // Якорь inline-объекта не печатается и не должен попадать в вывод.
+            assert!(!text.contains('\u{FFFC}'), "U+FFFC в выводе: {text:?}");
+            for data in [super::VENDORED_SANS, super::VENDORED_MONO, WORDCRAFT_INTER] {
+                let missing = missing_glyphs(text, data);
+                assert!(missing.is_empty(), "нет глифов {missing:?} в строке {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn display_text_strips_only_object_anchor() {
+        assert_eq!(super::display_text("Среднее значение x1: \u{FFFC}-7.598·10^-4\u{FFFC}"), "Среднее значение x1: -7.598·10^-4");
+        assert_eq!(super::display_text("\u{FFFC}"), "");
+        assert_eq!(super::display_text("FIG·1 — σ"), "FIG·1 — σ");
     }
 }

@@ -26,3 +26,5 @@ toml = { workspace = true }
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu"] }
 rde-docx = { workspace = true }
+# Проверка глифов строк таблиц (тест structure_and_insert_strings_have_glyphs); версия как в Cargo.lock.
+ttf-parser = "0.25"
