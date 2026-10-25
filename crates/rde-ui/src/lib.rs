@@ -4928,7 +4928,7 @@ impl RdeApp {
         let mut clicked_node: Option<String> = None;
         egui::ScrollArea::horizontal()
             .id_salt("rde_dag_scroll")
-            .auto_shrink([false, false])
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(content_w, dag_height), Sense::hover());
                 let painter = ui.painter_at(rect);
