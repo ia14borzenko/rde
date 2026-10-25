@@ -149,7 +149,11 @@ fn baseline_name(path: &str) -> String {
         .to_owned()
 }
 
-/// Хеш входа-ссылки (артефакт/заметка/источник). Файлы обрабатываются в [`activation`].
+/// Хеш входа-ссылки (артефакт/заметка/источник/константы). Файлы обрабатываются в [`activation`].
+///
+/// Для входа-артефакта по §7.2 берётся `out_hash` зависимости из ledger; если ledger пуст
+/// (data-артефакт, который не запускается) — хеш фактического файла или Merkle-дерево
+/// совпавших файлов glob-селектора.
 fn input_hash(
     project: &Project,
     ledger: &HashMap<String, ArtifactState>,
@@ -158,7 +162,7 @@ fn input_hash(
     match input {
         InputSpec::Artifact { artifact, selector } => {
             let dep = object(project, artifact)?;
-            if selector.is_empty() {
+            if selector.trim().is_empty() {
                 return Err(format!("у входа `{artifact}` не задан selector"));
             }
             if selector.starts_with("out/") {
@@ -170,11 +174,22 @@ fn input_hash(
                     }
                 }
             }
-            let path = dep.dir.join(selector);
-            match hash_file(&path) {
-                Some(hash) => Ok((artifact.clone(), hash)),
-                None => Ok((artifact.clone(), missing_hash(&format!("{artifact}/{selector}")))),
+            // Отсутствующий вход не делает артефакт «невычислимым»: он получает sentinel-хеш,
+            // а «устарел/не запускался» определяется статусом (см. §7.3 п.2).
+            let Ok(matches) = rde_core::expand_selector(&dep.dir, selector) else {
+                return Ok((artifact.clone(), missing_hash(&format!("{artifact}/{selector}"))));
+            };
+            if matches.len() == 1 {
+                let bytes = fs::read(&matches[0].path).map_err(|e| format!("прочитать вход {}: {e}", matches[0].rel))?;
+                return Ok((artifact.clone(), sha256(&bytes)));
             }
+            // Glob-селектор: идентичность набора файлов — Merkle-дерево (детерминированно).
+            let mut entries = Vec::with_capacity(matches.len());
+            for matched in &matches {
+                let bytes = fs::read(&matched.path).map_err(|e| format!("прочитать вход {}: {e}", matched.rel))?;
+                entries.push(TreeEntry::new(matched.rel.clone(), 0o644, sha256(&bytes)));
+            }
+            Ok((artifact.clone(), tree_hash(&entries)))
         }
         InputSpec::File { file } => Ok((format!("file:{file}"), missing_hash(&format!("file:{file}")))),
         InputSpec::Note { note } => {
@@ -198,6 +213,32 @@ fn input_hash(
                 Err(format!("{source} — не источник"))
             }
         }
+        InputSpec::Constants { constants, selector } => {
+            let target = object(project, constants)?;
+            let ObjectData::Artifact(manifest) = &target.data else {
+                return Err(format!("{constants} — не набор констант"));
+            };
+            if manifest.kind != "constants" {
+                return Err(format!("{constants} — не набор констант (type={})", manifest.kind));
+            }
+            let value = constants_value(manifest, selector)?;
+            let json = rde_hash::canonical_json(&value)?;
+            Ok((format!("constants:{constants}"), sha256(json.as_bytes())))
+        }
+    }
+}
+
+/// JSON-значение констант: весь набор или одна величина (`selector`).
+fn constants_value(manifest: &rde_core::ArtifactManifest, selector: &str) -> Result<serde_json::Value, String> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        serde_json::to_value(&manifest.values).map_err(|e| format!("константы: {e}"))
+    } else {
+        let value = manifest
+            .values
+            .get(selector)
+            .ok_or_else(|| format!("константа `{selector}` не найдена"))?;
+        serde_json::to_value(value).map_err(|e| format!("константа `{selector}`: {e}"))
     }
 }
 
@@ -233,6 +274,7 @@ pub fn activation(
                 InputSpec::File { file } => file.clone(),
                 InputSpec::Note { note } => note.clone(),
                 InputSpec::Source { source } => source.clone(),
+                InputSpec::Constants { selector, .. } => selector.clone(),
             };
             members.push(GroupMember { target, out: hash, selector });
         }
@@ -424,52 +466,74 @@ impl UpdateReport {
     }
 }
 
-/// Построить `RunSpec` артефакта: входы hashed-групп → `inputs/<basename>`, объявленные выходы.
+/// Построить `RunSpec` артефакта: входы hashed-групп материализуются в `inputs/...`.
+///
+/// - файл проекта → `inputs/<basename>`;
+/// - выход другого артефакта: selector-файл → `inputs/<basename>`, glob → все совпавшие файлы;
+/// - константы → сгенерированный `inputs/constants.json` / `inputs/constant-<имя>.json`;
+/// - заметка/источник → `inputs/<basename>`.
 fn build_spec(project: &Project, artifact: &ArtifactManifest) -> Result<RunSpec, String> {
     let artifact_object = object(project, &artifact.id)?;
     let runtime = artifact.runtime.as_ref().ok_or_else(|| "нет runtime".to_owned())?;
     let mut inputs = Vec::new();
     let mut used_names: BTreeSet<String> = BTreeSet::new();
-    for group in artifact.groups.iter().filter(|group| group.mode == "hashed") {
-        for input in &group.inputs {
-            let (source, rel_name) = match input {
-                InputSpec::File { file } => (artifact_object.dir.join(file), file.clone()),
-                InputSpec::Artifact { artifact: dep_id, selector } => {
-                    if selector.is_empty() {
-                        return Err(format!("у входа `{dep_id}` пустой selector"));
-                    }
-                    let dep = object(project, dep_id)?;
-                    (dep.dir.join(selector), selector.clone())
-                }
-                InputSpec::Note { note } => {
-                    let note_object = object(project, note)?;
-                    if let ObjectData::Note(manifest) = &note_object.data {
-                        (note_object.dir.join(&manifest.file), manifest.file.clone())
-                    } else {
-                        return Err(format!("{note} — не заметка"));
-                    }
-                }
-                InputSpec::Source { source } => {
-                    let source_object = object(project, source)?;
-                    if let ObjectData::Source(manifest) = &source_object.data {
-                        let file = manifest.file.clone().unwrap_or_else(|| manifest.url.clone().unwrap_or_default());
-                        if file.is_empty() {
-                            return Err(format!("источник {source} без файла/URL — нельзя подать в скрипт"));
-                        }
-                        (source_object.dir.join(&file), file)
-                    } else {
-                        return Err(format!("{source} — не источник"));
-                    }
-                }
-            };
-            let mut name = baseline_name(&rel_name);
-            let mut counter = 1;
-            while used_names.contains(&name) {
-                name = format!("{counter}-{}", baseline_name(&rel_name));
-                counter += 1;
+    for (_, input) in artifact.hashed_inputs() {
+        match input {
+            InputSpec::File { file } => {
+                let name = unique_input_name(&mut used_names, baseline_name(file));
+                inputs.push(InputFile::new(artifact_object.dir.join(file), format!("inputs/{name}")));
             }
-            used_names.insert(name.clone());
-            inputs.push(InputFile::new(source, format!("inputs/{name}")));
+            InputSpec::Artifact { artifact: dep_id, selector } => {
+                if selector.trim().is_empty() {
+                    return Err(format!("у входа `{dep_id}` пустой selector"));
+                }
+                let dep = object(project, dep_id)?;
+                let matches = rde_core::expand_selector(&dep.dir, selector)?;
+                for matched in matches {
+                    let name = unique_input_name(&mut used_names, baseline_name(&matched.rel));
+                    inputs.push(InputFile::new(matched.path, format!("inputs/{name}")));
+                }
+            }
+            InputSpec::Note { note } => {
+                let note_object = object(project, note)?;
+                if let ObjectData::Note(manifest) = &note_object.data {
+                    let name = unique_input_name(&mut used_names, baseline_name(&manifest.file));
+                    inputs.push(InputFile::new(note_object.dir.join(&manifest.file), format!("inputs/{name}")));
+                } else {
+                    return Err(format!("{note} — не заметка"));
+                }
+            }
+            InputSpec::Source { source } => {
+                let source_object = object(project, source)?;
+                if let ObjectData::Source(manifest) = &source_object.data {
+                    let file = manifest.file.clone().unwrap_or_else(|| manifest.url.clone().unwrap_or_default());
+                    if file.is_empty() {
+                        return Err(format!("источник {source} без файла/URL — нельзя подать в скрипт"));
+                    }
+                    let name = unique_input_name(&mut used_names, baseline_name(&file));
+                    inputs.push(InputFile::new(source_object.dir.join(&file), format!("inputs/{name}")));
+                } else {
+                    return Err(format!("{source} — не источник"));
+                }
+            }
+            InputSpec::Constants { constants, selector } => {
+                let target = object(project, constants)?;
+                let ObjectData::Artifact(manifest) = &target.data else {
+                    return Err(format!("{constants} — не набор констант"));
+                };
+                if manifest.kind != "constants" {
+                    return Err(format!("{constants} — не набор констант (type={})", manifest.kind));
+                }
+                let value = constants_value(manifest, selector)?;
+                let bytes = serde_json::to_vec_pretty(&value).map_err(|e| format!("константы: {e}"))?;
+                let selector = selector.trim();
+                let name = if selector.is_empty() {
+                    unique_input_name(&mut used_names, "constants.json".to_owned())
+                } else {
+                    unique_input_name(&mut used_names, format!("constant-{}.json", sanitize_name(selector)))
+                };
+                inputs.push(InputFile::from_bytes(format!("inputs/{name}"), bytes));
+            }
         }
     }
     if artifact.outputs.is_empty() {
@@ -485,6 +549,28 @@ fn build_spec(project: &Project, artifact: &ArtifactManifest) -> Result<RunSpec,
         timeout: artifact.timeout_s.map(Duration::from_secs),
         env: BTreeMap::new(),
     })
+}
+
+/// Уникальное имя входа в `inputs/` (коллизии базовых имён получают числовой префикс).
+fn unique_input_name(used: &mut BTreeSet<String>, name: String) -> String {
+    if used.insert(name.clone()) {
+        return name;
+    }
+    let mut counter = 1;
+    loop {
+        let candidate = format!("{counter}-{name}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
+/// Безопасное имя файла для селектора константы (`R_н` → `R_н`).
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| if ch.is_alphanumeric() || ch == '_' || ch == '-' || ch == '.' { ch } else { '_' })
+        .collect()
 }
 
 fn state_from_outcome(artifact: &ArtifactManifest, outcome: &RunOutcome, act_key: Hash, entries: &[TreeEntry]) -> ArtifactState {

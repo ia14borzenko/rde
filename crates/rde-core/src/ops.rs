@@ -216,7 +216,84 @@ pub fn create_object(root: &Path, request: &CreateRequest) -> Result<PathBuf, St
         let _ = fs::remove_dir_all(&dir);
         return Err(error);
     }
+    // R-ART-01: у артефакта есть readme и собственный .gitignore (выходы не коммитятся).
+    if matches!(
+        request.kind,
+        NewObjectKind::ComputeArtifact | NewObjectKind::DataArtifact | NewObjectKind::ConstantsArtifact
+    ) {
+        if let Err(error) = write_artifact_scaffold(&dir, request.kind, title) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(error);
+        }
+    }
     Ok(dir)
+}
+
+/// readme.md + `.gitignore` (+ `out/.gitignore`) артефакта: R-ART-01, R-VCS-02.
+fn write_artifact_scaffold(dir: &Path, kind: NewObjectKind, title: &str) -> Result<(), String> {
+    let (type_line, run_line) = match kind {
+        NewObjectKind::ComputeArtifact => (
+            "compute — скрипт, запускаемый RDE; выходы объявлены в artifact.toml",
+            "Входы hashed-групп материализуются в `inputs/`, скрипт запускается в изолированном рабочем каталоге; выходы объявляются в `artifact.toml`.",
+        ),
+        NewObjectKind::DataArtifact => (
+            "data — статические входные данные проекта",
+            "Файлы данных лежат в `inputs/` и входят в `in_hash` как hashed-группа.",
+        ),
+        _ => (
+            "constants — типизированные значения проекта (без скрипта)",
+            "Значения задаются в `artifact.toml` (`[values.<имя>]`) и доступны документам и другим артефактам как вход `{ constants = \"<id>\" }`.",
+        ),
+    };
+    let readme = format!(
+        "# {title}\n\nТип: {type_line}.\n\n{run_line}\n\nМанифест: `artifact.toml`.\n"
+    );
+    fs::write(dir.join("readme.md"), readme).map_err(|e| format!("создать readme.md: {e}"))?;
+    // Выходы не коммитятся: их идентичность фиксирует out_hash в artifact.toml (R-VCS-02).
+    let gitignore = "out/*\n!out/.gitignore\n__pycache__/\n*.pyc\n.rde-tmp*\n";
+    fs::write(dir.join(".gitignore"), gitignore).map_err(|e| format!("создать .gitignore: {e}"))?;
+    if matches!(kind, NewObjectKind::ComputeArtifact) {
+        fs::create_dir_all(dir.join("out")).map_err(|e| format!("создать out/: {e}"))?;
+        fs::write(dir.join("out/.gitignore"), "").map_err(|e| format!("создать out/.gitignore: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Записать `out_hash` последнего успешного обновления в `artifact.toml`, не трогая остальной
+/// файл (комментарии и порядок сохраняются): ключ верхнего уровня, вставляется перед первой
+/// таблицей `[...]` или заменяет существующий. `out_hash` — идентичность выходов для git (R-VCS-02).
+pub fn record_artifact_out_hash(artifact_dir: &Path, out_hash: &str) -> Result<(), String> {
+    let path = artifact_dir.join("artifact.toml");
+    let text = fs::read_to_string(&path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
+    let new_line = format!("out_hash = {}", toml_string(out_hash));
+    let mut lines: Vec<String> = Vec::new();
+    let mut replaced = false;
+    let mut inserted = false;
+    for line in text.lines() {
+        let top_level = !line.starts_with(' ') && !line.starts_with('\t');
+        let key = line.split('=').next().map(str::trim).unwrap_or("");
+        if top_level && key == "out_hash" {
+            if !replaced {
+                lines.push(new_line.clone());
+                replaced = true;
+            } else {
+                // Повторяющийся ключ TOML не допускает — старую строку убираем.
+            }
+            continue;
+        }
+        if !replaced && !inserted && top_level && line.starts_with('[') {
+            lines.push(new_line.clone());
+            inserted = true;
+        }
+        lines.push(line.to_owned());
+    }
+    if !replaced && !inserted {
+        lines.push(new_line);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    fs::write(&path, out).map_err(|e| format!("записать {}: {e}", path.display()))?;
+    validate_manifest(ManifestKind::Artifact, &path)
 }
 
 /// Создать минимальный проект RDE (rde.toml + каталоги objects/**).
@@ -445,6 +522,55 @@ mod tests {
         assert!(root.join(format!(".rde/trash/{}-{id}.meta.json", trash.file_name().unwrap().to_string_lossy().split('-').next().unwrap())).exists() || trash.parent().unwrap().read_dir().unwrap().count() >= 2);
         let project = load_project(&root).unwrap();
         assert!(project.objects.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn artifacts_get_readme_and_gitignore() {
+        let root = minimal_project("scaffold");
+        let compute = create_object(&root, &CreateRequest { kind: NewObjectKind::ComputeArtifact, title: "Расчёт".into() }).unwrap();
+        assert!(compute.join("readme.md").is_file());
+        let ignore = fs::read_to_string(compute.join(".gitignore")).unwrap();
+        assert!(ignore.contains("out/*"), "выходы не коммитятся: {ignore}");
+        assert!(compute.join("out/.gitignore").is_file());
+        let data = create_object(&root, &CreateRequest { kind: NewObjectKind::DataArtifact, title: "Данные".into() }).unwrap();
+        assert!(data.join("readme.md").is_file());
+        assert!(data.join(".gitignore").is_file());
+        // Проект после появления readme/.gitignore загружается без issues.
+        let project = load_project(&root).unwrap();
+        assert!(project.issues.is_empty(), "{:?}", project.issues);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn record_out_hash_keeps_manifest_text_and_roundtrips() {
+        let root = minimal_project("outhash");
+        let dir = create_object(&root, &CreateRequest { kind: NewObjectKind::ComputeArtifact, title: "Расчёт".into() }).unwrap();
+        let path = dir.join("artifact.toml");
+        // Добавим комментарий, который не должен потеряться.
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("# комментарий пользователя\n{original}")).unwrap();
+        let hash = "ab".repeat(32);
+        record_artifact_out_hash(&dir, &hash).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# комментарий пользователя"), "комментарии сохраняются");
+        assert!(text.contains(&format!("out_hash = \"{hash}\"")));
+        // Ключ верхнего уровня должен стоять до первой таблицы.
+        let out_pos = text.find("out_hash").unwrap();
+        let table_pos = text.find("\n[").unwrap();
+        assert!(out_pos < table_pos, "out_hash до первой таблицы:\n{text}");
+        // Повторная запись заменяет, а не дублирует.
+        let hash2 = "cd".repeat(32);
+        record_artifact_out_hash(&dir, &hash2).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("out_hash").count(), 1, "{text}");
+        assert!(text.contains(&format!("out_hash = \"{hash2}\"")));
+        // Загрузка проекта видит out_hash.
+        let project = load_project(&root).unwrap();
+        assert!(project.issues.is_empty(), "{:?}", project.issues);
+        let artifact = project.artifact_object(&project.objects[0].id).unwrap();
+        let crate::ObjectData::Artifact(manifest) = &artifact.data else { panic!() };
+        assert_eq!(manifest.out_hash.as_deref(), Some(hash2.as_str()));
         let _ = fs::remove_dir_all(&root);
     }
 }

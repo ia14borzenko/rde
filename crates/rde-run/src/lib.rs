@@ -47,15 +47,24 @@ impl RuntimeKind {
 }
 
 /// Вход, материализуемый в workdir: источник и относительный путь назначения.
+///
+/// Вход бывает файлом проекта (`source`) или сгенерированным содержимым (`inline`) — так
+/// материализуются константы проекта и другие вычисляемые входы (R-ART-09).
 #[derive(Clone, Debug)]
 pub struct InputFile {
     pub source: PathBuf,
     pub dest: String,
+    pub inline: Option<Vec<u8>>,
 }
 
 impl InputFile {
     pub fn new(source: impl Into<PathBuf>, dest: impl Into<String>) -> Self {
-        Self { source: source.into(), dest: dest.into() }
+        Self { source: source.into(), dest: dest.into(), inline: None }
+    }
+
+    /// Вход из сгенерированного содержимого (например, JSON констант проекта).
+    pub fn from_bytes(dest: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self { source: PathBuf::new(), dest: dest.into(), inline: Some(bytes.into()) }
     }
 }
 
@@ -137,10 +146,21 @@ pub fn run(project_root: &Path, spec: &RunSpec, cancel: Option<Arc<AtomicBool>>)
     let entry_dst = work_dir.join(&spec.entry);
     copy_file(&entry_src, &entry_dst).map_err(|e| format!("скопировать скрипт: {e}"))?;
     for input in &spec.inputs {
-        if !input.source.is_file() {
-            return Ok(spawn_error(&run_id, &run_dir, &work_dir, &stdout_log, &stderr_log, 0, format!("вход не найден: {}", input.source.display())));
+        let dest = work_dir.join(&input.dest);
+        match &input.inline {
+            Some(bytes) => {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| format!("создать каталог входа {}: {e}", input.dest))?;
+                }
+                fs::write(&dest, bytes).map_err(|e| format!("записать вход {}: {e}", input.dest))?;
+            }
+            None => {
+                if !input.source.is_file() {
+                    return Ok(spawn_error(&run_id, &run_dir, &work_dir, &stdout_log, &stderr_log, 0, format!("вход не найден: {}", input.source.display())));
+                }
+                copy_file(&input.source, &dest).map_err(|e| format!("скопировать вход {}: {e}", input.dest))?;
+            }
         }
-        copy_file(&input.source, &work_dir.join(&input.dest)).map_err(|e| format!("скопировать вход {}: {e}", input.dest))?;
     }
 
     let runtime = RuntimeKind::from_kind(&spec.runtime)?;

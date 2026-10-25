@@ -201,12 +201,13 @@ impl Project {
             .filter(|o| matches!(o.data, ObjectData::Source(_)))
     }
 
-    /// Рёбра DAG: [(источник, зависимый)] по `hashed`-группам артефактов.
+    /// Рёбра DAG: [(источник, зависимый)] только по `hashed`-группам артефактов.
+    /// `ref`-группы связаны, но не входят в топосортировку/каскад (tz-02 §7.3 п.1/п.4).
     pub fn dag_edges(&self) -> Vec<(String, String)> {
         let mut edges = Vec::new();
         for object in &self.objects {
             let ObjectData::Artifact(a) = &object.data else { continue };
-            for group in &a.groups {
+            for group in a.groups.iter().filter(|group| group.is_hashed()) {
                 for input in &group.inputs {
                     if let manifest::InputSpec::Artifact { artifact, .. } = input {
                         if self.artifact_object(artifact).is_some() {
@@ -218,6 +219,143 @@ impl Project {
         }
         edges
     }
+
+    /// Цикл в `hashed`-графе артефактов: цепочка id `[A, B, ..., A]` или `None`.
+    ///
+    /// Цикл — ошибка проекта (tz-02 §7.3 п.3): обнаружение выполняется при загрузке и при
+    /// сохранении манифеста; здесь — общая функция для загрузчика и DAG-слоя.
+    pub fn dag_cycle(&self) -> Option<Vec<String>> {
+        let ids: Vec<String> = self
+            .objects
+            .iter()
+            .filter(|object| matches!(object.data, ObjectData::Artifact(_)))
+            .map(|object| object.id.clone())
+            .collect();
+        let edges: Vec<(String, String)> = self
+            .dag_edges()
+            .into_iter()
+            .filter(|(from, to)| ids.contains(from) && ids.contains(to))
+            .collect();
+        find_cycle(&ids, &edges).map(|chain| chain.into_iter().map(|index| ids[index].clone()).collect())
+    }
+
+    /// Названия артефактов в цепочке цикла (для сообщения пользователю).
+    pub fn dag_cycle_titles(&self) -> Option<Vec<String>> {
+        let chain = self.dag_cycle()?;
+        Some(
+            chain
+                .into_iter()
+                .map(|id| self.object(&id).map(|object| object.title.clone()).unwrap_or(id))
+                .collect(),
+        )
+    }
+}
+
+/// Найти цикл в ориентированном графе (DFS-раскраска). Возвращает цепочку индексов вида
+/// `[a, b, a]`, где `a` — замыкающий узел. Порядок обхода детерминирован (индексы по порядку).
+fn find_cycle(nodes: &[String], edges: &[(String, String)]) -> Option<Vec<usize>> {
+    let index: std::collections::HashMap<&str, usize> =
+        nodes.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (from, to) in edges {
+        let (Some(&from), Some(&to)) = (index.get(from.as_str()), index.get(to.as_str())) else { continue };
+        adjacency[from].push(to);
+    }
+    for list in &mut adjacency {
+        list.sort_unstable();
+        list.dedup();
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        New,
+        Visiting,
+        Done,
+    }
+    fn visit(
+        node: usize,
+        adjacency: &[Vec<usize>],
+        state: &mut [State],
+        stack: &mut Vec<usize>,
+    ) -> Option<Vec<usize>> {
+        state[node] = State::Visiting;
+        stack.push(node);
+        for &next in &adjacency[node] {
+            match state[next] {
+                State::New => {
+                    if let Some(chain) = visit(next, adjacency, state, stack) {
+                        return Some(chain);
+                    }
+                }
+                State::Visiting => {
+                    // Цикл: от первого вхождения `next` в стек до текущей вершины + замыкание.
+                    let start = stack.iter().position(|&n| n == next).unwrap_or(0);
+                    let mut chain = stack[start..].to_vec();
+                    chain.push(next);
+                    return Some(chain);
+                }
+                State::Done => {}
+            }
+        }
+        stack.pop();
+        state[node] = State::Done;
+        None
+    }
+    let mut state = vec![State::New; nodes.len()];
+    for node in 0..nodes.len() {
+        if state[node] == State::New {
+            let mut stack = Vec::new();
+            if let Some(chain) = visit(node, &adjacency, &mut state, &mut stack) {
+                return Some(chain);
+            }
+        }
+    }
+    None
+}
+
+/// Топологический порядок (Кан): зависимость раньше зависимого. Узлы из циклов (если они есть —
+/// загрузчик уже сообщил о них) добавляются в конце в порядке id, чтобы дерево всё равно строилось.
+fn topological_order(nodes: &[String], edges: &[(String, String)]) -> Vec<usize> {
+    let index: std::collections::HashMap<&str, usize> =
+        nodes.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+    let mut indegree = vec![0usize; nodes.len()];
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (from, to) in edges {
+        let (Some(&from), Some(&to)) = (index.get(from.as_str()), index.get(to.as_str())) else { continue };
+        adjacency[from].push(to);
+        indegree[to] += 1;
+    }
+    for list in &mut adjacency {
+        list.sort_unstable();
+        list.dedup();
+    }
+    let mut queue: Vec<usize> = indegree
+        .iter()
+        .enumerate()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(i, _)| i)
+        .collect();
+    queue.sort_unstable();
+    let mut order = Vec::with_capacity(nodes.len());
+    let mut cursor = 0;
+    while cursor < queue.len() {
+        let node = queue[cursor];
+        cursor += 1;
+        order.push(node);
+        for &next in &adjacency[node] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                queue.push(next);
+            }
+        }
+    }
+    if order.len() != nodes.len() {
+        for (i, degree) in indegree.iter().enumerate() {
+            if *degree > 0 && !order.contains(&i) {
+                order.push(i);
+            }
+        }
+    }
+    order
 }
 
 /// Загрузить проект из каталога. Фатальные ошибки `rde.toml` — `Err`; проблемы объектов —
@@ -470,46 +608,32 @@ impl LoadCtx<'_> {
                 }
             }
         }
-        // Топологический порядок: зависимость раньше зависимого; циклы — issue, порядок как есть.
+        // Топологический порядок по hashed-рёбрам (ref-рёбра исключены, tz-02 §7.3 п.4);
+        // цикл — issue с цепочкой, порядок для участников цикла остаётся условным.
         let ids: Vec<String> = loaded.iter().map(|(m, _)| m.id.clone()).collect();
-        let mut order: Vec<usize> = Vec::new();
-        let mut state = vec![0u8; loaded.len()]; // 0 = new, 1 = visiting, 2 = done
-        fn visit(
-            i: usize,
-            loaded: &[(ArtifactManifest, PathBuf)],
-            ids: &[String],
-            state: &mut Vec<u8>,
-            order: &mut Vec<usize>,
-            cycle: &mut bool,
-        ) {
-            match state[i] {
-                2 => return,
-                1 => {
-                    *cycle = true;
-                    return;
-                }
-                _ => {}
-            }
-            state[i] = 1;
-            for group in &loaded[i].0.groups {
-                for input in &group.inputs {
-                    if let manifest::InputSpec::Artifact { artifact, .. } = input {
-                        if let Some(j) = ids.iter().position(|id| id == artifact) {
-                            visit(j, loaded, ids, state, order, cycle);
+        let edges: Vec<(String, String)> = {
+            let mut edges = Vec::new();
+            for (m, _) in &loaded {
+                for group in m.groups.iter().filter(|group| group.is_hashed()) {
+                    for input in &group.inputs {
+                        if let manifest::InputSpec::Artifact { artifact, .. } = input {
+                            if ids.iter().any(|id| id == artifact) {
+                                edges.push((artifact.clone(), m.id.clone()));
+                            }
                         }
                     }
                 }
             }
-            state[i] = 2;
-            order.push(i);
+            edges
+        };
+        if let Some(chain) = find_cycle(&ids, &edges) {
+            let titles: Vec<String> = chain
+                .iter()
+                .map(|&index| loaded[index].0.title.clone())
+                .collect();
+            self.issue(&dir, format!("цикл в hashed-зависимостях: {}", titles.join(" → ")));
         }
-        let mut cycle = false;
-        for i in 0..loaded.len() {
-            visit(i, &loaded, &ids, &mut state, &mut order, &mut cycle);
-        }
-        if cycle {
-            self.issue(&dir, "цикл в hashed-зависимостях артефактов (порядок условный)");
-        }
+        let order = topological_order(&ids, &edges);
         for i in order {
             let (m, object_dir) = loaded[i].clone();
             let object = self.artifact_object(m, &object_dir);
@@ -566,8 +690,11 @@ impl LoadCtx<'_> {
     }
 }
 
+/// Проверить наличие `hashed`-входов артефакта (ref-группы не влияют на свежесть, §7.3 п.1).
+/// Селекторы раскрываются как путь или glob (см. [`crate::selector`]).
 fn inputs_present(m: &ArtifactManifest, dir: &Path, objects: &[Object]) -> (bool, String) {
-    for group in &m.groups {
+    let find = |id: &str| objects.iter().find(|object| object.id == id);
+    for group in m.groups.iter().filter(|group| group.is_hashed()) {
         for input in &group.inputs {
             match input {
                 manifest::InputSpec::File { file } => {
@@ -576,22 +703,57 @@ fn inputs_present(m: &ArtifactManifest, dir: &Path, objects: &[Object]) -> (bool
                     }
                 }
                 manifest::InputSpec::Artifact { artifact, selector } => {
-                    let target = objects.iter().find(|o| &o.id == artifact);
-                    match target {
-                        Some(t) => {
-                            let path = if selector.is_empty() {
-                                t.dir.clone()
-                            } else {
-                                t.dir.join(selector)
-                            };
-                            if !path.exists() {
-                                return (false, format!("вход зависимого артефакта недоступен: {selector}"));
-                            }
-                        }
-                        None => return (false, format!("зависимый артефакт не найден: {artifact}")),
+                    let Some(target) = find(artifact) else {
+                        return (false, format!("зависимый артефакт не найден: {artifact}"));
+                    };
+                    if selector.trim().is_empty() {
+                        return (false, format!("у входа `{artifact}` не задан selector"));
+                    }
+                    if let Err(error) = crate::selector::expand_selector(&target.dir, selector) {
+                        return (false, format!("вход {artifact}/{selector}: {error}"));
                     }
                 }
-                manifest::InputSpec::Note { .. } | manifest::InputSpec::Source { .. } => {}
+                manifest::InputSpec::Note { note } => {
+                    let Some(target) = find(note) else {
+                        return (false, format!("заметка не найдена: {note}"));
+                    };
+                    let file = match &target.data {
+                        ObjectData::Note(manifest) => target.dir.join(&manifest.file),
+                        _ => return (false, format!("{note} — не заметка")),
+                    };
+                    if !file.is_file() {
+                        return (false, format!("файл заметки не найден: {note}"));
+                    }
+                }
+                manifest::InputSpec::Source { source } => {
+                    let Some(target) = find(source) else {
+                        return (false, format!("источник не найден: {source}"));
+                    };
+                    match &target.data {
+                        ObjectData::Source(manifest) => {
+                            if let Some(file) = &manifest.file {
+                                if !target.dir.join(file).is_file() {
+                                    return (false, format!("файл источника не найден: {source}"));
+                                }
+                            }
+                        }
+                        _ => return (false, format!("{source} — не источник")),
+                    }
+                }
+                manifest::InputSpec::Constants { constants, selector } => {
+                    let Some(target) = find(constants) else {
+                        return (false, format!("набор констант не найден: {constants}"));
+                    };
+                    match &target.data {
+                        ObjectData::Artifact(manifest) if manifest.kind == "constants" => {
+                            let selector = selector.trim();
+                            if !selector.is_empty() && !manifest.values.contains_key(selector) {
+                                return (false, format!("константа не найдена: {constants}/{selector}"));
+                            }
+                        }
+                        _ => return (false, format!("{constants} — не набор констант")),
+                    }
+                }
             }
         }
     }
@@ -709,6 +871,11 @@ fn human_size(bytes: u64) -> String {
 fn has_any_file(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else { return false };
     for e in entries.flatten() {
+        let name = e.file_name();
+        // Служебные/скрытые файлы (.gitignore-заглушки) не считаются выходом.
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
         let p = e.path();
         if p.is_file() || p.is_dir() && has_any_file(&p) {
             return true;

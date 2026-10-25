@@ -14,16 +14,21 @@ use std::path::PathBuf;
 pub mod manifest;
 pub mod ops;
 pub mod project;
+pub mod selector;
 
 pub use manifest::{
     ArtifactManifest, AuthorManifest, ConstantValue, DocumentManifest, GroupManifest, InputSpec,
     ManifestKind, NoteManifest, ProjectManifest, ReferenceManifest, RepositoryManifest,
     RuntimeManifest, SourceManifest,
 };
-pub use ops::{CreateRequest, NewObjectKind, create_document_stub, create_object, create_project, delete_object, rename_object};
+pub use ops::{
+    CreateRequest, NewObjectKind, create_document_stub, create_object, create_project, delete_object,
+    record_artifact_out_hash, rename_object,
+};
 pub use project::{
     Freshness, Group, Issue, Level, LogLine, Object, ObjectData, ObjectKind, Project, load_project,
 };
+pub use selector::{SelectorMatch, expand_selector, glob_match, is_glob};
 
 /// Каталог демо-проекта по умолчанию.
 ///
@@ -194,6 +199,114 @@ mod tests {
         let project = load(&dir).unwrap();
         assert_eq!(project.object_count(), 0, "несовместимая schema не должна загружаться");
         assert!(project.issues.iter().any(|i| i.message.contains("schema")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── §7.3: ref-рёбра, циклы, константы ────────────────────────────────────
+
+    fn write_project_with_artifacts(name: &str, manifests: &[(&str, &str)]) -> PathBuf {
+        let dir = unique_tmp(name);
+        std::fs::write(
+            dir.join("rde.toml"),
+            "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"T\"\n",
+        )
+        .unwrap();
+        for (id, manifest) in manifests {
+            let art = dir.join("objects/artifacts").join(id);
+            std::fs::create_dir_all(&art).unwrap();
+            std::fs::write(art.join("artifact.toml"), manifest).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn ref_groups_do_not_create_dag_edges() {
+        let a = "01M5VJ1JG0HD99FDTGJ8YEPFZX";
+        let b = "01M5VJ1JG0QQJM2S6R76FQCZ25";
+        let dir = write_project_with_artifacts(
+            "ref-edges",
+            &[
+                (a, &format!("schema=\"rde/artifact@1\"\nid=\"{a}\"\ntitle=\"A\"\ntype=\"data\"\n")),
+                (
+                    b,
+                    &format!(
+                        "schema=\"rde/artifact@1\"\nid=\"{b}\"\ntitle=\"B\"\ntype=\"compute\"\n\
+                         outputs=[\"out/b.txt\"]\n[runtime]\nkind=\"python\"\nenv=\"project\"\nentry=\"s.py\"\n\
+                         [[groups]]\nname=\"link\"\nmode=\"ref\"\ninputs=[{{ artifact=\"{a}\", selector=\"inputs/x.csv\" }}]\n"
+                    ),
+                ),
+            ],
+        );
+        let project = load(&dir).unwrap();
+        assert!(project.issues.is_empty(), "{:?}", project.issues);
+        assert!(project.dag_edges().is_empty(), "ref-группа не должна давать hashed-ребро");
+        assert!(project.dag_cycle().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hashed_cycle_is_detected_with_chain() {
+        let a = "01M5VJ1JG0HD99FDTGJ8YEPFZX";
+        let b = "01M5VJ1JG0QQJM2S6R76FQCZ25";
+        let manifest = |id: &str, title: &str, dep: &str| {
+            format!(
+                "schema=\"rde/artifact@1\"\nid=\"{id}\"\ntitle=\"{title}\"\ntype=\"compute\"\n\
+                 outputs=[\"out/x.txt\"]\n[runtime]\nkind=\"python\"\nenv=\"project\"\nentry=\"s.py\"\n\
+                 [[groups]]\nname=\"g\"\nmode=\"hashed\"\ninputs=[{{ artifact=\"{dep}\", selector=\"out/x.txt\" }}]\n"
+            )
+        };
+        let dir = write_project_with_artifacts(
+            "cycle",
+            &[(a, &manifest(a, "A", b)), (b, &manifest(b, "B", a))],
+        );
+        let project = load(&dir).unwrap();
+        assert!(
+            project.issues.iter().any(|issue| issue.message.contains("цикл")),
+            "цикл должен попасть в issues: {:?}",
+            project.issues
+        );
+        let cycle = project.dag_cycle().expect("dag_cycle должен найти цикл");
+        assert!(cycle.len() >= 3, "цепочка цикла: {cycle:?}");
+        assert_eq!(cycle.first(), cycle.last(), "цикл замкнут");
+        assert!(project.dag_cycle_titles().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn constants_inputs_parse_and_validate() {
+        let constants = "01M5VJ1JG0T9NS5SEZX35HGNFY";
+        let compute = "01M5VJ1JG039MMV97SZGY6V9EQ";
+        let dir = write_project_with_artifacts(
+            "constants",
+            &[
+                (
+                    constants,
+                    &format!(
+                        "schema=\"rde/artifact@1\"\nid=\"{constants}\"\ntitle=\"K\"\ntype=\"constants\"\n\
+                         [values.R_n]\nvalue=1.0\nunit=\"Ом\"\n"
+                    ),
+                ),
+                (
+                    compute,
+                    &format!(
+                        "schema=\"rde/artifact@1\"\nid=\"{compute}\"\ntitle=\"C\"\ntype=\"compute\"\n\
+                         outputs=[\"out/c.txt\"]\n[runtime]\nkind=\"python\"\nenv=\"project\"\nentry=\"s.py\"\n\
+                         [[groups]]\nname=\"consts\"\nmode=\"hashed\"\n\
+                         inputs=[{{ constants=\"{constants}\", selector=\"R_n\" }}]\n"
+                    ),
+                ),
+            ],
+        );
+        let project = load(&dir).unwrap();
+        assert!(project.issues.is_empty(), "{:?}", project.issues);
+        let object = project.artifact_object(compute).unwrap();
+        let ObjectData::Artifact(manifest) = &object.data else { panic!() };
+        let inputs: Vec<&InputSpec> = manifest.hashed_inputs().map(|(_, input)| input).collect();
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(inputs[0], InputSpec::Constants { selector, .. } if selector == "R_n"));
+        assert_eq!(manifest.hashed_inputs().next().unwrap().0.name, "consts");
+        // Нет файла-входа — но константы есть, поэтому вход присутствует.
+        assert_eq!(object.freshness, Freshness::Stale, "выходов нет — устарел");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -69,15 +69,17 @@ pub struct RuntimeManifest {
     pub entry: String,
 }
 
-/// Вход артефакта: ссылка на выход другого артефакта, файл, заметка или источник.
+/// Вход артефакта: ссылка на выход другого артефакта, файл, заметка, источник или константы.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
 #[serde(untagged)]
 pub enum InputSpec {
+    /// Выход другого артефакта; `selector` — относительный путь или glob (`out/*.csv`).
     Artifact {
         artifact: String,
         #[serde(default)]
         selector: String,
     },
+    /// Файл данных внутри каталога артефакта (`inputs/data.csv`).
     File {
         file: String,
     },
@@ -87,6 +89,38 @@ pub enum InputSpec {
     Source {
         source: String,
     },
+    /// Типизированные константы проекта (артефакт `type = "constants"`).
+    /// `selector` — имя конкретной величины; пусто — весь набор значений.
+    Constants {
+        constants: String,
+        #[serde(default)]
+        selector: String,
+    },
+}
+
+impl InputSpec {
+    /// Короткая подпись входа для UI/логов.
+    pub fn label_ru(&self) -> String {
+        match self {
+            InputSpec::Artifact { artifact, selector } => {
+                if selector.is_empty() {
+                    format!("артефакт {artifact}")
+                } else {
+                    format!("{artifact}/{selector}")
+                }
+            }
+            InputSpec::File { file } => format!("файл {file}"),
+            InputSpec::Note { note } => format!("заметка {note}"),
+            InputSpec::Source { source } => format!("источник {source}"),
+            InputSpec::Constants { constants, selector } => {
+                if selector.is_empty() {
+                    format!("константы {constants}")
+                } else {
+                    format!("константа {constants}/{selector}")
+                }
+            }
+        }
+    }
 }
 
 /// Группа зависимостей артефакта (`hashed` — влияет на хеш/каскад, `ref` — только provenance).
@@ -97,6 +131,13 @@ pub struct GroupManifest {
     pub mode: String,
     #[serde(default)]
     pub inputs: Vec<InputSpec>,
+}
+
+impl GroupManifest {
+    /// Входит ли группа в `in_hash`/топосортировку (tz-02 §7.3 п.1/п.4).
+    pub fn is_hashed(&self) -> bool {
+        self.mode == "hashed"
+    }
 }
 
 /// Значение константы проекта (тип `constants`).
@@ -125,11 +166,20 @@ pub struct ArtifactManifest {
     pub rebuild: String,
     #[serde(default)]
     pub runtime: Option<RuntimeManifest>,
-    /// Произвольные параметры запуска (входят в `params_hash` в M2.3).
+    /// Произвольные параметры запуска (входят в `params_hash`).
     #[serde(default)]
     pub params: serde_json::Value,
+    /// Объявленные выходы (относительные пути/glob внутри каталога артефакта).
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// Дополнительные файлы скрипта, входящие в `script_hash` (tz-02 §7.2, `extra_script_files`).
+    /// Пути относительно каталога артефакта; читаются вместе с `runtime.entry`.
+    #[serde(default)]
+    pub script_files: Vec<String>,
+    /// `out_hash` последнего успешного обновления (идентичность выходов, tz-02 §7.3 п.10).
+    /// Пишется RDE после успешного обновления; отсутствует до первого запуска.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_hash: Option<String>,
     #[serde(default)]
     pub timeout_s: Option<u64>,
     #[serde(default)]
@@ -139,6 +189,24 @@ pub struct ArtifactManifest {
     /// Для `type = "constants"`: типизированные значения проекта.
     #[serde(default)]
     pub values: BTreeMap<String, ConstantValue>,
+}
+
+impl ArtifactManifest {
+    /// Входы всех `hashed`-групп (только они влияют на `in_hash` и каскад, §7.3 п.1).
+    pub fn hashed_inputs(&self) -> impl Iterator<Item = (&GroupManifest, &InputSpec)> {
+        self.groups
+            .iter()
+            .filter(|group| group.is_hashed())
+            .flat_map(|group| group.inputs.iter().map(move |input| (group, input)))
+    }
+
+    /// Входы `ref`-групп: связаны, но не пересчитываются (§7.3 п.1).
+    pub fn ref_inputs(&self) -> impl Iterator<Item = (&GroupManifest, &InputSpec)> {
+        self.groups
+            .iter()
+            .filter(|group| !group.is_hashed())
+            .flat_map(|group| group.inputs.iter().map(move |input| (group, input)))
+    }
 }
 
 /// `document.toml` — манифест документа.
