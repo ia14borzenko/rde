@@ -883,3 +883,102 @@ fn insert_with_anchor_block_lands_after_selected_block() {
     assert!(tag_index < later, "вставка после выбранного блока, до конца документа");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── P0-3: статичный image1 (M3, ручной ассет) соседствует с живыми вставками ──
+
+/// Инвариант соседства: ручной `word/media/image1.png` (байт-идентичен
+/// `report.doc.rde` из demo-project, генератора в репозитории нет) остаётся
+/// вне `w:sdt`, а живая вставка рисунка живёт внутри `w:sdt` с тегом `rde:<id>`.
+#[test]
+fn static_legacy_figure_coexists_with_live_figure() {
+    let dir = tmp("static-live");
+    let clean = dir.join("clean.docx");
+    copy_file(&demo_docx(), &clean);
+    // Эталон статичного ассета — сама фикстура (M3, до живых вставок).
+    let legacy = {
+        let file = std::fs::File::open(demo_docx()).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut part = zip.by_name("word/media/image1.png").expect("image1 в фикстуре");
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        part.read_to_end(&mut bytes).unwrap();
+        bytes
+    };
+    assert!(legacy.starts_with(b"\x89PNG"), "image1 — PNG");
+    assert_eq!(legacy.len(), 55283, "размер ручного ассета M3");
+
+    let mut rde_doc = build_rde_doc(&clean, "01TESTDOC", "").unwrap();
+    let package = dir.join("report.doc.rde");
+    write_package(&clean, &mut rde_doc, &package).unwrap();
+    let live = dir.join("live.png");
+    std::fs::write(&live, PNG_1PX).unwrap();
+    let report = add_figure_insert(
+        &package,
+        &live,
+        "rde://artifact/01A/out/plot.svg".into(),
+        "Рисунок — живой".into(),
+        "deadbeef".into(),
+        None,
+    )
+    .unwrap();
+
+    // Статичный рисунок не тронут, живая media-часть добавлена.
+    let file = std::fs::File::open(&package).unwrap();
+    let mut zip = zip::ZipArchive::new(file).unwrap();
+    let names: Vec<String> = zip.file_names().map(str::to_owned).collect();
+    assert!(names.contains(&"word/media/image1.png".to_owned()), "image1 на месте: {names:?}");
+    assert!(names.iter().any(|name| name.starts_with("word/media/rde-figure-")), "живая media-часть: {names:?}");
+    let mut part = zip.by_name("word/media/image1.png").unwrap();
+    let mut kept = Vec::new();
+    use std::io::Read;
+    part.read_to_end(&mut kept).unwrap();
+    assert_eq!(kept, legacy, "байты image1 не изменились");
+    drop(part);
+    drop(zip);
+
+    let document = package_document(&package);
+    assert!(document.contains("Рисунок 1 — Статистическая обработка"), "статичная подпись M3");
+    let live_tag = format!("<w:tag w:val=\"rde:{}\"", report.insert.id);
+    assert!(document.contains(&live_tag), "живая вставка в sdt");
+
+    // Границы content-control'ов: статичный drawing — вне всех w:sdt, живой — внутри.
+    let mut sdt_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut search = 0;
+    while let Some(open) = document[search..].find("<w:sdt>") {
+        let start = search + open;
+        let end = start + document[start..].find("</w:sdt>").expect("парный </w:sdt>") + "</w:sdt>".len();
+        sdt_ranges.push((start, end));
+        search = end;
+    }
+    assert!(!sdt_ranges.is_empty(), "в документе есть живые вставки");
+    let in_sdt = |pos: usize| sdt_ranges.iter().any(|&(start, end)| pos >= start && pos < end);
+    // relId статичного рисунка — из rels пакета.
+    let rels = {
+        let file = std::fs::File::open(&package).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut part = zip.by_name("word/_rels/document.xml.rels").unwrap();
+        let mut text = String::new();
+        part.read_to_string(&mut text).unwrap();
+        text
+    };
+    let static_rel = rels
+        .split("<Relationship")
+        .find(|chunk| chunk.contains("media/image1.png"))
+        .and_then(|chunk| chunk.split("Id=\"").nth(1))
+        .map(|rest| rest.split('"').next().unwrap().to_owned())
+        .expect("relationship image1");
+    let static_pos = document.find(&format!("r:embed=\"{static_rel}\"")).expect("drawing image1");
+    assert!(!in_sdt(static_pos), "статичный рисунок вне w:sdt");
+    let live_rel = {
+        let tag_index = document.find(&live_tag).unwrap();
+        let sdt_start = document[..tag_index].rfind("<w:sdt>").unwrap();
+        let sdt_end = document[sdt_start..].find("</w:sdt>").unwrap() + sdt_start;
+        let sdt = &document[sdt_start..sdt_end];
+        sdt.split("r:embed=\"").nth(1).unwrap().split('"').next().unwrap().to_owned()
+    };
+    assert_ne!(live_rel, static_rel, "у живой вставки свой relationship");
+    let live_pos = document.find(&format!("r:embed=\"{live_rel}\"")).unwrap();
+    assert!(in_sdt(live_pos), "живой рисунок внутри w:sdt");
+    assert_eq!(check_external_edit(&package).unwrap().verdict, EditVerdict::NotModified, "пакет консистентен");
+    let _ = std::fs::remove_dir_all(&dir);
+}
