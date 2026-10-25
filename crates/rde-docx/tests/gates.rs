@@ -1,6 +1,6 @@
 //! Fidelity-гейты на демо-документе: части, roundtrip WordCraft, LO-оракул.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rde_docx::{inventory, lo_oracle, report_json, roundtrip, run_gate, temp_work_dir, CRITICAL_PARTS};
 

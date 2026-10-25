@@ -46,6 +46,8 @@ fn rde_doc_xml_roundtrip_handles_unicode_and_escapes() {
             selector: "#/stats/x1/mean".into(),
             value_kind: "number".into(),
             para_id: Some("5E6F7A8B".into()),
+            style: "Normal".into(),
+            format: "dec:1".into(),
         }],
         review: RdeReview { open: 2, resolved: 5 },
         updated_unix: 42,
@@ -401,6 +403,8 @@ fn live_insert_value_is_sdt_and_updates() {
             value_kind: "number".into(),
             cached: "10".into(),
             caption: "Среднее x1".into(),
+            style: "Normal".into(),
+            format: "dec:1".into(),
         },
     )
     .unwrap();
@@ -480,6 +484,8 @@ fn sdt_and_figure_survive_document_update() {
             value_kind: "number".into(),
             cached: "3.14".into(),
             caption: "среднее".into(),
+            style: String::new(),
+            format: "auto".into(),
         },
     )
     .unwrap();
@@ -505,4 +511,73 @@ fn sdt_and_figure_survive_document_update() {
     };
     assert!(media_parts.iter().any(|name| name.starts_with("word/media/rde-figure")), "media переживает обновление: {media_parts:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn svg_figure_is_rasterized_for_docview() {
+    let dir = tmp("svg-raster");
+    let clean = dir.join("clean.docx");
+    copy_file(&demo_docx(), &clean);
+    let mut rde_doc = build_rde_doc(&clean, "01TESTDOC", "").unwrap();
+    let package = dir.join("report.doc.rde");
+    write_package(&clean, &mut rde_doc, &package).unwrap();
+    let svg = dir.join("plot.svg");
+    std::fs::write(
+        &svg,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60"><rect width="120" height="60" fill="#3366cc"/><text x="10" y="35" font-size="14">test</text></svg>"##,
+    )
+    .unwrap();
+    add_figure_insert(&package, &svg, "rde://artifact/01A/out/plot.svg".into(), "Рисунок — SVG".into(), "aa".into()).unwrap();
+    // Медиа-часть — PNG (DocView WordCraft не рендерит SVG), а не исходный SVG.
+    let (media_name, media) = {
+        let file = std::fs::File::open(&package).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let name = (0..zip.len())
+            .map(|index| zip.by_index(index).unwrap().name().to_owned())
+            .find(|name| name.starts_with("word/media/rde-figure"))
+            .expect("медиа-часть рисунка");
+        let mut part = zip.by_name(&name).unwrap();
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        part.read_to_end(&mut bytes).unwrap();
+        (name, bytes)
+    };
+    assert!(media_name.ends_with(".png"), "SVG растеризован в PNG: {media_name}");
+    assert!(media.starts_with(b"\x89PNG"), "PNG-сигнатура: {} байт", media.len());
+    // Модель WordCraft видит рисунок (иначе DocView покажет серый прямоугольник).
+    let (doc, from_package) = open_document(&package).unwrap();
+    assert!(from_package);
+    let story = wordcraft_engine::doc::StoryRef::Body;
+    let images: usize = doc
+        .para_paths(story)
+        .iter()
+        .filter_map(|path| doc.para(story, path))
+        .map(|paragraph| paragraph.objects.iter().filter(|object| matches!(object, wordcraft_engine::doc::InlineObject::Image { .. })).count())
+        .sum();
+    assert!(images >= 2, "в модели два рисунка (исходный + вставленный): {images}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn insert_value_formats_are_configurable() {
+    // R-DOC-11: формат результата артефакта в тексте — параметр вставки, а не «как вышло».
+    let cases = [
+        ("1234.5678", "int", "1235"),
+        ("1234.5678", "dec:2", "1234.57"),
+        ("1234.5678", "dec:0", "1235"),
+        ("0.00075978125", "sci:3", "7.598·10^-4"),
+        ("1234.5678", "sci:2", "1.23·10^3"),
+        ("0.125", "percent:1", "12.5 %"),
+        ("0.125", "percent:0", "12 %"), // Rust округляет половину к чётному
+        ("42", "raw", "42"),
+        ("1234.5678", "", "1234.5678"),
+        ("не число", "dec:2", "не число"),
+    ];
+    for (raw, format, expected) in cases {
+        assert_eq!(format_value(raw, format), expected, "format_value({raw}, {format})");
+    }
+    // auto: целые без дробной части, крупные/малые — стандартный вид.
+    assert_eq!(format_value("42", "auto"), "42");
+    assert_eq!(format_value("42.5", "auto"), "42.5");
+    assert_eq!(format_value("0.00001", "auto"), "1.0000·10^-5");
 }

@@ -241,6 +241,29 @@ struct DocBlock {
 }
 
 /// Приложение прототипа RDE.
+/// Раздел рабочего места артефакта: входные данные / генерация / результат.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ArtifactSection {
+    Inputs,
+    Generation,
+    Result,
+}
+
+/// Редактор артефакта: манифест, скрипт и поля редактирования (R-ART-01/02/04).
+#[derive(Clone, Debug)]
+struct ArtifactEditorState {
+    artifact_id: String,
+    manifest: rde_core::ArtifactManifest,
+    script_text: String,
+    params_text: String,
+    outputs_text: String,
+    timeout_text: String,
+    new_input_artifact: String,
+    new_input_selector: String,
+    new_input_file: String,
+    new_input_mode: String,
+}
+
 /// Диалог настроек проекта (R-SET-01): имя/шаблон/режим пересборки + авторы.
 #[derive(Clone, Debug)]
 pub struct ProjectSettingsState {
@@ -269,6 +292,21 @@ struct InsertDialogState {
     selector: String,
     pointer: String,
     caption: String,
+    /// Стиль абзаца вставки (`w:pStyle` из текущего документа).
+    style: String,
+    /// `auto|raw|int|dec|sci|percent` + точность.
+    format: String,
+    precision: usize,
+}
+
+impl InsertDialogState {
+    /// Спецификация формата для `rde_doc::format_value` (например, `dec:2`).
+    fn format_spec(&self) -> String {
+        match self.format.as_str() {
+            "dec" | "sci" | "percent" => format!("{}:{}", self.format, self.precision),
+            other => other.to_owned(),
+        }
+    }
 }
 
 /// Результат фонового обновления (возвращается из потока вместе с хранилищем).
@@ -318,8 +356,8 @@ pub struct RdeApp {
     pdf_cache: Option<(String, Result<PdfSourceInfo, String>)>,
     /// Кэш числа комментариев Word: ключ (путь+время) → количество.
     comments_cache: Option<(String, usize)>,
-    /// Кэш числа вставок rde:doc для вкладки «Структура».
-    inserts_cache: Option<(String, usize)>,
+    /// Кэш вставок rde:doc для вкладки «Структура» (ключ — путь пакета).
+    inserts_cache: Option<(String, Vec<rde_doc::RdeInsert>)>,
     /// Фокус на поиске объектов (кнопка «Поиск», меню «Найти», Ctrl+F).
     search_focus: bool,
     open_project_dialog: Option<String>,
@@ -346,6 +384,10 @@ pub struct RdeApp {
     app_settings: rde_core::AppSettings,
     /// Диалог настроек приложения.
     app_settings_dialog: Option<rde_core::AppSettings>,
+    /// Раздел рабочего места артефакта (вкладка «Артефакты»).
+    artifact_section: ArtifactSection,
+    /// Редактор выбранного артефакта (манифест + скрипт).
+    artifact_editor: Option<ArtifactEditorState>,
 }
 
 impl RdeApp {
@@ -397,6 +439,8 @@ impl RdeApp {
             lang,
             app_settings,
             app_settings_dialog: None,
+            artifact_section: ArtifactSection::Result,
+            artifact_editor: None,
         };
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
         let _ = rde_run::prune_runs(&app.project.root, 200);
@@ -712,12 +756,22 @@ impl RdeApp {
             return;
         };
         let selector = artifact.outputs.first().cloned().unwrap_or_default();
+        // Стиль обычного текста текущего шаблона (если документ уже .doc.rde).
+        let style = self
+            .project
+            .document_path()
+            .filter(|path| rde_doc::is_rde_package(path))
+            .map(|path| rde_doc::default_paragraph_style(&path))
+            .unwrap_or_default();
         self.insert_dialog = Some(InsertDialogState {
             kind: kind.to_owned(),
             artifact_id: artifact.id,
             selector,
             pointer: String::new(),
             caption: String::new(),
+            style,
+            format: "auto".to_owned(),
+            precision: 2,
         });
     }
 
@@ -749,13 +803,16 @@ impl RdeApp {
             })
         } else {
             rde_dag::resolve_insert_text(&self.project, store, &uri).and_then(|(value, hash)| {
+                let formatted = rde_doc::format_value(&value, &dialog.format_spec());
                 let request = rde_doc::InsertRequest {
                     kind: "value".to_owned(),
                     target: uri.clone(),
                     selector: pointer.to_owned(),
                     value_kind: if pointer.is_empty() { "text".to_owned() } else { "number".to_owned() },
-                    cached: value,
+                    cached: formatted,
                     caption: dialog.caption.clone(),
+                    style: dialog.style.clone(),
+                    format: dialog.format_spec(),
                 };
                 rde_doc::add_insert(&package, request).map(|report| (report, hash, String::new()))
             })
@@ -873,7 +930,8 @@ impl RdeApp {
                 } else if insert.kind == "value" {
                     match rde_dag::resolve_insert_text(&self.project, store, &insert.target) {
                         Ok((value, hash)) => {
-                            values.insert(insert.id.clone(), value);
+                            // Формат отображения — из rde:doc (R-DOC-11): int/dec:N/sci:N/percent:N.
+                            values.insert(insert.id.clone(), rde_doc::format_value(&value, &insert.format));
                             hashes.insert(insert.id.clone(), hash);
                         }
                         Err(error) => errors.push(format!("{}: {error}", insert.id)),
@@ -1138,6 +1196,17 @@ impl RdeApp {
                 None
             }
         }
+    }
+
+    /// Для демо/скриншотов: открыть рабочее место артефакта в нужном разделе.
+    pub fn demo_set_artifact_section(&mut self, section: &str) {
+        self.tab = Tab::Artifacts;
+        self.artifact_editor = None;
+        self.artifact_section = match section {
+            "inputs" => ArtifactSection::Inputs,
+            "generation" => ArtifactSection::Generation,
+            _ => ArtifactSection::Result,
+        };
     }
 
     /// Для демо/скриншотов: открыть настройки приложения.
@@ -1948,7 +2017,13 @@ impl RdeApp {
                     self.show_inspector = true;
                     self.tab = match object.kind {
                         ObjectKind::Document => Tab::Document,
-                        ObjectKind::Artifact | ObjectKind::Constants => Tab::Artifacts,
+                        ObjectKind::Artifact => {
+                            // «Открыть» артефакт = рабочее место: входы/генерация/результат.
+                            self.artifact_editor = None;
+                            self.artifact_section = ArtifactSection::Result;
+                            Tab::Artifacts
+                        }
+                        ObjectKind::Constants => Tab::Artifacts,
                         ObjectKind::Source | ObjectKind::Note => Tab::Source,
                         ObjectKind::Repository => Tab::Artifacts,
                     };
@@ -3172,7 +3247,47 @@ impl RdeApp {
                                     .desired_width(360.0),
                             );
                         });
+                        // Формат отображения результата (R-DOC-11): число/проценты/стандартный вид.
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("формат").small().color(MUTED));
+                            egui::ComboBox::from_id_salt("rde_insert_format")
+                                .selected_text(&dialog.format)
+                                .show_ui(ui, |ui| {
+                                    for (value, label) in [
+                                        ("auto", "авто"),
+                                        ("raw", "как в артефакте"),
+                                        ("int", "целое"),
+                                        ("dec", "дробь"),
+                                        ("sci", "стандартный вид (m·10^e)"),
+                                        ("percent", "проценты"),
+                                    ] {
+                                        ui.selectable_value(&mut dialog.format, value.to_owned(), label);
+                                    }
+                                });
+                            if matches!(dialog.format.as_str(), "dec" | "sci" | "percent") {
+                                ui.label(RichText::new("знаков").small().color(MUTED));
+                                ui.add(egui::DragValue::new(&mut dialog.precision).range(0..=8));
+                            }
+                        });
                     }
+                    // Стиль обычного текста шаблона — можно сменить (R-DOC-25).
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("стиль").small().color(MUTED));
+                        let styles = self
+                            .project
+                            .document_path()
+                            .filter(|path| rde_doc::is_rde_package(path))
+                            .and_then(|path| rde_doc::list_document_styles(&path).ok())
+                            .unwrap_or_default();
+                        egui::ComboBox::from_id_salt("rde_insert_style")
+                            .selected_text(if dialog.style.is_empty() { "обычный (по умолчанию)" } else { &dialog.style })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut dialog.style, String::new(), "обычный (по умолчанию)");
+                                for style in styles.iter().filter(|style| style.kind == "paragraph") {
+                                    ui.selectable_value(&mut dialog.style, style.id.clone(), format!("{} ({})", style.name, style.id));
+                                }
+                            });
+                    });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("подпись").small().color(MUTED));
                         ui.add(egui::TextEdit::singleline(&mut dialog.caption).hint_text("например, «Среднее x1»").desired_width(360.0));
@@ -3563,15 +3678,16 @@ impl RdeApp {
         // Число вставок из rde:doc (кэш по пути пакета).
         let package_key = self.project.document_path().map(|path| path.display().to_string()).unwrap_or_default();
         if self.inserts_cache.as_ref().map(|(key, _)| key != &package_key).unwrap_or(true) {
-            let count = self
+            let inserts = self
                 .project
                 .document_path()
                 .and_then(|path| rde_doc::load_rde_doc(&path).ok())
-                .map(|rde_doc| rde_doc.inserts.len())
-                .unwrap_or(0);
-            self.inserts_cache = Some((package_key.clone(), count));
+                .map(|rde_doc| rde_doc.inserts)
+                .unwrap_or_default();
+            self.inserts_cache = Some((package_key.clone(), inserts));
         }
-        let inserts_count = self.inserts_cache.as_ref().map(|(_, count)| *count).unwrap_or(0);
+        let inserts: Vec<rde_doc::RdeInsert> = self.inserts_cache.as_ref().map(|(_, inserts)| inserts.clone()).unwrap_or_default();
+        let inserts_count = inserts.len();
         let mut clicked_block: Option<(usize, String)> = None;
         ui.horizontal(|ui| {
             ui.add_space(8.0);
@@ -3589,6 +3705,8 @@ impl RdeApp {
             });
         });
         ui.separator();
+        let mut pending_insert_updates: Vec<String> = Vec::new();
+        let mut pending_insert_edits: Vec<(String, String, String)> = Vec::new();
         egui::ScrollArea::both().id_salt("rde_struct_scroll").auto_shrink([false, false]).show(ui, |ui| {
             match cache {
                 Some(Ok((blocks, _figures))) => {
@@ -3631,7 +3749,121 @@ impl RdeApp {
                 }
                 None => {}
             }
+            // Живые вставки rde:doc (R-DOC-11): стиль/формат можно менять, значение — из артефакта.
+            if !inserts.is_empty() {
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label(RichText::new("Вставки rde:doc (живые значения/рисунки из артефактов)").strong().color(TEXT));
+                let styles = self
+                    .project
+                    .document_path()
+                    .filter(|path| rde_doc::is_rde_package(path))
+                    .and_then(|path| rde_doc::list_document_styles(&path).ok())
+                    .unwrap_or_default();
+                egui::Grid::new("rde_inserts").num_columns(6).spacing([12.0, 5.0]).striped(true).show(ui, |ui| {
+                    ui.label(RichText::new("id").small().color(MUTED));
+                    ui.label(RichText::new("вид").small().color(MUTED));
+                    ui.label(RichText::new("цель").small().color(MUTED));
+                    ui.label(RichText::new("стиль").small().color(MUTED));
+                    ui.label(RichText::new("формат").small().color(MUTED));
+                    ui.label(RichText::new("значение/действие").small().color(MUTED));
+                    ui.end_row();
+                    for insert in &inserts {
+                        ui.label(RichText::new(&insert.id).monospace().size(11.0).color(ACCENT));
+                        ui.label(RichText::new(&insert.kind).monospace().size(11.0).color(MUTED));
+                        let target = insert.target.rsplit('/').next().unwrap_or(&insert.target);
+                        ui.label(RichText::new(target).monospace().size(10.5).color(MUTED)).on_hover_text(&insert.target);
+                        let mut style = insert.style.clone();
+                        let mut format = if insert.format.is_empty() { "auto".to_owned() } else { insert.format.clone() };
+                        egui::ComboBox::from_id_salt(format!("rde_insert_style_{}", insert.id))
+                            .selected_text(if style.is_empty() { "(обычный)".to_owned() } else { style.clone() })
+                            .width(130.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut style, String::new(), "(обычный)");
+                                for style_info in styles.iter().filter(|style_info| style_info.kind == "paragraph") {
+                                    ui.selectable_value(&mut style, style_info.id.clone(), format!("{} ({})", style_info.name, style_info.id));
+                                }
+                            });
+                        egui::ComboBox::from_id_salt(format!("rde_insert_format_{}", insert.id))
+                            .selected_text(format.clone())
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                for (value, label) in [
+                                    ("auto", "авто"),
+                                    ("raw", "как в артефакте"),
+                                    ("int", "целое"),
+                                    ("dec:2", "дробь 2"),
+                                    ("dec:4", "дробь 4"),
+                                    ("sci:3", "стандартный вид"),
+                                    ("percent:1", "проценты"),
+                                ] {
+                                    ui.selectable_value(&mut format, value.to_owned(), label);
+                                }
+                            });
+                        if style != insert.style || format != (if insert.format.is_empty() { "auto".to_owned() } else { insert.format.clone() }) {
+                            pending_insert_edits.push((insert.id.clone(), style, format));
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(insert.cached.chars().take(28).collect::<String>()).size(11.5).color(TEXT));
+                            if ui.small_button("применить").on_hover_text("Перечитать значение из артефакта и применить стиль/формат").clicked() {
+                                pending_insert_updates.push(insert.id.clone());
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+            }
         });
+        // Применяем правки стиля/формата вставок (R-DOC-11/25).
+        if !pending_insert_edits.is_empty() || !pending_insert_updates.is_empty() {
+            let Some(package) = self.project.document_path() else { return };
+            for (insert_id, style, format) in &pending_insert_edits {
+                if let Err(error) = rde_doc::apply_insert_style(&package, insert_id, style) {
+                    self.push_log(Level::Warn, format!("Вставка {insert_id}: стиль не применён — {error}"));
+                }
+                if let Err(error) = rde_doc::set_insert_format(&package, insert_id, format) {
+                    self.push_log(Level::Warn, format!("Вставка {insert_id}: формат не сохранён — {error}"));
+                }
+            }
+            // Перечитываем значения из артефактов с учётом формата.
+            let rde_doc = rde_doc::load_rde_doc(&package).ok();
+            let mut values = std::collections::BTreeMap::new();
+            let mut hashes = std::collections::BTreeMap::new();
+            let mut resolve_errors: Vec<String> = Vec::new();
+            if let (Some(rde_doc), Some(store)) = (&rde_doc, self.store.as_ref()) {
+                for insert in &rde_doc.inserts {
+                    if insert.kind != "value" || insert.target.is_empty() {
+                        continue;
+                    }
+                    if !pending_insert_updates.is_empty() && !pending_insert_updates.contains(&insert.id) && pending_insert_edits.is_empty() {
+                        continue;
+                    }
+                    match rde_dag::resolve_insert_text(&self.project, store, &insert.target) {
+                        Ok((value, hash)) => {
+                            values.insert(insert.id.clone(), rde_doc::format_value(&value, &insert.format));
+                            hashes.insert(insert.id.clone(), hash);
+                        }
+                        Err(error) => resolve_errors.push(format!("Вставка {}: {error}", insert.id)),
+                    }
+                }
+            }
+            for error in resolve_errors {
+                self.push_log(Level::Warn, error);
+            }
+            if !values.is_empty() {
+                match rde_doc::update_insert_values(&package, &values, &hashes) {
+                    Ok(report) => {
+                        self.inserts_cache = None;
+                        self.structure_cache = None;
+                        self.push_log(Level::Ok, format!("Вставки обновлены: {} (стиль/формат применены)", report.updated.len()));
+                    }
+                    Err(error) => self.push_log(Level::Warn, format!("Вставки: {error}")),
+                }
+            } else {
+                self.inserts_cache = None;
+                self.structure_cache = None;
+            }
+        }
         if let Some((number, text)) = clicked_block {
             if let Some(document) = self.project.document_object() {
                 self.selected = Some(document.id.clone());
@@ -3747,6 +3979,433 @@ impl RdeApp {
                     .map(|object| vec![object.id.clone()])
             });
             self.request_update(targets, false);
+        }
+        ui.separator();
+        self.artifact_workspace(ui);
+    }
+
+    /// Загрузить/обновить редактор артефакта для выбранного объекта.
+    fn ensure_artifact_editor(&mut self, object: &rde_core::Object) {
+        let need_reload = self.artifact_editor.as_ref().map(|editor| editor.artifact_id != object.id).unwrap_or(true);
+        if !need_reload {
+            return;
+        }
+        let ObjectData::Artifact(manifest) = object.data.clone() else { return };
+        let script_path = manifest
+            .runtime
+            .as_ref()
+            .map(|runtime| object.dir.join(&runtime.entry))
+            .unwrap_or_else(|| object.dir.join("script.py"));
+        let script_text = std::fs::read_to_string(&script_path).unwrap_or_default();
+        let params_text = serde_json::to_string_pretty(&manifest.params).unwrap_or_else(|_| "{}".to_owned());
+        let outputs_text = manifest.outputs.join("\n");
+        let timeout_text = manifest.timeout_s.map(|value| value.to_string()).unwrap_or_default();
+        self.artifact_editor = Some(ArtifactEditorState {
+            artifact_id: object.id.clone(),
+            manifest,
+            script_text,
+            params_text,
+            outputs_text,
+            timeout_text,
+            new_input_artifact: String::new(),
+            new_input_selector: String::new(),
+            new_input_file: String::new(),
+            new_input_mode: "hashed".to_owned(),
+        });
+    }
+
+    /// Сохранить редактор артефакта: скрипт + `artifact.toml` (валидируется JSON Schema).
+    pub fn save_artifact_editor(&mut self) -> Result<(), String> {
+        let Some(editor) = self.artifact_editor.clone() else { return Ok(()) };
+        let Some(object) = self.project.artifact_object(&editor.artifact_id).cloned() else {
+            return Err("артефакт не найден".to_owned());
+        };
+        let mut manifest = editor.manifest.clone();
+        // Поля из текстовых редакторов.
+        manifest.params = if editor.params_text.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&editor.params_text).map_err(|e| format!("params не JSON: {e}"))?
+        };
+        manifest.outputs = editor
+            .outputs_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        manifest.timeout_s = {
+            let text = editor.timeout_text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.parse::<u64>().map_err(|e| format!("timeout_s: {e}"))?)
+            }
+        };
+        // Скрипт — только если изменился (не трогаем mtime зря).
+        if let Some(runtime) = &manifest.runtime {
+            let script_path = object.dir.join(&runtime.entry);
+            let current = std::fs::read_to_string(&script_path).unwrap_or_default();
+            if current != editor.script_text {
+                std::fs::write(&script_path, &editor.script_text)
+                    .map_err(|e| format!("записать {}: {e}", script_path.display()))?;
+            }
+        }
+        rde_core::write_artifact_manifest(&self.project.root, &manifest)?;
+        self.reload_project();
+        self.artifact_editor = None;
+        self.push_log(Level::Ok, format!("Артефакт «{}» сохранён (манифест + скрипт)", object.title));
+        Ok(())
+    }
+
+    /// Рабочее место артефакта (R-ART-01/02/04): входные данные, генерация, результат генерации.
+    fn artifact_workspace(&mut self, ui: &mut egui::Ui) {
+        let selected = self.selected.clone();
+        let artifact_object = self
+            .project
+            .objects
+            .iter()
+            .filter(|object| matches!(&object.data, ObjectData::Artifact(artifact) if artifact.kind != "constants"))
+            .find(|object| selected.as_deref() == Some(object.id.as_str()))
+            .cloned()
+            .or_else(|| {
+                self.project
+                    .objects
+                    .iter()
+                    .find(|object| matches!(&object.data, ObjectData::Artifact(artifact) if artifact.kind != "constants"))
+                    .cloned()
+            });
+        let Some(object) = artifact_object else { return };
+        let ObjectData::Artifact(manifest) = object.data.clone() else { return };
+        self.ensure_artifact_editor(&object);
+        let status = self.dag_statuses.get(&object.id).cloned();
+        let mut section = self.artifact_section;
+        let mut update_artifact = false;
+        let mut save_editor = false;
+        let mut take_log: Option<PathBuf> = None;
+        let mut reveal: Option<PathBuf> = None;
+        let mut copy_text: Option<String> = None;
+        let root = self.project.root.clone();
+        let mut editor = self.artifact_editor.take();
+        // Данные результата: выходы + превью файлов.
+        let output_rows: Vec<(String, PathBuf, u64, Option<String>)> = manifest
+            .outputs
+            .iter()
+            .map(|rel| {
+                let path = object.dir.join(rel);
+                let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
+                let preview = if matches!(ext.as_str(), "json" | "csv" | "txt" | "md" | "svg" | "py" | "sh") {
+                    std::fs::read_to_string(&path).ok().map(|text| {
+                        if text.chars().count() > 4000 {
+                            text.chars().take(4000).collect::<String>() + "…"
+                        } else {
+                            text
+                        }
+                    })
+                } else {
+                    None
+                };
+                (rel.clone(), path, size, preview)
+            })
+            .collect();
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new(format!("Артефакт: {}", object.title)).strong().color(TEXT));
+            ui.label(RichText::new(format!("{} · {}", manifest.kind, object.detail)).small().color(MUTED));
+            if let Some(status) = &status {
+                ui.label(
+                    RichText::new(format!("{} {}", status.status.label_ru(), status.status.reason().unwrap_or_default()))
+                        .small()
+                        .color(if matches!(status.status, rde_dag::LiveStatus::Fresh) { GREEN } else { AMBER }),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(RichText::new("Обновить связанные").size(12.0)).clicked() {
+                    self.request_update(Some(vec![object.id.clone()]), true);
+                }
+                if ui.button(RichText::new("Обновить артефакт").size(12.0)).clicked() {
+                    update_artifact = true;
+                }
+                if ui.button(RichText::new("Сохранить").size(12.0)).clicked() {
+                    save_editor = true;
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            for (value, label) in [
+                (ArtifactSection::Inputs, "Входные данные"),
+                (ArtifactSection::Generation, "Генерация"),
+                (ArtifactSection::Result, "Результат генерации"),
+            ] {
+                if ui.selectable_label(section == value, RichText::new(label).size(12.5)).clicked() {
+                    section = value;
+                }
+            }
+        });
+        ui.separator();
+        let Some(editor_state) = editor.as_mut() else { return };
+        egui::ScrollArea::vertical().id_salt("rde_artifact_workspace").auto_shrink([false, false]).show(ui, |ui| {
+            match section {
+                ArtifactSection::Inputs => {
+                    ui.label(RichText::new("Группы зависимостей (hashed — влияют на хеш и каскад, ref — только provenance)").small().color(MUTED));
+                    let mut remove: Option<(usize, usize)> = None;
+                    for (group_index, group) in editor_state.manifest.groups.iter_mut().enumerate() {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut group.name).desired_width(140.0));
+                            egui::ComboBox::from_id_salt(format!("rde_group_mode_{group_index}"))
+                                .selected_text(group.mode.clone())
+                                .width(100.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut group.mode, "hashed".to_owned(), "hashed");
+                                    ui.selectable_value(&mut group.mode, "ref".to_owned(), "ref");
+                                });
+                            ui.label(RichText::new(format!("входов: {}", group.inputs.len())).small().color(MUTED));
+                        });
+                        for (input_index, input) in group.inputs.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.add_space(18.0);
+                                match input {
+                                    rde_core::InputSpec::Artifact { artifact, selector } => {
+                                        let title = self.project.object(artifact).map(|object| object.title.clone()).unwrap_or_else(|| artifact.clone());
+                                        ui.label(RichText::new(format!("артефакт: {title}")).size(12.0).color(TEXT));
+                                        ui.add(egui::TextEdit::singleline(selector).hint_text("out/*.csv").desired_width(220.0));
+                                    }
+                                    rde_core::InputSpec::File { file } => {
+                                        ui.label(RichText::new("файл").size(12.0).color(TEXT));
+                                        ui.add(egui::TextEdit::singleline(file).desired_width(260.0));
+                                    }
+                                    rde_core::InputSpec::Note { note } => {
+                                        ui.label(RichText::new(format!("заметка: {note}")).size(12.0).color(TEXT));
+                                    }
+                                    rde_core::InputSpec::Source { source } => {
+                                        ui.label(RichText::new(format!("источник: {source}")).size(12.0).color(TEXT));
+                                    }
+                                    rde_core::InputSpec::Constants { constants, selector } => {
+                                        ui.label(RichText::new(format!("константы: {constants}")).size(12.0).color(TEXT));
+                                        ui.add(egui::TextEdit::singleline(selector).hint_text("R_n").desired_width(120.0));
+                                    }
+                                }
+                                if ui.small_button("×").on_hover_text("Удалить вход").clicked() {
+                                    remove = Some((group_index, input_index));
+                                }
+                            });
+                        }
+                    }
+                    if let Some((group_index, input_index)) = remove {
+                        if let Some(group) = editor_state.manifest.groups.get_mut(group_index) {
+                            if input_index < group.inputs.len() {
+                                group.inputs.remove(input_index);
+                            }
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(RichText::new("Добавить вход").small().strong().color(MUTED));
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("rde_new_input_artifact")
+                            .selected_text(if editor_state.new_input_artifact.is_empty() {
+                                "выбрать артефакт".to_owned()
+                            } else {
+                                editor_state
+                                    .new_input_artifact
+                                    .clone()
+                            })
+                            .width(220.0)
+                            .show_ui(ui, |ui| {
+                                for candidate in self.project.artifacts() {
+                                    ui.selectable_value(&mut editor_state.new_input_artifact, candidate.id.clone(), &candidate.title);
+                                }
+                            });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor_state.new_input_selector)
+                                .hint_text("селектор (out/*.csv, inputs/data.csv)")
+                                .desired_width(220.0),
+                        );
+                        egui::ComboBox::from_id_salt("rde_new_input_mode")
+                            .selected_text(editor_state.new_input_mode.clone())
+                            .width(90.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut editor_state.new_input_mode, "hashed".to_owned(), "hashed");
+                                ui.selectable_value(&mut editor_state.new_input_mode, "ref".to_owned(), "ref");
+                            });
+                        if ui.button("+ артефакт").clicked() && !editor_state.new_input_artifact.is_empty() {
+                            let group_name = if editor_state.new_input_mode == "hashed" { "inputs" } else { "refs" };
+                            let group = input_group_mut(&mut editor_state.manifest.groups, group_name, &editor_state.new_input_mode);
+                            group.inputs.push(rde_core::InputSpec::Artifact {
+                                artifact: editor_state.new_input_artifact.clone(),
+                                selector: editor_state.new_input_selector.clone(),
+                            });
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor_state.new_input_file)
+                                .hint_text("файл данных (inputs/data.csv)")
+                                .desired_width(300.0),
+                        );
+                        if ui.button("+ файл").clicked() && !editor_state.new_input_file.is_empty() {
+                            let group = input_group_mut(&mut editor_state.manifest.groups, "inputs", "hashed");
+                            group.inputs.push(rde_core::InputSpec::File { file: editor_state.new_input_file.clone() });
+                        }
+                    });
+                }
+                ArtifactSection::Generation => {
+                    egui::Grid::new("rde_generation").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label(RichText::new("runtime").color(MUTED));
+                        ui.horizontal(|ui| {
+                            let runtime = editor_state.manifest.runtime.get_or_insert_with(|| rde_core::RuntimeManifest {
+                                kind: "python".to_owned(),
+                                env: "project".to_owned(),
+                                entry: "script.py".to_owned(),
+                                vars: std::collections::BTreeMap::new(),
+                            });
+                            egui::ComboBox::from_id_salt("rde_runtime_kind")
+                                .selected_text(runtime.kind.clone())
+                                .width(100.0)
+                                .show_ui(ui, |ui| {
+                                    for kind in ["python", "shell", "node", "r"] {
+                                        ui.selectable_value(&mut runtime.kind, kind.to_owned(), kind);
+                                    }
+                                });
+                            egui::ComboBox::from_id_salt("rde_runtime_env")
+                                .selected_text(runtime.env.clone())
+                                .width(110.0)
+                                .show_ui(ui, |ui| {
+                                    for env in ["project", "system", "artifact"] {
+                                        ui.selectable_value(&mut runtime.env, env.to_owned(), env);
+                                    }
+                                });
+                            ui.add(egui::TextEdit::singleline(&mut runtime.entry).hint_text("script.py").desired_width(160.0));
+                        });
+                        ui.end_row();
+                        ui.label(RichText::new("timeout, с").color(MUTED));
+                        ui.add(egui::TextEdit::singleline(&mut editor_state.timeout_text).desired_width(100.0));
+                        ui.end_row();
+                        ui.label(RichText::new("сеть").color(MUTED));
+                        let mut network = editor_state.manifest.network_allow.unwrap_or(false);
+                        if ui.checkbox(&mut network, "разрешить network_allow").changed() {
+                            editor_state.manifest.network_allow = Some(network);
+                        }
+                        ui.end_row();
+                        ui.label(RichText::new("params (JSON)").color(MUTED));
+                        ui.add(egui::TextEdit::multiline(&mut editor_state.params_text).desired_rows(4).desired_width(420.0));
+                        ui.end_row();
+                        ui.label(RichText::new("outputs").color(MUTED));
+                        ui.add(
+                            egui::TextEdit::multiline(&mut editor_state.outputs_text)
+                                .hint_text("out/stats.json — по одному пути на строку")
+                                .desired_rows(4)
+                                .desired_width(420.0),
+                        );
+                        ui.end_row();
+                    });
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Скрипт артефакта").strong().small().color(MUTED));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut editor_state.script_text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(16)
+                            .desired_width(f32::INFINITY)
+                            .code_editor(),
+                    );
+                }
+                ArtifactSection::Result => {
+                    ui.label(RichText::new("Результат генерации (выходы артефакта)").strong().small().color(MUTED));
+                    if let Some(status) = &status {
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some(act_key) = &status.act_key {
+                                ui.label(RichText::new(format!("act_key {}", &act_key[..12.min(act_key.len())])).monospace().small().color(MUTED));
+                            }
+                            if let Some(out_hash) = &status.out_hash {
+                                ui.label(RichText::new(format!("out_hash {}", &out_hash[..12.min(out_hash.len())])).monospace().small().color(MUTED));
+                            }
+                            if let Some(run_id) = &status.run_id {
+                                ui.label(RichText::new(format!("run {run_id}")).monospace().small().color(MUTED));
+                            }
+                            if let Some(updated) = status.updated_unix {
+                                ui.label(RichText::new(format!("обновлён unix {updated}")).small().color(MUTED));
+                            }
+                        });
+                    }
+                    if output_rows.is_empty() {
+                        ui.label(RichText::new("Объявленных выходов нет").small().color(MUTED));
+                    }
+                    for (rel, path, size, preview) in &output_rows {
+                        let header = format!("{rel} · {} байт", size);
+                        egui::CollapsingHeader::new(RichText::new(header).size(12.0)).id_salt(format!("rde_out_{rel}")).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("копировать путь").clicked() {
+                                    copy_text = Some(path.display().to_string());
+                                }
+                                if ui.small_button("открыть каталог").clicked() {
+                                    reveal = Some(path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone()));
+                                }
+                            });
+                            if !path.is_file() {
+                                ui.label(RichText::new("файл ещё не создан — обновите артефакт").small().color(AMBER));
+                            } else if let Some(preview) = preview {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut preview.clone())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_rows(10)
+                                        .desired_width(f32::INFINITY)
+                                        .interactive(false),
+                                );
+                            } else {
+                                ui.label(RichText::new("изображение: предпросмотр — в документе или внешнем просмотрщике").small().color(MUTED));
+                            }
+                        });
+                    }
+                    if let Some(run_id) = status.as_ref().and_then(|status| status.run_id.clone()) {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let run_dir = root.join(".rde/runs").join(&run_id);
+                            if ui.small_button("лог запуска").clicked() {
+                                take_log = Some(run_dir.join("stdout.log"));
+                            }
+                            if ui.small_button("provenance").clicked() {
+                                take_log = Some(run_dir.join("provenance.json"));
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        self.artifact_editor = editor;
+        self.artifact_section = section;
+        if save_editor {
+            if let Err(error) = self.save_artifact_editor() {
+                self.push_log(Level::Warn, format!("Артефакт: {error}"));
+            }
+        }
+        if update_artifact {
+            self.request_update(Some(vec![object.id.clone()]), false);
+        }
+        if let Some(path) = copy_text {
+            ui.ctx().copy_text(path);
+        }
+        if let Some(path) = take_log {
+            if path.is_file() {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        let tail: String = text.chars().rev().take(4000).collect::<String>().chars().rev().collect();
+                        self.push_log(Level::Info, format!("{}:\n{tail}", path.display()));
+                    }
+                    Err(error) => self.push_log(Level::Warn, format!("{}: {error}", path.display())),
+                }
+            } else {
+                self.push_log(Level::Warn, format!("Файл не найден: {}", path.display()));
+            }
+        }
+        if let Some(path) = reveal {
+            #[cfg(unix)]
+            if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+            }
+            self.push_log(Level::Info, format!("Каталог: {}", path.display()));
         }
     }
 
@@ -4051,6 +4710,19 @@ fn write_project_zip(root: &Path, out: &Path) -> Result<usize, String> {
 }
 
 /// Записать/заменить строковое поле верхнего уровня в TOML-манифесте (без переформатирования файла).
+/// Найти или создать группу входов по имени (для редактора артефакта).
+fn input_group_mut<'a>(
+    groups: &'a mut Vec<rde_core::GroupManifest>,
+    name: &str,
+    mode: &str,
+) -> &'a mut rde_core::GroupManifest {
+    if let Some(index) = groups.iter().position(|group| group.name == name) {
+        return &mut groups[index];
+    }
+    groups.push(rde_core::GroupManifest { name: name.to_owned(), mode: mode.to_owned(), inputs: Vec::new() });
+    groups.last_mut().expect("группа только что добавлена")
+}
+
 fn set_manifest_string(path: &Path, key: &str, value: &str) {
     let Ok(text) = fs::read_to_string(path) else { return };
     let mut out = String::with_capacity(text.len() + value.len() + 8);
@@ -4751,15 +5423,19 @@ mod docview_tests {
             selector: "out/stats.json".into(),
             pointer: "#/stats/x1/mean".into(),
             caption: "Среднее x1".into(),
+            style: String::new(),
+            format: "auto".into(),
+            precision: 2,
         });
         let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
         let insert = rde_doc
             .inserts
             .iter()
-            .find(|insert| insert.kind == "value")
+            .filter(|insert| insert.kind == "value")
+            .next_back()
             .unwrap_or_else(|| panic!("вставка значения не добавлена; журнал: {:?}", app.project.log.iter().map(|line| &line.text).collect::<Vec<_>>()))
             .clone();
-        assert_eq!(insert.cached, value_before);
+        assert_eq!(insert.cached, rde_doc::format_value(&value_before, "auto"));
         let document_xml = {
             let file = std::fs::File::open(&package).unwrap();
             let mut zip = zip::ZipArchive::new(file).unwrap();
@@ -4785,8 +5461,8 @@ mod docview_tests {
         assert_ne!(value_before, value_after, "значение изменилось");
         app.update_project_document();
         let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
-        let insert = rde_doc.inserts.iter().find(|insert| insert.kind == "value").expect("вставка значения");
-        assert_eq!(insert.cached, value_after, "вставка обновлена из артефакта");
+        let insert = rde_doc.inserts.iter().filter(|insert| insert.kind == "value").next_back().expect("вставка значения");
+        assert_eq!(insert.cached, rde_doc::format_value(&value_after, "auto"), "вставка обновлена из артефакта");
         assert!(
             app.project.log.iter().any(|line| line.text.contains("Документ обновлён")),
             "журнал: {:?}",
@@ -4797,8 +5473,8 @@ mod docview_tests {
         // Откат документа: пакет восстанавливается из CAS (значение снова прежнее).
         app.rollback_document();
         let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
-        let insert = rde_doc.inserts.iter().find(|insert| insert.kind == "value").expect("вставка значения");
-        assert_eq!(insert.cached, value_before, "откат вернул прежнюю версию документа");
+        let insert = rde_doc.inserts.iter().filter(|insert| insert.kind == "value").next_back().expect("вставка значения");
+        assert_eq!(insert.cached, rde_doc::format_value(&value_before, "auto"), "откат вернул прежнюю версию документа");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4819,6 +5495,9 @@ mod docview_tests {
             selector: "out/plot.svg".into(),
             pointer: String::new(),
             caption: "График статистик".into(),
+            style: String::new(),
+            format: "auto".into(),
+            precision: 2,
         });
         let rde_doc = rde_doc::load_rde_doc(&package).unwrap();
         assert!(rde_doc.inserts.iter().any(|insert| insert.kind == "figure" && !insert.target.is_empty()));
@@ -4828,6 +5507,19 @@ mod docview_tests {
             "media-часть рисунка: {:?}",
             info.part_names()
         );
+        let media_before = {
+            let file = std::fs::File::open(&package).unwrap();
+            let mut zip = zip::ZipArchive::new(file).unwrap();
+            let name = (0..zip.len())
+                .map(|index| zip.by_index(index).unwrap().name().to_owned())
+                .find(|name| name.starts_with("word/media/rde-figure"))
+                .expect("media-часть");
+            let mut part = zip.by_name(&name).unwrap();
+            let mut bytes = Vec::new();
+            use std::io::Read;
+            part.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
 
         // Пересобираем график с другим содержимым и обновляем документ: media-часть меняется.
         let plot_script = app.project.artifact_object(plot).unwrap().dir.join("script.py");
@@ -4857,7 +5549,9 @@ mod docview_tests {
             part.read_to_end(&mut bytes).unwrap();
             bytes
         };
-        assert!(String::from_utf8_lossy(&media).contains("fill=\"red\""), "рисунок обновлён из артефакта");
+        assert!(media.starts_with(b"\x89PNG"), "SVG растеризован в PNG для DocView: {} байт", media.len());
+        assert_ne!(media, media_before, "рисунок обновлён из артефакта (новые пиксели)");
+        let _ = (media_before, media);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4970,6 +5664,50 @@ mod docview_tests {
         }
         assert!(summary.contains("RDE diagnostics"), "{summary}");
         assert!(summary.contains("Демо"), "{summary}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P6: рабочее место артефакта (входы/генерация/результат) ────────────
+
+    #[test]
+    fn artifact_workspace_edits_inputs_script_and_params() {
+        if !python_available() {
+            return;
+        }
+        let root = temp_demo_copy("artifact-workspace");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        app.selected = Some(STATS.to_owned());
+        app.artifact_section = super::ArtifactSection::Inputs;
+        app.artifact_editor = None;
+        let object = app.project.artifact_object(STATS).cloned().unwrap();
+        app.ensure_artifact_editor(&object);
+        {
+            let editor = app.artifact_editor.as_mut().expect("редактор артефакта");
+            assert!(!editor.script_text.is_empty(), "скрипт прочитан в редактор");
+            editor.params_text = r#"{"window": 256, "method": "welch"}"#.into();
+            editor.outputs_text = "out/stats.json\nout/stats.csv".into();
+            editor.script_text.push_str("\n# edit from artifact workspace\n");
+            editor.new_input_file = "inputs/experiment.csv".into();
+            let group = super::input_group_mut(&mut editor.manifest.groups, "inputs", "hashed");
+            group.inputs.push(rde_core::InputSpec::File { file: "inputs/experiment.csv".into() });
+        }
+        app.save_artifact_editor().expect("сохранить артефакт");
+        let reloaded = rde_core::load_project(&root).unwrap();
+        let artifact_object = reloaded.artifact_object(STATS).unwrap();
+        let rde_core::ObjectData::Artifact(manifest) = &artifact_object.data else { panic!() };
+        assert_eq!(manifest.params["window"], 256);
+        assert!(manifest.outputs.contains(&"out/stats.csv".to_owned()));
+        assert!(manifest.groups.iter().any(|group| group.name == "inputs" && !group.inputs.is_empty()), "новый вход сохранён");
+        let script = std::fs::read_to_string(artifact_object.dir.join("script.py")).unwrap();
+        assert!(script.contains("edit from artifact workspace"), "скрипт сохранён");
+        // Изменение скрипта делает артефакт устаревшим (P1).
+        let statuses = rde_dag::evaluate(&reloaded, app.store.as_ref().unwrap()).unwrap();
+        assert!(
+            matches!(statuses[STATS].status, rde_dag::LiveStatus::Stale(_) | rde_dag::LiveStatus::NeverRun),
+            "{:?}",
+            statuses[STATS].status
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

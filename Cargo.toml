@@ -25,6 +25,7 @@ quick-xml = "0.42"
 sha2 = "0.11"
 rusqlite = { version = "0.41", features = ["bundled"] }
 zstd = "0.13"
+resvg = { version = "0.45", default-features = true }
 
 egui = "0.36.2"
 eframe = { version = "0.36.2", default-features = false, features = [

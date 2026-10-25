@@ -259,6 +259,20 @@ fn write_artifact_scaffold(dir: &Path, kind: NewObjectKind, title: &str) -> Resu
     Ok(())
 }
 
+/// Перезаписать `artifact.toml` из типизированной модели (редактор артефакта в UI).
+/// Комментарии/порядок при этом не сохраняются (полноценный `toml_edit` — v0.2), но схема
+/// валидируется; скрипты/выходы при сохранении манифеста не трогаются.
+pub fn write_artifact_manifest(root: &Path, manifest: &crate::manifest::ArtifactManifest) -> Result<(), String> {
+    let dir = root.join("objects/artifacts").join(&manifest.id);
+    if !dir.is_dir() {
+        return Err(format!("каталог артефакта {} не найден", dir.display()));
+    }
+    let text = toml::to_string_pretty(manifest).map_err(|e| format!("artifact.toml: {e}"))?;
+    let path = dir.join("artifact.toml");
+    fs::write(&path, text).map_err(|e| format!("записать {}: {e}", path.display()))?;
+    validate_manifest(ManifestKind::Artifact, &path)
+}
+
 /// Записать список авторов проекта в `rde.toml` (R-SET-01, R-UI-06): заменяет `[[authors]]`-блоки,
 /// остальной файл не трогает. Пустой список удаляет авторов.
 pub fn set_project_authors(root: &Path, authors: &[crate::manifest::AuthorManifest]) -> Result<(), String> {
@@ -729,6 +743,45 @@ mod authors_tests {
         // Пустой список удаляет авторов.
         set_project_authors(&root, &[]).unwrap();
         assert_eq!(crate::load_project(&root).unwrap().manifest.authors.len(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod manifest_write_tests {
+    use super::*;
+
+    #[test]
+    fn write_artifact_manifest_roundtrips_typed_fields() {
+        let root = std::env::temp_dir().join(format!("rde-core-manifest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("rde.toml"),
+            "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"T\"\ntrusted = true\n",
+        )
+        .unwrap();
+        let dir = create_object(&root, &CreateRequest { kind: NewObjectKind::ComputeArtifact, title: "A".into() }).unwrap();
+        let project = crate::load_project(&root).unwrap();
+        let object = &project.objects[0];
+        let crate::ObjectData::Artifact(mut manifest) = object.data.clone() else { panic!() };
+        manifest.params = serde_json::json!({"window": 256, "method": "welch"});
+        manifest.outputs = vec!["out/a.csv".into(), "out/b.svg".into()];
+        manifest.network_allow = Some(true);
+        manifest.groups.push(crate::manifest::GroupManifest {
+            name: "refs".into(),
+            mode: "ref".into(),
+            inputs: vec![crate::manifest::InputSpec::File { file: "inputs/x.csv".into() }],
+        });
+        write_artifact_manifest(&root, &manifest).unwrap();
+        let reloaded = crate::load_project(&root).unwrap();
+        let crate::ObjectData::Artifact(again) = reloaded.objects[0].data.clone() else { panic!() };
+        assert_eq!(again.params, manifest.params);
+        assert_eq!(again.outputs, manifest.outputs);
+        assert_eq!(again.network_allow, Some(true));
+        assert_eq!(again.groups.len(), 2);
+        assert_eq!(again.groups[1].mode, "ref");
+        assert!(reloaded.issues.is_empty(), "{:?}", reloaded.issues);
         let _ = fs::remove_dir_all(&root);
     }
 }

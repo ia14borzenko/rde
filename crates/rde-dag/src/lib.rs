@@ -1568,38 +1568,13 @@ pub fn resolve_insert_text(project: &Project, store: &Store, uri: &str) -> Resul
                 .ok_or_else(|| format!("JSON pointer `{pointer}` не найден в {file_part}"))?;
             match value {
                 serde_json::Value::String(text) => text.clone(),
-                serde_json::Value::Number(number) => format_display_number(number),
+                // Сырое значение: формат отображения выбирает документ (rde_doc::format_value).
                 other => other.to_string(),
             }
         }
         None => String::from_utf8_lossy(&bytes).trim_end_matches(['\n', '\r']).to_owned(),
     };
     Ok((value, hash))
-}
-
-/// Формат числа для отображения во вставке (R-DOC-11): до 4 значащих знаков после запятой,
-/// крупные/малые — экспонента; точное значение остаётся в выходе артефакта.
-fn format_display_number(number: &serde_json::Number) -> String {
-    let Some(value) = number.as_f64() else { return number.to_string() };
-    if !value.is_finite() {
-        return number.to_string();
-    }
-    if value == 0.0 {
-        return "0".to_owned();
-    }
-    let abs = value.abs();
-    if (1e-3..1e6).contains(&abs) {
-        let mut text = format!("{value:.3}");
-        while text.ends_with('0') && text.contains('.') {
-            text.pop();
-        }
-        if text.ends_with('.') {
-            text.pop();
-        }
-        text
-    } else {
-        format!("{value:.3e}")
-    }
 }
 
 /// Разрешить рисунок вставки: путь к файлу-выходу артефакта + расширение + hash цели.

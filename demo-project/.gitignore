@@ -5,3 +5,5 @@ objects/*/*/out/
 __pycache__/
 .venv/
 uv.lock
+*.doc.rde.bak
+*.docx.bak

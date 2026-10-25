@@ -37,12 +37,19 @@ fn main() -> Result<(), String> {
     let (value, hash) = rde_dag::resolve_insert_text(&project, &store, &value_uri)?;
     let existing = load_rde_doc(&package)?;
     if let Some(insert) = existing.inserts.iter().find(|insert| insert.target == value_uri) {
+        // Стиль обычного текста текущего шаблона + формат «стандартный вид» (R-DOC-11/25).
+        if insert.style.is_empty() {
+            let style = rde_doc::default_paragraph_style(&package);
+            rde_doc::apply_insert_style(&package, &insert.id, &style)?;
+        }
+        rde_doc::set_insert_format(&package, &insert.id, "sci:3")?;
+        let formatted = rde_doc::format_value(&value, "sci:3");
         let mut values = std::collections::BTreeMap::new();
-        values.insert(insert.id.clone(), value.clone());
+        values.insert(insert.id.clone(), formatted.clone());
         let mut hashes = std::collections::BTreeMap::new();
         hashes.insert(insert.id.clone(), hash.clone());
         rde_doc::update_insert_values(&package, &values, &hashes)?;
-        println!("вставка значения обновлена: {} = {value}", insert.id);
+        println!("вставка значения обновлена: {} = {formatted}", insert.id);
     } else {
         let report = add_insert(
             &package,
@@ -51,8 +58,10 @@ fn main() -> Result<(), String> {
                 target: value_uri.clone(),
                 selector: "#/stats/x1/mean".to_owned(),
                 value_kind: "number".to_owned(),
-                cached: value.clone(),
+                cached: rde_doc::format_value(&value, "sci:3"),
                 caption: "Среднее значение x1".to_owned(),
+                style: String::new(), // обычный стиль документа подставится автоматически
+                format: "sci:3".to_owned(),
             },
         )?;
         println!("вставка значения добавлена: {} = {value}", report.insert.id);

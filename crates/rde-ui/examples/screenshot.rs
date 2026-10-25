@@ -28,6 +28,9 @@ fn main() {
         Some("insert-value") => state.demo_open_insert_dialog("value"),
         Some("insert-figure") => state.demo_open_insert_dialog("figure"),
         Some("app-settings") => state.demo_open_app_settings(),
+        Some("artifact-inputs") => state.demo_set_artifact_section("inputs"),
+        Some("artifact-generation") => state.demo_set_artifact_section("generation"),
+        Some("artifact-result") => state.demo_set_artifact_section("result"),
         _ => {}
     }
 

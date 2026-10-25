@@ -87,6 +87,12 @@ pub struct RdeInsert {
     /// Анкор `w14:paraId` content-control'а вставки (если есть).
     #[serde(default)]
     pub para_id: Option<String>,
+    /// Стиль абзаца вставки (`w:pStyle`, например `Normal`) из текущего шаблона документа.
+    #[serde(default)]
+    pub style: String,
+    /// Формат отображения значения: `auto|raw|int|dec:N|sci:N|percent:N` (R-DOC-11).
+    #[serde(default)]
+    pub format: String,
 }
 
 /// Сводка ревью (комментарии/правки; полноценно — M5).
@@ -286,6 +292,12 @@ pub fn render_rde_doc(doc: &RdeDoc) -> String {
         if let Some(para_id) = &insert.para_id {
             out.push_str(&format!(" para_id=\"{}\"", escape_attr(para_id)));
         }
+        if !insert.style.is_empty() {
+            out.push_str(&format!(" style=\"{}\"", escape_attr(&insert.style)));
+        }
+        if !insert.format.is_empty() {
+            out.push_str(&format!(" format=\"{}\"", escape_attr(&insert.format)));
+        }
         out.push_str("/>\n");
     }
     out.push_str("  </rde:inserts>\n");
@@ -375,6 +387,8 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                             selector: String::new(),
                             value_kind: String::new(),
                             para_id: None,
+                            style: String::new(),
+                            format: String::new(),
                         };
                         for attr in event.attributes().flatten() {
                             let key = local_name(attr.key.as_ref());
@@ -391,6 +405,8 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                                 "selector" => insert.selector = value,
                                 "value_kind" => insert.value_kind = value,
                                 "para_id" => insert.para_id = Some(value),
+                                "style" => insert.style = value,
+                                "format" => insert.format = value,
                                 _ => {}
                             }
                         }
@@ -791,14 +807,216 @@ fn sdt_paragraph_xml(insert: &RdeInsert) -> String {
     } else {
         format!("<w:r><w:t xml:space=\"preserve\">{}: </w:t></w:r>", escape_attr(&insert.caption))
     };
+    // Стиль обычного текста текущего шаблона (R-DOC-11/25): w:pStyle из styles.xml документа.
+    let paragraph_props = if insert.style.is_empty() {
+        String::new()
+    } else {
+        format!("<w:pPr><w:pStyle w:val=\"{}\"/></w:pPr>", escape_attr(&insert.style))
+    };
     format!(
-        "<w:p>{label}<w:sdt><w:sdtPr><w:tag w:val=\"{prefix}{id}\"/><w:alias w:val=\"{alias}\"/></w:sdtPr>\
+        "<w:p>{paragraph_props}{label}<w:sdt><w:sdtPr><w:tag w:val=\"{prefix}{id}\"/><w:alias w:val=\"{alias}\"/></w:sdtPr>\
          <w:sdtContent><w:r><w:t xml:space=\"preserve\">{value}</w:t></w:r></w:sdtContent></w:sdt></w:p>",
         prefix = INSERT_TAG_PREFIX,
         id = escape_attr(&insert.id),
         alias = escape_attr(if insert.caption.is_empty() { &insert.kind } else { &insert.caption }),
         value = escape_attr(&insert.cached),
     )
+}
+
+/// Стиль абзаца из `word/styles.xml` (для выбора стиля вставки пользователем).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StyleInfo {
+    pub id: String,
+    pub name: String,
+    /// `paragraph` | `character` | `table` | `numbering`.
+    pub kind: String,
+    /// Стиль абзаца по умолчанию (`w:default="1"`).
+    pub is_default: bool,
+}
+
+/// Список стилей пакета (из `word/styles.xml`).
+pub fn list_document_styles(package: &Path) -> Result<Vec<StyleInfo>, String> {
+    let entries = read_package(package)?.entries;
+    let Some(bytes) = entries.get("word/styles.xml") else { return Ok(Vec::new()) };
+    let xml = String::from_utf8_lossy(bytes).to_string();
+    let mut styles = Vec::new();
+    let mut rest = xml.as_str();
+    while let Some(start) = rest.find("<w:style ") {
+        let Some(end) = rest[start..].find("</w:style>") else { break };
+        let element = &rest[start..start + end + "</w:style>".len()];
+        let attr = |name: &str| -> Option<String> {
+            let marker = format!("w:{name}=\"");
+            let index = element.find(&marker)?;
+            let value = &element[index + marker.len()..];
+            let close = value.find('"')?;
+            Some(value[..close].to_owned())
+        };
+        let id = attr("styleId").unwrap_or_default();
+        let kind = attr("type").unwrap_or_else(|| "paragraph".to_owned());
+        let is_default = element.contains("w:default=\"1\"");
+        let name = element
+            .find("<w:name ")
+            .and_then(|index| {
+                let value = &element[index..];
+                let marker = "w:val=\"";
+                let value_start = value.find(marker)? + marker.len();
+                let close = value[value_start..].find('"')?;
+                Some(value[value_start..value_start + close].to_owned())
+            })
+            .unwrap_or_else(|| id.clone());
+        if !id.is_empty() {
+            styles.push(StyleInfo { id, name, kind, is_default });
+        }
+        rest = &rest[start + end + "</w:style>".len()..];
+    }
+    Ok(styles)
+}
+
+/// Стиль абзаца по умолчанию (для вставок): `w:default="1"`, иначе `Normal`, иначе пусто.
+pub fn default_paragraph_style(package: &Path) -> String {
+    let Ok(styles) = list_document_styles(package) else { return String::new() };
+    if let Some(style) = styles.iter().find(|style| style.kind == "paragraph" && style.is_default) {
+        return style.id.clone();
+    }
+    if styles.iter().any(|style| style.kind == "paragraph" && style.id == "Normal") {
+        return "Normal".to_owned();
+    }
+    styles.iter().find(|style| style.kind == "paragraph").map(|style| style.id.clone()).unwrap_or_default()
+}
+
+/// Форматирование значения вставки (R-DOC-11): «компьютерный» вид — лишь один из вариантов.
+/// `auto` — умный вид (целые без дробной части, иначе до 4 значащих), `raw` — как в артефакте,
+/// `int` — целое, `dec:N` — N знаков после запятой, `sci:N` — стандартный вид `m·10^e`,
+/// `percent:N` — проценты с N знаками.
+pub fn format_value(raw: &str, format: &str) -> String {
+    let format = format.trim();
+    if format.is_empty() || format == "raw" {
+        return raw.to_owned();
+    }
+    let Ok(value) = raw.trim().parse::<f64>() else {
+        return raw.to_owned();
+    };
+    if !value.is_finite() {
+        return raw.to_owned();
+    }
+    let precision = |prefix: &str, default: usize| -> usize {
+        format
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .and_then(|rest| rest.parse::<usize>().ok())
+            .unwrap_or(default)
+            .min(10)
+    };
+    match format {
+        "int" => format!("{value:.0}"),
+        _ if format.starts_with("dec") => {
+            let digits = precision("dec", 2);
+            format!("{value:.digits$}")
+        }
+        _ if format.starts_with("sci") => {
+            let digits = precision("sci", 3);
+            let text = format!("{value:.digits$e}"); // 1.235e3
+            match text.split_once('e') {
+                Some((mantissa, exponent)) => {
+                    let exponent: i32 = exponent.parse().unwrap_or(0);
+                    format!("{mantissa}·10^{exponent}")
+                }
+                None => text,
+            }
+        }
+        _ if format.starts_with("percent") => {
+            let digits = precision("percent", 1);
+            format!("{:.digits$} %", value * 100.0)
+        }
+        _ => format_display_number_auto(value),
+    }
+}
+
+fn format_display_number_auto(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let abs = value.abs();
+    if (1e-3..1e6).contains(&abs) {
+        let mut text = format!("{value:.4}");
+        while text.ends_with('0') && text.contains('.') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+        text
+    } else {
+        let text = format!("{value:.4e}");
+        match text.split_once('e') {
+            Some((mantissa, exponent)) => {
+                let exponent: i32 = exponent.parse().unwrap_or(0);
+                format!("{mantissa}·10^{exponent}")
+            }
+            None => text,
+        }
+    }
+}
+
+/// Задать формат отображения вставки (R-DOC-11): `auto|raw|int|dec:N|sci:N|percent:N`.
+pub fn set_insert_format(package: &Path, insert_id: &str, format: &str) -> Result<RdeDoc, String> {
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let mut found = false;
+    for insert in &mut rde_doc.inserts {
+        if insert.id == insert_id {
+            insert.format = format.to_owned();
+            found = true;
+        }
+    }
+    if !found {
+        return Err(format!("вставка {insert_id} не найдена"));
+    }
+    entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+    write_entries_atomic(&entries, package)?;
+    Ok(rde_doc)
+}
+
+/// Сменить стиль абзаца вставки (пользователь выбирает стиль из шаблона): правит `w:pStyle`
+/// в документе и `rde:doc` (R-DOC-11/25).
+pub fn apply_insert_style(package: &Path, insert_id: &str, style: &str) -> Result<PackageInfo, String> {
+    let mut entries = read_package(package)?.entries;
+    let mut rde_doc = load_rde_doc_from_entries(&entries)?;
+    let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
+    let document_xml = String::from_utf8_lossy(document).to_string();
+    let tag = format!("<w:tag w:val=\"{INSERT_TAG_PREFIX}{insert_id}\"");
+    let tag_index = document_xml.find(&tag).ok_or_else(|| format!("вставка {insert_id} не найдена в документе"))?;
+    let paragraph_start = document_xml[..tag_index].rfind("<w:p").ok_or_else(|| "не найден абзац вставки".to_owned())?;
+    // Конец открывающего тега <w:p ...>.
+    let open_end = document_xml[paragraph_start..]
+        .find('>')
+        .map(|index| paragraph_start + index + 1)
+        .ok_or_else(|| "некорректный тег абзаца".to_owned())?;
+    let after_open = &document_xml[open_end..];
+    let props = if style.is_empty() { String::new() } else { format!("<w:pPr><w:pStyle w:val=\"{}\"/></w:pPr>", escape_attr(style)) };
+    let new_xml = if let Some(props_end) = after_open.strip_prefix("").and_then(|rest| {
+        if rest.starts_with("<w:pPr") {
+            rest.find("</w:pPr>").map(|index| open_end + index + "</w:pPr>".len())
+        } else {
+            None
+        }
+    }) {
+        format!("{}{}{}", &document_xml[..open_end], props, &document_xml[props_end..])
+    } else {
+        format!("{}{}{}", &document_xml[..open_end], props, &document_xml[open_end..])
+    };
+    for insert in &mut rde_doc.inserts {
+        if insert.id == insert_id {
+            insert.style = style.to_owned();
+        }
+    }
+    rde_doc.body_hash = rde_hash::sha256(new_xml.as_bytes()).hex();
+    entries.insert(DOCUMENT_XML.to_owned(), new_xml.into_bytes());
+    entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
+    upsert_custom_props(&mut entries, &rde_doc);
+    let info = info_from_entries(&entries);
+    write_entries_atomic(&entries, package)?;
+    Ok(info)
 }
 
 /// Заменить текст внутри `w:sdt` вставки (по тегу `rde:<id>`) на новое значение.
@@ -1078,6 +1296,8 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 selector: String::new(),
                 value_kind: "figure".to_owned(),
                 para_id: block.para_id.clone(),
+                style: String::new(),
+                format: String::new(),
             });
         } else if block.kind == "caption" {
             inserts.push(RdeInsert {
@@ -1092,6 +1312,8 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 selector: String::new(),
                 value_kind: "text".to_owned(),
                 para_id: block.para_id.clone(),
+                style: String::new(),
+                format: String::new(),
             });
         }
     }
@@ -1238,6 +1460,10 @@ pub struct InsertRequest {
     /// Кэш значения, который сразу попадает в документ.
     pub cached: String,
     pub caption: String,
+    /// Стиль абзаца (`w:pStyle`), пусто — обычный стиль документа.
+    pub style: String,
+    /// Формат отображения значения (`auto|raw|int|dec:N|sci:N|percent:N`).
+    pub format: String,
 }
 
 /// Результат добавления вставки.
@@ -1254,6 +1480,8 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
     let id = format!("v{}", rde_doc.inserts.len() + 1);
     let para_id = para_id_for(&format!("{}:insert:{id}", rde_doc.doc_id), 0);
+    // Стиль обычного текста текущего шаблона — по умолчанию стиль абзаца документа.
+    let style = if request.style.is_empty() { default_paragraph_style(package) } else { request.style };
     let insert = RdeInsert {
         id,
         block: String::new(),
@@ -1266,6 +1494,8 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
         selector: request.selector,
         value_kind: request.value_kind,
         para_id: Some(para_id.clone()),
+        style,
+        format: request.format,
     };
     let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
     let document_xml = String::from_utf8_lossy(document).to_string();
@@ -1337,6 +1567,36 @@ pub fn document_root_name(doc_id: &str) -> String {
 
 fn rels_path_for_document() -> &'static str {
     "word/_rels/document.xml.rels"
+}
+
+/// Растеризовать SVG в PNG: WordCraft DocView не умеет SVG (рисует серый прямоугольник),
+/// а Word/LO умеют и PNG. Источник истины (target в rde:doc) остаётся SVG-выход артефакта.
+pub fn rasterize_svg(svg: &[u8]) -> Result<Vec<u8>, String> {
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(svg, &options).map_err(|e| format!("SVG не разобран: {e}"))?;
+    let size = tree.size().to_int_size();
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
+        .ok_or_else(|| format!("SVG-холст {}×{} не создан", size.width(), size.height()))?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+    pixmap.encode_png().map_err(|e| format!("SVG → PNG: {e}"))
+}
+
+/// Подготовить медиа рисунка для пакета: SVG растеризуется в PNG (иначе DocView показывает
+/// серый прямоугольник); PNG/JPEG/GIF сохраняются как есть.
+fn prepare_figure_media(ext: &str, bytes: Vec<u8>) -> (String, Vec<u8>) {
+    let ext = ext.to_ascii_lowercase();
+    if ext == "svg" {
+        match rasterize_svg(&bytes) {
+            Ok(png) => ("png".to_owned(), png),
+            Err(error) => {
+                // Не блокируем вставку: Word/LO покажут SVG, DocView — заглушку; причина в stderr.
+                eprintln!("RDE: SVG → PNG не удалось ({error}); сохраняем SVG");
+                (ext, bytes)
+            }
+        }
+    } else {
+        (ext, bytes)
+    }
 }
 
 fn image_content_type(ext: &str) -> &'static str {
@@ -1465,6 +1725,7 @@ pub fn add_figure_insert(
         .unwrap_or("png")
         .to_ascii_lowercase();
     let bytes = fs::read(image).map_err(|e| format!("прочитать рисунок {}: {e}", image.display()))?;
+    let (ext, bytes) = prepare_figure_media(&ext, bytes);
     let mut entries = read_package(package)?.entries;
     let mut rde_doc = load_rde_doc_from_entries(&entries)?;
     let index = rde_doc.inserts.iter().filter(|insert| insert.kind == "figure").count() + 1;
@@ -1493,6 +1754,8 @@ pub fn add_figure_insert(
         selector: String::new(),
         value_kind: "figure".to_owned(),
         para_id: Some(para_id.clone()),
+        style: String::new(),
+        format: String::new(),
     };
     let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
     let document_xml = String::from_utf8_lossy(document).to_string();
@@ -1535,6 +1798,7 @@ pub fn update_figure_images(
             continue;
         }
         let Some((ext, bytes)) = images.get(&insert.id) else { continue };
+        let (ext, bytes) = prepare_figure_media(ext, bytes.clone());
         // media-часть для этой вставки: находим по drawing/relationship через tag → rel id.
         let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
         let document_xml = String::from_utf8_lossy(document).to_string();

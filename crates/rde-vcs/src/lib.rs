@@ -109,7 +109,7 @@ fn run(root: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// Содержимое `.gitignore` проекта RDE (выходы/локальное состояние не коммитятся).
-pub const PROJECT_GITIGNORE: &str = "# Локальное состояние RDE (CAS, журнал, корни, запуски)\n/.rde/\n# Экспорты и кэши\n/exports/\n# Выходы артефактов (идентичность — out_hash в artifact.toml, R-VCS-02)\nobjects/*/*/out/\n__pycache__/\n.venv/\nuv.lock\n";
+pub const PROJECT_GITIGNORE: &str = "# Локальное состояние RDE (CAS, журнал, корни, запуски)\n/.rde/\n# Экспорты и кэши\n/exports/\n# Выходы артефактов (идентичность — out_hash в artifact.toml, R-VCS-02)\nobjects/*/*/out/\n__pycache__/\n.venv/\nuv.lock\n# Бэкапы пакета документа (R-DOC-12)\n*.doc.rde.bak\n*.docx.bak\n";
 
 /// Содержимое `.gitattributes`: пакеты документов — бинарные.
 pub const PROJECT_GITATTRIBUTES: &str = "# RDE: пакеты документов бинарные (сравнение — через rde:doc/diff)\n*.doc.rde binary\n*.docx binary\n*.rde.zip binary\n";
