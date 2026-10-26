@@ -189,6 +189,39 @@ fn kind_icon(kind: ObjectKind) -> &'static str {
     }
 }
 
+// ── раскладка: ширины боковых панелей (одна точка правды; ТЗ-03 §19-8) ──────────────────
+/// Левая панель «Проект» (дерево объектов).
+const TREE_WIDTH: f32 = 268.0;
+const TREE_WIDTH_MIN: f32 = 120.0;
+/// Правая панель «Агент».
+const AGENT_WIDTH: f32 = 316.0;
+const AGENT_WIDTH_MIN: f32 = 180.0;
+/// Инспектор объекта: 340 px по умолчанию, перетаскивается в диапазоне 280–480 px.
+/// Решение владельца §19-8: инспектор не должен съедать центр документа.
+const INSPECTOR_WIDTH: f32 = 340.0;
+const INSPECTOR_WIDTH_MIN: f32 = 280.0;
+const INSPECTOR_WIDTH_MAX: f32 = 480.0;
+
+// ── строка вкладок центра: ОДНА линия без переноса (ТЗ-03 §19-7) ────────────────────────
+/// Высота таба строки вкладок и сегмента переключателя режимов (равна `interact_size.y`
+/// глобального стиля: кнопки не бывают ниже 32 px, поэтому строка ровно в одну кнопку).
+const CENTER_TAB_HEIGHT: f32 = 32.0;
+const CENTER_SEGMENT_HEIGHT: f32 = 24.0;
+/// Горизонтальный отступ таба строки вкладок (компактнее кнопок ленты).
+const CENTER_TAB_PADDING_X: f32 = 6.0;
+/// Зазор между табами строки вкладок.
+const CENTER_TAB_SPACING_X: f32 = 1.0;
+/// Зазор между вкладками и переключателем режимов в той же строке.
+const CENTER_MODE_GAP: f32 = 10.0;
+/// Отступ сегмента переключателя режимов и зазор между сегментами.
+const CENTER_SEGMENT_PADDING_X: f32 = 6.0;
+const CENTER_SEGMENT_SPACING_X: f32 = 1.0;
+/// Поля сегментированной рамки (2 px поля + 1 px обводка) — входят в ширину переключателя.
+const CENTER_SEGMENT_MARGIN: f32 = 2.0;
+const CENTER_SEGMENT_FRAME: f32 = CENTER_SEGMENT_MARGIN + 1.0;
+/// Запас по ширине: строка не должна упираться в правый край вплотную.
+const CENTER_LINE_SAFETY: f32 = 8.0;
+
 /// Вкладки центральной области.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -287,7 +320,7 @@ fn load_and_render(path: &Path, ctx: &egui::Context) -> Result<(Vec<egui::Textur
 }
 
 /// Режим области документа.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DocMode {
     /// Чистый редактор: canvas WordCraft без его ribbon/titlebar (RDE-патч `rde-docview`).
     DocView,
@@ -300,6 +333,7 @@ enum DocMode {
 impl DocMode {
     const ALL: [DocMode; 3] = [DocMode::DocView, DocMode::Full, DocMode::Preview];
 
+    /// Полное название режима: доступное имя кнопки-сегмента и статусы/тесты.
     fn label(self) -> &'static str {
         match self {
             DocMode::DocView => "RDE",
@@ -307,6 +341,43 @@ impl DocMode {
             DocMode::Preview => "Предпросмотр страниц",
         }
     }
+
+    /// Короткая подпись для компактного переключателя в строке вкладок центра (§19-7):
+    /// «Предпросмотр страниц» → «Предпросмотр», полное название остаётся в тултипе и a11y.
+    fn short_label(self) -> &'static str {
+        match self {
+            DocMode::DocView | DocMode::Full => self.label(),
+            DocMode::Preview => "Предпросмотр",
+        }
+    }
+
+    /// Иконка сегмента переключателя (Phosphor-сабсет: документ / правка / поиск-просмотр).
+    fn icon(self) -> &'static str {
+        match self {
+            DocMode::DocView => IC_DOC,
+            DocMode::Full => IC_RENAME,
+            DocMode::Preview => IC_SEARCH,
+        }
+    }
+
+    /// Подсказка сегмента: что за режим и чем отличается.
+    fn tooltip(self) -> &'static str {
+        match self {
+            DocMode::DocView => "Режим RDE: редактор документа в оболочке RDE (лента RDE)",
+            DocMode::Full => "Режим WordCraft: полный интерфейс встроенного редактора WordCraft",
+            DocMode::Preview => "Предпросмотр страниц: растеризованные страницы документа",
+        }
+    }
+}
+
+/// Плотность строки вкладок центра (§19-7): каким элементам хватает места для подписи.
+/// Строка всегда одна — при нехватке ширины остаются иконки с тултипами, а не перенос.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CenterLineDensity {
+    /// Вкладки центра — с подписями («Документ | Структура | …»), а не только иконками.
+    tab_labels: bool,
+    /// Сегменты переключателя режимов — с подписями (RDE | WordCraft | Предпросмотр).
+    mode_labels: bool,
 }
 
 /// Встроенный редактор WordCraft: полноценный `WordApp` (ribbon + canvas + ввод).
@@ -2190,6 +2261,37 @@ impl RdeApp {
                 });
                 None
             }
+            Slot::Zoom => {
+                // Масштаб документа (§19-7): живёт на ленте (вкладка «Документ», группа «Масштаб»),
+                // а не в строке вкладок центра. Высота — как у кнопок ленты, чтобы группы не «плясали».
+                let mut picked: Option<Cmd> = None;
+                let zoom = self.editor.as_ref().map(|editor| editor.app.session.view.zoom);
+                ui.allocate_ui_with_layout(
+                    vec2(RIBBON_ZOOM_W, RIBBON_BUTTON_H),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        if ui.small_button("−").on_hover_text("Уменьшить масштаб").clicked() {
+                            picked = Some(Cmd::ZoomOut);
+                        }
+                        let percent = match zoom {
+                            Some(zoom) => format!("{:.0}%", zoom * 100.0),
+                            None => "—".to_owned(),
+                        };
+                        ui.label(RichText::new(percent).monospace().size(FS_MONO).color(pal.muted));
+                        if ui.small_button("+").on_hover_text("Увеличить масштаб").clicked() {
+                            picked = Some(Cmd::ZoomIn);
+                        }
+                        if ui.small_button("Сброс").on_hover_text("Масштаб 100%").clicked() {
+                            picked = Some(Cmd::Zoom100);
+                        }
+                        if ui.small_button("По ширине").on_hover_text("Масштаб по ширине страницы").clicked() {
+                            picked = Some(Cmd::PageWidth);
+                        }
+                    },
+                );
+                picked
+            }
             Slot::Note(text) => {
                 ui.vertical(|ui| {
                     ui.set_max_width(170.0);
@@ -2200,57 +2302,28 @@ impl RdeApp {
         }
     }
 
-    /// Строка режимов документа (центральная область, только вкладка «Документ»): переключатель
-    /// RDE | WordCraft | Предпросмотр и масштаб. Возвращает команду, если нажали кнопку действия.
-    fn doc_mode_controls(&mut self, ui: &mut egui::Ui) -> Option<Cmd> {
+    /// Компактная строка контролов предпросмотра страниц (§19-7): «Обновить вставки», масштаб,
+    /// «Открыть копию в Word». Живёт над страницами, потому что лента (и её группа «Масштаб»)
+    /// показывается только в режиме RDE.
+    fn preview_controls(&mut self, ui: &mut egui::Ui) {
         let pal = theme_colors(ui.ctx().theme());
-        let mut picked: Option<Cmd> = None;
-        let mut mode = self.doc_mode;
-        if mode != DocMode::Preview {
-            self.ensure_editor();
-        }
-        ui.spacing_mut().item_spacing.x = 2.0;
-        for m in DocMode::ALL {
-            let sel = mode == m;
-            let text = RichText::new(m.label()).size(FS_BODY).color(if sel { pal.text } else { pal.muted });
-            if ui.add(egui::Button::selectable(sel, text).corner_radius(8).min_size(vec2(0.0, 28.0))).clicked() {
-                mode = m;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if btn(ui, Role::Secondary, Some(IC_UPDATE), "Обновить вставки")
+                .on_hover_text("Пересчитать живые вставки документа и пересохранить пакет")
+                .clicked()
+            {
+                self.run_cmd(Cmd::UpdateInserts);
             }
-        }
-        ui.separator();
-        match mode {
-            DocMode::DocView | DocMode::Full => {
-                if let Some(ed) = &self.editor {
-                    if ui.small_button("-").on_hover_text("Уменьшить масштаб").clicked() {
-                        picked = Some(Cmd::ZoomOut);
-                    }
-                    ui.label(RichText::new(format!("{:.0}%", ed.app.session.view.zoom * 100.0)).monospace().size(11.5).color(pal.muted));
-                    if ui.small_button("+").on_hover_text("Увеличить масштаб").clicked() {
-                        picked = Some(Cmd::ZoomIn);
-                    }
-                    if ui.small_button("Сброс").on_hover_text("Масштаб 100%").clicked() {
-                        picked = Some(Cmd::Zoom100);
-                    }
-                    if ui.small_button("По ширине").clicked() {
-                        picked = Some(Cmd::PageWidth);
-                    }
-                }
+            ui.separator();
+            ui.label(RichText::new("Масштаб").small().color(pal.muted));
+            ui.add(egui::Slider::new(&mut self.zoom, 0.35..=1.5).show_value(false));
+            ui.separator();
+            if ui.button(RichText::new("Открыть копию в Word").size(12.0)).clicked() {
+                self.run_cmd(Cmd::OpenWordCopy);
             }
-            DocMode::Preview => {
-                if btn(ui, Role::Secondary, Some(IC_UPDATE), "Обновить вставки").clicked() {
-                    picked = Some(Cmd::UpdateInserts);
-                }
-                ui.separator();
-                ui.label(RichText::new("Масштаб").small().color(pal.muted));
-                ui.add(egui::Slider::new(&mut self.zoom, 0.35..=1.5).show_value(false));
-                ui.separator();
-                if ui.button(RichText::new("Открыть копию в Word").size(12.0)).clicked() {
-                    picked = Some(Cmd::OpenWordCopy);
-                }
-            }
-        }
-        self.doc_mode = mode;
-        picked
+        });
+        ui.add_space(4.0);
     }
 
     // ── «Обновить всё» и отмена фонового обновления ─────────────────────────
@@ -2454,8 +2527,8 @@ impl RdeApp {
         let focus_filter = std::mem::take(&mut self.search_focus);
         egui::Panel::left("rde_tree")
             .resizable(true)
-            .default_size(268.0)
-            .min_size(120.0)
+            .default_size(TREE_WIDTH)
+            .min_size(TREE_WIDTH_MIN)
             .frame(egui::Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2687,8 +2760,8 @@ impl RdeApp {
         let mut review = false;
         egui::Panel::right("rde_agent")
             .resizable(true)
-            .default_size(316.0)
-            .min_size(180.0)
+            .default_size(AGENT_WIDTH)
+            .min_size(AGENT_WIDTH_MIN)
             .frame(egui::Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2811,10 +2884,14 @@ impl RdeApp {
         let mut bibliography_clicked = false;
         let mut word_copy_clicked = false;
         let mut review_import_clicked = false;
+        // Инспектор (19-8): 340 px по умолчанию, перетаскивается в диапазоне 280–480 px —
+        // центр документа и DAG не должны обрезаться. Ширины — константы раскладки выше.
         egui::Panel::right("rde_inspector")
             .frame(egui::Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(12, 8)))
-            .default_size(320.0)
-            .resizable(false)
+            .default_size(INSPECTOR_WIDTH)
+            .min_size(INSPECTOR_WIDTH_MIN)
+            .max_size(INSPECTOR_WIDTH_MAX)
+            .resizable(true)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("rde_inspector_scroll").auto_shrink([false, false]).show(ui, |ui| {
                     let Some(object) = &object else {
@@ -3018,7 +3095,8 @@ impl RdeApp {
                         }
                     }
                     ui.separator();
-                    ui.horizontal(|ui| {
+                    // Строка «id … копировать» переносится, если не влезает: не раздувает панель.
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("id").small().color(pal.muted));
                         ui.label(RichText::new(&object.id).monospace().size(FS_CAPTION).color(pal.muted));
                         if ui.small_button("копировать").clicked() {
@@ -4438,35 +4516,26 @@ impl RdeApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
-                // Линия вкладок центра: вкладки слева; на вкладке «Документ» через разделитель — режимы
-                // RDE | WordCraft | Предпросмотр и масштаб. Если колонка узкая, строка переносится, а не
-                // обрезается: все переключатели остаются видимыми (одна линия — при достаточной ширине).
-                let mut picked: Option<Cmd> = None;
-                ui.horizontal_wrapped(|ui| {
-                    // Компактнее обычного: 5 табов с иконками должны влезать в центральную колонку.
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    ui.spacing_mut().button_padding = vec2(8.0, 4.0);
+                // Строка вкладок центра — ОДНА линия без переноса (§19-7): слева вкладки, на вкладке
+                // «Документ» справа — компактный переключатель режимов. Если подписи не влезают,
+                // вкладки сжимаются до иконок с тултипами (`center_line_density`), но строка одна.
+                let density = self.center_line_density(ui);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = CENTER_TAB_SPACING_X;
+                    ui.spacing_mut().button_padding = vec2(CENTER_TAB_PADDING_X, 3.0);
                     for tab in Tab::ALL {
-                        let sel = self.tab == tab;
-                        // Pill-таб: выбранный — заливка выделения, остальные — ghost без рамки.
-                        let text = RichText::new(format!("{}  {}", tab.icon(), tab.title(self.lang)))
-                            .size(FS_BODY)
-                            .color(if sel { pal.text } else { pal.muted });
-                        if ui.add(egui::Button::selectable(sel, text).corner_radius(8).min_size(vec2(0.0, 30.0))).clicked() {
+                        if self.center_tab(ui, tab, density.tab_labels).clicked() {
                             self.tab = tab;
                         }
-                        ui.add_space(4.0);
                     }
                     if self.tab == Tab::Document {
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-                        picked = self.doc_mode_controls(ui);
+                        // Переключатель режимов прижат к правому краю той же строки: режимы доступны
+                        // во всех режимах документа, даже когда лента (режим RDE) не показана.
+                        let gap = (ui.available_width() - self.doc_mode_switch_width(ui, density.mode_labels)).max(CENTER_MODE_GAP);
+                        ui.add_space(gap);
+                        self.doc_mode_switch(ui, density.mode_labels);
                     }
                 });
-                if let Some(cmd) = picked {
-                    self.run_cmd(cmd);
-                }
                 ui.separator();
                 match self.tab {
                     Tab::Document => self.doc_tab(ui),
@@ -4476,6 +4545,86 @@ impl RdeApp {
                     Tab::Code => self.code_tab(ui),
                 }
             });
+    }
+
+    /// Таб строки вкладок центра: pill с иконкой; подпись — только если строка не переносится.
+    /// Полное название всегда остаётся в доступном имени (и в тултипе, когда видна лишь иконка).
+    fn center_tab(&mut self, ui: &mut egui::Ui, tab: Tab, labels: bool) -> egui::Response {
+        let pal = theme_colors(ui.ctx().theme());
+        let selected = self.tab == tab;
+        let title = tab.title(self.lang);
+        let text = if labels { format!("{}  {}", tab.icon(), title) } else { tab.icon().to_owned() };
+        let text = RichText::new(text).size(FS_BODY).color(if selected { pal.text } else { pal.muted });
+        let response = ui.add(egui::Button::selectable(selected, text).corner_radius(8).min_size(vec2(0.0, CENTER_TAB_HEIGHT)));
+        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, title));
+        if labels { response } else { response.on_hover_text(title) }
+    }
+
+    /// Ширина кнопки-таба строки вкладок: текст (иконка+подпись либо только иконка) + отступы кнопки.
+    fn center_tab_width(&self, ui: &egui::Ui, tab: Tab, labels: bool) -> f32 {
+        let text = if labels { format!("{}  {}", tab.icon(), tab.title(self.lang)) } else { tab.icon().to_owned() };
+        text_width(ui, &text, FS_BODY) + 2.0 * CENTER_TAB_PADDING_X
+    }
+
+    /// Ширина клавиши-сегмента переключателя режимов.
+    fn center_mode_width(&self, ui: &egui::Ui, mode: DocMode, labels: bool) -> f32 {
+        let text = if labels { format!("{}  {}", mode.icon(), mode.short_label()) } else { mode.icon().to_owned() };
+        text_width(ui, &text, FS_SMALL) + 2.0 * CENTER_SEGMENT_PADDING_X
+    }
+
+    /// Ширина сегментированного переключателя режимов целиком (сегменты, зазоры, рамка).
+    fn doc_mode_switch_width(&self, ui: &egui::Ui, labels: bool) -> f32 {
+        let segments: f32 = DocMode::ALL.iter().map(|mode| self.center_mode_width(ui, *mode, labels)).sum();
+        segments + CENTER_SEGMENT_SPACING_X * (DocMode::ALL.len() - 1) as f32 + 2.0 * CENTER_SEGMENT_FRAME
+    }
+
+    /// Ширина всей строки вкладок центра при заданной плотности: вкладки (+ переключатель
+    /// режимов и зазор на вкладке «Документ») + запас. По ней выбирается плотность.
+    fn center_line_width(&self, ui: &egui::Ui, tab_labels: bool, mode_labels: bool) -> f32 {
+        let tabs: f32 = Tab::ALL.iter().map(|tab| self.center_tab_width(ui, *tab, tab_labels)).sum();
+        let tabs = tabs + CENTER_TAB_SPACING_X * (Tab::ALL.len() - 1) as f32;
+        if self.tab != Tab::Document {
+            return tabs;
+        }
+        tabs + CENTER_MODE_GAP + self.doc_mode_switch_width(ui, mode_labels) + CENTER_LINE_SAFETY
+    }
+
+    /// Подобрать плотность строки вкладок: сначала подписи, затем только иконки — но БЕЗ переноса.
+    fn center_line_density(&self, ui: &egui::Ui) -> CenterLineDensity {
+        let available = ui.available_width();
+        for (tab_labels, mode_labels) in [(true, true), (true, false), (false, true), (false, false)] {
+            if self.center_line_width(ui, tab_labels, mode_labels) <= available {
+                return CenterLineDensity { tab_labels, mode_labels };
+            }
+        }
+        CenterLineDensity { tab_labels: false, mode_labels: false }
+    }
+
+    /// Сегментированный переключатель режимов документа в строке вкладок центра (§19-7):
+    /// иконки с тултипами, подписи — если хватает места. Режимы доступны во всех режимах.
+    fn doc_mode_switch(&mut self, ui: &mut egui::Ui, labels: bool) {
+        let pal = theme_colors(ui.ctx().theme());
+        let mut mode = self.doc_mode;
+        egui::Frame::new()
+            .fill(pal.panel_hi)
+            .stroke(Stroke::new(1.0, pal.border))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(CENTER_SEGMENT_MARGIN as i8))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = CENTER_SEGMENT_SPACING_X;
+                ui.spacing_mut().button_padding = vec2(CENTER_SEGMENT_PADDING_X, 2.0);
+                for candidate in DocMode::ALL {
+                    let selected = mode == candidate;
+                    let text = if labels { format!("{}  {}", candidate.icon(), candidate.short_label()) } else { candidate.icon().to_owned() };
+                    let text = RichText::new(text).size(FS_SMALL).color(if selected { pal.text } else { pal.muted });
+                    let response = ui.add(egui::Button::selectable(selected, text).corner_radius(5).min_size(vec2(0.0, CENTER_SEGMENT_HEIGHT)));
+                    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, candidate.label()));
+                    if response.on_hover_text(candidate.tooltip()).clicked() {
+                        mode = candidate;
+                    }
+                }
+            });
+        self.doc_mode = mode;
     }
 
     fn doc_tab(&mut self, ui: &mut egui::Ui) {
@@ -4538,6 +4687,7 @@ impl RdeApp {
             }
             DocMode::Preview => {
                 self.doc.ensure(ui.ctx());
+                self.preview_controls(ui);
                 let zoom = self.zoom;
                 match &self.doc.state {
                     DocState::Pending => {
@@ -5972,12 +6122,33 @@ fn btn(ui: &mut egui::Ui, role: Role, icon: Option<&str>, label: &str) -> egui::
 }
 
 /// Кнопка 32 px заданной ширины — для сеток инспектора (кнопки одной группы — равной ширины).
+/// Подпись обрезается по фактической ширине колонки (полная — в подсказке): иначе длинная
+/// подпись («Импорт ревью из exports») раздувает инспектор за его default width (§19-8).
 fn btn_w(ui: &mut egui::Ui, role: Role, icon: Option<&str>, label: &str, width: f32) -> egui::Response {
-    let text = match icon {
-        Some(icon) => format!("{icon}  {label}"),
-        None => label.to_owned(),
-    };
-    styled_button(ui, role, RichText::new(text).size(FS_BUTTON), vec2(width, 32.0))
+    let icon_prefix = icon.map(|icon| format!("{icon}  ")).unwrap_or_default();
+    let padding = 2.0 * ui.spacing().button_padding.x;
+    let text_room = (width - padding - text_width(ui, &icon_prefix, FS_BUTTON)).max(8.0);
+    let fitted = fit_label(ui, label, text_room, FS_BUTTON);
+    let truncated = fitted != label;
+    let response = styled_button(ui, role, RichText::new(format!("{icon_prefix}{fitted}")).size(FS_BUTTON), vec2(width, 32.0));
+    if truncated { response.on_hover_text(label) } else { response }
+}
+
+/// Вписать подпись в лимит ширины, заменив хвост на «…». Нужна кнопкам-сеткам инспектора:
+/// кнопка не должна становиться шире своей колонки, иначе панель растёт и обрезает центр.
+fn fit_label(ui: &egui::Ui, text: &str, max_width: f32, size: f32) -> String {
+    if text_width(ui, text, size) <= max_width {
+        return text.to_owned();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    while chars.len() > 1 {
+        chars.pop();
+        let candidate = format!("{}…", chars.iter().collect::<String>());
+        if text_width(ui, &candidate, size) <= max_width {
+            return candidate;
+        }
+    }
+    "…".to_owned()
 }
 
 /// Ширина одной колонки сетки из `n` кнопок с зазором 8 px (делит доступную ширину поровну).
@@ -6007,6 +6178,8 @@ const RIBBON_BUTTON_W: f32 = 84.0;
 const RIBBON_BUTTON_H: f32 = 50.0;
 /// Иконка-кнопка без подписи (семь видов вставок).
 const RIBBON_ICON_W: f32 = 36.0;
+/// Ширина кластера масштаба на ленте: «−», процент, «+», «Сброс», «По ширине».
+const RIBBON_ZOOM_W: f32 = 216.0;
 
 /// Вертикальный разделитель групп ленты фиксированной высоты (без растягивания на колонку).
 fn ribbon_divider(ui: &mut egui::Ui, height: f32) {
@@ -6209,6 +6382,12 @@ fn display_text(s: &str) -> String {
 /// Внутренний отступ ячейки таблицы: текст не прилипает к левой границе строки/полосы.
 fn pad_cell<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new().inner_margin(Margin { left: 8, right: 8, top: 4, bottom: 4 }).show(ui, add).inner
+}
+
+/// Ширина строки в пропорциональном шрифте заданного размера. Нужна строке вкладок центра
+/// (19-7), чтобы заранее решить, влезают ли подписи, и перейти на иконки без переноса строки.
+fn text_width(ui: &egui::Ui, text: &str, size: f32) -> f32 {
+    ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(size), Color32::PLACEHOLDER).size().x
 }
 
 /// Обрезать строку до `max` символов, добавив многоточие.
@@ -7659,8 +7838,13 @@ mod shell_tests {
 
     /// Вьюер-харнесс без wgpu: достаточно дерева доступности (подписи, меню).
     fn render(app: RdeApp) -> egui_kittest::Harness<'static, RdeApp> {
+        render_sized(app, 1600.0)
+    }
+
+    /// Тот же харнесс заданной ширины — для проверки адаптивной строки вкладок центра (§19-7).
+    fn render_sized(app: RdeApp, width: f32) -> egui_kittest::Harness<'static, RdeApp> {
         let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_size(egui::vec2(width, 1000.0))
             .with_max_steps(200_000)
             .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
         for _ in 0..4 {
@@ -7668,6 +7852,20 @@ mod shell_tests {
         }
         harness
     }
+
+    /// Прямоугольник самого верхнего узла с подписью. Нужен там, где подпись встречается дважды:
+    /// «Документ» — вкладка строки центра (верх) и вкладка ленты (ниже).
+    fn top_rect(harness: &egui_kittest::Harness<'static, RdeApp>, label: &'static str) -> egui::Rect {
+        let mut rects: Vec<egui::Rect> = harness.query_all_by_label(label).map(|node| node.rect()).collect();
+        assert!(!rects.is_empty(), "узел «{label}» не найден в дереве доступности");
+        rects.sort_by(|a, b| a.top().partial_cmp(&b.top()).expect("конечные координаты"));
+        rects[0]
+    }
+
+    /// Подписи вкладок центра (19-7): слева направо, как в ТЗ.
+    const CENTER_TAB_LABELS: [&str; 5] = ["Документ", "Структура", "Артефакты", "Источник", "Код документа"];
+    /// Подписи переключателя режимов (19-7): доступные имена сегментов.
+    const MODE_LABELS: [&str; 3] = ["RDE", "WordCraft", "Предпросмотр страниц"];
 
     /// Подсказки (полные названия) всех кнопок вкладки ленты — по ним кнопку находят в дереве
     /// доступности.
@@ -7677,7 +7875,7 @@ mod shell_tests {
             .flat_map(|group| group.slots.iter())
             .filter_map(|slot| match slot {
                 Slot::Button { tip, .. } | Slot::Toggle { tip, .. } | Slot::Icon { tip, .. } => Some(*tip),
-                Slot::InsertPosition | Slot::Note(_) => None,
+                Slot::InsertPosition | Slot::Zoom | Slot::Note(_) => None,
             })
             .collect()
     }
@@ -7711,6 +7909,181 @@ mod shell_tests {
             let shown = harness.query_by_label("Предпросмотр страниц").is_some() && harness.query_by_label("WordCraft").is_some();
             assert_eq!(shown, tab == Tab::Document, "строка режимов видна только на «Документе»");
         }
+    }
+
+    /// (19-7) Строка вкладок центра и переключатель режимов — ОДНА строка без переноса при
+    /// 1600×1000: подписи вкладок видны, режимы справа от них, масштаба в строке нет (он на ленте).
+    #[test]
+    fn center_tab_line_is_single_row_with_mode_switch() {
+        let mut app = RdeApp::new(rde_core::demo());
+        app.tab = Tab::Document;
+        app.doc_mode = DocMode::DocView;
+        // Лента открыта на вкладке «Документ», чтобы проверить группу «Масштаб» (§19-7 B3).
+        app.ribbon_tab = RibbonTab::Document;
+        let harness = render(app);
+
+        let tabs: Vec<egui::Rect> = CENTER_TAB_LABELS.iter().map(|label| top_rect(&harness, label)).collect();
+        let row_top = tabs.iter().map(|rect| rect.top()).fold(f32::INFINITY, f32::min);
+        let row_bottom = tabs.iter().map(|rect| rect.bottom()).fold(f32::NEG_INFINITY, f32::max);
+        for rect in &tabs {
+            assert!((rect.center().y - tabs[0].center().y).abs() < 1.5, "вкладки центра не на одной строке: {rect:?}");
+            // Подписи вкладок видны при 1600 px: кнопка с подписью заметно шире иконочной.
+            assert!(rect.width() > 60.0, "вкладка сжата до иконки при 1600×1000: {rect:?}");
+        }
+        // Одна строка: высота ряда — одна кнопка (с допуском на рамку сегментов), без второго ряда.
+        assert!(row_bottom - row_top <= super::CENTER_TAB_HEIGHT + 1.0, "строка вкладок переносится: высота {}", row_bottom - row_top);
+
+        let modes: Vec<egui::Rect> = MODE_LABELS.iter().map(|label| top_rect(&harness, label)).collect();
+        for rect in &modes {
+            assert!(
+                (rect.center().y - tabs[0].center().y).abs() < 3.5,
+                "переключатель режимов вне строки вкладок: {rect:?} при вкладках {tabs:?}"
+            );
+        }
+        let last_tab_right = tabs.iter().map(|rect| rect.right()).fold(f32::NEG_INFINITY, f32::max);
+        let modes_left = modes.iter().map(|rect| rect.left()).fold(f32::INFINITY, f32::min);
+        assert!(modes_left > last_tab_right, "переключатель режимов не справа от вкладок: {modes_left} vs {last_tab_right}");
+
+        // (19-7 B3) Масштаб убран из строки и живёт на ленте («Документ» → «Масштаб»):
+        // кнопки кластера видны и находятся НИЖЕ строки вкладок.
+        for label in ["−", "+", "Сброс", "По ширине"] {
+            let zoom = top_rect(&harness, label);
+            assert!(zoom.top() > row_bottom, "«{label}» осталось в строке вкладок: {zoom:?}");
+        }
+    }
+
+    /// (19-7 B4) При нехватке ширины строка вкладок остаётся ОДНОЙ: вкладки сжимаются до иконочного
+    /// вида (полное название — в доступном имени/тултипе), а не переносятся на вторую строку.
+    #[test]
+    fn center_tab_line_compacts_to_icons_without_wrap() {
+        let mut app = RdeApp::new(rde_core::demo());
+        app.tab = Tab::Document;
+        app.doc_mode = DocMode::DocView;
+        let harness = render_sized(app, 1280.0);
+        let tabs: Vec<egui::Rect> = CENTER_TAB_LABELS.iter().map(|label| top_rect(&harness, label)).collect();
+        for rect in &tabs {
+            assert!((rect.center().y - tabs[0].center().y).abs() < 1.5, "вкладки центра перенеслись на другую строку: {rect:?}");
+            assert!(rect.width() < 50.0, "вкладка не сжалась до иконки на узкой колонке: {rect:?}");
+        }
+        // Подписи не потеряны: полные названия остались в доступном имени (у «Документа» два узла —
+        // вкладка центра и вкладка ленты, поэтому query_all).
+        for label in CENTER_TAB_LABELS.iter().chain(MODE_LABELS.iter()) {
+            assert!(harness.query_all_by_label(label).next().is_some(), "«{label}» пропала из дерева доступности в компактном режиме");
+        }
+    }
+
+    /// (19-7 B2) На широкой колонке подписи режимов видны: «подписи — если хватает места».
+    #[test]
+    fn center_mode_switch_shows_labels_on_wide_column() {
+        let mut app = RdeApp::new(rde_core::demo());
+        app.tab = Tab::Document;
+        app.doc_mode = DocMode::DocView;
+        let harness = render_sized(app, 1920.0);
+        let modes: Vec<egui::Rect> = MODE_LABELS.iter().map(|label| top_rect(&harness, label)).collect();
+        for rect in &modes {
+            assert!(rect.width() > 40.0, "подпись режима не показана на широкой колонке: {rect:?}");
+        }
+    }
+
+    /// (19-7 B5) Режимы документа доступны во ВСЕХ режимах: лента в WordCraft и предпросмотре
+    /// скрыта, но переключатель остаётся в строке вкладок — и возвращает в RDE.
+    #[test]
+    fn doc_mode_switch_available_in_all_modes() {
+        for mode in DocMode::ALL {
+            let mut app = RdeApp::new(rde_core::demo());
+            app.tab = Tab::Document;
+            app.doc_mode = mode;
+            let harness = render(app);
+            for label in MODE_LABELS {
+                assert!(harness.query_by_label(label).is_some(), "в режиме {} недоступен «{label}»", mode.label());
+            }
+        }
+        // Из WordCraft/предпросмотра переключатель возвращает в RDE (иначе пользователь «заперт»).
+        for mode in [DocMode::Full, DocMode::Preview] {
+            let mut app = RdeApp::new(rde_core::demo());
+            app.tab = Tab::Document;
+            app.doc_mode = mode;
+            let mut harness = render(app);
+            {
+                harness.get_by_label("RDE").click_accesskit();
+            }
+            for _ in 0..3 {
+                harness.step();
+            }
+            assert_eq!(harness.state().doc_mode, DocMode::DocView, "клик по «RDE» не вернул режим из {}", mode.label());
+        }
+    }
+
+    /// (19-8) Инспектор: 340 px по умолчанию (решение владельца 320–380), перетаскивается,
+    /// клампится 280–480; центр при 1600×1000 не обрезан.
+    #[test]
+    fn inspector_is_340_by_default_resizable_and_keeps_center() {
+        assert_eq!(super::INSPECTOR_WIDTH, 340.0);
+        assert_eq!(super::INSPECTOR_WIDTH_MIN, 280.0);
+        assert_eq!(super::INSPECTOR_WIDTH_MAX, 480.0);
+        assert!((280.0..=380.0).contains(&super::INSPECTOR_WIDTH), "default width вне диапазона 320–380");
+
+        let ctx_cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let cell = ctx_cell.clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(
+                move |ui, app: &mut RdeApp| {
+                    *cell.lock().expect("мьютекс контекста") = Some(ui.ctx().clone());
+                    app.ui(ui);
+                },
+                RdeApp::new(rde_core::demo()),
+            );
+        for _ in 0..4 {
+            harness.step();
+        }
+        let ctx = ctx_cell.lock().expect("мьютекс контекста").clone().expect("ctx после кадра");
+        let panel_width = |id: &'static str| {
+            egui::containers::panel::PanelState::load(&ctx, egui::Id::new(id)).unwrap_or_else(|| panic!("нет состояния панели «{id}»")).size().x
+        };
+
+        let inspector_width = panel_width("rde_inspector");
+        assert!((inspector_width - super::INSPECTOR_WIDTH).abs() < 1.0, "инспектор {inspector_width} px вместо {} px", super::INSPECTOR_WIDTH);
+        // Ширины панелей — из одного конфига раскладки (не хардкод в разных местах, §19-8 A3).
+        assert!((panel_width("rde_tree") - super::TREE_WIDTH).abs() < 1.0, "дерево не TREE_WIDTH");
+        assert!((panel_width("rde_agent") - super::AGENT_WIDTH).abs() < 1.0, "агент не AGENT_WIDTH");
+        // Центр не обрезан: странице документа и DAG остаётся ≥ 600 px (kx: 1600 − 2×8 полей kittest).
+        let central = ctx.viewport_rect().width() - 16.0 - panel_width("rde_tree") - panel_width("rde_agent") - inspector_width;
+        assert!(central >= 600.0, "центр обрезан: {central} px");
+
+        // resizable: тянем левый край инспектора влево на 200 px → ширина растёт, но клампится к 480.
+        fn drag(harness: &mut egui_kittest::Harness<'static, RdeApp>, edge_x: f32, y: f32, dx: f32) {
+            let press = egui::pos2(edge_x, y);
+            harness.input_mut().events.push(egui::Event::PointerMoved(press));
+            harness.input_mut().events.push(egui::Event::PointerButton {
+                pos: press,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            });
+            harness.step();
+            let moved = egui::pos2(edge_x + dx, y);
+            harness.input_mut().events.push(egui::Event::PointerMoved(moved));
+            harness.step();
+            harness.input_mut().events.push(egui::Event::PointerButton {
+                pos: moved,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            harness.step();
+        }
+        let inspector_rect = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("rde_inspector")).expect("инспектор").outer_rect;
+        // Край перетаскивания — левая граница правой панели (+2 px внутрь панели, чтобы взялся resize-handle).
+        drag(&mut harness, inspector_rect.left() + 2.0, inspector_rect.center().y, -200.0);
+        let widened = panel_width("rde_inspector");
+        assert!((widened - super::INSPECTOR_WIDTH_MAX).abs() < 6.0, "resizable/кламп: ширина {widened} px вместо {}", super::INSPECTOR_WIDTH_MAX);
+        // Обратный крайний случай: тянем вправо на 400 px → клампится к минимуму 280.
+        let widened_rect = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("rde_inspector")).expect("инспектор").outer_rect;
+        drag(&mut harness, widened_rect.left() + 2.0, widened_rect.center().y, 400.0);
+        let narrowed = panel_width("rde_inspector");
+        assert!((narrowed - super::INSPECTOR_WIDTH_MIN).abs() < 6.0, "resizable/кламп: ширина {narrowed} px вместо {}", super::INSPECTOR_WIDTH_MIN);
     }
 
     /// (а, UI) Каждая кнопка каждой вкладки ленты есть в дереве доступности: ничего не потеряно.

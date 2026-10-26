@@ -63,9 +63,12 @@ pub(crate) enum Cmd {
     // Агент / Помощь
     Audit,
     About,
-    // Не на ленте: строка режимов документа (центральная область).
+    // Масштаб — на ленте (вкладка «Документ», группа «Масштаб», слот `Slot::Zoom`): из строки
+    // вкладок центра он убран (§19-7).
     ZoomOut,
     ZoomIn,
+    // Единственная команда, которая не на ленте: контролы предпросмотра страниц (лента в этом
+    // режиме не показывается, поэтому кнопка живёт в панели предпросмотра).
     UpdateInserts,
 }
 
@@ -123,6 +126,9 @@ pub(crate) enum Slot {
     Icon { cmd: Cmd, icon: &'static str, tip: &'static str },
     /// Позиция следующей вставки + «сброс» + счётчик вставок (состояние — в `RdeApp`).
     InsertPosition,
+    /// Кластер масштаба (§19-7): «−», текущий %, «+», «Сброс», «По ширине». Отрисовка — в
+    /// `lib.rs` (`ribbon_slot_ui`), потому что процент — динамическое состояние редактора.
+    Zoom,
     /// Текст без команды (состояние агента: v0.3, не подключён).
     Note(&'static str),
 }
@@ -133,7 +139,7 @@ impl Slot {
     pub(crate) fn cmd(self) -> Option<Cmd> {
         match self {
             Slot::Button { cmd, .. } | Slot::Toggle { cmd, .. } | Slot::Icon { cmd, .. } => Some(cmd),
-            Slot::InsertPosition | Slot::Note(_) => None,
+            Slot::InsertPosition | Slot::Zoom | Slot::Note(_) => None,
         }
     }
 }
@@ -294,10 +300,8 @@ pub(crate) fn ribbon_groups(tab: RibbonTab) -> &'static [Group] {
             },
             Group {
                 title: "Масштаб",
-                slots: &[
-                    Slot::Button { cmd: Cmd::Zoom100, icon: "", label: "100%", tip: "Масштаб 100%", primary: false },
-                    Slot::Button { cmd: Cmd::PageWidth, icon: "", label: "По ширине", tip: "Масштаб по ширине страницы", primary: false },
-                ],
+                // Весь кластер масштаба живёт на ленте (§19-7): в строке вкладок центра его нет.
+                slots: &[Slot::Zoom],
             },
         ],
         RibbonTab::Project => &[
