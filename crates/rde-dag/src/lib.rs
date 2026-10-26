@@ -2581,4 +2581,3 @@ where
         png_hash,
     })
 }
-
