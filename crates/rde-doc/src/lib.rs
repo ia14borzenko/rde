@@ -32,6 +32,9 @@ use zip::ZipArchive;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
+mod equation;
+pub use equation::*;
+
 pub const RDE_NS: &str = "https://rde.dev/ns/doc";
 pub const SCHEMA_VERSION: &str = "1";
 pub const RDE_DOC_PART: &str = "customXml/item1.xml";

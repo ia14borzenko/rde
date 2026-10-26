@@ -26,19 +26,25 @@ fn main() {
                     passed += 1;
                 }
                 println!(
-                    "{:<28} {}  частей {}→{}  абзацев {}→{}  opc={}  LO={}",
+                    "{:<28} {}  частей {}→{}  абзацев {}→{}  omml={}  opc={}  LO={}",
                     name,
                     if report.passed() { "PASS" } else { "FAIL" },
                     report.source_parts,
                     report.roundtrip_parts,
                     report.paragraphs_source,
                     report.paragraphs_roundtrip,
+                    report.omml.ok,
                     report.opc.ok,
                     report.lo.pdf_is_valid
                 );
                 if !report.opc.errors.is_empty() {
                     for error in report.opc.errors.iter().take(5) {
                         println!("    OPC: {error}");
+                    }
+                }
+                if !report.omml.ok {
+                    for error in report.omml.errors.iter().take(5) {
+                        println!("    OMML: {error}");
                     }
                 }
                 if !report.missing.is_empty() || !report.critical_missing.is_empty() {

@@ -3,13 +3,17 @@
 //!
 //! Показывает все основные виды вставок R-DOC-11 на демо-проекте: значение (два формата),
 //! рисунок (гистограмма), второй рисунок (линия), таблица из CSV-выхода, константа с
-//! rich-форматированием (`R_н`), перекрёстная ссылка, цитата и дата. Затем перенумеровывает
-//! подписи и фиксирует версию документа в store.
+//! rich-форматированием (`R_н`), перекрёстная ссылка, цитата и дата. Затем — формула
+//! (R-DOC-21/22, OMML-фундамент: display-уравнение с номером справа в скобках), перенумерация
+//! подписей и фиксация версии документа в store.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use rde_doc::{InsertRequest, add_figure_insert, add_insert, add_table_insert, commit_document, load_rde_doc};
+use rde_doc::{
+    EquationRequest, InsertRequest, add_equation, add_figure_insert, add_insert, add_table_insert, commit_document, list_equations,
+    load_rde_doc, renumber_equations,
+};
 
 fn main() -> Result<(), String> {
     let root = std::env::args()
@@ -97,7 +101,30 @@ fn main() -> Result<(), String> {
     let date_id = upsert_text(&package, "date", &date_uri, &today_iso(), "дата", "")?;
     println!("дата: {date_id}");
 
-    // 10) Перенумерация подписей/перекрёстных ссылок + версия документа в store.
+    // 10) Формула (R-DOC-21/22, фаза 1): OMML display-уравнение + номер (1) справа в скобках.
+    //     Вставка идемпотентна: если в документе уже есть формулы, повторно не добавляем.
+    if list_equations(&package)?.is_empty() {
+        let anchor = top_level_anchor(&package, "График построен по выходным данным")?;
+        let formula = add_equation(
+            &package,
+            EquationRequest {
+                formula: "\\sigma = \\sqrt{\\frac{1}{N-1}\\sum_{i=1}^{N}(x_i-\\bar{x})^2}".to_owned(),
+                number: Some(1),
+                display: true,
+                anchor_block: Some(anchor),
+            },
+        )?;
+        println!("формула: {} (display, номер {:?}, блок {}, LaTeX {})", formula.id, formula.number, formula.block, formula.latex);
+    } else {
+        let existing = list_equations(&package)?;
+        println!("формулы уже есть: {} ({:?})", existing.len(), existing.iter().map(|equation| equation.block.clone()).collect::<Vec<_>>());
+    }
+    let renumbered = renumber_equations(&package)?;
+    if !renumbered.is_empty() {
+        println!("формулы перенумерованы: {renumbered:?}");
+    }
+
+    // 11) Перенумерация подписей/перекрёстных ссылок + версия документа в store.
     //     Стиль значений — «обычный текст документа» (без случайных pStyle после round-trip).
     let live = rde_doc::load_rde_doc(&package)?.inserts;
     for insert in live.iter().filter(|insert| matches!(insert.kind.as_str(), "value" | "crossref" | "citation" | "date")) {
@@ -117,6 +144,19 @@ fn main() -> Result<(), String> {
         println!("  {} {:10} {:>28} = {}", insert.id, insert.kind, insert.caption, insert.cached);
     }
     Ok(())
+}
+
+/// Индекс верхнеуровневого блока тела, текст которого содержит `needle` (для `anchor_block`).
+fn top_level_anchor(package: &Path, needle: &str) -> Result<usize, String> {
+    let (document, _) = rde_doc::open_document(package)?;
+    let blocks = rde_doc::extract_blocks(&document);
+    let block = blocks.iter().find(|block| block.text.contains(needle)).ok_or_else(|| format!("в документе нет блока «{needle}»"))?;
+    block
+        .path
+        .split('/')
+        .next()
+        .and_then(|index| index.parse::<usize>().ok())
+        .ok_or_else(|| format!("путь блока без индекса тела: {}", block.path))
 }
 
 fn find_artifact(project: &rde_core::Project, needle: &str) -> Result<rde_core::Object, String> {

@@ -10,10 +10,15 @@
    `word/styles.xml`).
 2. **Roundtrip WordCraft** — открыть документ движком и сохранить заново: какие части пропали/
    добавились/изменились, сохранились ли медиа байт-в-байт, совпало ли число абзацев.
-3. **LO-оракул** — независимая headless-конвертация LibreOffice в PDF (валидный `%PDF`, размер > 1 КБ).
+3. **OMML-гейт формул (R-DOC-22)** — в `word/document.xml` до и после roundtrip сверяются счётчики
+   `m:oMath`/`m:oMathPara`/`m:eqArr`, пустые формулы (`empty`) и структурная sha256-подпись
+   содержательных `m:*`-элементов (свойства формул WordCraft может нормализовать, поэтому в подпись
+   они не входят). Вырезанный/потерянный OMML роняет гейт; негативный тест —
+   `crates/rde-docx/tests/equation_gate.rs`.
+4. **LO-оракул** — независимая headless-конвертация LibreOffice в PDF (валидный `%PDF`, размер > 1 КБ).
 
 Отчёт — JSON (`FidelityReport`), пригодный для CI: `passed = critical_missing пусто && media_preserved &&
-абзацы совпали && LO-PDF валиден`.
+абзацы совпали && LO-PDF валиден && OPC ok && omml.ok`.
 
 ## Запуск
 
@@ -22,8 +27,9 @@ cd rde
 ./scripts/build.sh run -p rde-docx --example fidelity -- <файл.docx> docs/fidelity/report.json
 ```
 
-Пример отчёта: [`demo-report.json`](demo-report.json) — 10 частей, 0 пропавших, 13→13 абзацев,
-LibreOffice 26.2 → PDF 82.8 КБ, гейт PASS (снят до миграции в `.doc.rde`, содержимое OOXML то же).
+Пример отчёта: [`demo-report.json`](demo-report.json) — 12 частей, 0 пропавших, 44→44 абзацев
+(в разделе 2 — формула σ, номер `(1)` справа в скобках), OMML 1→1, LibreOffice 26.2.6.3 →
+PDF 181 516 Б, гейт PASS. Как формула выглядит в PDF — [`demo-formula.png`](demo-formula.png).
 
 ## Ограничения
 

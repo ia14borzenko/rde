@@ -42,6 +42,18 @@ fn main() {
     for error in report.opc.errors.iter().take(10) {
         println!("  OPC: {error}");
     }
+    println!(
+        "OMML: {} (oMath {}→{}, oMathPara {}→{}, структура {})",
+        if report.omml.ok { "OK" } else { "ОШИБКИ" },
+        report.omml.source.o_math,
+        report.omml.roundtrip.o_math,
+        report.omml.source.o_math_para,
+        report.omml.roundtrip.o_math_para,
+        if report.omml.source.signature == report.omml.roundtrip.signature { "та же" } else { "изменилась" }
+    );
+    for error in report.omml.errors.iter().take(10) {
+        println!("  OMML: {error}");
+    }
     if let Some(error) = &report.lo.error { println!("  LO error: {error}"); }
     println!("ГЕЙТ: {}", if report.passed() { "PASS" } else { "FAIL" });
     if let Some(out) = std::env::args().nth(2) {

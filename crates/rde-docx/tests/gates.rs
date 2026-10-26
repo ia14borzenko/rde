@@ -9,7 +9,11 @@ fn demo_docx() -> PathBuf {
     let path = project.document_path().expect("документ демо-проекта");
     if path.extension().and_then(|ext| ext.to_str()) == Some("rde") {
         // M3: гейт проверяет чистый OOXML, извлечённый из .doc.rde (как его увидит Word).
-        let out = temp_work_dir("clean").join("demo.docx");
+        // Путь уникален на вызов: тесты идут параллельно и не должны извлекать один файл
+        // одновременно (иначе чужой поток читает недописанный zip).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let out = temp_work_dir("clean").join(format!("demo-{}-{unique}.docx", std::process::id()));
         std::fs::create_dir_all(out.parent().unwrap()).unwrap();
         rde_doc::extract_docx(&path, &out).expect("извлечь чистый .docx");
         out

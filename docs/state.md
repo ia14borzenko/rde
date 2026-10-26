@@ -324,3 +324,66 @@ MCP-сервер и ACP-агент).
   v02 — история, при расхождении прав v03.
 - **Демо-снапшот зафиксирован:** `demo-project/` — 11 объектов, документ с 9 живыми вставками,
   незакоммиченных изменений в демо нет.
+
+---
+
+## Обновление 2026-10-26 (формулы, фаза 1 — OMML-фундамент)
+
+Сессия «формулы — фаза 1» (R-DOC-21/22, ТЗ v03 §5.7.5): один коммит
+`feat(doc): формулы — OMML-фундамент` поверх `a3600d5`. UI не менялся (фаза 2), генерация
+MathType и рендер формулы в картинку не делались (фаза 3), шаблонные правила `formulas.toml`
+(v0.2) не трогались.
+
+**Что работает (доказательства — ТЗ §16, тесты ниже):**
+
+| Что | Где |
+|---|---|
+| Вставка display/inline-уравнения LaTeX/linear через модель WordCraft | `rde_doc::insert_equation`/`add_equation` (`crates/rde-doc/src/equation.rs`) |
+| OMML-хранение: `m:oMathPara` для display, `m:oMath` для inline; редактируется в Word | `word/document.xml` пакета `.doc.rde` |
+| Нумерация «справа в скобках» — таблица 1×2 (§9.4), сквозная перенумерация | `numbered_table`, `renumber_equations`, `list_equations` |
+| Roundtrip `.doc.rde` → `save_engine_document` → `.doc.rde` → `extract_docx` без потери OMML | `crates/rde-doc/tests/equation.rs` |
+| OMML-гейт fidelity: счётчики + структура до/после roundtrip, `passed()` учитывает | `rde_docx::{omml_stats, check_omml, compare_omml}`, `compare_gate` |
+| Негативный гейт: вырезанный OMML роняет отчёт | `crates/rde-docx/tests/equation_gate.rs` |
+| LO-оракул собирает PDF для документа с формулой | там же (`lo_oracle`) |
+| Демо: формула σ в разделе 2, номер (1) справа; fidelity PASS | [`docs/fidelity/demo-formula.png`](fidelity/demo-formula.png) |
+
+**Почему таблица 1×2, а не `#`/`eqArr` WordCraft.** Рекомендация сессии была `number_equation`
+(`m:eqArr` + номер `#`), но OOXML-writer WordCraft пишет сам маркер `#` в `m:t`
+(`vendor/wordcraft/crates/docx/src/write/math.rs:96`), поэтому в Word/LibreOffice номер выглядит
+как `E=mc² # (1)` внутри формулы вместо правого поля (проверено LO-рендером PDF). Канон §9.4
+допускает таблицу 1×2 — она и выбрана; `SEQ Eq` — задел фазы 2 вместе с полями Word (R-DOC-14).
+
+**Что НЕ работает / ограничения (честно):**
+
+- Нет UI-диалога/редактора формул и визуального (построчного) редактирования — фаза 2.
+- Нет нумерации по разделам/приложениям и «где»-списка (R-DOC-21 полностью — фаза 2), нет
+  многострочных формул и разрывов на операциях (поддержка `m:eqArr` в модели есть, UI нет).
+- Нет «отрендеренной картинки» формулы для совместимости (фаза 2/3) и нет генерации MathType —
+  только best-effort passthrough существующих OLE, который не проверялся (фаза 3).
+- Реестр формул в `rde:doc` не ведётся: формула — содержимое документа, id/позиция вычисляются
+  по модели; при внешних правках OOXML `list_equations`/`renumber_equations` читают документ заново.
+- Номер — обычный текст в ячейке таблицы, а не поле Word: автообновление номера при вставке
+  формулы в середину документа делает только `renumber_equations` (вызывающий слой).
+- WordCraft gap (не обходили, только использовали API): (1) writer `#`-номера пишет маркер
+  литерально (`vendor/wordcraft/crates/docx/src/write/math.rs:96-99`); (2) нет API «номер уравнения
+  как поле/перекрёстная ссылка»; (3) нет нумерации по разделам. Для фазы 2 нужен либо фикс writer'а
+  в форке, либо собственная запись OMML в `rde-doc` (сейчас её нет — пакет собирается движком).
+
+**Замеры:** 182 теста (было 173, +9: rde-doc 21→26, rde-docx 5→9), 15 examples; LOC
+rde-doc 4835, rde-docx 1089; демо fidelity PASS — 12 частей, 44/44 абзацев, LO 26.2.6.3,
+PDF 181 516 Б, OMML 1→1; корпус 13/13 PASS.
+
+**Проверить руками:**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh test -p rde-doc -p rde-docx        # формулы + OMML-гейт
+./scripts/build.sh test --workspace                   # 182 теста
+cargo run -q -p rde-docx --example fidelity -- \
+  demo-project/objects/documents/01M5VJ1JG04TFF59TDWH9EDD1R/report.doc.rde \
+  docs/fidelity/demo-report.json                      # ГЕЙТ: PASS, OMML 1→1
+```
+

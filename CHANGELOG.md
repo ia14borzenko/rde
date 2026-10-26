@@ -17,6 +17,25 @@
   реализации от ТЗ v02: требование, как требует ТЗ, как сделано, доказательство, решение.
 - [`docs/tz-03.md`](docs/tz-03.md) — каноническое ТЗ v03 по итогам аудита 2026-10-25 (публикует Lead);
   README и `docs/state.md` ссылаются на него как на истину последней инстанции.
+- **Формулы, фаза 1 (R-DOC-21/22, OMML-фундамент)** — [`crates/rde-doc/src/equation.rs`](crates/rde-doc/src/equation.rs):
+  `insert_equation`/`add_equation` вставляют display- и inline-уравнения через модель WordCraft
+  (нативные OMML `m:oMath`/`m:oMathPara`, редактируемые в Word), `list_equations` — список формул,
+  `renumber_equations` — сквозная перенумерация; хранение — OMML внутри `word/document.xml`, реестр
+  в `rde:doc` не дублируется.
+- **Нумерация формул** — по §9.4 таблица 1×2: формула по центру в левой ячейке, номер `(n)` справа
+  в скобках в правой; альтернатива WordCraft (`#`/`m:eqArr`) отклонена на фазе 1 из-за gap'а writer'а
+  (`vendor/wordcraft/crates/docx/src/write/math.rs:96` пишет маркер `#` в `m:t`; LO рендерит
+  `E=mc² # (1)`), обоснование — ТЗ §5.7.5.
+- **OMML-гейт в [`crates/rde-docx`](crates/rde-docx/src/lib.rs)** — `omml_stats`/`check_omml`/`compare_omml`:
+  до/после roundtrip сверяются счётчики `m:oMath`/`m:oMathPara`/`m:eqArr`, пустые формулы и
+  структурная sha256-подпись; `FidelityReport::passed()` учитывает `omml.ok`; `compare_gate` —
+  сравнение с готовым roundtrip-файлом (для негативных тестов).
+- Тесты: [`crates/rde-doc/tests/equation.rs`](crates/rde-doc/tests/equation.rs) (roundtrip OMML через
+  `.doc.rde`↔`.docx`, нумерация/перенумерация, inline, отказ невалидных запросов),
+  [`crates/rde-docx/tests/equation_gate.rs`](crates/rde-docx/tests/equation_gate.rs) (позитив гейта,
+  негатив «OMML вырезан», LO-оракул PDF). Итого 9 новых тестов, 182 в workspace.
+- Демо: формула σ в разделе 2 демо-документа (fidelity PASS, OMML 1→1) — доказательство
+  [`docs/fidelity/demo-formula.png`](docs/fidelity/demo-formula.png).
 
 ### Изменено
 
@@ -24,6 +43,11 @@
   вкладки «Структура»/«Код документа», честные ограничения, ссылки на ТЗ v03 и ADR.
 - [`docs/state.md`](docs/state.md) — раздел «P9 «Интерфейс» + аудит ТЗ»: 7 коммитов серии, 173 теста,
   результаты аудита, ссылки на ADR-0003 и CHANGELOG.
+- [`docs/tz-03.md`](docs/tz-03.md): R-DOC-21/22 → `[ЧАСТИЧНО]` (фаза 1), §0.1/§0.2/§0.4, §5.7.5
+  (механизм нумерации и gap WordCraft), §9.4, §16 (173→182 теста, демо 44/44 абзацев, OMML-гейт).
+- Fidelity-отчёты перегенерированы с OMML-полем: [`docs/fidelity/demo-report.json`](docs/fidelity/demo-report.json)
+  (44/44 абзацев, LO PDF 181 516 Б), [`docs/fidelity/corpus-report.json`](docs/fidelity/corpus-report.json) (13/13 PASS);
+  [`docs/fidelity/README.md`](docs/fidelity/README.md) — описание OMML-проверки.
 
 ### Исправлено
 

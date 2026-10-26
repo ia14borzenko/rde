@@ -5,7 +5,8 @@
 //! 1) все ли критичные части OOXML на месте после roundtrip;
 //! 2) сохранились ли медиа-файлы байт-в-байт;
 //! 3) какие части пропали/добавились/изменились (отчёт для ревью);
-//! 4) открывает ли документ независимый офисный пакет (LO) и получается ли PDF.
+//! 4) сохранились ли формулы (OMML: счётчики `m:oMath`/`m:oMathPara` и структура);
+//! 5) открывает ли документ независимый офисный пакет (LO) и получается ли PDF.
 //!
 //! Отчёт — JSON, пригодный для CI/артефакта.
 
@@ -48,6 +49,41 @@ pub struct LoOracle {
     pub pdf_is_valid: bool,
     pub error: Option<String>,
 }
+
+/// Счётчики и структурная подпись формул (OMML) в `word/document.xml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmmlStats {
+    /// Число математических зон (`m:oMath`).
+    pub o_math: usize,
+    /// Число display-абзацев формул (`m:oMathPara`).
+    pub o_math_para: usize,
+    /// Число массивов уравнений (`m:eqArr`, многострочные/нумерованные).
+    pub eq_arr: usize,
+    /// Всего элементов `m:*` (без учёта closing-тегов).
+    pub nodes: usize,
+    /// Пустые `m:oMath` (`<m:oMath/>` или без содержимого) — дефект, а не формула.
+    pub empty: usize,
+    /// sha256 упорядоченной последовательности содержательных `m:*`-элементов:
+    /// структурное сравнение «до/после», не побайтовое (свойства формул WordCraft может
+    /// нормализовать, поэтому `*Pr`/`m:jc`/`m:ctrlPr` в подпись не входят).
+    pub signature: String,
+}
+
+/// Проверка сохранности OMML при roundtrip WordCraft.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmmlCheck {
+    pub ok: bool,
+    pub source: OmmlStats,
+    pub roundtrip: OmmlStats,
+    pub errors: Vec<String>,
+}
+
+/// Содержательные элементы OMML (для структурной подписи). Свойства (`*Pr`, `m:ctrlPr`,
+/// `m:jc`, `m:rPr`, `w:*`) исключены: WordCraft вправе их нормализовать.
+const OMML_CONTENT_TAGS: [&str; 31] = [
+    "oMath", "oMathPara", "r", "t", "f", "num", "den", "sSup", "sSub", "sSubSup", "sPre", "rad", "deg", "e", "nary", "sub", "sup", "d",
+    "eqArr", "m", "mr", "mc", "func", "fName", "limLow", "limUpp", "acc", "bar", "box", "borderBox", "groupChr",
+];
 
 /// Полный отчёт fidelity-гейта.
 /// Результат OPC/XML-валидации пакета (XSD-lite: без внешних XSD-схем, но с проверкой
@@ -186,6 +222,91 @@ fn normalize_zip_path(path: &str) -> String {
     parts.join("/")
 }
 
+// ── OMML-гейт (R-DOC-22: формулы не теряются) ─────────────────────────────────
+
+/// Прочитать `word/document.xml` из пакета (`.docx` или `.doc.rde` — это zip в обоих случаях).
+pub fn document_xml(path: &Path) -> Result<String, String> {
+    let file = File::open(path).map_err(|e| format!("открыть {}: {e}", path.display()))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("zip {}: {e}", path.display()))?;
+    let mut part = archive.by_name("word/document.xml").map_err(|e| format!("{}: нет word/document.xml: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    part.read_to_end(&mut bytes).map_err(|e| format!("прочитать word/document.xml: {e}"))?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// Счётчики OMML и структурная подпись по `word/document.xml`.
+pub fn omml_stats(xml: &str) -> OmmlStats {
+    let mut stats = OmmlStats::default();
+    let mut signature: Vec<&str> = Vec::new();
+    let mut rest = xml;
+    while let Some(index) = rest.find("<m:") {
+        let after = &rest[index + "<m:".len()..];
+        let end = after.find(|c: char| c.is_whitespace() || c == '>' || c == '/').unwrap_or(after.len());
+        let name = &after[..end];
+        if !name.is_empty() {
+            stats.nodes += 1;
+            match name {
+                "oMath" => stats.o_math += 1,
+                "oMathPara" => stats.o_math_para += 1,
+                "eqArr" => stats.eq_arr += 1,
+                _ => {}
+            }
+            if OMML_CONTENT_TAGS.contains(&name) {
+                signature.push(name);
+            }
+        }
+        rest = &after[end..];
+    }
+    stats.empty = xml.matches("<m:oMath/>").count() + xml.matches("<m:oMath></m:oMath>").count();
+    stats.signature = rde_hash::sha256(signature.join(",").as_bytes()).hex();
+    stats
+}
+
+/// Сравнить OMML «до» (source) и «после» (roundtrip) структурно.
+pub fn compare_omml(source_xml: &str, roundtrip_xml: &str) -> OmmlCheck {
+    let source = omml_stats(source_xml);
+    let roundtrip = omml_stats(roundtrip_xml);
+    let mut errors = Vec::new();
+    if source.o_math == 0 {
+        if roundtrip.o_math > 0 {
+            errors.push(format!("в roundtrip появились формулы (source 0, roundtrip {})", roundtrip.o_math));
+        }
+    } else if roundtrip.o_math == 0 {
+        errors.push(format!("OMML вырезан: в исходнике {} формул, после roundtrip 0", source.o_math));
+    } else {
+        if source.o_math != roundtrip.o_math {
+            errors.push(format!("счётчик m:oMath не совпал: {} → {}", source.o_math, roundtrip.o_math));
+        }
+        if source.o_math_para != roundtrip.o_math_para {
+            errors.push(format!("счётчик m:oMathPara не совпал: {} → {}", source.o_math_para, roundtrip.o_math_para));
+        }
+        if source.eq_arr != roundtrip.eq_arr {
+            errors.push(format!("счётчик m:eqArr не совпал: {} → {}", source.eq_arr, roundtrip.eq_arr));
+        }
+        if source.signature != roundtrip.signature {
+            errors.push(format!(
+                "структура OMML изменилась (элементов {} → {}): {} → {}",
+                source.nodes, roundtrip.nodes, &source.signature[..12.min(source.signature.len())], &roundtrip.signature[..12.min(roundtrip.signature.len())]
+            ));
+        }
+    }
+    if source.empty > 0 {
+        errors.push(format!("пустой OMML в исходнике: {} (формула без содержимого)", source.empty));
+    }
+    if roundtrip.empty > 0 {
+        errors.push(format!("пустой OMML после roundtrip: {}", roundtrip.empty));
+    }
+    OmmlCheck { ok: errors.is_empty(), source, roundtrip, errors }
+}
+
+/// Проверить сохранность формул между двумя пакетами (source → roundtrip).
+pub fn check_omml(source: &Path, roundtrip: &Path) -> Result<OmmlCheck, String> {
+    let source_xml = document_xml(source)?;
+    let roundtrip_xml = document_xml(roundtrip)?;
+    Ok(compare_omml(&source_xml, &roundtrip_xml))
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FidelityReport {
     pub source: String,
@@ -205,6 +326,9 @@ pub struct FidelityReport {
     /// OPC/XML-валидация (XSD-lite, P5).
     #[serde(default)]
     pub opc: OpcValidation,
+    /// OMML-гейт (R-DOC-22): формулы до/после roundtrip (P10).
+    #[serde(default)]
+    pub omml: OmmlCheck,
     pub generated_unix: u64,
 }
 
@@ -215,6 +339,7 @@ impl FidelityReport {
             && self.paragraphs_source == self.paragraphs_roundtrip
             && self.lo.pdf_is_valid
             && self.opc.ok
+            && self.omml.ok
     }
 }
 
@@ -338,10 +463,18 @@ pub fn lo_oracle(docx: &Path, work_dir: &Path) -> LoOracle {
 /// Полный fidelity-гейт: инвентаризация → roundtrip WordCraft → сравнение → LO-оракул.
 pub fn run_gate(input: &Path, work_dir: &Path) -> Result<FidelityReport, String> {
     fs::create_dir_all(work_dir).map_err(|e| format!("создать {}: {e}", work_dir.display()))?;
-    let source = inventory(input)?;
     let roundtrip_path = work_dir.join("roundtrip.docx");
     roundtrip(input, &roundtrip_path)?;
-    let roundtrip_parts = inventory(&roundtrip_path)?;
+    compare_gate(input, &roundtrip_path, work_dir)
+}
+
+/// Сравнить исходник с готовым roundtrip-файлом (без прогона движка): части, медиа, абзацы,
+/// OMML, LO-оракул, OPC. Публичен для негативных тестов гейта (негатив: файл с вырезанными
+/// формулами должен ронять `passed()`).
+pub fn compare_gate(source_path: &Path, roundtrip_path: &Path, work_dir: &Path) -> Result<FidelityReport, String> {
+    fs::create_dir_all(work_dir).map_err(|e| format!("создать {}: {e}", work_dir.display()))?;
+    let source = inventory(source_path)?;
+    let roundtrip_parts = inventory(roundtrip_path)?;
 
     let source_map: BTreeMap<&str, &PartInfo> = source.iter().map(|part| (part.name.as_str(), part)).collect();
     let roundtrip_map: BTreeMap<&str, &PartInfo> = roundtrip_parts.iter().map(|part| (part.name.as_str(), part)).collect();
@@ -367,12 +500,13 @@ pub fn run_gate(input: &Path, work_dir: &Path) -> Result<FidelityReport, String>
         .filter(|(name, _)| name.starts_with("word/media/"))
         .all(|(name, part)| roundtrip_map.get(name).is_some_and(|other| other.sha256 == part.sha256));
 
-    let paragraphs_source = paragraph_count(input)?;
-    let paragraphs_roundtrip = paragraph_count(&roundtrip_path)?;
-    let lo = lo_oracle(&roundtrip_path, work_dir);
-    let opc = validate_opc(&roundtrip_path)?;
+    let paragraphs_source = paragraph_count(source_path)?;
+    let paragraphs_roundtrip = paragraph_count(roundtrip_path)?;
+    let omml = check_omml(source_path, roundtrip_path)?;
+    let lo = lo_oracle(roundtrip_path, work_dir);
+    let opc = validate_opc(roundtrip_path)?;
     Ok(FidelityReport {
-        source: input.display().to_string(),
+        source: source_path.display().to_string(),
         source_parts: source.len(),
         roundtrip_parts: roundtrip_parts.len(),
         missing,
@@ -384,6 +518,7 @@ pub fn run_gate(input: &Path, work_dir: &Path) -> Result<FidelityReport, String>
         paragraphs_roundtrip,
         lo,
         opc,
+        omml,
         generated_unix: now_unix(),
     })
 }

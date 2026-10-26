@@ -1,5 +1,5 @@
 {
-  "source": "/tmp/rde-docx-example-322120/clean.docx",
+  "source": "/tmp/rde-docx-example-3/clean.docx",
   "source_parts": 12,
   "roundtrip_parts": 12,
   "missing": [],
@@ -10,12 +10,12 @@
   ],
   "critical_missing": [],
   "media_preserved": true,
-  "paragraphs_source": 42,
-  "paragraphs_roundtrip": 42,
+  "paragraphs_source": 44,
+  "paragraphs_roundtrip": 44,
   "lo": {
     "available": true,
     "version": "LibreOffice 26.2.6.3 620(Build:3)",
-    "pdf_bytes": 161540,
+    "pdf_bytes": 181516,
     "pdf_is_valid": true,
     "error": null
   },
@@ -25,5 +25,25 @@
     "xml_parts": 8,
     "errors": []
   },
-  "generated_unix": 1792927749
+  "omml": {
+    "ok": true,
+    "source": {
+      "o_math": 1,
+      "o_math_para": 1,
+      "eq_arr": 0,
+      "nodes": 59,
+      "empty": 0,
+      "signature": "6957a022c9a0f1eaede0446ed5300da2bf3727fdc2c0093d39e5170c2d040527"
+    },
+    "roundtrip": {
+      "o_math": 1,
+      "o_math_para": 1,
+      "eq_arr": 0,
+      "nodes": 59,
+      "empty": 0,
+      "signature": "6957a022c9a0f1eaede0446ed5300da2bf3727fdc2c0093d39e5170c2d040527"
+    },
+    "errors": []
+  },
+  "generated_unix": 1793005575
 }

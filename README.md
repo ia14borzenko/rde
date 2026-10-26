@@ -17,8 +17,9 @@
 До неё прототип **v0.1** закрыт по [`docs/exit-v0.1.md`](docs/exit-v0.1.md) (P5, теги `p5-gates` /
 `v0.1-prototype`) и отполирован в P6–P8.
 
-- **173 теста** (`#[test]`) в 12 крейтах, 15 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
-- Демо-проект [`demo-project/`](demo-project): 11 объектов, документ с 9 живыми вставками,
+- **182 теста** (`#[test]`) в 12 крейтах, 15 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
+- Демо-проект [`demo-project/`](demo-project): 11 объектов, документ с 9 живыми вставками и
+  формулой σ (R-DOC-21/22, номер `(1)` справа — [`docs/fidelity/demo-formula.png`](docs/fidelity/demo-formula.png)),
   Python-артефакты, PDF-источник, библиография.
 - Актуальные документы: ТЗ [`docs/tz-03.md`](docs/tz-03.md) (v03, канон; ведёт Lead), решения —
   [`docs/adr/`](docs/adr/), история — [`CHANGELOG.md`](CHANGELOG.md).
@@ -93,10 +94,10 @@ RDE_PROJECT=/путь/к/проекту ./scripts/build.sh run -p rde
 ### Тесты
 
 ```bash
-./scripts/build.sh test --workspace   # 173 теста (#[test]) в 12 крейтах
+./scripts/build.sh test --workspace   # 182 теста (#[test]) в 12 крейтах
 ```
 
-Разбивка: core 21, dag 25, ui 45, doc 21, run 14, hash 13, store 12, sources 6, docx 5,
+Разбивка: core 21, dag 25, ui 45, doc 26, run 14, hash 13, store 12, docx 9, sources 6,
 templates 5, env 4, vcs 2. Тесты, которым нужны внешние инструменты (LibreOffice, poppler,
 tesseract), проверяют наличие и пропускают проверку, если инструмента нет.
 
@@ -182,7 +183,10 @@ rde/
 - **Правка TOML** — `artifact.toml` перезаписывается из модели, комментарии/порядок теряются;
   `toml_edit` — v0.2 (§6).
 - **Режимы обновления** — реализован только `manual`; `watch`/`strict` — v0.2 (§7).
-- **Формулы** (R-DOC-21/22) — не реализованы (отдельная работа, см. ТЗ v03 §19-9).
+- **Формулы** (R-DOC-21/22) — фаза 1 (OMML-фундамент) есть: вставка display/inline через API
+  `rde-doc`, нумерация таблицей 1×2 `(n)` справа, roundtrip и OMML-гейт, формула в демо; нет
+  UI-редактора и визуального редактирования (фаза 2), «картинки»/MathType (фазы 2/3); подробности —
+  [ТЗ §5.7.5](docs/tz-03.md) и [`docs/state.md`](docs/state.md).
 - **MCP-сервер и ACP-агент** — v0.3: панель агента честно «не подключён», быстрые действия работают
   без агента.
 - **За пределами v0.1** — `.rde`-пакет шаринга (R-ART-10), ГОСТ 2.105 (рамки/штампы) и вузовские
