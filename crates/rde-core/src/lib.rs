@@ -16,10 +16,11 @@ pub mod ops;
 pub mod project;
 pub mod selector;
 pub mod settings;
+pub mod value_format;
 
 pub use manifest::{
-    ArtifactManifest, AuthorManifest, ConstantValue, DocumentManifest, GroupManifest, InputSpec,
-    ManifestKind, NoteManifest, ProjectManifest, ReferenceManifest, RepositoryManifest,
+    ArtifactManifest, AuthorManifest, ConstantSource, ConstantValue, DocumentManifest, GroupManifest,
+    InputSpec, ManifestKind, NoteManifest, ProjectManifest, ReferenceManifest, RepositoryManifest,
     RuntimeManifest, SourceManifest,
 };
 pub use ops::{
@@ -339,6 +340,127 @@ mod backup_tests {
         let restored = restore_project(&dir, &archive).expect("восстановление");
         assert!(restored > 0);
         assert_eq!(std::fs::read_to_string(&manifest).unwrap(), original, "rde.toml восстановлен");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod constant_value_tests {
+    use super::*;
+    use crate::tests::unique_tmp;
+
+    /// P1 (ADR-0005 §1.3): сериализация литеральной константы не изменилась — хеши `act_key`
+    /// зависимых артефактов остаются прежними (новые поля не пишутся, пока пусты).
+    #[test]
+    fn legacy_constant_serialization_unchanged() {
+        let value: ConstantValue = toml::from_str(
+            "value = 12.4\nunit = \"Ом\"\ndisplay = \"R_н\"\nstyle = \"italic-subscript\"\n",
+        )
+        .expect("литеральная константа");
+        let json = serde_json::to_value(&value).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"value": 12.4, "unit": "Ом", "display": "R_н", "style": "italic-subscript"}),
+            "новые поля не должны попадать в JSON/HJCS литеральной константы"
+        );
+        // Обратная совместимость: непустые новые поля появляются, пустые — нет.
+        let extended: ConstantValue = toml::from_str(
+            "value = 1\nsymbol = \"R\"\nsubscript = \"н\"\nformat = \"dec:2\"\nsource = \"rde://artifact/01M5VJ1JG0HD99FDTGJ8YEPFZX/out/x.json#/v\"\n",
+        )
+        .unwrap();
+        let json = serde_json::to_value(&extended).unwrap();
+        assert_eq!(json["symbol"], "R");
+        assert_eq!(json["subscript"], "н");
+        assert_eq!(json["format"], "dec:2");
+        assert_eq!(json["source"], "rde://artifact/01M5VJ1JG0HD99FDTGJ8YEPFZX/out/x.json#/v");
+        assert!(json.get("value").is_some());
+    }
+
+    #[test]
+    fn constant_source_uri_parsing() {
+        let value: ConstantValue = toml::from_str(
+            "value = 1\nsource = \"rde://artifact/01M5VJ1JG039MMV97SZGY6V9EQ@dd7e3c10/out/stats.json#/stats/x1/mean\"\n",
+        )
+        .unwrap();
+        let source = value.source_parsed().unwrap().expect("source разобран");
+        assert_eq!(source.artifact_id, "01M5VJ1JG039MMV97SZGY6V9EQ");
+        assert_eq!(source.out_hash.as_deref(), Some("dd7e3c10"));
+        assert_eq!(source.file, "out/stats.json");
+        assert_eq!(source.pointer.as_deref(), Some("/stats/x1/mean"));
+        // Без @out_hash и без pointer.
+        let plain: ConstantValue =
+            toml::from_str("value = 1\nsource = \"rde://artifact/01M5VJ1JG039MMV97SZGY6V9EQ/out/x.txt\"\n").unwrap();
+        let source = plain.source_parsed().unwrap().unwrap();
+        assert!(source.out_hash.is_none());
+        assert!(source.pointer.is_none());
+        // Ошибки: чужой scheme / неполный URI.
+        for bad in ["constants://x", "rde://constants/01M5/R_n", "rde://artifact/", "rde://artifact/01M5/"] {
+            let value: ConstantValue = toml::from_str(&format!("value = 1\nsource = \"{bad}\"\n")).unwrap();
+            assert!(value.source_parsed().is_err(), "должен быть отказ: {bad}");
+        }
+    }
+
+    /// P1: проблемы расширенных констант — `issues` загрузки (не фатальны), а хорошая константа
+    /// с `source` на существующий артефакт грузится без issues.
+    #[test]
+    fn load_reports_bad_constant_sources() {
+        let dir = unique_tmp("constants-p1");
+        std::fs::write(
+            dir.join("rde.toml"),
+            "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"T\"\n",
+        )
+        .unwrap();
+        let constants = "01M5VJ1JG0T9NS5SEZX35HGNFY";
+        let source_art = "01M5VJ1JG039MMV97SZGY6V9EQ";
+        let dirs = [
+            (format!("objects/artifacts/{constants}"), "constants"),
+            (format!("objects/artifacts/{source_art}"), "data"),
+        ];
+        for (path, kind) in dirs {
+            std::fs::create_dir_all(dir.join(&path)).unwrap();
+            let manifest = if kind == "constants" {
+                format!(
+                    "schema=\"rde/artifact@1\"\nid=\"{constants}\"\ntitle=\"К\"\ntype=\"constants\"\n\
+                     [values.R_n]\nvalue=12.4\nunit=\"Ом\"\ndisplay=\"R_н\"\nstyle=\"italic-subscript\"\n\
+                     symbol=\"R\"\nsubscript=\"н\"\nformat=\"dec:1\"\n\
+                     source=\"rde://artifact/{source_art}/out/stats.json#/v\"\n"
+                )
+            } else {
+                format!(
+                    "schema=\"rde/artifact@1\"\nid=\"{source_art}\"\ntitle=\"Д\"\ntype=\"data\"\n\
+                     [[groups]]\nname=\"data\"\nmode=\"hashed\"\ninputs=[{{ file=\"inputs/data.csv\" }}]\n"
+                )
+            };
+            std::fs::write(dir.join(&path).join("artifact.toml"), manifest).unwrap();
+        }
+        std::fs::create_dir_all(dir.join(format!("objects/artifacts/{source_art}/inputs"))).unwrap();
+        std::fs::write(dir.join(format!("objects/artifacts/{source_art}/inputs/data.csv")), "x\n1\n").unwrap();
+        let project = load(&dir).unwrap();
+        assert!(project.issues.is_empty(), "issues: {:?}", project.issues);
+        let object = project.artifact_object(constants).unwrap();
+        let ObjectData::Artifact(manifest) = &object.data else { panic!() };
+        let value = manifest.values.get("R_n").unwrap();
+        assert_eq!(value.symbol, "R");
+        assert_eq!(value.document_run_style(), "italic-subscript");
+        assert_eq!(value.document_text(), "R_н");
+
+        // Плохие источники/поля → issues (загрузка продолжается).
+        std::fs::write(
+            dir.join(format!("objects/artifacts/{constants}/artifact.toml")),
+            format!(
+                "schema=\"rde/artifact@1\"\nid=\"{constants}\"\ntitle=\"К\"\ntype=\"constants\"\n\
+                 [values.A]\nvalue=1\nsymbol=\"R н\"\nformat=\"nonsense\"\n\
+                 source=\"rde://artifact/01M5VJ1JG0ZZZZZZZZZZZZZZZZ/out/x.json\"\n\
+                 [values.B]\nvalue=2\nsource=\"вне-URI\"\n"
+            ),
+        )
+        .unwrap();
+        let project = load(&dir).unwrap();
+        let messages: Vec<&str> = project.issues.iter().map(|issue| issue.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("symbol содержит пробелы")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("неизвестный format")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("не найден")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("rde://artifact/")), "{messages:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

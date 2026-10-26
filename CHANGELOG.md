@@ -12,6 +12,27 @@
 
 ### Добавлено
 
+- **P1: величины/обозначения со `source` (ADR-0005, 2026-10-26)** —
+  [`ConstantValue`](crates/rde-core/src/manifest.rs) расширен `symbol/subscript/format/source`
+  (`value` остаётся обязательным кэшем последнего разрешённого значения, схема `rde/artifact@1`;
+  новые поля `skip_serializing_if` — литеральные константы сериализуются как раньше, совместимость
+  `act_key`); [`rde-core/src/value_format.rs`](crates/rde-core/src/value_format.rs) — общее
+  форматирование чисел/обозначений (`auto|raw|int|dec:N|sci:N|percent:N`), текст «значение +
+  неразрывный пробел + единица» (ГОСТ 8.417-2024 §9.7), rich-стиль `italic`/`italic-subscript`;
+  загрузчик валидирует `source`-URI, обозначение и `format` (`issues`, не фатально).
+  [`rde-hash`](crates/rde-hash/src/lib.rs) — `constants_hash` (домен `rde:const:1`).
+  [`rde-dag`](crates/rde-dag/src/lib.rs) — `resolve_constant` (значение из выхода артефакта через
+  JSON pointer; digest = закреплённый/ledger `out_hash` или sha256 файла), `constants_input_hash`
+  (литералы — прежняя схема `sha256(JCS(ConstantValue))`, расширенные — с digest источника;
+  недоступный источник — кэш + детерминированный sentinel, а не `NotComputable`),
+  `resolved_constants_json` (материализация `inputs/constants.json` для скриптов),
+  `resolve_insert_constant` — rich-текст/стиль/hash из разрешённого значения.
+  [`rde-doc`](crates/rde-doc/src/lib.rs) — `format_value` делегирует общему коду (поведение
+  сохранено). UI: редактор констант — `symbol/subscript/format/source` (10 колонок, горизонтальная
+  прокрутка), вставка/обновление документа учитывают ledger артефактов.
+  Схема [`docs/schema/artifact.schema.json`](docs/schema/artifact.schema.json) перегенерирована
+  (аддитивно). Тесты: **196 passed** (было 188; +8: 4 `value_format`, 3 модель/валидация констант,
+  1 интеграционный «константа со `source` → разрешение/hash/stale/fallback»).
 - **P0.1: уточнения владельца по формулам (2026-10-26)** — переработаны ADR-0005 и нормативные
   расширения ТЗ-03, кода не касались:
   1) формулы — **project-level служебные объекты** (`objects/formulas/<ULID>/formula.toml`, как

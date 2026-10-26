@@ -153,9 +153,10 @@ impl GroupManifest {
     }
 }
 
-/// Значение константы проекта (тип `constants`).
+/// Значение константы проекта (тип `constants`, R-ART-09).
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
 pub struct ConstantValue {
+    /// Литерал значения ИЛИ кэш последнего разрешённого значения при заданном `source`.
     pub value: f64,
     #[serde(default)]
     pub unit: String,
@@ -164,6 +165,73 @@ pub struct ConstantValue {
     /// Подсказка форматирования (например, `italic-subscript` для `R_н`).
     #[serde(default)]
     pub style: String,
+    /// Обозначение величины (R-DOC-23): базовая буква; курсив обеспечивается `style`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub symbol: String,
+    /// Подстрочный индекс обозначения (R-DOC-23), например `н` в `R_н`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subscript: String,
+    /// Формат отображения значения: `auto|raw|int|dec:N|sci:N|percent:N` (R-DOC-11).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub format: String,
+    /// Источник значения (R-ART-09, ADR-0005): URI выхода артефакта
+    /// `rde://artifact/<id>[@<out_hash>]/<selector>`; при заданном `source` значение разрешается
+    /// из артефакта, а `value` — кэш последнего разрешённого значения.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// Разобранный источник значения константы (`ConstantValue::source`, ADR-0005 P1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstantSource {
+    /// Артефакт-источник (id).
+    pub artifact_id: String,
+    /// Закреплённый `out_hash` цели (если указан в URI через `@`).
+    pub out_hash: Option<String>,
+    /// Путь файла внутри каталога артефакта (до `#`), например `out/stats.json`.
+    pub file: String,
+    /// JSON pointer после `#` (`/stats/x1/mean`), если задан.
+    pub pointer: Option<String>,
+}
+
+impl ConstantValue {
+    /// Разобрать `source` (если задан). Формат URI — как у вставок (R-DOC-11):
+    /// `rde://artifact/<id>[@<out_hash>]/<selector>`, где selector — путь внутри каталога
+    /// артефакта; JSON pointer — после `#`.
+    pub fn source_parsed(&self) -> Result<Option<ConstantSource>, String> {
+        let Some(uri) = self.source.as_deref().map(str::trim).filter(|uri| !uri.is_empty()) else {
+            return Ok(None);
+        };
+        let rest = uri
+            .strip_prefix("rde://artifact/")
+            .ok_or_else(|| format!("source константы должен начинаться с rde://artifact/: {uri}"))?;
+        let (head, selector) = match rest.split_once('/') {
+            Some((head, selector)) => (head, selector.trim().to_owned()),
+            None => return Err(format!("source константы неполный (нужен artifact/<id>/<selector>): {uri}")),
+        };
+        let (artifact_id, out_hash) = match head.split_once('@') {
+            Some((id, hash)) => (id.to_owned(), Some(hash.to_owned())),
+            None => (head.to_owned(), None),
+        };
+        if artifact_id.is_empty() || selector.is_empty() {
+            return Err(format!("source константы неполный (нужен artifact/<id>/<selector>): {uri}"));
+        }
+        let (file, pointer) = match selector.split_once('#') {
+            Some((file, pointer)) => (file.to_owned(), Some(pointer.to_owned())),
+            None => (selector, None),
+        };
+        Ok(Some(ConstantSource { artifact_id, out_hash, file, pointer }))
+    }
+
+    /// Текст обозначения/значения для документа (R-DOC-23, §9.7) — см. `value_format`.
+    pub fn document_text(&self) -> String {
+        crate::value_format::constant_text(self.value, &self.unit, &self.display, &self.symbol, &self.subscript, &self.format)
+    }
+
+    /// Rich-стиль текста обозначения (`italic`/`italic-subscript`), R-ART-09.
+    pub fn document_run_style(&self) -> String {
+        crate::value_format::constant_run_style(&self.style, &self.symbol, &self.subscript)
+    }
 }
 
 /// `artifact.toml` — манифест артефакта (`compute`, `data` или `constants`).

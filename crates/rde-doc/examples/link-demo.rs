@@ -75,7 +75,8 @@ fn main() -> Result<(), String> {
 
     // 6) Константа с rich-форматированием (R_н: курсив + подстрочный индекс, R-ART-09).
     let constant_uri = format!("rde://constants/{}/R_n", constants.id);
-    let (constant_text, constant_style, _) = rde_dag::resolve_insert_constant(&project, &constant_uri)?;
+    let ledger = rde_dag::ledger(&store)?;
+    let (constant_text, constant_style, _) = rde_dag::resolve_insert_constant(&project, &ledger, &constant_uri)?;
     let constant_id = upsert_text(&package, "constant", &constant_uri, &constant_text, "Удельное сопротивление", &constant_style)?;
     println!("константа R_н: {constant_id}");
 

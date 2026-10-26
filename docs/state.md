@@ -509,3 +509,56 @@ cargo run -q -p rde-doc --example spike_p0_vector -- /tmp/spike-p0 bc
 rm crates/rde-ui/examples/spike_p0_equation.rs crates/rde-doc/examples/spike_p0_vector.rs
 ```
 
+---
+
+## Обновление 2026-10-26 (P1: величины/обозначения со `source`, ADR-0005)
+
+Фаза **P1** по ADR-0005 (решения владельца от 2026-10-26): константы/величины получили источник
+значения из выхода артефакта, обозначение (`symbol/subscript`), формат отображения и rich-вставки.
+Коммит — `feat(core): P1 — величины/обозначения со source` (после P0.1 `d4679d9`).
+
+| Что | Где |
+|---|---|
+| `ConstantValue` + `symbol/subscript/format/source`; `value` — обязательный кэш/литерал; новые поля `skip_serializing_if` → литералы сериализуются как раньше (совместимость `act_key`) | [`crates/rde-core/src/manifest.rs`](../crates/rde-core/src/manifest.rs) |
+| Общее форматирование значений/обозначений: `auto|raw|int|dec:N|sci:N|percent:N`, «значение + NBSP + единица» (ГОСТ 8.417-2024), rich-стиль `italic`/`italic-subscript` | [`crates/rde-core/src/value_format.rs`](../crates/rde-core/src/value_format.rs), `rde_doc::format_value` делегирует |
+| Валидация при загрузке: source-URI (`rde://artifact/<id>[@<out_hash>]/<selector>`), цель, `format`, `symbol/subscript` без пробелов (`issues`, не фатально) | `rde-core/src/project.rs::validate_constant_values` |
+| `constants_hash` (`rde:const:1`): литералы — прежняя схема `sha256(JCS)`, расширенные — с digest источника | [`crates/rde-hash/src/lib.rs`](../crates/rde-hash/src/lib.rs) |
+| `resolve_constant` (значение из `out/*.json` через JSON pointer; digest = закреплённый/ledger `out_hash` или sha256 файла), `constants_input_hash`, `resolved_constants_json` (материализация `inputs/constants.json`), `resolve_insert_constant` — rich-текст/стиль/hash | [`crates/rde-dag/src/lib.rs`](../crates/rde-dag/src/lib.rs) |
+| UI: редактор констант — `symbol/subscript/format/source` (10 колонок, горизонтальная прокрутка); вставка/обновление документа учитывают ledger | [`crates/rde-ui/src/lib.rs`](../crates/rde-ui/src/lib.rs) |
+| Схема перегенерирована (аддитивно) | [`docs/schema/artifact.schema.json`](schema/artifact.schema.json) |
+
+**Ключевые свойства:** при недоступном источнике зависимый артефакт **не** становится
+`NotComputable` — используется кэш `value` + детерминированный sentinel-digest в `in_hash`
+(как missing-вход §7.3 п.2), а UI-резолвер возвращает ошибку с причиной; пересчёт артефакта
+меняет digest → `InputsChanged`/stale у зависимых; централизованная замена обозначения работает
+через существующий механизм вставок (`insert.hash` → «Обновить документ»).
+
+**Тесты:** `cargo test --workspace` — **196 passed, 0 failed** (195 тестов + 1 doctest; было 188,
++8: 4 теста `value_format`, 3 теста модели/валидации констант, 1 интеграционный
+`constant_with_source_resolves_and_changes_hash`). Покрыто: разрешение значения из файла/JSON
+pointer, digest из файла и из ledger `out_hash`, смена digest → смена хеша, sentinel при
+недоступном источнике, совместимость хеша литералов, парсинг/валидация source-URI, текст
+обозначения/единицы/NBSP.
+
+**Ограничения (честно):** `source` на другую константу (`rde://constants/...`) в P1 не
+поддерживается — только выход артефакта; UI-подсказки «где вставлено» для констант и
+интерактивная диагностика источника (кроме issues/ошибок обновления) — не в P1; компиляция
+формул/объект формулы — P2.
+
+**Следующий шаг:** **P2** — project-level объект формулы (`objects/formulas/<id>/formula.toml`,
+`act_key`/входы/фрагменты, компиляция OMML/SVG-кэшей) → P2.5 (фикс WordCraft-writer для `svgBlip` +
+пин) → P3 (вставки формул) → P4 (редактор) → P5 (вектор/обмен).
+
+**Проверить руками (P1):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh test -p rde-core -p rde-dag -p rde-doc -p rde-ui   # P1-тесты + регрессия
+./scripts/build.sh test --workspace                                   # 196 passed (195 + doctest)
+# добавить константу со source в демо (out/stats.json #/stats/x1/mean) и вставить её в документ
+cargo run -q -p rde-ui --example screenshot -- /tmp/p1-constants.png artifacts "Константы проекта"
+```
+

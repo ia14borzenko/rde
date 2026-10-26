@@ -482,12 +482,17 @@ struct ArtifactEditorState {
     new_input_selector: String,
     new_input_file: String,
     new_input_mode: String,
-    /// Новая строка редактора констант (R-ART-09): имя/значение/единица/display/стиль.
+    /// Новая строка редактора констант (R-ART-09): имя/значение/единица/symbol/subscript/
+    /// display/стиль/format/source (ADR-0005 P1).
     new_constant_name: String,
     new_constant_value: String,
     new_constant_unit: String,
+    new_constant_symbol: String,
+    new_constant_subscript: String,
     new_constant_display: String,
     new_constant_style: String,
+    new_constant_format: String,
+    new_constant_source: String,
 }
 
 /// Диалог настроек проекта (R-SET-01): имя/шаблон/режим пересборки + авторы.
@@ -1202,7 +1207,8 @@ impl RdeApp {
                 }),
                 "constant" => {
                     let uri = format!("rde://constants/{}/{}", dialog.artifact_id, dialog.selector);
-                    rde_dag::resolve_insert_constant(project, &uri).and_then(|(text, run_style, hash)| {
+                    let ledger = rde_dag::ledger(store).unwrap_or_default();
+                    rde_dag::resolve_insert_constant(project, &ledger, &uri).and_then(|(text, run_style, hash)| {
                         let request = rde_doc::InsertRequest {
                             kind: "constant".to_owned(),
                             target: uri.clone(),
@@ -1507,6 +1513,8 @@ impl RdeApp {
                 self.push_log(Level::Warn, "Обновить документ: хранилище проекта не открыто");
                 return;
             };
+            // Ledger артефактов нужен для констант со source (ADR-0005): закреплённый/текущий out_hash.
+            let ledger = rde_dag::ledger(store).unwrap_or_default();
             for insert in before.inserts.iter().filter(|insert| !insert.target.is_empty()) {
                 if insert.kind == "figure" {
                     match rde_dag::resolve_insert_image(&self.project, store, &insert.target) {
@@ -1538,7 +1546,7 @@ impl RdeApp {
                     }
                 } else if insert.kind == "constant" {
                     // Константа проекта (R-ART-09): значение + подсказка rich-форматирования.
-                    match rde_dag::resolve_insert_constant(&self.project, &insert.target) {
+                    match rde_dag::resolve_insert_constant(&self.project, &ledger, &insert.target) {
                         Ok((text, run_style, hash)) => {
                             let _ = rde_doc::set_insert_run_style(&package, &insert.id, &run_style);
                             values.insert(insert.id.clone(), text);
@@ -5186,8 +5194,12 @@ impl RdeApp {
             new_constant_name: String::new(),
             new_constant_value: String::new(),
             new_constant_unit: String::new(),
+            new_constant_symbol: String::new(),
+            new_constant_subscript: String::new(),
             new_constant_display: String::new(),
             new_constant_style: "italic-subscript".to_owned(),
+            new_constant_format: String::new(),
+            new_constant_source: String::new(),
         });
     }
 
@@ -5360,11 +5372,20 @@ impl RdeApp {
         }
         let Some(editor_state) = editor.as_mut() else { return };
         if editor_state.manifest.kind == "constants" {
-            // Редактор констант проекта (R-ART-09): значения + docx-совместимое форматирование.
-            ui.label(RichText::new("Константы проекта (R-ART-09): значение, единица, отображение, rich-стиль").small().color(pal.muted));
+            // Редактор констант/величин проекта (R-ART-09, ADR-0005 P1): значение (литерал или
+            // кэш из `source`), обозначение (symbol/subscript), единица, display, rich-стиль,
+            // формат отображения и источник значения из выхода артефакта.
+            ui.label(
+                RichText::new("Константы проекта (R-ART-09): значение/источник, обозначение (symbol/subscript), единица, display, стиль, format")
+                    .small()
+                    .color(pal.muted),
+            );
             egui::ScrollArea::vertical().id_salt("rde_constants_editor").auto_shrink([false, false]).show(ui, |ui| {
-                egui::Grid::new("rde_constants_grid").num_columns(6).spacing([10.0, 6.0]).striped(true).show(ui, |ui| {
-                    for header in ["имя", "значение", "единица", "отображение", "стиль", ""] {
+                // Широкий редактор (10 колонок) — горизонтальная прокрутка, чтобы source/format
+                // не уезжали под инспектор при узком центре.
+                egui::ScrollArea::horizontal().id_salt("rde_constants_hscroll").show(ui, |ui| {
+                    egui::Grid::new("rde_constants_grid").num_columns(10).spacing([10.0, 6.0]).striped(true).show(ui, |ui| {
+                    for header in ["имя", "значение (кэш)", "единица", "symbol", "subscript", "отображение", "стиль", "format", "source (rde://artifact/…)", ""] {
                         ui.label(RichText::new(header).small().color(pal.muted));
                     }
                     ui.end_row();
@@ -5375,16 +5396,27 @@ impl RdeApp {
                         if ui.add(egui::DragValue::new(&mut number).speed(0.01).max_decimals(6)).changed() {
                             value.value = number;
                         }
-                        ui.add(egui::TextEdit::singleline(&mut value.unit).desired_width(80.0));
-                        ui.add(egui::TextEdit::singleline(&mut value.display).hint_text("R_н").desired_width(100.0));
+                        ui.add(egui::TextEdit::singleline(&mut value.unit).desired_width(70.0));
+                        ui.add(egui::TextEdit::singleline(&mut value.symbol).hint_text("R").desired_width(50.0));
+                        ui.add(egui::TextEdit::singleline(&mut value.subscript).hint_text("н").desired_width(50.0));
+                        ui.add(egui::TextEdit::singleline(&mut value.display).hint_text("R_н").desired_width(80.0));
                         egui::ComboBox::from_id_salt(format!("rde_constant_style_{name}"))
                             .selected_text(if value.style.is_empty() { "обычный".to_owned() } else { value.style.clone() })
-                            .width(150.0)
+                            .width(130.0)
                             .show_ui(ui, |ui| {
                                 for style in ["", "italic", "italic-subscript"] {
                                     ui.selectable_value(&mut value.style, style.to_owned(), if style.is_empty() { "обычный" } else { style });
                                 }
                             });
+                        ui.add(egui::TextEdit::singleline(&mut value.format).hint_text("auto|dec:2").desired_width(80.0));
+                        let mut source = value.source.clone().unwrap_or_default();
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut source).hint_text("rde://artifact/<id>@<out_hash>/out/x.json#/поле").desired_width(280.0))
+                            .changed()
+                        {
+                            let source = source.trim().to_owned();
+                            value.source = if source.is_empty() { None } else { Some(source) };
+                        }
                         if ui.small_button("×").on_hover_text("Удалить константу").clicked() {
                             remove = Some(name.clone());
                         }
@@ -5393,15 +5425,21 @@ impl RdeApp {
                     if let Some(name) = remove {
                         editor_state.manifest.values.remove(&name);
                     }
+                    });
                 });
                 ui.add_space(8.0);
                 ui.separator();
                 ui.label(RichText::new("Добавить константу").small().strong().color(pal.muted));
+                egui::ScrollArea::horizontal().id_salt("rde_new_constant_hscroll").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut editor_state.new_constant_name).hint_text("R_н").desired_width(90.0));
                     ui.add(egui::TextEdit::singleline(&mut editor_state.new_constant_value).hint_text("12.4").desired_width(90.0));
                     ui.add(egui::TextEdit::singleline(&mut editor_state.new_constant_unit).hint_text("Ом").desired_width(70.0));
+                    ui.add(egui::TextEdit::singleline(&mut editor_state.new_constant_symbol).hint_text("R").desired_width(50.0));
+                    ui.add(egui::TextEdit::singleline(&mut editor_state.new_constant_subscript).hint_text("н").desired_width(50.0));
                     ui.add(egui::TextEdit::singleline(&mut editor_state.new_constant_display).hint_text("R_н").desired_width(90.0));
+                    ui.add(egui::TextEdit::singleline(&mut editor_state.new_constant_format).hint_text("format").desired_width(70.0));
+                    ui.add(egui::TextEdit::singleline(&mut editor_state.new_constant_source).hint_text("source (rde://artifact/…)").desired_width(220.0));
                     egui::ComboBox::from_id_salt("rde_new_constant_style")
                         .selected_text(editor_state.new_constant_style.clone())
                         .width(140.0)
@@ -5413,6 +5451,7 @@ impl RdeApp {
                     if ui.button("+ константа").clicked() && !editor_state.new_constant_name.trim().is_empty() {
                         let name = editor_state.new_constant_name.trim().to_owned();
                         let value = editor_state.new_constant_value.trim().parse::<f64>().unwrap_or(0.0);
+                        let source = editor_state.new_constant_source.trim().to_owned();
                         editor_state.manifest.values.insert(
                             name.clone(),
                             rde_core::ConstantValue {
@@ -5420,13 +5459,22 @@ impl RdeApp {
                                 unit: editor_state.new_constant_unit.trim().to_owned(),
                                 display: editor_state.new_constant_display.trim().to_owned(),
                                 style: editor_state.new_constant_style.clone(),
+                                symbol: editor_state.new_constant_symbol.trim().to_owned(),
+                                subscript: editor_state.new_constant_subscript.trim().to_owned(),
+                                format: editor_state.new_constant_format.trim().to_owned(),
+                                source: if source.is_empty() { None } else { Some(source) },
                             },
                         );
                         editor_state.new_constant_name.clear();
                         editor_state.new_constant_value.clear();
                         editor_state.new_constant_unit.clear();
+                        editor_state.new_constant_symbol.clear();
+                        editor_state.new_constant_subscript.clear();
                         editor_state.new_constant_display.clear();
+                        editor_state.new_constant_format.clear();
+                        editor_state.new_constant_source.clear();
                     }
+                });
                 });
             });
             self.artifact_editor = editor;

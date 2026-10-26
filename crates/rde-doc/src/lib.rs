@@ -1004,74 +1004,11 @@ pub fn default_paragraph_style(package: &Path) -> String {
 /// `auto` — умный вид (целые без дробной части, иначе до 4 значащих), `raw` — как в артефакте,
 /// `int` — целое, `dec:N` — N знаков после запятой, `sci:N` — стандартный вид `m·10^e`,
 /// `percent:N` — проценты с N знаками.
+///
+/// Реализация — общая с `rde-dag` (`rde_core::value_format::format_raw`), чтобы форматирование
+/// констант/величин и значений вставок не расходилось.
 pub fn format_value(raw: &str, format: &str) -> String {
-    let format = format.trim();
-    if format.is_empty() || format == "raw" {
-        return raw.to_owned();
-    }
-    let Ok(value) = raw.trim().parse::<f64>() else {
-        return raw.to_owned();
-    };
-    if !value.is_finite() {
-        return raw.to_owned();
-    }
-    let precision = |prefix: &str, default: usize| -> usize {
-        format
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_prefix(':'))
-            .and_then(|rest| rest.parse::<usize>().ok())
-            .unwrap_or(default)
-            .min(10)
-    };
-    match format {
-        "int" => format!("{value:.0}"),
-        _ if format.starts_with("dec") => {
-            let digits = precision("dec", 2);
-            format!("{value:.digits$}")
-        }
-        _ if format.starts_with("sci") => {
-            let digits = precision("sci", 3);
-            let text = format!("{value:.digits$e}"); // 1.235e3
-            match text.split_once('e') {
-                Some((mantissa, exponent)) => {
-                    let exponent: i32 = exponent.parse().unwrap_or(0);
-                    format!("{mantissa}·10^{exponent}")
-                }
-                None => text,
-            }
-        }
-        _ if format.starts_with("percent") => {
-            let digits = precision("percent", 1);
-            format!("{:.digits$} %", value * 100.0)
-        }
-        _ => format_display_number_auto(value),
-    }
-}
-
-fn format_display_number_auto(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_owned();
-    }
-    let abs = value.abs();
-    if (1e-3..1e6).contains(&abs) {
-        let mut text = format!("{value:.4}");
-        while text.ends_with('0') && text.contains('.') {
-            text.pop();
-        }
-        if text.ends_with('.') {
-            text.pop();
-        }
-        text
-    } else {
-        let text = format!("{value:.4e}");
-        match text.split_once('e') {
-            Some((mantissa, exponent)) => {
-                let exponent: i32 = exponent.parse().unwrap_or(0);
-                format!("{mantissa}·10^{exponent}")
-            }
-            None => text,
-        }
-    }
+    rde_core::value_format::format_raw(raw, format)
 }
 
 /// Задать формат отображения вставки (R-DOC-11): `auto|raw|int|dec:N|sci:N|percent:N`.

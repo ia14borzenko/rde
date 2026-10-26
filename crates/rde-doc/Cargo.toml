@@ -6,6 +6,7 @@ license.workspace = true
 description = "RDE document package (M3): .doc.rde = OOXML + rde:doc customXml part, save/load, caption updates, docx extraction"
 
 [dependencies]
+rde-core = { workspace = true }
 rde-hash = { workspace = true }
 rde-store = { workspace = true }
 resvg = { workspace = true }
@@ -16,5 +17,4 @@ zip = { workspace = true }
 wordcraft-engine = { workspace = true }
 
 [dev-dependencies]
-rde-core = { workspace = true }
 rde-dag = { workspace = true }

@@ -373,6 +373,16 @@ pub fn env_hash(runtime: &str, platform: &str, lockfile: Option<Hash>, vars: &BT
     canon.finish()
 }
 
+/// `constant_hash` — хеш расширенной константы/величины (ADR-0005, R-ART-09): канонический JSON
+/// разрешённого значения (поля обозначения/единицы/формата + разрешённое значение + digest
+/// источника). Для **литеральных** констант без новых полей используется прежняя схема
+/// `sha256(canonical_json(ConstantValue))` (совместимость act_key) — см. `rde-dag`.
+pub fn constants_hash(payload: &str) -> Hash {
+    let mut canon = Canonical::new("rde:const:1");
+    canon.str(payload);
+    canon.finish()
+}
+
 /// `act_key` — ключ активации артефакта (§7.2).
 ///
 /// `H("rde:act:1" | type | schema_version | in_hash | script_hash | params_hash | env_hash)`.

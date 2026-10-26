@@ -3,7 +3,7 @@
 | Поле | Значение |
 |---|---|
 | Дата | 2026-10-26 |
-| Статус | **принято владельцем** (2026-10-26): формулы — **project-level** объекты (уточнение к первоначальному документному варианту), SVG-вставки — фикс WordCraft-writer в форке (P2.5) вместо переприменения в RDE; см. §12 |
+| Статус | **принято владельцем** (2026-10-26): формулы — **project-level** объекты, SVG-вставки — фикс WordCraft-writer в форке (P2.5) вместо переприменения в RDE; **реализация: P1 — готово (2026-10-26), P2–P5 — в работе** |
 | Контекст | решения владельца по формулам (нативный редактор WordCraft, SVG-вектор, формулы/величины — объекты с зависимостями, project-level хранение формул, фикс writer'а в форке) + спайки P0 |
 | Нормативная база | [`docs/tz-03.md`](../tz-03.md): §4.2, §7.2/7.3, §8.3, §8.5, §9.4, §9.7; R-DOC-11…13, R-DOC-19…24, R-ART-09, R-TREE-01/02; NFR-LIC-02 |
 | Связанные ADR | [ADR-0001](0001-repo-layout-and-build.md) — WordCraft-форк; [ADR-0002](0002-component-boundaries.md) — границы крейтов; [ADR-0003](0003-deviations-from-tz02.md) — отклонения (poppler §15-2) |
@@ -151,6 +151,16 @@ constant_hash = H("rde:const:1" |
   выход артефакта, использующего константу как вход, зависит от текста/оформления (R-DOC-23:
   централизованная замена); при желании «стиль не влияет» — `ref`-группа (решение: hashed, т.к.
   значение/единицы входят в результат).
+
+**Реализовано в P1 (2026-10-26).** `ConstantValue` расширен (`symbol/subscript/format/source`,
+`value` обязателен); `rde_core::value_format` — общее форматирование/NBSP/обозначение;
+загрузчик валидирует source/обозначения/format; `rde_hash::constants_hash` (`rde:const:1`);
+`rde_dag::{resolve_constant, constants_input_hash, resolved_constants_json}` (+ ledger-aware
+`resolve_insert_constant`; литералы — старая схема хеша, расширенные — с digest источника;
+недоступный источник — кэш + sentinel в `in_hash`, ошибка — в UI-резолвере);
+`rde_doc::format_value` делегирует общему коду; UI-редактор констант — symbol/subscript/format/
+source. Тесты: `rde-core` (value_format ×4, модель/валидация констант ×3), `rde-dag` интеграционный
+«константа со `source` → разрешение/hash/stale/fallback»; всего **196 passed** (+8 к P0).
 
 ---
 
@@ -549,7 +559,7 @@ act_key     = rde_hash::act_key("formula", "rde/formula@1", in_hash, Some(src_ha
 
 | Фаза | Содержание | Крейты | Выход (тесты/доказательства) |
 |---|---|---|---|
-| **P1** value | `ConstantValue`+ (symbol/subscript/format/source), `constant_hash`, `resolve_constant`, формат value+NBSP+unit, rich-вставка, централизованная замена, UI-редактор констант | core, hash, dag, doc, ui | golden-хеши (совместимость литералов), резолвер из артефакта, stale→update (как C4–C6), kittest |
+| **P1** value — **ГОТОВО (2026-10-26)** | `ConstantValue`+ (symbol/subscript/format/source), `constant_hash`, `resolve_constant`, формат value+NBSP+unit, rich-вставка, централизованная замена, UI-редактор констант | core, hash, dag, doc, ui | golden-хеши (совместимость литералов), резолвер из артефакта, stale→update (как C4–C6), kittest |
 | **P2** formula | `FormulaManifest` в `objects/formulas/` + загрузка/валидация/циклы, `formula_edges`/топопорядок, compile OMML/SVG/PNG в CAS, `[state]`/ledger, статусы/причины, переиспользование в документах | core, hash, dag, doc | тесты модели/циклов, стабильность act_key, компиляция σ=F/A (как A16/B), откат кэшей |
 | **P2.5** writer fix | WordCraft `crates/docx`: сохранение blip-extLst/`svgBlip` + `word/media/*.svg` + rels + Content_Types при open/save; регрессионный тест форка; docs/wordcraft-fork.md; коммит `rde/main`; пин субмодуля отдельным RDE-коммитом | vendor/wordcraft, rde-docx (гейт) | тест форка «svgBlip → open → save → сохранён»; RDE fidelity-гейты не сломаны; пин |
 | **P3** вставка | `RdeInsert kind="formula"`+`render_mode`, `rde:doc` 1→2, sdt-оболочка/якоря, update-транзакция формул+документов, конфликты R-DOC-13, «где вставлено» по всем документам, документно-локальная нумерация, миграция демо явной командой | doc, dag, ui | roundtrip OMML/SVG через `.doc.rde`, обновление/откат, миграция демо, OMML-гейт, svgBlip сохраняется после engine save (после P2.5) |
@@ -582,5 +592,14 @@ P5 после P2/P3 (частично параллельно P4). Порядок
 * Харнессы спайков: [`spikes/harness/`](../spikes/harness/) (временные examples, из воркспейса удалены).
 * `cargo test --workspace` на P0 — зелёный: **188 passed, 0 failed** (187 тестов + 1 doctest) —
   число не изменилось, продуктовый код P0 не менялся; `git status`/`git diff --stat` — только docs.
+* **P1 (2026-10-26)** — зелёный: **196 passed, 0 failed** (195 тестов + 1 doctest; +8 к P0):
+  `rde-core` — 4 теста `value_format` (`number_formats_match_phase_1_behavior`,
+  `format_raw_keeps_text`, `constant_text_prefers_designation`, `known_formats_validation`),
+  3 теста констант (`legacy_constant_serialization_unchanged` — совместимость хеша литералов,
+  `constant_source_uri_parsing`, `load_reports_bad_constant_sources`);
+  `rde-dag/tests/dag.rs` — `constant_with_source_resolves_and_changes_hash` (значение из `out/*.json`,
+  digest в хеше, ledger `out_hash`, digest источника в `in_hash`, sentinel при недоступном
+  источнике, совместимость литералов). Схема `docs/schema/artifact.schema.json` перегенерирована
+  (аддитивно); документ-независимый `resolve_insert_constant` проверен существующим тестом вставок.
 * P2.5 (фикс writer'а) обязан добавить: регрессионный тест форка «svgBlip → open → save → сохранён»
   + запись в `docs/wordcraft-fork.md` + пин субмодуля; доказательства — в отчёте фазы P2.5.

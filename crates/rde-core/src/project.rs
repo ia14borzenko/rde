@@ -385,6 +385,7 @@ pub fn load_project(root: &Path) -> Result<Project, String> {
     ctx.load_artifacts();
 
     let mut project = build_project(project_manifest, root.to_path_buf(), ctx);
+    validate_constant_values(&mut project);
     project.log.insert(
         0,
         LogLine {
@@ -688,6 +689,49 @@ impl LoadCtx<'_> {
             data: ObjectData::Artifact(m),
         }
     }
+}
+
+/// Проверить расширенные значения констант (R-ART-09, ADR-0005 P1): URI `source`, цель,
+/// формат отображения, обозначение. Проблемы — `issues` загрузки (не фатальны), значения с
+/// недоступным источником разрешаются позже (`rde-dag`: кэш/ошибка статуса).
+fn validate_constant_values(project: &mut Project) {
+    let mut issues: Vec<(PathBuf, String)> = Vec::new();
+    for object in &project.objects {
+        let ObjectData::Artifact(manifest) = &object.data else { continue };
+        if manifest.kind != "constants" {
+            continue;
+        }
+        for (key, value) in &manifest.values {
+            if !crate::value_format::is_known_format(&value.format) {
+                issues.push((object.dir.clone(), format!("константа `{key}`: неизвестный format `{}`", value.format)));
+            }
+            if value.symbol.chars().any(char::is_whitespace) {
+                issues.push((object.dir.clone(), format!("константа `{key}`: symbol содержит пробелы")));
+            }
+            if value.subscript.chars().any(char::is_whitespace) {
+                issues.push((object.dir.clone(), format!("константа `{key}`: subscript содержит пробелы")));
+            }
+            match value.source_parsed() {
+                Err(error) => issues.push((object.dir.clone(), format!("константа `{key}`: {error}"))),
+                Ok(None) => {}
+                Ok(Some(source)) => {
+                    let target = project.object(&source.artifact_id);
+                    match target {
+                        Some(target) if matches!(target.data, ObjectData::Artifact(_)) => {}
+                        Some(_) => issues.push((
+                            object.dir.clone(),
+                            format!("константа `{key}`: источник `{}` — не артефакт", source.artifact_id),
+                        )),
+                        None => issues.push((
+                            object.dir.clone(),
+                            format!("константа `{key}`: артефакт-источник `{}` не найден", source.artifact_id),
+                        )),
+                    }
+                }
+            }
+        }
+    }
+    project.issues.extend(issues.into_iter().map(|(path, message)| Issue { path, message }));
 }
 
 /// Проверить наличие `hashed`-входов артефакта (ref-группы не влияют на свежесть, §7.3 п.1).

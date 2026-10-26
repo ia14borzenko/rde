@@ -821,7 +821,8 @@ fn resolves_constants_and_csv_tables_for_inserts() {
         .find(|object| matches!(&object.data, rde_core::ObjectData::Artifact(artifact) if artifact.kind == "constants"))
         .expect("константы в демо");
     let uri = format!("rde://constants/{}/R_n", constants.id);
-    let (text, run_style, hash) = rde_dag::resolve_insert_constant(&project, &uri).unwrap();
+    let ledger = rde_dag::ledger(&store).unwrap();
+    let (text, run_style, hash) = rde_dag::resolve_insert_constant(&project, &ledger, &uri).unwrap();
     assert_eq!(text, "R_н");
     assert_eq!(run_style, "italic-subscript");
     assert!(!hash.is_empty());
@@ -834,5 +835,113 @@ fn resolves_constants_and_csv_tables_for_inserts() {
     let (rows, _hash) = rde_dag::resolve_insert_table(&project, &store, &table_uri).unwrap();
     assert!(rows.len() >= 2, "строки CSV: {rows:?}");
     assert!(rows[0].len() >= 2, "колонки CSV: {rows:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// P1 (ADR-0005 §1): константа со `source` из выхода артефакта разрешается, digest источника
+/// входит в хеш (пересчёт артефакта → другой хеш → зависимые stale), литеральные константы
+/// хешируются прежней схемой.
+#[test]
+fn constant_with_source_resolves_and_changes_hash() {
+    let (root, _project) = demo_copy("const-source");
+    let constants_id = {
+        let project = load_project(&root).unwrap();
+        project
+            .objects
+            .iter()
+            .find(|object| matches!(&object.data, rde_core::ObjectData::Artifact(artifact) if artifact.kind == "constants"))
+            .expect("константы в демо")
+            .id
+            .clone()
+    };
+    let constants_dir = root.join("objects/artifacts").join(&constants_id);
+    let manifest_path = constants_dir.join("artifact.toml");
+    let mut text = std::fs::read_to_string(&manifest_path).unwrap();
+    text.push_str(&format!(
+        "\n[values.S]\nvalue = 0.0\nunit = \"Ом\"\n\
+         source = \"rde://artifact/{STATS}/out/stats.json#/v\"\n\
+         \n[values.T]\nvalue = 12.4\nunit = \"Ом\"\nsymbol = \"R\"\nsubscript = \"н\"\n"
+    ));
+    std::fs::write(&manifest_path, text).unwrap();
+    // Выход артефакта-источника (в копии out/ нет — создаём руками, как после запуска).
+    let stats_dir = root.join("objects/artifacts").join(STATS);
+    std::fs::create_dir_all(stats_dir.join("out")).unwrap();
+    std::fs::write(stats_dir.join("out/stats.json"), "{\"v\": 12.5}").unwrap();
+
+    let project = load_project(&root).unwrap();
+    assert!(project.issues.is_empty(), "issues: {:?}", project.issues);
+    let store = Store::open(&root).unwrap();
+    let ledger = rde_dag::ledger(&store).unwrap();
+
+    // source разрешается значением из файла; digest — sha256 файла (ledger пуст).
+    let resolved = rde_dag::resolve_constant(&project, &ledger, &constants_id, "S").unwrap();
+    assert_eq!(resolved.value, 12.5);
+    assert_eq!(resolved.text, "12.5\u{00A0}Ом");
+    assert_eq!(resolved.source_digest.as_deref().map(str::len), Some(64));
+    let hash_before = resolved.hash;
+    // Обозначение из symbol/subscript: текст обозначения + rich-стиль, авто-стиль подстрочного.
+    let designation = rde_dag::resolve_constant(&project, &ledger, &constants_id, "T").unwrap();
+    assert_eq!(designation.text, "Rн");
+    assert_eq!(designation.run_style, "italic-subscript");
+    assert!(designation.source_digest.is_none());
+
+    // Пересчёт артефакта (новый файл, без ledger) → другой хеш константы.
+    std::fs::write(stats_dir.join("out/stats.json"), "{\"v\": 13.5}").unwrap();
+    let project = load_project(&root).unwrap();
+    let resolved_after = rde_dag::resolve_constant(&project, &ledger, &constants_id, "S").unwrap();
+    assert_eq!(resolved_after.value, 13.5);
+    assert_ne!(resolved_after.hash, hash_before);
+
+    // Ledger с out_hash: digest источника = out_hash артефакта (даже если файл тот же),
+    // смена out_hash меняет хеш константы → каскад на зависимые артефакты.
+    let state_with = |out_hash: &str| rde_dag::ArtifactState {
+        artifact_id: STATS.to_owned(),
+        act_key: "0".repeat(64),
+        in_hash: None,
+        script_hash: None,
+        params_hash: None,
+        env_hash: None,
+        schema_version: None,
+        out_hash: Some(out_hash.to_owned()),
+        outputs: Vec::new(),
+        run_id: None,
+        updated_unix: 0,
+    };
+    let mut ledger_with = std::collections::HashMap::new();
+    ledger_with.insert(STATS.to_owned(), state_with(&"aa".repeat(32)));
+    let with_aa = rde_dag::resolve_constant(&project, &ledger_with, &constants_id, "S").unwrap();
+    assert_eq!(with_aa.source_digest.as_deref(), Some("aa".repeat(32).as_str()));
+    ledger_with.insert(STATS.to_owned(), state_with(&"bb".repeat(32)));
+    let with_bb = rde_dag::resolve_constant(&project, &ledger_with, &constants_id, "S").unwrap();
+    assert_ne!(with_aa.hash, with_bb.hash, "digest источника входит в хеш константы");
+
+    // Литеральная константа R_n: хеш — прежняя схема `sha256(canonical_json(ConstantValue))`.
+    let object = project.artifact_object(&constants_id).unwrap();
+    let rde_core::ObjectData::Artifact(manifest) = &object.data else { panic!() };
+    let literal = manifest.values.get("R_n").unwrap();
+    let expected = rde_hash::sha256(
+        rde_hash::canonical_json(&serde_json::to_value(literal).unwrap()).unwrap().as_bytes(),
+    );
+    assert_eq!(
+        rde_dag::constants_input_hash(&project, &ledger, &constants_id, "R_n").unwrap(),
+        expected,
+        "совместимость act_key: литеральная константа хешируется старой схемой"
+    );
+    let uri = format!("rde://constants/{constants_id}/R_n");
+    let (text, run_style, hash_hex) = rde_dag::resolve_insert_constant(&project, &ledger, &uri).unwrap();
+    assert_eq!(text, "R_н");
+    assert_eq!(run_style, "italic-subscript");
+    assert_eq!(hash_hex, expected.hex());
+
+    // Недоступный источник: для документа — ошибка (UI покажет причину), для in_hash зависимого
+    // артефакта — кэш value + sentinel-digest (артефакт не «невычислим», §7.3 п.2).
+    std::fs::remove_file(stats_dir.join("out/stats.json")).unwrap();
+    let project = load_project(&root).unwrap();
+    assert!(rde_dag::resolve_constant(&project, &ledger, &constants_id, "S").is_err());
+    let fallback_hash = rde_dag::constants_input_hash(&project, &ledger, &constants_id, "S").unwrap();
+    std::fs::write(stats_dir.join("out/stats.json"), "{\"v\": 13.5}").unwrap();
+    let project = load_project(&root).unwrap();
+    let restored_hash = rde_dag::constants_input_hash(&project, &ledger, &constants_id, "S").unwrap();
+    assert_ne!(fallback_hash, restored_hash, "sentinel-digest отличается от разрешённого источника");
     let _ = std::fs::remove_dir_all(&root);
 }

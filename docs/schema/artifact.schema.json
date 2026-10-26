@@ -1,15 +1,34 @@
 {
   "$defs": {
     "ConstantValue": {
-      "description": "Значение константы проекта (тип `constants`).",
+      "description": "Значение константы проекта (тип `constants`, R-ART-09).",
       "properties": {
         "display": {
           "default": "",
           "type": "string"
         },
+        "format": {
+          "description": "Формат отображения значения: `auto|raw|int|dec:N|sci:N|percent:N` (R-DOC-11).",
+          "type": "string"
+        },
+        "source": {
+          "description": "Источник значения (R-ART-09, ADR-0005): URI выхода артефакта\n`rde://artifact/<id>[@<out_hash>]/<selector>`; при заданном `source` значение разрешается\nиз артефакта, а `value` — кэш последнего разрешённого значения.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "style": {
           "default": "",
           "description": "Подсказка форматирования (например, `italic-subscript` для `R_н`).",
+          "type": "string"
+        },
+        "subscript": {
+          "description": "Подстрочный индекс обозначения (R-DOC-23), например `н` в `R_н`.",
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Обозначение величины (R-DOC-23): базовая буква; курсив обеспечивается `style`.",
           "type": "string"
         },
         "unit": {
@@ -17,6 +36,7 @@
           "type": "string"
         },
         "value": {
+          "description": "Литерал значения ИЛИ кэш последнего разрешённого значения при заданном `source`.",
           "format": "double",
           "type": "number"
         }

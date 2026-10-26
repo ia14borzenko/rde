@@ -339,25 +339,290 @@ fn input_hash(
             if manifest.kind != "constants" {
                 return Err(format!("{constants} — не набор констант (type={})", manifest.kind));
             }
-            let value = constants_value(manifest, selector)?;
-            let json = rde_hash::canonical_json(&value)?;
-            Ok((format!("constants:{constants}"), sha256(json.as_bytes())))
+            let (_json, hash) = resolve_constants(project, ledger, manifest, selector)?;
+            Ok((format!("constants:{constants}"), hash))
         }
     }
 }
 
-/// JSON-значение констант: весь набор или одна величина (`selector`).
-fn constants_value(manifest: &rde_core::ArtifactManifest, selector: &str) -> Result<serde_json::Value, String> {
+/// Разрешённая константа/величина (ADR-0005, P1): значение с учётом `source`, обозначение,
+/// формат и хеш, участвующий в `in_hash` зависимых артефактов.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedConstant {
+    pub constants_id: String,
+    pub key: String,
+    /// Разрешённое значение (для `source` — из выхода артефакта, иначе литерал `value`).
+    pub value: f64,
+    pub unit: String,
+    pub display: String,
+    pub style: String,
+    pub symbol: String,
+    pub subscript: String,
+    pub format: String,
+    /// Текст для документа (R-DOC-23): `display` / `symbol+subscript` / «значение + NBSP + единица».
+    pub text: String,
+    /// Rich-стиль docx-вставки (`italic`/`italic-subscript`).
+    pub run_style: String,
+    /// Digest источника (`out_hash` артефакта или sha256 файла) — только при `source`.
+    pub source_digest: Option<String>,
+    /// Хеш константы (совместим со старой схемой для литералов без новых полей).
+    pub hash: Hash,
+}
+
+impl ResolvedConstant {
+    /// JSON-представление для материализации входа-константы в скрипт (`inputs/constants.json`).
+    pub fn json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert("value".to_owned(), serde_json::json!(self.value));
+        map.insert("unit".to_owned(), serde_json::json!(self.unit));
+        map.insert("display".to_owned(), serde_json::json!(self.display));
+        map.insert("style".to_owned(), serde_json::json!(self.style));
+        if !self.symbol.is_empty() {
+            map.insert("symbol".to_owned(), serde_json::json!(self.symbol));
+        }
+        if !self.subscript.is_empty() {
+            map.insert("subscript".to_owned(), serde_json::json!(self.subscript));
+        }
+        if !self.format.is_empty() {
+            map.insert("format".to_owned(), serde_json::json!(self.format));
+        }
+        if let Some(digest) = &self.source_digest {
+            map.insert("source_digest".to_owned(), serde_json::json!(digest));
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
+/// Найти артефакт-набор констант по id.
+fn constants_artifact<'a>(project: &'a Project, id: &str) -> Result<&'a ArtifactManifest, String> {
+    let target = object(project, id)?;
+    let ObjectData::Artifact(manifest) = &target.data else {
+        return Err(format!("{id} — не артефакт"));
+    };
+    if manifest.kind != "constants" {
+        return Err(format!("{id} не является объектом констант (type = {})", manifest.kind));
+    }
+    Ok(manifest)
+}
+
+/// Расширенная ли константа (есть `source` или новые поля обозначения/формата). Для литеральных
+/// констант без новых полей хеш остаётся прежним — совместимость `act_key` (ADR-0005 §1.3).
+fn constant_is_extended(value: &rde_core::ConstantValue) -> bool {
+    value.source.is_some() || !value.symbol.is_empty() || !value.subscript.is_empty() || !value.format.is_empty()
+}
+
+/// Значение из `source` (выход артефакта) и digest источника (закреплённый `out_hash`,
+/// текущий `out_hash` из ledger или sha256 файла).
+fn source_value_and_digest(
+    project: &Project,
+    ledger: &HashMap<String, ArtifactState>,
+    value: &rde_core::ConstantValue,
+) -> Result<(f64, String), String> {
+    let Some(source) = value.source_parsed()? else {
+        return Err("source не задан".to_owned());
+    };
+    let target = object(project, &source.artifact_id)?;
+    let path = target.dir.join(&source.file);
+    let bytes = fs::read(&path).map_err(|e| format!("прочитать источник значения {}: {e}", path.display()))?;
+    let digest = match &source.out_hash {
+        Some(pinned) if !pinned.is_empty() => pinned.clone(),
+        _ => match ledger.get(&source.artifact_id).and_then(|state| state.out_hash.clone()) {
+            Some(current) => current,
+            None => sha256(&bytes).hex(),
+        },
+    };
+    let numeric = match &source.pointer {
+        Some(pointer) => {
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| format!("{} не JSON: {e}", path.display()))?;
+            match json.pointer(pointer) {
+                Some(serde_json::Value::Number(number)) => {
+                    number.as_f64().ok_or_else(|| format!("JSON pointer `{pointer}` — не число"))?
+                }
+                Some(serde_json::Value::String(text)) => text
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|e| format!("JSON pointer `{pointer}` не число: {e}"))?,
+                Some(other) => return Err(format!("JSON pointer `{pointer}` дал не число: {other}")),
+                None => return Err(format!("JSON pointer `{pointer}` не найден в {}", source.file)),
+            }
+        }
+        None => String::from_utf8_lossy(&bytes)
+            .trim()
+            .parse::<f64>()
+            .map_err(|e| format!("{} не число: {e}", source.file))?,
+    };
+    Ok((numeric, digest))
+}
+
+/// JSON одной константы с разрешённым значением (для материализации/хеша).
+fn constant_json(value: &rde_core::ConstantValue, resolved: f64, digest: Option<&str>) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("value".to_owned(), serde_json::json!(resolved));
+    map.insert("unit".to_owned(), serde_json::json!(value.unit));
+    map.insert("display".to_owned(), serde_json::json!(value.display));
+    map.insert("style".to_owned(), serde_json::json!(value.style));
+    if !value.symbol.is_empty() {
+        map.insert("symbol".to_owned(), serde_json::json!(value.symbol));
+    }
+    if !value.subscript.is_empty() {
+        map.insert("subscript".to_owned(), serde_json::json!(value.subscript));
+    }
+    if !value.format.is_empty() {
+        map.insert("format".to_owned(), serde_json::json!(value.format));
+    }
+    if let Some(source) = &value.source {
+        map.insert("source".to_owned(), serde_json::json!(source));
+    }
+    if let Some(digest) = digest {
+        map.insert("source_digest".to_owned(), serde_json::json!(digest));
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Значение константы для `in_hash`: `source` разрешается, если доступен; ошибка источника не
+/// делает артефакт «невычислимым» (как missing_hash у входов, §7.3 п.2) — используется кэш `value`
+/// и sentinel-digest, детерминированный по URI источника.
+fn source_or_cached(
+    project: &Project,
+    ledger: &HashMap<String, ArtifactState>,
+    value: &rde_core::ConstantValue,
+) -> (f64, Option<String>) {
+    match &value.source {
+        None => (value.value, None),
+        Some(uri) => match source_value_and_digest(project, ledger, value) {
+            Ok((resolved, digest)) => (resolved, Some(digest)),
+            Err(_error) => {
+                let sentinel = sha256(format!("rde:missing:constant-source:{uri}")).hex();
+                (value.value, Some(format!("missing:{sentinel}")))
+            }
+        },
+    }
+}
+
+/// Разрешить набор констант (все — при пустом `selector`, одну — по имени):
+/// JSON для материализации входа + хеш для `in_hash`. Литеральные константы без новых полей
+/// хешируются прежней схемой (`sha256(JCS(ConstantValue))`), расширенные — `rde:const:1`.
+fn resolve_constants(
+    project: &Project,
+    ledger: &HashMap<String, ArtifactState>,
+    manifest: &rde_core::ArtifactManifest,
+    selector: &str,
+) -> Result<(serde_json::Value, Hash), String> {
     let selector = selector.trim();
     if selector.is_empty() {
-        serde_json::to_value(&manifest.values).map_err(|e| format!("константы: {e}"))
+        let mut map = serde_json::Map::new();
+        let mut extended = false;
+        for (key, value) in &manifest.values {
+            if constant_is_extended(value) {
+                extended = true;
+                let (resolved, digest) = source_or_cached(project, ledger, value);
+                map.insert(key.clone(), constant_json(value, resolved, digest.as_deref()));
+            } else {
+                map.insert(
+                    key.clone(),
+                    serde_json::to_value(value).map_err(|e| format!("константа `{key}`: {e}"))?,
+                );
+            }
+        }
+        let json = serde_json::Value::Object(map);
+        let canonical = rde_hash::canonical_json(&json)?;
+        let hash = if extended {
+            rde_hash::constants_hash(&canonical)
+        } else {
+            sha256(canonical.as_bytes())
+        };
+        Ok((json, hash))
     } else {
         let value = manifest
             .values
             .get(selector)
             .ok_or_else(|| format!("константа `{selector}` не найдена"))?;
-        serde_json::to_value(value).map_err(|e| format!("константа `{selector}`: {e}"))
+        if constant_is_extended(value) {
+            let (resolved, digest) = source_or_cached(project, ledger, value);
+            let json = constant_json(value, resolved, digest.as_deref());
+            let canonical = rde_hash::canonical_json(&json)?;
+            Ok((json, rde_hash::constants_hash(&canonical)))
+        } else {
+            let json = serde_json::to_value(value).map_err(|e| format!("константа `{selector}`: {e}"))?;
+            let canonical = rde_hash::canonical_json(&json)?;
+            Ok((json, sha256(canonical.as_bytes())))
+        }
     }
+}
+
+/// Разрешить константу/величину для UI/документа (ADR-0005, P1): значение (с `source`),
+/// обозначение, единица, формат, текст и хеш.
+pub fn resolve_constant(
+    project: &Project,
+    ledger: &HashMap<String, ArtifactState>,
+    constants_id: &str,
+    key: &str,
+) -> Result<ResolvedConstant, String> {
+    let manifest = constants_artifact(project, constants_id)?;
+    let value = manifest
+        .values
+        .get(key)
+        .ok_or_else(|| format!("константа `{key}` не найдена в {}", manifest.title))?;
+    let (resolved, source_digest) = match &value.source {
+        Some(_) => {
+            let (resolved, digest) = source_value_and_digest(project, ledger, value)?;
+            (resolved, Some(digest))
+        }
+        None => (value.value, None),
+    };
+    let canonical = rde_hash::canonical_json(&constant_json(value, resolved, source_digest.as_deref()))?;
+    let hash = if constant_is_extended(value) {
+        rde_hash::constants_hash(&canonical)
+    } else {
+        sha256(canonical.as_bytes())
+    };
+    Ok(ResolvedConstant {
+        constants_id: constants_id.to_owned(),
+        key: key.to_owned(),
+        value: resolved,
+        unit: value.unit.clone(),
+        display: value.display.clone(),
+        style: value.style.clone(),
+        symbol: value.symbol.clone(),
+        subscript: value.subscript.clone(),
+        format: value.format.clone(),
+        text: rde_core::value_format::constant_text(
+            resolved,
+            &value.unit,
+            &value.display,
+            &value.symbol,
+            &value.subscript,
+            &value.format,
+        ),
+        run_style: rde_core::value_format::constant_run_style(&value.style, &value.symbol, &value.subscript),
+        source_digest,
+        hash,
+    })
+}
+
+/// Разрешить значение набора констант для материализации входа скрипта: `selector` пуст —
+/// весь набор (`inputs/constants.json`), иначе одна константа.
+pub fn resolved_constants_json(
+    project: &Project,
+    ledger: &HashMap<String, ArtifactState>,
+    manifest: &rde_core::ArtifactManifest,
+    selector: &str,
+) -> Result<serde_json::Value, String> {
+    resolve_constants(project, ledger, manifest, selector).map(|(json, _hash)| json)
+}
+
+/// Хеш констант для `in_hash` зависимого артефакта (ADR-0005 P1): для литеральных констант — прежняя
+/// схема `sha256(JCS(ConstantValue))` (совместимость `act_key`), для расширенных (`source`,
+/// обозначение, format) — `rde:const:1` с разрешённым значением и digest источника.
+pub fn constants_input_hash(
+    project: &Project,
+    ledger: &HashMap<String, ArtifactState>,
+    constants_id: &str,
+    selector: &str,
+) -> Result<Hash, String> {
+    let manifest = constants_artifact(project, constants_id)?;
+    resolve_constants(project, ledger, manifest, selector).map(|(_json, hash)| hash)
 }
 
 /// Дополнительные файлы скрипта (`script_files`): путь → хеш блоба; отсутствующий файл
@@ -720,6 +985,7 @@ impl UpdateReport {
 fn build_spec(
     project: &Project,
     artifact: &ArtifactManifest,
+    ledger: &HashMap<String, ArtifactState>,
     env: &EnvContext,
     activation: &Activation,
 ) -> Result<RunSpec, String> {
@@ -774,7 +1040,7 @@ fn build_spec(
                 if manifest.kind != "constants" {
                     return Err(format!("{constants} — не набор констант (type={})", manifest.kind));
                 }
-                let value = constants_value(manifest, selector)?;
+                let value = resolved_constants_json(project, ledger, manifest, selector)?;
                 let bytes = serde_json::to_vec_pretty(&value).map_err(|e| format!("константы: {e}"))?;
                 let selector = selector.trim();
                 let name = if selector.is_empty() {
@@ -1109,7 +1375,7 @@ pub fn update(project: &Project, store: &mut Store, options: &UpdateOptions) -> 
             continue;
         }
 
-        let spec = match build_spec(project, artifact, &env, &activation) {
+        let spec = match build_spec(project, artifact, &ledger, &env, &activation) {
             Ok(spec) => spec,
             Err(error) => {
                 report.errors.push(format!("{}: {error}", artifact.title));
@@ -1602,48 +1868,20 @@ pub fn resolve_insert_image(project: &Project, store: &Store, uri: &str) -> Resu
 
 /// Разрешить вставку константы (`rde://constants/<object_id>/<key>`, R-ART-09/R-DOC-11):
 /// возвращает (текст для документа, подсказка rich-формата, hash значения).
-pub fn resolve_insert_constant(project: &Project, uri: &str) -> Result<(String, String, String), String> {
+/// Значение с `source` разрешается из выхода артефакта (ADR-0005, P1), digest входит в hash.
+pub fn resolve_insert_constant(
+    project: &Project,
+    ledger: &HashMap<String, ArtifactState>,
+    uri: &str,
+) -> Result<(String, String, String), String> {
     let rest = uri
         .strip_prefix("rde://constants/")
         .ok_or_else(|| format!("URI константы должен начинаться с rde://constants/: {uri}"))?;
     let (object_id, key) = rest
         .split_once('/')
         .ok_or_else(|| format!("в URI константы нет ключа значения: {uri}"))?;
-    let object = project
-        .artifact_object(object_id)
-        .ok_or_else(|| format!("объект констант {object_id} не найден"))?;
-    let ObjectData::Artifact(manifest) = &object.data else {
-        return Err(format!("{object_id} — не артефакт констант"));
-    };
-    if manifest.kind != "constants" {
-        return Err(format!("{object_id} не является объектом констант (type = {})", manifest.kind));
-    }
-    let value = manifest
-        .values
-        .get(key)
-        .ok_or_else(|| format!("константа `{key}` не найдена в {}", manifest.title))?;
-    let text = if !value.display.is_empty() {
-        value.display.clone()
-    } else if value.unit.is_empty() {
-        rde_doc_format_number(value.value)
-    } else {
-        format!("{} {}", rde_doc_format_number(value.value), value.unit)
-    };
-    let hash = sha256(format!("{}|{}|{}|{}", value.value, value.unit, value.display, value.style).as_bytes()).hex();
-    Ok((text, value.style.clone(), hash))
-}
-
-/// Число для константы: целое без «.0», иначе до 4 знаков.
-fn rde_doc_format_number(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else {
-        let mut text = format!("{value:.4}");
-        while text.ends_with('0') && text.contains('.') {
-            text.pop();
-        }
-        text
-    }
+    let resolved = resolve_constant(project, ledger, object_id, key)?;
+    Ok((resolved.text, resolved.run_style, resolved.hash.hex()))
 }
 
 /// Разрешить вставку таблицы (`rde://artifact/<id>@<out_hash>/<csv-путь>`): строки + hash данных.
