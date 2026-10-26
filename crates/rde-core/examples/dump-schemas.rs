@@ -18,6 +18,7 @@ fn main() {
         ("source", ManifestKind::Source),
         ("note", ManifestKind::Note),
         ("repository", ManifestKind::Repository),
+        ("formula", ManifestKind::Formula),
     ];
     for (name, kind) in kinds {
         let schema = kind.schema();

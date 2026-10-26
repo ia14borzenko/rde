@@ -461,6 +461,57 @@ pub fn set_project_trusted(root: &Path, trusted: bool) -> Result<(), String> {
     }
 }
 
+/// Записать `[state]` формулы (кэш актуальности, ADR-0005 P2) в `formula.toml`, не трогая
+/// остальной файл: заменяет существующую таблицу `[state]` целиком; валидирует JSON Schema.
+/// Источник истины актуальности — ledger (`rde-dag`), `[state]` — человекочитаемое зеркало
+/// (прецедент `out_hash` у артефактов).
+pub fn record_formula_state(
+    formula_dir: &Path,
+    act_key: &str,
+    resolved_latex_hash: &str,
+    omml_hash: &str,
+    svg_hash: Option<&str>,
+    png_hash: Option<&str>,
+    computed_at: u64,
+) -> Result<(), String> {
+    let path = formula_dir.join("formula.toml");
+    let text = fs::read_to_string(&path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
+    let mut kept: Vec<String> = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        let top_level = !line.starts_with(' ') && !line.starts_with('\t');
+        if top_level && line.starts_with('[') {
+            skipping = line.trim() == "[state]";
+            if skipping {
+                continue;
+            }
+        }
+        if skipping {
+            continue;
+        }
+        kept.push(line.to_owned());
+    }
+    while kept.last().is_some_and(|line| line.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut out = kept.join("\n");
+    out.push_str(&format!(
+        "\n\n[state]\nact_key = {}\nresolved_latex_hash = {}\nomml_hash = {}\n",
+        toml_string(act_key),
+        toml_string(resolved_latex_hash),
+        toml_string(omml_hash)
+    ));
+    if let Some(svg) = svg_hash {
+        out.push_str(&format!("svg_hash = {}\n", toml_string(svg)));
+    }
+    if let Some(png) = png_hash {
+        out.push_str(&format!("png_hash = {}\n", toml_string(png)));
+    }
+    out.push_str(&format!("computed_at = {computed_at}\n"));
+    fs::write(&path, out).map_err(|e| format!("записать {}: {e}", path.display()))?;
+    validate_manifest(ManifestKind::Formula, &path)
+}
+
 /// Убрать `out_hash` из `artifact.toml` (откат к состоянию «артефакт ещё не запускался»).
 pub fn clear_artifact_out_hash(artifact_dir: &Path) -> Result<(), String> {
     let path = artifact_dir.join("artifact.toml");
@@ -527,7 +578,7 @@ pub fn create_project(root: &Path, name: &str) -> Result<(), String> {
         return Err(format!("в {} уже есть rde.toml", root.display()));
     }
     fs::create_dir_all(root).map_err(|e| format!("создать {}: {e}", root.display()))?;
-    for dir in ["artifacts", "documents", "sources", "notes", "repos"] {
+    for dir in ["artifacts", "documents", "sources", "notes", "repos", "formulas"] {
         fs::create_dir_all(root.join("objects").join(dir)).map_err(|e| format!("создать objects/{dir}: {e}"))?;
     }
     let id = new_id();
@@ -558,6 +609,38 @@ pub fn create_document_stub(root: &Path, title: &str) -> Result<PathBuf, String>
     let path = dir.join("document.toml");
     fs::write(&path, manifest).map_err(|e| format!("записать document.toml: {e}"))?;
     if let Err(error) = validate_manifest(ManifestKind::Document, &path) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(error);
+    }
+    Ok(dir)
+}
+
+/// Создать project-level объект формулы (ADR-0005 P2): `objects/formulas/<id>/formula.toml`
+/// с LaTeX-источником (display, политика нумерации по умолчанию — auto).
+pub fn create_formula(root: &Path, title: &str, latex: &str) -> Result<PathBuf, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("название формулы не может быть пустым".to_owned());
+    }
+    let latex = latex.trim();
+    if latex.is_empty() {
+        return Err("LaTeX-источник формулы не может быть пустым".to_owned());
+    }
+    let id = new_id();
+    let dir = root.join("objects/formulas").join(&id);
+    fs::create_dir_all(&dir).map_err(|e| format!("создать каталог формулы: {e}"))?;
+    let manifest = format!(
+        "schema = \"{}\"\nid = \"{id}\"\ntitle = {}\nlatex = {}\ndisplay = true\n\n[numbering]\nmode = \"auto\"\nlabel = \"\"\n",
+        crate::manifest::SCHEMA_FORMULA,
+        toml_string(title),
+        toml_string(latex)
+    );
+    let path = dir.join("formula.toml");
+    fs::write(&path, manifest).map_err(|e| format!("записать formula.toml: {e}"))?;
+    let readme = format!("# {title}\n\nФормула проекта (ADR-0005). LaTeX-источник — `formula.toml`; кэши OMML/SVG/PNG — в CAS.\n");
+    let _ = fs::write(dir.join("readme.md"), readme);
+    let _ = fs::write(dir.join(".gitignore"), "");
+    if let Err(error) = validate_manifest(ManifestKind::Formula, &path) {
         let _ = fs::remove_dir_all(&dir);
         return Err(error);
     }
@@ -622,6 +705,7 @@ pub fn rename_object(project: &crate::Project, id: &str, new_title: &str) -> Res
         crate::ObjectData::Source(_) => "source.toml",
         crate::ObjectData::Note(_) => "note.toml",
         crate::ObjectData::Repository(_) => "repo.toml",
+        crate::ObjectData::Formula(_) => "formula.toml",
     };
     let path = object.dir.join(manifest_name);
     let text = fs::read_to_string(&path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
@@ -649,6 +733,7 @@ pub fn rename_object(project: &crate::Project, id: &str, new_title: &str) -> Res
         crate::ObjectData::Source(_) => ManifestKind::Source,
         crate::ObjectData::Note(_) => ManifestKind::Note,
         crate::ObjectData::Repository(_) => ManifestKind::Repository,
+        crate::ObjectData::Formula(_) => ManifestKind::Formula,
     };
     validate_manifest(kind, &path)
 }

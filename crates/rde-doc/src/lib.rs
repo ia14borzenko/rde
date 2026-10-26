@@ -35,6 +35,9 @@ use zip::write::SimpleFileOptions;
 mod equation;
 pub use equation::*;
 
+pub mod formula;
+pub use formula::*;
+
 pub const RDE_NS: &str = "https://rde.dev/ns/doc";
 pub const SCHEMA_VERSION: &str = "1";
 pub const RDE_DOC_PART: &str = "customXml/item1.xml";

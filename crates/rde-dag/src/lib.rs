@@ -16,8 +16,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rde_core::{ArtifactManifest, InputSpec, Object, ObjectData, Project};
-use rde_hash::{act_key, env_hash, group_hash, in_hash, params_hash, script_hash, sha256, tree_hash, GroupMember, Hash, InGroup, TreeEntry};
+use rde_core::{
+    parse_formula_input_source, parse_formula_ref, ArtifactManifest, FormulaInputSource, InputSpec, Object, ObjectData, Project,
+};
+use rde_hash::{
+    act_key, env_hash, formula_env_hash, formula_source_hash, group_hash, in_hash, params_hash, script_hash, sha256,
+    tree_hash, GroupMember, Hash, InGroup, TreeEntry,
+};
 use rde_run::{run, InputFile, NetworkPolicy, RunOutcome, RunSpec, RunStatus};
 use rde_store::{Store, TxRecord, TxStatus};
 use serde::{Deserialize, Serialize};
@@ -1948,3 +1953,632 @@ pub fn stale_artifacts(project: &Project, store: &Store) -> Result<Vec<String>, 
         .filter(|id| matches!(statuses.get(id).map(|s| &s.status), Some(LiveStatus::Stale(_) | LiveStatus::NeverRun)))
         .collect())
 }
+
+// ── проектные формулы (ADR-0005 P2): активация, входы/фрагменты, ledger, кэши ─────────────
+
+/// Идентификация рендерера формул (WordCraft + poppler) — входит в `env_hash` активации:
+/// апгрейд рендерера инвалидирует кэши OMML/SVG/PNG.
+#[derive(Clone, Copy, Debug)]
+pub struct FormulaRenderer<'a> {
+    pub id: &'a str,
+    pub version: &'a str,
+}
+
+/// Имя корня кэша формулы в store: `formula/<id>` → дерево `formula.omml`/`formula.svg`/`formula.png`.
+pub fn formula_root_name(formula_id: &str) -> String {
+    format!("formula/{formula_id}")
+}
+
+/// Состояние формулы в ledger (payload транзакции `kind="formula-update"`). Зеркало — `[state]`
+/// в `formula.toml`; источник истины актуальности — ledger (как у артефактов).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FormulaState {
+    pub formula_id: String,
+    pub act_key: String,
+    #[serde(default)]
+    pub in_hash: Option<String>,
+    #[serde(default)]
+    pub src_hash: Option<String>,
+    #[serde(default)]
+    pub params_hash: Option<String>,
+    #[serde(default)]
+    pub env_hash: Option<String>,
+    #[serde(default)]
+    pub resolved_latex: String,
+    #[serde(default)]
+    pub resolved_latex_hash: Option<String>,
+    #[serde(default)]
+    pub omml_hash: Option<String>,
+    #[serde(default)]
+    pub svg_hash: Option<String>,
+    #[serde(default)]
+    pub png_hash: Option<String>,
+    #[serde(default)]
+    pub updated_unix: u64,
+}
+
+/// Прочитать ledger формул из committed-транзакций `kind="formula-update"`.
+pub fn formula_ledger(store: &Store) -> Result<HashMap<String, FormulaState>, String> {
+    let mut txs: Vec<TxRecord> = store.list_txs().map_err(|e| e.to_string())?;
+    txs.retain(|tx| {
+        tx.status == TxStatus::Committed
+            && tx.data.as_ref().and_then(|data| data.get("kind")).and_then(|kind| kind.as_str()) == Some("formula-update")
+    });
+    txs.sort_by(|a, b| a.started_unix.cmp(&b.started_unix).then_with(|| a.id.cmp(&b.id)));
+    let mut ledger = HashMap::new();
+    for tx in txs {
+        let Some(data) = tx.data else { continue };
+        let Some(items) = data.get("formulas").and_then(|value| value.as_array()) else { continue };
+        for item in items {
+            if item.get("removed").and_then(|value| value.as_bool()) == Some(true) {
+                if let Some(id) = item.get("formula_id").and_then(|value| value.as_str()) {
+                    ledger.remove(id);
+                }
+                continue;
+            }
+            if let Ok(state) = serde_json::from_value::<FormulaState>(item.clone()) {
+                ledger.insert(state.formula_id.clone(), state);
+            }
+        }
+    }
+    Ok(ledger)
+}
+
+/// Зафиксировать состояние формулы транзакцией store (при необходимости — с деревом кэшей).
+pub fn commit_formula_update(
+    store: &mut Store,
+    state: &FormulaState,
+    cache_tree: Option<Hash>,
+    note: &str,
+) -> Result<String, String> {
+    let payload = serde_json::json!({ "kind": "formula-update", "formulas": [state] });
+    let mut roots = store.current_roots().map_err(|e| e.to_string())?;
+    if let Some(tree) = cache_tree {
+        roots.insert(formula_root_name(&state.formula_id), tree);
+    }
+    let tx = store
+        .begin_tx_with_roots(note, Some(payload), roots)
+        .map_err(|e| e.to_string())?;
+    match store.commit_tx(&tx) {
+        Ok(()) => Ok(tx),
+        Err(error) => {
+            let message = error.to_string();
+            let _ = store.fail_tx(&tx, &message);
+            Err(message)
+        }
+    }
+}
+
+/// Разрешённый вход формулы: псевдоним, digest источника и LaTeX-подстановка.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedFormulaInput {
+    pub alias: String,
+    pub mode: String,
+    pub source: String,
+    pub as_kind: String,
+    pub digest: Option<Hash>,
+    pub value_text: String,
+    pub latex: String,
+}
+
+/// Разрешённый фрагмент формулы: act_key закреплённого/ledger-состояния и эффективный LaTeX.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedFormulaFragment {
+    pub alias: String,
+    pub formula_id: String,
+    pub act_key: String,
+    pub effective_latex: String,
+}
+
+/// Результат активации формулы (ADR-0005 §4.1): `act_key` и данные для компиляции/вставки.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedFormula {
+    pub formula_id: String,
+    pub act_key: Hash,
+    pub in_hash: Hash,
+    pub src_hash: Hash,
+    pub params_hash: Hash,
+    pub env_hash: Hash,
+    /// Эффективный LaTeX после подстановок входов и фрагментов.
+    pub effective_latex: String,
+    pub resolved_latex_hash: String,
+    pub inputs: Vec<ResolvedFormulaInput>,
+    pub fragments: Vec<ResolvedFormulaFragment>,
+}
+
+/// LaTeX-обозначение величины (R-DOC-23): `R` курсивом + подстрочный `н` → `R_{\text{н}}`.
+pub fn latex_symbol(symbol: &str, subscript: &str) -> String {
+    if subscript.is_empty() {
+        symbol.to_owned()
+    } else {
+        format!("{symbol}_{{\\text{{{subscript}}}}}")
+    }
+}
+
+/// Digest выхода артефакта для входа формулы: закреплённый `@out_hash`, ledger `out_hash` или
+/// sha256 файла (как у вставок, R-DOC-11).
+fn formula_artifact_source(
+    project: &Project,
+    ledger: &HashMap<String, ArtifactState>,
+    artifact_id: &str,
+    out_hash: Option<&str>,
+    selector: &str,
+) -> Result<(String, Hash), String> {
+    let target = object(project, artifact_id)?;
+    let (file, pointer) = match selector.split_once('#') {
+        Some((file, pointer)) => (file, Some(pointer)),
+        None => (selector, None),
+    };
+    let path = target.dir.join(file);
+    let bytes = fs::read(&path).map_err(|e| format!("прочитать вход формулы {}: {e}", path.display()))?;
+    let digest = match out_hash.filter(|hash| !hash.is_empty()) {
+        Some(pinned) => Hash::from_hex(pinned).map_err(|e| format!("out_hash входа: {e}"))?,
+        None => match ledger.get(artifact_id).and_then(|state| state.out_hash.as_deref()).and_then(|hash| Hash::from_hex(hash).ok()) {
+            Some(current) => current,
+            None => sha256(&bytes),
+        },
+    };
+    let text = match pointer {
+        Some(pointer) => {
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| format!("{} не JSON: {e}", path.display()))?;
+            match json.pointer(pointer) {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(other) => other.to_string(),
+                None => return Err(format!("JSON pointer `{pointer}` не найден в {file}")),
+            }
+        }
+        None => String::from_utf8_lossy(&bytes).trim_end_matches(['\n', '\r']).to_owned(),
+    };
+    Ok((text, digest))
+}
+
+/// Подставить `\rdeinput{...}`/`\rdefragment{...}` в LaTeX-источник.
+fn substitute_formula_placeholders(
+    latex: &str,
+    inputs: &std::collections::BTreeMap<String, String>,
+    fragments: &std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(latex.len());
+    let mut rest = latex;
+    loop {
+        let input_pos = rest.find("\\rdeinput{");
+        let fragment_pos = rest.find("\\rdefragment{");
+        let (pos, marker, table, what) = match (input_pos, fragment_pos) {
+            (None, None) => break,
+            (Some(pos), None) => (pos, "\\rdeinput{", inputs, "вход"),
+            (None, Some(pos)) => (pos, "\\rdefragment{", fragments, "фрагмент"),
+            (Some(a), Some(b)) if a <= b => (a, "\\rdeinput{", inputs, "вход"),
+            (Some(_), Some(b)) => (b, "\\rdefragment{", fragments, "фрагмент"),
+        };
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos + marker.len()..];
+        let end = tail
+            .find('}')
+            .ok_or_else(|| format!("незакрытый плейсхолдер {what} в latex формулы"))?;
+        let alias = &tail[..end];
+        let value = table
+            .get(alias)
+            .ok_or_else(|| format!("{what} `{alias}` не найден в разметке формулы"))?;
+        out.push_str(value);
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn resolve_formula_inner(
+    project: &Project,
+    artifact_ledger: &HashMap<String, ArtifactState>,
+    formula_ledger: &HashMap<String, FormulaState>,
+    formula_id: &str,
+    renderer: &FormulaRenderer<'_>,
+    depth: u32,
+) -> Result<ResolvedFormula, String> {
+    if depth > 32 {
+        return Err("слишком глубокая вложенность фрагментов формул".to_owned());
+    }
+    let formula_object = project
+        .formula_object(formula_id)
+        .ok_or_else(|| format!("формула {formula_id} не найдена"))?;
+    let ObjectData::Formula(formula) = &formula_object.data else {
+        return Err(format!("{formula_id} — не формула"));
+    };
+
+    let mut resolved_inputs: Vec<ResolvedFormulaInput> = Vec::new();
+    let mut input_latex: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for input in &formula.inputs {
+        let (value_text, latex, digest) = match parse_formula_input_source(&input.source)? {
+            FormulaInputSource::Constants { constants_id, key } => {
+                let resolved = resolve_constant(project, artifact_ledger, &constants_id, &key)?;
+                let value_text = resolved.text.clone();
+                let latex = match input.as_kind.as_str() {
+                    "symbol" => {
+                        if resolved.symbol.is_empty() {
+                            resolved.text.clone()
+                        } else {
+                            latex_symbol(&resolved.symbol, &resolved.subscript)
+                        }
+                    }
+                    "value" => {
+                        let format = if input.format.is_empty() { resolved.format.as_str() } else { input.format.as_str() };
+                        rde_core::value_format::format_number(resolved.value, format)
+                    }
+                    _ => resolved.text.clone(),
+                };
+                (value_text, latex, Some(resolved.hash))
+            }
+            FormulaInputSource::Artifact { artifact_id, out_hash, selector } => {
+                let (text, hash) =
+                    formula_artifact_source(project, artifact_ledger, &artifact_id, out_hash.as_deref(), &selector)?;
+                let latex = match input.as_kind.as_str() {
+                    "value" if !input.format.is_empty() && text.trim().parse::<f64>().is_ok() => {
+                        rde_core::value_format::format_number(text.trim().parse::<f64>().unwrap_or(0.0), &input.format)
+                    }
+                    _ => text.clone(),
+                };
+                (text, latex, Some(hash))
+            }
+        };
+        input_latex.insert(input.alias.clone(), latex.clone());
+        resolved_inputs.push(ResolvedFormulaInput {
+            alias: input.alias.clone(),
+            mode: input.mode.clone(),
+            source: input.source.clone(),
+            as_kind: input.as_kind.clone(),
+            digest,
+            value_text,
+            latex,
+        });
+    }
+
+    let mut resolved_fragments: Vec<ResolvedFormulaFragment> = Vec::new();
+    let mut fragment_latex: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut fragment_members: Vec<GroupMember> = Vec::new();
+    for fragment in &formula.fragments {
+        let reference = parse_formula_ref(&fragment.source)?;
+        let act_key = match reference.act_key.as_deref().filter(|key| !key.is_empty()) {
+            Some(pinned) => pinned.to_owned(),
+            None => formula_ledger
+                .get(&reference.formula_id)
+                .map(|state| state.act_key.clone())
+                .ok_or_else(|| format!("фрагмент `{}`: формула {} ещё не вычислена", fragment.alias, reference.formula_id))?,
+        };
+        let resolved_fragment =
+            resolve_formula_inner(project, artifact_ledger, formula_ledger, &reference.formula_id, renderer, depth + 1)?;
+        fragment_latex.insert(fragment.alias.clone(), format!("\\left({}\\right)", resolved_fragment.effective_latex));
+        if let Ok(hash) = Hash::from_hex(&act_key) {
+            fragment_members.push(GroupMember {
+                target: format!("rde://formula/{}", reference.formula_id),
+                out: hash,
+                selector: fragment.alias.clone(),
+            });
+        }
+        resolved_fragments.push(ResolvedFormulaFragment {
+            alias: fragment.alias.clone(),
+            formula_id: reference.formula_id,
+            act_key,
+            effective_latex: resolved_fragment.effective_latex,
+        });
+    }
+
+    let effective_latex = substitute_formula_placeholders(&formula.latex, &input_latex, &fragment_latex)?;
+    let resolved_latex_hash = sha256(effective_latex.as_bytes()).hex();
+
+    let mut input_members: Vec<GroupMember> = Vec::new();
+    let mut ref_members: Vec<GroupMember> = Vec::new();
+    for input in &resolved_inputs {
+        let Some(digest) = input.digest else { continue };
+        let member = GroupMember {
+            target: input.source.clone(),
+            out: digest,
+            selector: input.alias.clone(),
+        };
+        if input.mode == "hashed" {
+            input_members.push(member);
+        } else {
+            ref_members.push(member);
+        }
+    }
+    let groups = vec![
+        InGroup {
+            name: "inputs".to_owned(),
+            mode: "hashed".into(),
+            grp_hash: group_hash("inputs", "hashed", &input_members),
+        },
+        InGroup {
+            name: "fragments".to_owned(),
+            mode: "hashed".into(),
+            grp_hash: group_hash("fragments", "hashed", &fragment_members),
+        },
+        // ref-входы: связаны, но не входят в in_hash (§7.3 п.1).
+        InGroup {
+            name: "refs".to_owned(),
+            mode: "ref".into(),
+            grp_hash: group_hash("refs", "ref", &ref_members),
+        },
+    ];
+    let in_hash = in_hash(&groups);
+    let src_hash = formula_source_hash(
+        &formula.latex,
+        formula.display,
+        &formula.numbering.mode,
+        &formula.numbering.label,
+    );
+    let params = params_hash(&serde_json::json!({}))?;
+    let env = formula_env_hash(renderer.id, renderer.version);
+    let key = act_key("formula", "rde/formula@1", in_hash, Some(src_hash), params, env);
+    Ok(ResolvedFormula {
+        formula_id: formula_id.to_owned(),
+        act_key: key,
+        in_hash,
+        src_hash,
+        params_hash: params,
+        env_hash: env,
+        effective_latex,
+        resolved_latex_hash,
+        inputs: resolved_inputs,
+        fragments: resolved_fragments,
+    })
+}
+
+/// Активировать формулу: разрешить входы/фрагменты, построить эффективный LaTeX и `act_key`
+/// (ADR-0005 §4.1). `artifact_ledger` — для out_hash входов-артефактов, `formula_ledger` — для
+/// act_key фрагментов без закреплённого ключа.
+pub fn resolve_formula(
+    project: &Project,
+    artifact_ledger: &HashMap<String, ArtifactState>,
+    formula_ledger: &HashMap<String, FormulaState>,
+    formula_id: &str,
+    renderer: &FormulaRenderer<'_>,
+) -> Result<ResolvedFormula, String> {
+    resolve_formula_inner(project, artifact_ledger, formula_ledger, formula_id, renderer, 0)
+}
+
+/// Причина устаревания формулы (ADR-0005 §3.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FormulaStaleReason {
+    InputsChanged,
+    FragmentsChanged,
+    SourceChanged,
+    ParamsChanged,
+    EnvChanged,
+    StateIncomplete,
+    CacheMissing,
+}
+
+impl FormulaStaleReason {
+    pub fn label_ru(self) -> &'static str {
+        match self {
+            FormulaStaleReason::InputsChanged => "изменились входы",
+            FormulaStaleReason::FragmentsChanged => "изменились фрагменты",
+            FormulaStaleReason::SourceChanged => "изменился LaTeX-источник",
+            FormulaStaleReason::ParamsChanged => "изменились параметры",
+            FormulaStaleReason::EnvChanged => "изменилось окружение рендеринга",
+            FormulaStaleReason::StateIncomplete => "состояние записано старой версией RDE",
+            FormulaStaleReason::CacheMissing => "нет кэшей OMML/SVG",
+        }
+    }
+}
+
+/// Живой статус формулы.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormulaLiveStatus {
+    Fresh,
+    Stale(Vec<FormulaStaleReason>),
+    NeverComputed,
+    NotComputable(String),
+}
+
+impl FormulaLiveStatus {
+    pub fn label_ru(&self) -> &'static str {
+        match self {
+            FormulaLiveStatus::Fresh => "актуальна",
+            FormulaLiveStatus::Stale(_) => "устарела",
+            FormulaLiveStatus::NeverComputed => "не вычислялась",
+            FormulaLiveStatus::NotComputable(_) => "ошибка",
+        }
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            FormulaLiveStatus::Stale(reasons) => {
+                Some(reasons.iter().map(|reason| reason.label_ru()).collect::<Vec<_>>().join(" · "))
+            }
+            FormulaLiveStatus::NotComputable(reason) => Some(reason.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Статус формулы для UI/документов.
+#[derive(Clone, Debug)]
+pub struct FormulaStatus {
+    pub formula_id: String,
+    pub title: String,
+    pub status: FormulaLiveStatus,
+    pub act_key: Option<String>,
+    pub resolved_latex_hash: Option<String>,
+    pub updated_unix: Option<u64>,
+}
+
+/// Оценить формулы проекта: `act_key` из разрешённых входов/фрагментов vs ledger, наличие кэшей.
+pub fn formula_statuses(
+    project: &Project,
+    store: &Store,
+    renderer: &FormulaRenderer<'_>,
+) -> Result<BTreeMap<String, FormulaStatus>, String> {
+    let artifact_ledger = ledger(store)?;
+    let formula_ledger = formula_ledger(store)?;
+    let mut result = BTreeMap::new();
+    for formula in project.formulas() {
+        let title = project
+            .formula_object(&formula.id)
+            .map(|object| object.title.clone())
+            .unwrap_or_else(|| formula.id.clone());
+        let (status, act_key, resolved_latex_hash, updated) =
+            match resolve_formula(project, &artifact_ledger, &formula_ledger, &formula.id, renderer) {
+                Err(error) => (FormulaLiveStatus::NotComputable(error), None, None, None),
+                Ok(resolved) => match formula_ledger.get(&formula.id) {
+                    None => (FormulaLiveStatus::NeverComputed, Some(resolved.act_key.hex()), None, None),
+                    Some(state) => {
+                        let mut reasons = Vec::new();
+                        if state.act_key != resolved.act_key.hex() {
+                            if state.src_hash.as_deref() != Some(resolved.src_hash.hex().as_str()) {
+                                reasons.push(FormulaStaleReason::SourceChanged);
+                            }
+                            if state.in_hash.as_deref() != Some(resolved.in_hash.hex().as_str()) {
+                                reasons.push(FormulaStaleReason::InputsChanged);
+                            }
+                            if state.params_hash.as_deref() != Some(resolved.params_hash.hex().as_str()) {
+                                reasons.push(FormulaStaleReason::ParamsChanged);
+                            }
+                            if state.env_hash.as_deref() != Some(resolved.env_hash.hex().as_str()) {
+                                reasons.push(FormulaStaleReason::EnvChanged);
+                            }
+                            if reasons.is_empty() {
+                                reasons.push(FormulaStaleReason::StateIncomplete);
+                            }
+                        }
+                        let caches = [state.omml_hash.as_deref(), state.svg_hash.as_deref(), state.png_hash.as_deref()];
+                        let missing = caches.iter().any(|hash| match hash {
+                            Some(hex) => Hash::from_hex(hex).map(|hash| !store.has_blob(hash)).unwrap_or(true),
+                            None => true,
+                        });
+                        if missing {
+                            reasons.push(FormulaStaleReason::CacheMissing);
+                        }
+                        let status = if reasons.is_empty() {
+                            FormulaLiveStatus::Fresh
+                        } else {
+                            FormulaLiveStatus::Stale(reasons)
+                        };
+                        (
+                            status,
+                            Some(resolved.act_key.hex()),
+                            Some(resolved.resolved_latex_hash),
+                            Some(state.updated_unix),
+                        )
+                    }
+                },
+            };
+        result.insert(
+            formula.id.clone(),
+            FormulaStatus {
+                formula_id: formula.id.clone(),
+                title,
+                status,
+                act_key,
+                resolved_latex_hash,
+                updated_unix: updated,
+            },
+        );
+    }
+    Ok(result)
+}
+
+/// Байты скомпилированных кэшей формулы (результат compile-колбэка, см.
+/// [`compile_and_update_formula`]). Сам компилятор — `rde-doc` (`compile_formula`): `rde-dag` не
+/// зависит от движка документа (ADR-0002), поэтому компиляция передаётся колбэком.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FormulaCompiled {
+    /// OMML-фрагмент (`m:oMathPara`/`m:oMath`).
+    pub omml: Vec<u8>,
+    pub svg: Option<Vec<u8>>,
+    pub png: Option<Vec<u8>>,
+}
+
+/// Отчёт вычисления формулы (активация + компиляция + кэши + ledger + `[state]`).
+#[derive(Clone, Debug)]
+pub struct FormulaUpdateReport {
+    pub formula_id: String,
+    pub act_key: String,
+    pub tx: String,
+    pub omml_hash: String,
+    pub svg_hash: Option<String>,
+    pub png_hash: Option<String>,
+}
+
+/// Вычислить формулу: разрешить входы/фрагменты (`resolve_formula`), вызвать компилятор кэшей,
+/// положить блобы/дерево в store и зафиксировать состояние (ledger `formula-update` + `[state]`
+/// в `formula.toml`). Атомарность: кэши и состояние фиксируются одной транзакцией store.
+pub fn compile_and_update_formula<F>(
+    project: &Project,
+    store: &mut Store,
+    formula_id: &str,
+    renderer: &FormulaRenderer<'_>,
+    compile: F,
+) -> Result<FormulaUpdateReport, String>
+where
+    F: FnOnce(&str, bool) -> Result<FormulaCompiled, String>,
+{
+    let artifact_ledger = ledger(store)?;
+    let formula_ledger = formula_ledger(store)?;
+    let resolved = resolve_formula(project, &artifact_ledger, &formula_ledger, formula_id, renderer)?;
+    let formula_object = project
+        .formula_object(formula_id)
+        .ok_or_else(|| format!("формула {formula_id} не найдена"))?;
+    let ObjectData::Formula(formula) = &formula_object.data else {
+        return Err(format!("{formula_id} — не формула"));
+    };
+    let compiled = compile(&resolved.effective_latex, formula.display)?;
+    if compiled.omml.is_empty() {
+        return Err("компилятор формулы вернул пустой OMML".to_owned());
+    }
+    let omml_blob = store.put_blob(&compiled.omml).map_err(|e| e.to_string())?;
+    let mut entries = vec![TreeEntry::new("formula.omml", 0o644, omml_blob)];
+    let svg_hash = match &compiled.svg {
+        Some(bytes) => {
+            let blob = store.put_blob(bytes).map_err(|e| e.to_string())?;
+            entries.push(TreeEntry::new("formula.svg", 0o644, blob));
+            Some(blob.hex())
+        }
+        None => None,
+    };
+    let png_hash = match &compiled.png {
+        Some(bytes) => {
+            let blob = store.put_blob(bytes).map_err(|e| e.to_string())?;
+            entries.push(TreeEntry::new("formula.png", 0o644, blob));
+            Some(blob.hex())
+        }
+        None => None,
+    };
+    let tree = store.put_tree(&entries).map_err(|e| e.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let state = FormulaState {
+        formula_id: formula_id.to_owned(),
+        act_key: resolved.act_key.hex(),
+        in_hash: Some(resolved.in_hash.hex()),
+        src_hash: Some(resolved.src_hash.hex()),
+        params_hash: Some(resolved.params_hash.hex()),
+        env_hash: Some(resolved.env_hash.hex()),
+        resolved_latex: resolved.effective_latex.clone(),
+        resolved_latex_hash: Some(resolved.resolved_latex_hash.clone()),
+        omml_hash: Some(omml_blob.hex()),
+        svg_hash: svg_hash.clone(),
+        png_hash: png_hash.clone(),
+        updated_unix: now,
+    };
+    let tx = commit_formula_update(store, &state, Some(tree), &format!("formula update: {formula_id}"))?;
+    rde_core::record_formula_state(
+        &formula_object.dir,
+        &state.act_key,
+        state.resolved_latex_hash.as_deref().unwrap_or(""),
+        state.omml_hash.as_deref().unwrap_or(""),
+        svg_hash.as_deref(),
+        png_hash.as_deref(),
+        now,
+    )?;
+    Ok(FormulaUpdateReport {
+        formula_id: formula_id.to_owned(),
+        act_key: state.act_key.clone(),
+        tx,
+        omml_hash: state.omml_hash.clone().unwrap_or_default(),
+        svg_hash,
+        png_hash,
+    })
+}
+

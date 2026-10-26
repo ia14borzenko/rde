@@ -3,7 +3,7 @@
 | Поле | Значение |
 |---|---|
 | Дата | 2026-10-26 |
-| Статус | **принято владельцем** (2026-10-26): формулы — **project-level** объекты, SVG-вставки — фикс WordCraft-writer в форке (P2.5) вместо переприменения в RDE; **реализация: P1 — готово (2026-10-26), P2–P5 — в работе** |
+| Статус | **принято владельцем** (2026-10-26): формулы — **project-level** объекты, SVG-вставки — фикс WordCraft-writer в форке (P2.5) вместо переприменения в RDE; **реализация: P1, P2 — готово (2026-10-26), P2.5–P5 — в работе** |
 | Контекст | решения владельца по формулам (нативный редактор WordCraft, SVG-вектор, формулы/величины — объекты с зависимостями, project-level хранение формул, фикс writer'а в форке) + спайки P0 |
 | Нормативная база | [`docs/tz-03.md`](../tz-03.md): §4.2, §7.2/7.3, §8.3, §8.5, §9.4, §9.7; R-DOC-11…13, R-DOC-19…24, R-ART-09, R-TREE-01/02; NFR-LIC-02 |
 | Связанные ADR | [ADR-0001](0001-repo-layout-and-build.md) — WordCraft-форк; [ADR-0002](0002-component-boundaries.md) — границы крейтов; [ADR-0003](0003-deviations-from-tz02.md) — отклонения (poppler §15-2) |
@@ -279,6 +279,20 @@ computed_at = 0                  # unix
    `env_hash`; при апгрейде движка кэши инвалидируются — причина «изменилось окружение»).
    Производительность компиляции не измерялась (P2 — замер и бюджет; спайки собрали только
    размеры: OMML 6,6 КБ docx, PDF 4,9 КБ, SVG 2,8 КБ, PNG 0,8 КБ).
+
+**Реализовано в P2 (2026-10-26).** `rde-core`: `FormulaManifest` (`rde/formula@1`),
+`FormulaInput/Fragment/Numbering/State`, `ManifestKind::Formula`, загрузка `objects/formulas/`
+служебными объектами (топопорядок/цикл по фрагментам, валидация входов/фрагментов), `Project::
+{formulas, formula_edges, formula_cycle}`, `create_formula`, `record_formula_state`; схема
+`docs/schema/formula.schema.json`. `rde-hash`: `formula_source_hash`/`formula_env_hash`.
+`rde-dag`: `resolve_formula` (подстановки `\rdeinput`/`\rdefragment`, входы-константы и выходы
+артефактов, рекурсивные фрагменты, `act_key` из §7.2-примитивов), `formula_ledger`/
+`commit_formula_update`/`compile_and_update_formula` (кэши в CAS + атомарная tx + `[state]`),
+`formula_statuses` (Fresh/Stale(причины)/NeverComputed/NotComputable). `rde-doc`: `compile_formula`
+(OMML→`m:oMathPara`/`m:oMath`, SVG из WordCraft PDF через `pdftocairo` с кропом bbox, PNG через
+resvg), `store_formula_caches`; измерено на σ=F/A: компиляция **≈0,1–0,2 с** (тест
+`project_formula_compiles_caches_and_becomes_fresh`), SVG без `<image>`, OMML с `m:f`. В дереве RDE
+группа «Формулы» пока скрыта (P4 даст переключатель «показать служебные»).
 
 ---
 
@@ -560,7 +574,7 @@ act_key     = rde_hash::act_key("formula", "rde/formula@1", in_hash, Some(src_ha
 | Фаза | Содержание | Крейты | Выход (тесты/доказательства) |
 |---|---|---|---|
 | **P1** value — **ГОТОВО (2026-10-26)** | `ConstantValue`+ (symbol/subscript/format/source), `constant_hash`, `resolve_constant`, формат value+NBSP+unit, rich-вставка, централизованная замена, UI-редактор констант | core, hash, dag, doc, ui | golden-хеши (совместимость литералов), резолвер из артефакта, stale→update (как C4–C6), kittest |
-| **P2** formula | `FormulaManifest` в `objects/formulas/` + загрузка/валидация/циклы, `formula_edges`/топопорядок, compile OMML/SVG/PNG в CAS, `[state]`/ledger, статусы/причины, переиспользование в документах | core, hash, dag, doc | тесты модели/циклов, стабильность act_key, компиляция σ=F/A (как A16/B), откат кэшей |
+| **P2** formula — **ГОТОВО (2026-10-26)** | `FormulaManifest` в `objects/formulas/` + загрузка/валидация/циклы, `formula_edges`/топопорядок, compile OMML/SVG/PNG в CAS, `[state]`/ledger, статусы/причины, переиспользование в документах | core, hash, dag, doc | тесты модели/циклов, стабильность act_key, компиляция σ=F/A (как A16/B), откат кэшей |
 | **P2.5** writer fix | WordCraft `crates/docx`: сохранение blip-extLst/`svgBlip` + `word/media/*.svg` + rels + Content_Types при open/save; регрессионный тест форка; docs/wordcraft-fork.md; коммит `rde/main`; пин субмодуля отдельным RDE-коммитом | vendor/wordcraft, rde-docx (гейт) | тест форка «svgBlip → open → save → сохранён»; RDE fidelity-гейты не сломаны; пин |
 | **P3** вставка | `RdeInsert kind="formula"`+`render_mode`, `rde:doc` 1→2, sdt-оболочка/якоря, update-транзакция формул+документов, конфликты R-DOC-13, «где вставлено» по всем документам, документно-локальная нумерация, миграция демо явной командой | doc, dag, ui | roundtrip OMML/SVG через `.doc.rde`, обновление/откат, миграция демо, OMML-гейт, svgBlip сохраняется после engine save (после P2.5) |
 | **P4** редактор | панель `equation_tab` в DocView, LaTeX-поле+предпросмотр, правка существующей, нумерация из объекта, команды RDE | ui | kittest-панель (как спайк A), вставка/правка формулы из UI, headless-скриншоты |
@@ -590,6 +604,19 @@ P5 после P2/P3 (частично параллельно P4). Порядок
 * Скриншоты: панель `equation_tab` в egui-панели — [`spikes/assets/p0-equation-tab.png`](../spikes/assets/p0-equation-tab.png);
   LO-рендер SVG-формулы — [`spikes/assets/p0-svg-formula-libreoffice.png`](../spikes/assets/p0-svg-formula-libreoffice.png).
 * Харнессы спайков: [`spikes/harness/`](../spikes/harness/) (временные examples, из воркспейса удалены).
+* **P2 (2026-10-26)** — зелёный: **203 passed, 0 failed** (202 теста + 1 doctest; +7 к P1):
+  `rde-core` — `formulas_load_graph_edges_and_cycle` (загрузка `objects/formulas/`, граф
+  фрагментов, топопорядок, цикл A↔B — issue), `formula_validation_and_create`
+  (create_formula + issues для пустого latex/плохого URI/несуществующего фрагмента);
+  `rde-dag/tests/formula.rs` — `formula_activation_inputs_fragments_and_act_key` (вход-константа,
+  рекурсивный фрагмент, стабильность/смена act_key, значение из source-константы),
+  `formula_ledger_statuses_and_cache_roots` (CAS-корень `formula/<id>`, ledger, Fresh,
+  Stale(InputsChanged/EnvChanged), NeverComputed/NotComputable);
+  `rde-doc` — 2 юнит-теста (`extract_omml_fragment_display_and_inline`,
+  `compile_formula_end_to_end_when_poppler_available`: OMML `m:oMathPara`/`m:f`, SVG без `<image>`,
+  PNG) + сквозной `tests/formula_pipeline.rs` (`resolve_formula → compile_formula → CAS → ledger →
+  [state] → Fresh`, идемпотентность по act_key). Измерение: компиляция σ=F/A ≈0,1–0,2 с; схема
+  `docs/schema/formula.schema.json`.
 * `cargo test --workspace` на P0 — зелёный: **188 passed, 0 failed** (187 тестов + 1 doctest) —
   число не изменилось, продуктовый код P0 не менялся; `git status`/`git diff --stat` — только docs.
 * **P1 (2026-10-26)** — зелёный: **196 passed, 0 failed** (195 тестов + 1 doctest; +8 к P0):

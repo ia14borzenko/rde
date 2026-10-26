@@ -562,3 +562,56 @@ cd rde
 cargo run -q -p rde-ui --example screenshot -- /tmp/p1-constants.png artifacts "Константы проекта"
 ```
 
+---
+
+## Обновление 2026-10-26 (P2: project-level объект формулы, ADR-0005)
+
+Фаза **P2** по ADR-0005 (после P1 `705240e`): формулы — **служебные объекты проекта**
+(`objects/formulas/<id>/formula.toml`), LaTeX-источник истины, входы/фрагменты, `act_key` из
+примитивов §7.2, кэши OMML/SVG/PNG в CAS, ledger состояний и статусы актуальности. Коммит —
+`feat(formula): P2 — project-level объект формулы`.
+
+| Что | Где |
+|---|---|
+| `FormulaManifest` (`rde/formula@1`), `FormulaInput/Fragment/Numbering/State`, `ManifestKind::Formula`, `create_formula`, `record_formula_state` | [`crates/rde-core/src/manifest.rs`](../crates/rde-core/src/manifest.rs), [`ops.rs`](../crates/rde-core/src/ops.rs) |
+| Загрузка `objects/formulas/` как служебных объектов (группа «Формулы»), топопорядок/цикл по фрагментам, валидация входов/фрагментов, `Project::{formulas, formula_edges, formula_cycle}` | [`crates/rde-core/src/project.rs`](../crates/rde-core/src/project.rs) |
+| `formula_source_hash` (`rde:formula-src:1`), `formula_env_hash` (версия рендерера) | [`crates/rde-hash/src/lib.rs`](../crates/rde-hash/src/lib.rs) |
+| `resolve_formula` (подстановки `\rdeinput`/`\rdefragment`, входы-константы/выходы артефактов, рекурсивные фрагменты, `act_key`), `formula_ledger`/`commit_formula_update`/`compile_and_update_formula`, `formula_statuses` (Stale-причины), `FormulaRenderer` | [`crates/rde-dag/src/lib.rs`](../crates/rde-dag/src/lib.rs) |
+| `compile_formula` — OMML-фрагмент + SVG (WordCraft PDF → `pdftocairo -svg` → кроп bbox; без `<image>`) + PNG (resvg), `store_formula_caches`, `FORMULA_RENDERER_{ID,VERSION}` | [`crates/rde-doc/src/formula.rs`](../crates/rde-doc/src/formula.rs) |
+| UI: группа «Формулы» скрыта в дереве до P4 («показать служебные»); инспектор показывает разметку/входы/фрагменты/act_key формулы | [`crates/rde-ui/src/lib.rs`](../crates/rde-ui/src/lib.rs) |
+| Схема | [`docs/schema/formula.schema.json`](schema/formula.schema.json) |
+
+**Ключевые свойства:** `act_key = H(kind=formula, schema, in_hash входов/фрагментов, src_hash LaTeX+
+display+numbering, params, env рендерера)` — стабилен при неизменных входах и меняется при
+пересчёте входа; фрагмент без закреплённого/ledger `act_key` — честный `NotComputable`; кэши и
+состояние фиксируются **одной** store-транзакцией (`formula/<id>` root + payload
+`kind="formula-update"`), `[state]` в `formula.toml` — зеркало ledger. Компиляция σ=F/A измерена:
+≈0,1–0,2 с, SVG без растра (глифы путями), OMML содержит `m:f`.
+
+**Тесты:** `cargo test --workspace` — **203 passed, 0 failed** (202 + 1 doctest; было 196, +7):
+`rde-core` — 2 теста загрузки/графа/циклов/валидации формул; `rde-dag/tests/formula.rs` — 2 теста
+активации и ledger/статусов; `rde-doc` — 2 юнит-теста компиляции + сквозной `tests/formula_pipeline.rs`
+(`resolve_formula → compile_formula → CAS → ledger → Fresh`, идемпотентность).
+
+**Ограничения (честно):** вставка формул в документ (`RdeInsert kind="formula"`, `render_mode`) —
+P3; нативный редактор `equation_tab` — P4; PDF-гейт «нет растровых формул» и экспорт — P5;
+формула в демо-проекте ещё не создана (миграция inline-формулы σ — P3 явной командой); кэши
+формул не участвуют в rollback-материализации (ledger/roots есть, UI-откат — P3).
+
+**Следующий шаг:** **P2.5** — фикс WordCraft-writer для `svgBlip`/svg-медиа в форке (регрессионный
+тест, `docs/wordcraft-fork.md`, `rde/main`, отдельный пин субмодуля) → P3 (вставки формул) → P4 →
+P5.
+
+**Проверить руками (P2):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh test -p rde-core -p rde-dag -p rde-doc                       # P2-тесты
+./scripts/build.sh test --workspace                                            # 203 passed
+cargo run -q -p rde-core --example dump-schemas -- docs/schema                 # formula.schema.json
+# компиляция формулы (OMML+SVG+PNG) проверяется тестом rde-doc/tests/formula_pipeline.rs
+```
+

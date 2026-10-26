@@ -383,6 +383,26 @@ pub fn constants_hash(payload: &str) -> Hash {
     canon.finish()
 }
 
+/// `formula_source_hash` — хеш LaTeX-источника формулы (ADR-0005 §4.1): латех + display +
+/// политика нумерации. Занимает слот `script_hash` в `act_key` формулы.
+pub fn formula_source_hash(latex: &str, display: bool, numbering_mode: &str, label: &str) -> Hash {
+    let mut canon = Canonical::new("rde:formula-src:1");
+    canon.str(latex);
+    canon.u32(u32::from(display));
+    canon.str(numbering_mode);
+    canon.str(label);
+    canon.finish()
+}
+
+/// `formula_env_hash` — хеш окружения рендерера формулы (версия WordCraft/poppler): апгрейд
+/// рендерера инвалидирует кэши OMML/SVG (причина «изменилось окружение»).
+pub fn formula_env_hash(renderer: &str, version: &str) -> Hash {
+    let mut vars = BTreeMap::new();
+    vars.insert("renderer".to_owned(), renderer.to_owned());
+    vars.insert("version".to_owned(), version.to_owned());
+    env_hash("formula", &format!("{renderer}@{version}"), None, &vars)
+}
+
 /// `act_key` — ключ активации артефакта (§7.2).
 ///
 /// `H("rde:act:1" | type | schema_version | in_hash | script_hash | params_hash | env_hash)`.

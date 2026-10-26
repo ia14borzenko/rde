@@ -12,6 +12,28 @@
 
 ### Добавлено
 
+- **P2: project-level объект формулы (ADR-0005, 2026-10-26)** —
+  [`FormulaManifest`/`FormulaInput`/`FormulaFragment`/`FormulaNumbering`/`FormulaState`](crates/rde-core/src/manifest.rs)
+  (`schema = "rde/formula@1"`, `formula.toml`), `ManifestKind::Formula`, загрузка
+  `objects/formulas/<id>/` как **служебных объектов проекта** (группа «Формулы», в дереве RDE скрыта
+  до появления переключателя «показать служебные» — P4), топопорядок/цикл-детект по фрагментам
+  (project-wide), валидация разметки/входов/фрагментов (`issues`), `Project::{formulas, formula_edges,
+  formula_cycle}`, `create_formula`/rename/delete; JSON Schema
+  [`docs/schema/formula.schema.json`](docs/schema/formula.schema.json).
+  [`rde-hash`](crates/rde-hash/src/lib.rs): `formula_source_hash` (`rde:formula-src:1`),
+  `formula_env_hash` (версия рендерера). [`rde-dag`](crates/rde-dag/src/lib.rs):
+  `resolve_formula` — подстановка `\rdeinput{...}`/`\rdefragment{...}`, входы-константы
+  (`value/symbol/raw`, в т.ч. со `source` из артефакта) и входы-выходы артефактов, рекурсивные
+  фрагменты с закреплённым/ledger `act_key`, `act_key` формулы из примитивов §7.2 (inputs/fragments
+  группы + LaTeX-источник + env рендерера), `formula_ledger`/`commit_formula_update`/
+  `compile_and_update_formula`/`formula_statuses` (реализация, причины `FormulaStaleReason`,
+  кэши в CAS, атомарная tx), `record_formula_state` в `formula.toml`.
+  [`rde-doc`](crates/rde-doc/src/formula.rs): `compile_formula` — эффективный LaTeX → OMML-фрагмент
+  (`m:oMathPara`/`m:oMath`), SVG (WordCraft PDF → `pdftocairo -svg` → кроп по bbox; без `<image>`,
+  глифы путями) и PNG-fallback (resvg), `store_formula_caches` (CAS), константы рендерера
+  `FORMULA_RENDERER_{ID,VERSION}`. Тесты: **203 passed** (было 196; +7: 2 модель/граф/валидация
+  формул в `rde-core`, 2 активация/ledger/статусы в `rde-dag`, 2 юнит-теста компиляции +
+  1 сквозной пайплайн `resolve_formula → compile_formula → CAS → ledger → [state]` в `rde-doc`).
 - **P1: величины/обозначения со `source` (ADR-0005, 2026-10-26)** —
   [`ConstantValue`](crates/rde-core/src/manifest.rs) расширен `symbol/subscript/format/source`
   (`value` остаётся обязательным кэшем последнего разрешённого значения, схема `rde/artifact@1`;

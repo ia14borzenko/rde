@@ -19,14 +19,16 @@ pub mod settings;
 pub mod value_format;
 
 pub use manifest::{
-    ArtifactManifest, AuthorManifest, ConstantSource, ConstantValue, DocumentManifest, GroupManifest,
-    InputSpec, ManifestKind, NoteManifest, ProjectManifest, ReferenceManifest, RepositoryManifest,
-    RuntimeManifest, SourceManifest,
+    ArtifactManifest, AuthorManifest, ConstantSource, ConstantValue, DocumentManifest, FormulaFragment,
+    FormulaInput, FormulaInputSource, FormulaManifest, FormulaNumbering, FormulaRef, FormulaState,
+    GroupManifest, InputSpec, ManifestKind, NoteManifest, ProjectManifest, ReferenceManifest,
+    RepositoryManifest, RuntimeManifest, SourceManifest, parse_formula_input_source, parse_formula_ref,
 };
 pub use ops::{
-    CreateRequest, NewObjectKind, clear_artifact_out_hash, create_document_stub, create_object,
-    create_project, delete_object, record_artifact_out_hash, rename_object, set_project_authors,
-    backup_project, list_project_backups, restore_project, set_project_trusted, write_artifact_manifest,
+    CreateRequest, NewObjectKind, clear_artifact_out_hash, create_document_stub, create_formula,
+    create_object, create_project, delete_object, record_artifact_out_hash, record_formula_state,
+    rename_object, set_project_authors, backup_project, list_project_backups, restore_project,
+    set_project_trusted, write_artifact_manifest,
 };
 pub use project::{
     Freshness, Group, Issue, Level, LogLine, Object, ObjectData, ObjectKind, Project, load_project,
@@ -461,6 +463,96 @@ mod constant_value_tests {
         assert!(messages.iter().any(|m| m.contains("неизвестный format")), "{messages:?}");
         assert!(messages.iter().any(|m| m.contains("не найден")), "{messages:?}");
         assert!(messages.iter().any(|m| m.contains("rde://artifact/")), "{messages:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod formula_model_tests {
+    use super::*;
+    use crate::tests::unique_tmp;
+
+    const FORM_A: &str = "01M5VJ1JG0HD99FDTGJ8YEPFZX";
+    const FORM_B: &str = "01M5VJ1JG039MMV97SZGY6V9EQ";
+
+    fn project_with(dir: &std::path::Path, formulas: &[(&str, String)]) {
+        std::fs::write(
+            dir.join("rde.toml"),
+            "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"T\"\n",
+        )
+        .unwrap();
+        for (id, body) in formulas {
+            let formula_dir = dir.join("objects/formulas").join(id);
+            std::fs::create_dir_all(&formula_dir).unwrap();
+            std::fs::write(formula_dir.join("formula.toml"), body).unwrap();
+        }
+    }
+
+    fn formula_toml(id: &str, title: &str, latex: &str, extra: &str) -> String {
+        format!(
+            "schema = \"rde/formula@1\"\nid = \"{id}\"\ntitle = \"{title}\"\nlatex = \"{latex}\"\ndisplay = true\n\n[numbering]\nmode = \"auto\"\nlabel = \"\"\n{extra}"
+        )
+    }
+
+    /// P2 (ADR-0005 §2): project-level формула грузится из `objects/formulas/`, граф фрагментов и
+    /// топопорядок корректны; цикл — issue загрузки (не паника).
+    #[test]
+    fn formulas_load_graph_edges_and_cycle() {
+        let dir = unique_tmp("formula-graph");
+        let a = formula_toml(FORM_A, "A", "a+b", "");
+        // В TOML обратный слэш LaTeX экранируется: в файле `\\rdefragment{a}` = LaTeX `\rdefragment{a}`.
+        let b = formula_toml(
+            FORM_B,
+            "B",
+            "\\\\rdefragment{a}",
+            &format!("\n[[fragments]]\nalias = \"a\"\nsource = \"rde://formula/{FORM_A}\"\n"),
+        );
+        project_with(&dir, &[(FORM_A, a.clone()), (FORM_B, b.clone())]);
+        let project = load(&dir).unwrap();
+        assert!(project.issues.is_empty(), "issues: {:?}", project.issues);
+        assert_eq!(project.formulas().count(), 2);
+        assert!(project.groups.iter().any(|group| group.kind == ObjectKind::Formula && group.objects.len() == 2));
+        assert!(project.formula_object(FORM_A).is_some());
+        assert_eq!(project.formula_edges(), vec![(FORM_A.to_owned(), FORM_B.to_owned())]);
+        assert!(project.formula_cycle().is_none());
+        // Цикл A↔B — issue с цепочкой.
+        let a_with_fragment = formula_toml(FORM_A, "A", "a+b", &format!("\n[[fragments]]\nalias = \"b\"\nsource = \"rde://formula/{FORM_B}\"\n"));
+        project_with(&dir, &[(FORM_A, a_with_fragment), (FORM_B, b)]);
+        let project = load(&dir).unwrap();
+        assert!(
+            project.issues.iter().any(|issue| issue.message.contains("цикл по фрагментам формул")),
+            "issues: {:?}",
+            project.issues
+        );
+        assert!(project.formula_cycle().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2: невалидная разметка/ссылки формул — `issues` (загрузка не фатальна); `create_formula`
+    /// пишет валидный `formula.toml` и объект грузится.
+    #[test]
+    fn formula_validation_and_create() {
+        let dir = unique_tmp("formula-validate");
+        std::fs::create_dir_all(&dir).unwrap();
+        create_project(&dir, "Формулы").unwrap();
+        let created = create_formula(&dir, "Закон Ома", "\\sigma=\\frac{F}{A}").unwrap();
+        assert!(created.join("formula.toml").is_file());
+        let project = load(&dir).unwrap();
+        assert!(project.issues.is_empty(), "{:?}", project.issues);
+        assert_eq!(project.formulas().count(), 1);
+
+        // Плохая формула: пустой latex, mode, вход с чужим URI, фрагмент на несуществующую формулу.
+        let bad_id = FORM_A;
+        std::fs::create_dir_all(dir.join("objects/formulas").join(bad_id)).unwrap();
+        let bad = formula_toml(bad_id, "B", " ", "\n[[inputs]]\nalias = \"x\"\nsource = \"artifact://bad\"\n\n[[fragments]]\nalias = \"f\"\nsource = \"rde://formula/01M5VJ1JG0ZZZZZZZZZZZZZZZZ\"\n");
+        std::fs::write(dir.join("objects/formulas").join(bad_id).join("formula.toml"), bad).unwrap();
+        let project = load(&dir).unwrap();
+        let messages: Vec<&str> = project.issues.iter().map(|issue| issue.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("latex не может быть пустым")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("rde://constants/") || m.contains("rde://artifact/")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("не найдена")), "{messages:?}");
+        // Цикл-детект не мешает загрузке; formula_cycle — None (нет рёбер на существующие).
+        assert!(project.formula_cycle().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

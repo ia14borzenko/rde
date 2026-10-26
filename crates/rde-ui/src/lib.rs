@@ -186,7 +186,16 @@ fn kind_icon(kind: ObjectKind) -> &'static str {
         ObjectKind::Source => IC_SOURCE,
         ObjectKind::Note => IC_NOTE,
         ObjectKind::Repository => IC_REPO,
+        // Формула — служебный объект проекта (ADR-0005); отдельной иконки в сабсете нет.
+        ObjectKind::Formula => IC_CODE,
     }
+}
+
+/// Служебные объекты скрыты в дереве по умолчанию (R-TREE-01/02). Пока в UI нет переключателя
+/// «показать служебные» (P4), скрываем только проектные формулы; константы остаются видимы как
+/// раньше (обратная совместимость UI).
+fn tree_group_hidden(kind: ObjectKind) -> bool {
+    matches!(kind, ObjectKind::Formula)
 }
 
 // ── раскладка: ширины боковых панелей (одна точка правды; ТЗ-03 §19-8) ──────────────────
@@ -1888,6 +1897,7 @@ impl RdeApp {
                 ObjectKind::Artifact | ObjectKind::Constants => Tab::Artifacts,
                 ObjectKind::Source | ObjectKind::Note => Tab::Source,
                 ObjectKind::Repository => Tab::Artifacts,
+                ObjectKind::Formula => Tab::Artifacts,
             };
         }
     }
@@ -2566,7 +2576,7 @@ impl RdeApp {
                 }
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().id_salt("rde_tree_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                    for group in &groups {
+                    for group in groups.iter().filter(|group| !tree_group_hidden(group.kind)) {
                         let visible: Vec<&rde_core::Object> = group
                             .objects
                             .iter()
@@ -2693,6 +2703,7 @@ impl RdeApp {
                     ObjectKind::Artifact | ObjectKind::Constants => Tab::Artifacts,
                     ObjectKind::Source | ObjectKind::Note => Tab::Source,
                     ObjectKind::Repository => Tab::Artifacts,
+                    ObjectKind::Formula => Tab::Artifacts,
                 };
             }
             self.selected = Some(id);
@@ -2720,6 +2731,7 @@ impl RdeApp {
                         ObjectKind::Constants => Tab::Artifacts,
                         ObjectKind::Source | ObjectKind::Note => Tab::Source,
                         ObjectKind::Repository => Tab::Artifacts,
+                        ObjectKind::Formula => Tab::Artifacts,
                     };
                 }
             }
@@ -2854,6 +2866,8 @@ impl RdeApp {
             ObjectData::Artifact(_) => Some(Tab::Artifacts),
             ObjectData::Source(_) => Some(Tab::Source),
             ObjectData::Note(_) | ObjectData::Repository(_) => None,
+            // Формула — служебный объект (ADR-0005): отдельного вьюера пока нет (P3/P4).
+            ObjectData::Formula(_) => None,
         }
     }
 
@@ -3027,6 +3041,29 @@ impl RdeApp {
                                         }
                                     }
                                 });
+                            }
+                        }
+                        ObjectData::Formula(formula) => {
+                            field_row(ui, "тип", "formula (project-level, ADR-0005)", false);
+                            field_row(ui, "режим", if formula.display { "display" } else { "inline" }, false);
+                            let numbering = if formula.numbering.label.is_empty() {
+                                formula.numbering.mode.clone()
+                            } else {
+                                format!("{} · {}", formula.numbering.mode, formula.numbering.label)
+                            };
+                            field_row(ui, "нумерация", &numbering, false);
+                            field_row(ui, "latex", formula.latex.chars().take(80).collect::<String>().as_str(), true);
+                            let hashed = formula.inputs.iter().filter(|input| input.mode == "hashed").count();
+                            let refed = formula.inputs.len().saturating_sub(hashed);
+                            field_row(ui, "входы", &format!("{hashed} hashed · {refed} ref"), false);
+                            if !formula.fragments.is_empty() {
+                                field_row(ui, "фрагменты", &format!("{}", formula.fragments.len()), false);
+                            }
+                            if !formula.state.act_key.is_empty() {
+                                field_row(ui, "act_key", &formula.state.act_key.chars().take(20).collect::<String>(), true);
+                            }
+                            if formula.state.computed_at > 0 {
+                                field_row(ui, "вычислена", &format!("unix {}", formula.state.computed_at), false);
                             }
                         }
                         ObjectData::Source(source) => {
@@ -5974,6 +6011,7 @@ impl RdeApp {
                     ObjectData::Source(_) => "source.toml",
                     ObjectData::Note(_) => "note.toml",
                     ObjectData::Repository(_) => "repo.toml",
+                    ObjectData::Formula(_) => "formula.toml",
                 };
                 let path = object.dir.join(name);
                 let text = std::fs::read_to_string(&path)

@@ -14,6 +14,7 @@ pub const SCHEMA_DOCUMENT: &str = "rde/document@1";
 pub const SCHEMA_SOURCE: &str = "rde/source@1";
 pub const SCHEMA_NOTE: &str = "rde/note@1";
 pub const SCHEMA_REPOSITORY: &str = "rde/repo@1";
+pub const SCHEMA_FORMULA: &str = "rde/formula@1";
 
 fn default_kind() -> String {
     "human".to_owned()
@@ -302,6 +303,206 @@ pub struct DocumentManifest {
     pub file: String,
 }
 
+fn default_formula_numbering() -> String {
+    "auto".to_owned()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_input_as() -> String {
+    "value".to_owned()
+}
+
+/// Политика нумерации формулы (ADR-0005): фактический номер — документно-локальный.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+pub struct FormulaNumbering {
+    /// `auto` — нумеровать при вставке/обновлении документа; `none` — без номера.
+    #[serde(default = "default_formula_numbering")]
+    pub mode: String,
+    /// Метка/группа для будущих правил нумерации (по разделам/приложениям), пусто — нет.
+    #[serde(default)]
+    pub label: String,
+}
+
+impl Default for FormulaNumbering {
+    fn default() -> Self {
+        Self { mode: default_formula_numbering(), label: String::new() }
+    }
+}
+
+/// Вход формулы (ADR-0005 §2.2): `alias` + source на константу/выход артефакта.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+pub struct FormulaInput {
+    pub alias: String,
+    /// `hashed` — влияет на `act_key`/каскад; `ref` — только provenance.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// `rde://constants/<id>/<key>` или `rde://artifact/<id>[@<out_hash>]/<selector>`.
+    pub source: String,
+    /// Как подставлять: `value` — число по `format`; `symbol` — обозначение величины; `raw` — текст.
+    #[serde(default = "default_input_as", rename = "as")]
+    pub as_kind: String,
+    /// Формат значения (R-DOC-11), пусто — из константы/авто.
+    #[serde(default)]
+    pub format: String,
+    /// Переопределение единицы (пусто — из источника).
+    #[serde(default)]
+    pub unit: String,
+}
+
+/// Фрагмент формулы (ADR-0005 §2.3): другая формула проекта, подставляемая в LaTeX.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+pub struct FormulaFragment {
+    pub alias: String,
+    /// `rde://formula/<id>[@<act_key>]`.
+    pub source: String,
+}
+
+/// Кэш/зеркало ledger состояния формулы в `formula.toml` (не источник истины, пишет RDE).
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FormulaState {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub act_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolved_latex_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub omml_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub svg_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub png_hash: String,
+    #[serde(default)]
+    pub computed_at: u64,
+}
+
+/// `formula.toml` — project-level объект формулы (ADR-0005 §2): LaTeX-источник истины,
+/// входы/фрагменты, политика нумерации, кэш-хеши.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
+pub struct FormulaManifest {
+    pub schema: String,
+    pub id: String,
+    pub title: String,
+    /// LaTeX-источник истины (с плейсхолдерами `\rdeinput{...}`/`\rdefragment{...}`).
+    pub latex: String,
+    /// `true` — display (отдельная строка), `false` — inline.
+    #[serde(default = "default_true")]
+    pub display: bool,
+    #[serde(default)]
+    pub numbering: FormulaNumbering,
+    #[serde(default)]
+    pub inputs: Vec<FormulaInput>,
+    #[serde(default)]
+    pub fragments: Vec<FormulaFragment>,
+    #[serde(default)]
+    pub state: FormulaState,
+}
+
+/// Источник значения входа формулы (ADR-0005): константа проекта или выход артефакта.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormulaInputSource {
+    Constants { constants_id: String, key: String },
+    Artifact { artifact_id: String, out_hash: Option<String>, selector: String },
+}
+
+/// Ссылка на формулу-фрагмент (`rde://formula/<id>[@<act_key>]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormulaRef {
+    pub formula_id: String,
+    pub act_key: Option<String>,
+}
+
+/// Разобрать `source` входа формулы: `rde://constants/<id>/<key>` или
+/// `rde://artifact/<id>[@<out_hash>]/<selector>`.
+pub fn parse_formula_input_source(uri: &str) -> Result<FormulaInputSource, String> {
+    let uri = uri.trim();
+    if let Some(rest) = uri.strip_prefix("rde://constants/") {
+        let (constants_id, key) = rest
+            .split_once('/')
+            .ok_or_else(|| format!("source входа формулы неполный (нужен rde://constants/<id>/<key>): {uri}"))?;
+        if constants_id.is_empty() || key.is_empty() {
+            return Err(format!("source входа формулы неполный: {uri}"));
+        }
+        return Ok(FormulaInputSource::Constants { constants_id: constants_id.to_owned(), key: key.to_owned() });
+    }
+    let rest = uri
+        .strip_prefix("rde://artifact/")
+        .ok_or_else(|| format!("source входа формулы должен быть rde://constants/… или rde://artifact/…: {uri}"))?;
+    let (head, selector) = match rest.split_once('/') {
+        Some((head, selector)) if !selector.trim().is_empty() => (head, selector.trim().to_owned()),
+        _ => return Err(format!("source входа формулы неполный (нужен artifact/<id>/<selector>): {uri}")),
+    };
+    let (artifact_id, out_hash) = match head.split_once('@') {
+        Some((id, hash)) => (id.to_owned(), Some(hash.to_owned())),
+        None => (head.to_owned(), None),
+    };
+    if artifact_id.is_empty() {
+        return Err(format!("source входа формулы: пустой id артефакта: {uri}"));
+    }
+    Ok(FormulaInputSource::Artifact { artifact_id, out_hash, selector })
+}
+
+/// Разобрать ссылку на формулу-фрагмент `rde://formula/<id>[@<act_key>]`.
+pub fn parse_formula_ref(uri: &str) -> Result<FormulaRef, String> {
+    let rest = uri
+        .trim()
+        .strip_prefix("rde://formula/")
+        .ok_or_else(|| format!("ссылка на формулу должна начинаться с rde://formula/: {uri}"))?;
+    let (id, act_key) = match rest.split_once('@') {
+        Some((id, key)) => (id.to_owned(), Some(key.to_owned())),
+        None => (rest.to_owned(), None),
+    };
+    let id = id.trim_end_matches('/').to_owned();
+    if id.is_empty() {
+        return Err(format!("ссылка на формулу без id: {uri}"));
+    }
+    Ok(FormulaRef { formula_id: id, act_key })
+}
+
+impl FormulaManifest {
+    /// Проверить разметку формулы (без обращения к другим объектам): LaTeX, нумерация, входы,
+    /// фрагменты. Ошибки — строки для `issues` загрузчика.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.latex.trim().is_empty() {
+            errors.push("latex не может быть пустым".to_owned());
+        }
+        if !matches!(self.numbering.mode.as_str(), "auto" | "none") {
+            errors.push(format!("numbering.mode должен быть auto|none, а не `{}`", self.numbering.mode));
+        }
+        let mut aliases = std::collections::BTreeSet::new();
+        for input in &self.inputs {
+            if input.alias.trim().is_empty() {
+                errors.push("вход формулы без alias".to_owned());
+            } else if !aliases.insert(input.alias.clone()) {
+                errors.push(format!("повторяющийся alias входа `{}`", input.alias));
+            }
+            if !matches!(input.mode.as_str(), "hashed" | "ref") {
+                errors.push(format!("вход `{}`: mode должен быть hashed|ref", input.alias));
+            }
+            if !matches!(input.as_kind.as_str(), "value" | "symbol" | "raw") {
+                errors.push(format!("вход `{}`: as должен быть value|symbol|raw", input.alias));
+            }
+            if let Err(error) = parse_formula_input_source(&input.source) {
+                errors.push(format!("вход `{}`: {error}", input.alias));
+            }
+        }
+        let mut fragment_aliases = std::collections::BTreeSet::new();
+        for fragment in &self.fragments {
+            if fragment.alias.trim().is_empty() {
+                errors.push("фрагмент формулы без alias".to_owned());
+            } else if !fragment_aliases.insert(fragment.alias.clone()) {
+                errors.push(format!("повторяющийся alias фрагмента `{}`", fragment.alias));
+            }
+            if let Err(error) = parse_formula_ref(&fragment.source) {
+                errors.push(format!("фрагмент `{}`: {error}", fragment.alias));
+            }
+        }
+        errors
+    }
+}
+
 /// Библиографическая запись источника (подмножество ГОСТ 7.0.100-2018).
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, Default)]
 pub struct ReferenceManifest {
@@ -367,12 +568,25 @@ pub enum ManifestKind {
     Source,
     Note,
     Repository,
+    Formula,
 }
 
 impl ManifestKind {
-    pub const ALL_OBJECT_KINDS: [ManifestKind; 5] = [
+    /// Виды объектов проекта, которые грузятся из `objects/<dir>/` (ADR-0005: формула —
+    /// project-level служебный объект).
+    pub const ALL_OBJECT_KINDS: [ManifestKind; 6] = [
         ManifestKind::Document,
         ManifestKind::Artifact,
+        ManifestKind::Source,
+        ManifestKind::Note,
+        ManifestKind::Repository,
+        ManifestKind::Formula,
+    ];
+
+    /// Загружаемые «простые» виды (документы/источники/заметки/репозитории), кроме артефактов и
+    /// формул — у них свои порядки загрузки.
+    pub const SIMPLE_OBJECT_KINDS: [ManifestKind; 4] = [
+        ManifestKind::Document,
         ManifestKind::Source,
         ManifestKind::Note,
         ManifestKind::Repository,
@@ -387,6 +601,7 @@ impl ManifestKind {
             ManifestKind::Source => "sources",
             ManifestKind::Note => "notes",
             ManifestKind::Repository => "repos",
+            ManifestKind::Formula => "formulas",
         }
     }
 
@@ -398,6 +613,7 @@ impl ManifestKind {
             ManifestKind::Source => "source.toml",
             ManifestKind::Note => "note.toml",
             ManifestKind::Repository => "repo.toml",
+            ManifestKind::Formula => "formula.toml",
         }
     }
 
@@ -409,6 +625,7 @@ impl ManifestKind {
             ManifestKind::Source => SCHEMA_SOURCE,
             ManifestKind::Note => SCHEMA_NOTE,
             ManifestKind::Repository => SCHEMA_REPOSITORY,
+            ManifestKind::Formula => SCHEMA_FORMULA,
         }
     }
 
@@ -421,6 +638,7 @@ impl ManifestKind {
             ManifestKind::Source => schema_json::<SourceManifest>(),
             ManifestKind::Note => schema_json::<NoteManifest>(),
             ManifestKind::Repository => schema_json::<RepositoryManifest>(),
+            ManifestKind::Formula => schema_json::<FormulaManifest>(),
         }
     }
 }

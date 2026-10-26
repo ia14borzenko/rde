@@ -1,0 +1,158 @@
+{
+  "$defs": {
+    "FormulaFragment": {
+      "description": "Фрагмент формулы (ADR-0005 §2.3): другая формула проекта, подставляемая в LaTeX.",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "source": {
+          "description": "`rde://formula/<id>[@<act_key>]`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "alias",
+        "source"
+      ],
+      "type": "object"
+    },
+    "FormulaInput": {
+      "description": "Вход формулы (ADR-0005 §2.2): `alias` + source на константу/выход артефакта.",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "as": {
+          "default": "value",
+          "description": "Как подставлять: `value` — число по `format`; `symbol` — обозначение величины; `raw` — текст.",
+          "type": "string"
+        },
+        "format": {
+          "default": "",
+          "description": "Формат значения (R-DOC-11), пусто — из константы/авто.",
+          "type": "string"
+        },
+        "mode": {
+          "default": "hashed",
+          "description": "`hashed` — влияет на `act_key`/каскад; `ref` — только provenance.",
+          "type": "string"
+        },
+        "source": {
+          "description": "`rde://constants/<id>/<key>` или `rde://artifact/<id>[@<out_hash>]/<selector>`.",
+          "type": "string"
+        },
+        "unit": {
+          "default": "",
+          "description": "Переопределение единицы (пусто — из источника).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "alias",
+        "source"
+      ],
+      "type": "object"
+    },
+    "FormulaNumbering": {
+      "description": "Политика нумерации формулы (ADR-0005): фактический номер — документно-локальный.",
+      "properties": {
+        "label": {
+          "default": "",
+          "description": "Метка/группа для будущих правил нумерации (по разделам/приложениям), пусто — нет.",
+          "type": "string"
+        },
+        "mode": {
+          "default": "auto",
+          "description": "`auto` — нумеровать при вставке/обновлении документа; `none` — без номера.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "FormulaState": {
+      "description": "Кэш/зеркало ledger состояния формулы в `formula.toml` (не источник истины, пишет RDE).",
+      "properties": {
+        "act_key": {
+          "type": "string"
+        },
+        "computed_at": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "omml_hash": {
+          "type": "string"
+        },
+        "png_hash": {
+          "type": "string"
+        },
+        "resolved_latex_hash": {
+          "type": "string"
+        },
+        "svg_hash": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`formula.toml` — project-level объект формулы (ADR-0005 §2): LaTeX-источник истины,\nвходы/фрагменты, политика нумерации, кэш-хеши.",
+  "properties": {
+    "display": {
+      "default": true,
+      "description": "`true` — display (отдельная строка), `false` — inline.",
+      "type": "boolean"
+    },
+    "fragments": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/FormulaFragment"
+      },
+      "type": "array"
+    },
+    "id": {
+      "type": "string"
+    },
+    "inputs": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/FormulaInput"
+      },
+      "type": "array"
+    },
+    "latex": {
+      "description": "LaTeX-источник истины (с плейсхолдерами `\\rdeinput{...}`/`\\rdefragment{...}`).",
+      "type": "string"
+    },
+    "numbering": {
+      "$ref": "#/$defs/FormulaNumbering",
+      "default": {
+        "label": "",
+        "mode": "auto"
+      }
+    },
+    "schema": {
+      "type": "string"
+    },
+    "state": {
+      "$ref": "#/$defs/FormulaState",
+      "default": {
+        "computed_at": 0
+      }
+    },
+    "title": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "id",
+    "title",
+    "latex"
+  ],
+  "title": "FormulaManifest",
+  "type": "object"
+}

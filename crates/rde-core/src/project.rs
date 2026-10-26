@@ -20,6 +20,8 @@ pub enum ObjectKind {
     Source,
     Note,
     Repository,
+    /// Project-level служебный объект формулы (ADR-0005): скрыт в обычном дереве.
+    Formula,
 }
 
 impl ObjectKind {
@@ -31,6 +33,7 @@ impl ObjectKind {
             ObjectKind::Source => "Источники",
             ObjectKind::Note => "Заметки",
             ObjectKind::Repository => "Репозитории",
+            ObjectKind::Formula => "Формулы",
         }
     }
 
@@ -42,7 +45,13 @@ impl ObjectKind {
             ObjectKind::Source => "И",
             ObjectKind::Note => "З",
             ObjectKind::Repository => "R",
+            ObjectKind::Formula => "ƒ",
         }
+    }
+
+    /// Служебный объект (скрыт по умолчанию, R-TREE-01/02).
+    pub fn is_service(self) -> bool {
+        matches!(self, ObjectKind::Constants | ObjectKind::Formula)
     }
 }
 
@@ -75,6 +84,8 @@ pub enum ObjectData {
     Source(SourceManifest),
     Note(NoteManifest),
     Repository(RepositoryManifest),
+    /// Формула проекта (ADR-0005): LaTeX-источник, входы/фрагменты, политика нумерации.
+    Formula(crate::manifest::FormulaManifest),
 }
 
 /// Объект дерева проекта.
@@ -199,6 +210,66 @@ impl Project {
         self.objects
             .iter()
             .filter(|o| matches!(o.data, ObjectData::Source(_)))
+    }
+
+    /// Все документы проекта (вставки формул ищутся по всем документам, ADR-0005).
+    pub fn documents(&self) -> impl Iterator<Item = &Object> {
+        self.objects
+            .iter()
+            .filter(|o| matches!(o.data, ObjectData::Document(_)))
+    }
+
+    /// Формулы проекта (project-level служебные объекты, ADR-0005).
+    pub fn formulas(&self) -> impl Iterator<Item = &crate::manifest::FormulaManifest> {
+        self.objects.iter().filter_map(|o| match &o.data {
+            ObjectData::Formula(formula) => Some(formula),
+            _ => None,
+        })
+    }
+
+    pub fn formula_object(&self, id: &str) -> Option<&Object> {
+        self.objects
+            .iter()
+            .find(|o| o.id == id && matches!(o.data, ObjectData::Formula(_)))
+    }
+
+    /// Рёбра графа формул `(фрагмент → формула)`: formula.id зависит от fragment.formula_id.
+    /// Учитываются только фрагменты; входы-значения/артефакты — рёбра к артефактам/константам.
+    pub fn formula_edges(&self) -> Vec<(String, String)> {
+        let mut edges = Vec::new();
+        for object in &self.objects {
+            let ObjectData::Formula(formula) = &object.data else { continue };
+            for fragment in &formula.fragments {
+                if let Ok(reference) = crate::manifest::parse_formula_ref(&fragment.source) {
+                    if self.formula_object(&reference.formula_id).is_some() {
+                        edges.push((reference.formula_id, object.id.clone()));
+                    }
+                }
+            }
+        }
+        edges
+    }
+
+    /// Цикл по фрагментам формул (project-wide, ADR-0005 §2): цепочка id `[A, B, ..., A]`.
+    pub fn formula_cycle(&self) -> Option<Vec<String>> {
+        let ids: Vec<String> = self
+            .objects
+            .iter()
+            .filter(|object| matches!(object.data, ObjectData::Formula(_)))
+            .map(|object| object.id.clone())
+            .collect();
+        find_cycle(&ids, &self.formula_edges()).map(|chain| chain.into_iter().map(|index| ids[index].clone()).collect())
+    }
+
+    /// Названия формул в цепочке цикла (для сообщения пользователю).
+    pub fn formula_cycle_titles(&self) -> Option<Vec<String>> {
+        let chain = self.formula_cycle()?;
+        Some(
+            chain
+                .into_iter()
+                .map(|id| self.object(&id).map(|object| object.title.clone()).unwrap_or(id))
+                .collect(),
+        )
     }
 
     /// Рёбра DAG: [(источник, зависимый)] только по `hashed`-группам артефактов.
@@ -373,19 +444,17 @@ pub fn load_project(root: &Path) -> Result<Project, String> {
     };
 
     // Документы, источники, заметки, репозитории.
-    for kind in [
-        ManifestKind::Document,
-        ManifestKind::Source,
-        ManifestKind::Note,
-        ManifestKind::Repository,
-    ] {
+    for kind in ManifestKind::SIMPLE_OBJECT_KINDS {
         ctx.load_kind(kind);
     }
     // Артефакты — с топологической сортировкой по зависимостям.
     ctx.load_artifacts();
+    // Формулы (ADR-0005) — после артефактов: входы ссылаются на артефакты/константы.
+    ctx.load_formulas();
 
     let mut project = build_project(project_manifest, root.to_path_buf(), ctx);
     validate_constant_values(&mut project);
+    validate_formulas(&mut project);
     project.log.insert(
         0,
         LogLine {
@@ -643,6 +712,62 @@ impl LoadCtx<'_> {
         }
     }
 
+    /// Загрузить формулы (`objects/formulas/`, ADR-0005): project-level служебные объекты,
+    /// топопорядок по фрагментам (формула-фрагмент раньше зависимой), цикл — issue.
+    fn load_formulas(&mut self) {
+        let dir = self.objects_root().join(ManifestKind::Formula.objects_dir());
+        let Ok(entries) = fs::read_dir(&dir) else { return };
+        let mut dirs: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect();
+        dirs.sort();
+        let mut loaded: Vec<(crate::manifest::FormulaManifest, PathBuf)> = Vec::new();
+        for object_dir in dirs {
+            let path = object_dir.join(ManifestKind::Formula.file_name());
+            if !path.is_file() {
+                self.issue(&object_dir, "нет манифеста formula.toml");
+                continue;
+            }
+            match read_manifest::<crate::manifest::FormulaManifest>(&path, ManifestKind::Formula) {
+                Ok(m) => {
+                    self.check_id(&path, &object_dir, &m.id);
+                    loaded.push((m, object_dir));
+                }
+                Err(e) => {
+                    self.issue(&path, e);
+                }
+            }
+        }
+        // Рёбра по фрагментам (formula-фрагмент → зависимая формула), сортировка детерминирована.
+        let ids: Vec<String> = loaded.iter().map(|(m, _)| m.id.clone()).collect();
+        let mut edges: Vec<(String, String)> = Vec::new();
+        for (m, _) in &loaded {
+            for fragment in &m.fragments {
+                if let Ok(reference) = crate::manifest::parse_formula_ref(&fragment.source) {
+                    if ids.iter().any(|id| id == &reference.formula_id) {
+                        edges.push((reference.formula_id, m.id.clone()));
+                    }
+                }
+            }
+        }
+        if let Some(chain) = find_cycle(&ids, &edges) {
+            let titles: Vec<String> = chain.iter().map(|&index| loaded[index].0.title.clone()).collect();
+            self.issue(&dir, format!("цикл по фрагментам формул: {}", titles.join(" → ")));
+        }
+        let order = topological_order(&ids, &edges);
+        for i in order {
+            let (m, object_dir) = loaded[i].clone();
+            let detail = format!("formula · {}", if m.display { "display" } else { "inline" });
+            self.push_object(Object {
+                id: m.id.clone(),
+                title: m.title.clone(),
+                kind: ObjectKind::Formula,
+                freshness: Freshness::UpToDate,
+                detail,
+                dir: object_dir,
+                data: ObjectData::Formula(m),
+            });
+        }
+    }
+
     fn artifact_object(&mut self, m: ArtifactManifest, dir: &Path) -> Object {
         let (kind, freshness, detail) = match m.kind.as_str() {
             "constants" => {
@@ -734,6 +859,61 @@ fn validate_constant_values(project: &mut Project) {
     project.issues.extend(issues.into_iter().map(|(path, message)| Issue { path, message }));
 }
 
+/// Проверить разметку и ссылки формул (ADR-0005 P2): syntax/алиасы — `FormulaManifest::validate`,
+/// входы — существование константы/артефакта, фрагменты — существование формулы. Проблемы — `issues`
+/// (загрузка не фатальна; разрешение/статусы — `rde-dag`).
+fn validate_formulas(project: &mut Project) {
+    let mut issues: Vec<(PathBuf, String)> = Vec::new();
+    for object in &project.objects {
+        let ObjectData::Formula(formula) = &object.data else { continue };
+        for error in formula.validate() {
+            issues.push((object.dir.clone(), format!("формула `{}`: {error}", formula.id)));
+        }
+        for input in &formula.inputs {
+            match crate::manifest::parse_formula_input_source(&input.source) {
+                Ok(crate::manifest::FormulaInputSource::Constants { constants_id, key }) => {
+                    match project.artifact_object(&constants_id) {
+                        Some(target) => {
+                            if let ObjectData::Artifact(manifest) = &target.data {
+                                if !manifest.values.contains_key(&key) {
+                                    issues.push((
+                                        object.dir.clone(),
+                                        format!("вход `{}`: константа `{key}` не найдена в {constants_id}", input.alias),
+                                    ));
+                                }
+                            }
+                        }
+                        None => issues.push((
+                            object.dir.clone(),
+                            format!("вход `{}`: объект констант `{constants_id}` не найден", input.alias),
+                        )),
+                    }
+                }
+                Ok(crate::manifest::FormulaInputSource::Artifact { artifact_id, .. }) => {
+                    if project.artifact_object(&artifact_id).is_none() {
+                        issues.push((
+                            object.dir.clone(),
+                            format!("вход `{}`: артефакт `{artifact_id}` не найден", input.alias),
+                        ));
+                    }
+                }
+                Err(_) => {} // уже сообщено validate()
+            }
+        }
+        for fragment in &formula.fragments {
+            if let Ok(reference) = crate::manifest::parse_formula_ref(&fragment.source) {
+                if project.formula_object(&reference.formula_id).is_none() {
+                    issues.push((
+                        object.dir.clone(),
+                        format!("фрагмент `{}`: формула `{}` не найдена", fragment.alias, reference.formula_id),
+                    ));
+                }
+            }
+        }
+    }
+    project.issues.extend(issues.into_iter().map(|(path, message)| Issue { path, message }));
+}
+
 /// Проверить наличие `hashed`-входов артефакта (ref-группы не влияют на свежесть, §7.3 п.1).
 /// Селекторы раскрываются как путь или glob (см. [`crate::selector`]).
 fn inputs_present(m: &ArtifactManifest, dir: &Path, objects: &[Object]) -> (bool, String) {
@@ -814,6 +994,7 @@ fn build_project(manifest: ProjectManifest, root: PathBuf, ctx: LoadCtx<'_>) -> 
         ObjectKind::Source,
         ObjectKind::Note,
         ObjectKind::Repository,
+        ObjectKind::Formula,
     ] {
         let objects: Vec<usize> = ctx
             .objects
@@ -871,6 +1052,11 @@ impl HasSchemaField for NoteManifest {
     }
 }
 impl HasSchemaField for RepositoryManifest {
+    fn schema_field(&self) -> &str {
+        &self.schema
+    }
+}
+impl HasSchemaField for crate::manifest::FormulaManifest {
     fn schema_field(&self) -> &str {
         &self.schema
     }
