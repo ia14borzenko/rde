@@ -1,0 +1,164 @@
+//! ВРЕМЕННЫЙ файл P0.2 (спайк A), не коммитится: нативный редактор формул WordCraft
+//! через публичный `WordApp` — тот же класс, что встроен в rde-ui (`EmbeddedEditor.app`).
+//!
+//! Запуск: `cargo run -p rde-ui --example spike_p0_equation -- /tmp/spike-a.docx`
+//!
+//! 1) сценарий команд `insert.equation` → `equation.inputFormat(latex)` → `equation.type`
+//!    → `equation.convert` → `equation.exit` → сохранение docx → подсчёт OMML;
+//! 2) проверка `equation.edit` на пустом абзаце (ожидается «no equation at the caret»)
+//!    и на формуле под каретой;
+//! 3) встраивание `equation_tab::insert_button`/`equation_tab::show` в egui-панель через
+//!    `egui_kittest` (без правок vendor/wordcraft) + PNG-снимок панели.
+
+use serde_json::json;
+use wordcraft_engine::doc::Document;
+use wordcraft_engine::Session;
+use wordcraft_ui_egui::WordApp;
+
+fn main() {
+    let out_docx = std::env::args().nth(1).unwrap_or_else(|| "/tmp/spike-a-equation.docx".to_owned());
+    let out_panel = std::env::args().nth(2).unwrap_or_else(|| "/tmp/spike-a-panel.png".to_owned());
+
+    // ── 1. WordApp-харнесс: сценарий нативного редактора ────────────────────────
+    let mut session = Session::new(Document::new());
+    let _ = session.run("document.setText", &json!({"text": ""}));
+    let mut app = WordApp::new(session, wordcraft_ui_egui::Services::default());
+
+    let r = app.run("equation.edit", json!({}));
+    println!("[A1] equation.edit на пустом абзаце без формулы: {r:?}");
+
+    let r = app.run("insert.equation", json!({}));
+    println!("[A2] insert.equation (пустой абзац → display, режим правки): {r:?}");
+    println!("[A2] session.math есть: {}", app.session.math.is_some());
+
+    let r = app.run("equation.inputFormat", json!({"format": "latex"}));
+    println!("[A3] equation.inputFormat latex: {r:?}");
+
+    let r = app.run("equation.type", json!({"text": "\\frac{a}{b}"}));
+    println!("[A4] equation.type \\frac{{a}}{{b}}: {r:?}");
+    // Пробел запускает build-up в LaTeX-режиме (как в Word).
+    let r = app.run("equation.type", json!({"text": " "}));
+    println!("[A5] equation.type ' ' (build-up): {r:?}");
+
+    let r = app.run("equation.get", json!({}));
+    println!("[A6] equation.get после build-up: {r:?}");
+
+    let r = app.run("equation.convert", json!({"to": "linear"}));
+    println!("[A7] equation.convert → linear: {r:?}");
+    let r = app.run("equation.convert", json!({"to": "professional"}));
+    println!("[A8] equation.convert → professional: {r:?}");
+    let r = app.run("equation.get", json!({}));
+    println!("[A9] equation.get после конвертаций: {r:?}");
+
+    let r = app.run("equation.exit", json!({}));
+    println!("[A10] equation.exit: {r:?}");
+
+    // Открытие существующей формулы под каретой (то, что нужно панели RDE для правки).
+    let r = app.run("equation.edit", json!({}));
+    println!("[A11] equation.edit на формуле под каретой: {r:?}");
+    let r = app.run("equation.exit", json!({}));
+    println!("[A12] equation.exit: {r:?}");
+
+    // Предзаполненная формула из галереи (путь панели: Insert › Equation gallery).
+    let r = app.run("insert.equation", json!({"builtin": "quadratic"}));
+    println!("[A13] insert.equation builtin=quadratic: {r:?}");
+    let r = app.run("equation.exit", json!({}));
+    println!("[A14] equation.exit: {r:?}");
+
+    match wordcraft_engine::io::save_path(std::path::Path::new(&out_docx), &app.session.doc) {
+        Ok(()) => println!("[A15] docx сохранён: {out_docx}"),
+        Err(e) => {
+            eprintln!("[A15] ОШИБКА сохранения docx: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // OMML-инспекция сохранённого docx.
+    match omml_counts(&out_docx) {
+        Ok((o_math, o_math_para, frac, num, den, latex_text)) => {
+            println!("[A16] OMML в {out_docx}: m:oMath={o_math}, m:oMathPara={o_math_para}, m:f={frac}, m:num={num}, m:den={den}");
+            println!("[A16] текст m:t: {latex_text:?}");
+        }
+        Err(e) => {
+            eprintln!("[A16] ОШИБКА чтения docx: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // ── 2. Встраивание equation_tab в egui-панель без правок vendor ─────────────
+    // `insert_button` и `show` — публичные функции с сигнатурой `(&mut Ui, &mut WordApp)`,
+    // т.е. панель RDE может рисовать их напрямую (WordApp живёт в `EmbeddedEditor.app`).
+    let panel_app = WordApp::new(Session::new(Document::new()), wordcraft_ui_egui::Services::default());
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1280.0, 420.0))
+        .with_pixels_per_point(1.0)
+        .with_max_steps(10_000)
+        .wgpu()
+        .build_ui_state(
+            |ui, app: &mut WordApp| {
+                // Панель RDE обязана установить шрифты WordCraft (families "medium"/"semibold"),
+                // иначе equation_tab::show паникует на FontFamily::Name("semibold").
+                // set_fonts применяется со следующего кадра → первый кадр только шрифты.
+                let fonts_id = egui::Id::new("spike-p0-fonts");
+                let installed = ui.ctx().data(|data| data.get_temp::<bool>(fonts_id).unwrap_or(false));
+                if !installed {
+                    wordcraft_ui_egui::theme::install_fonts(ui.ctx());
+                    ui.ctx().data_mut(|data| data.insert_temp(fonts_id, true));
+                    return;
+                }
+                // Верхняя строка — кнопка ленты WordCraft «Equation» (split button: новый/галерея),
+                // ниже — вкладка Equation целиком, как её показывает WordCraft в режиме правки.
+                ui.horizontal(|ui| {
+                    wordcraft_ui_egui::equation_tab::insert_button(ui, app);
+                });
+                ui.separator();
+                wordcraft_ui_egui::equation_tab::show(app, ui);
+            },
+            panel_app,
+        );
+    harness.input_mut().max_texture_side = Some(8192);
+    for _ in 0..6 {
+        harness.step();
+    }
+    match harness.render() {
+        Ok(image) => {
+            image.save(&out_panel).expect("сохранить PNG панели");
+            println!("[A17] панель Equation tab отрендерена без правок vendor: {out_panel}");
+        }
+        Err(e) => {
+            eprintln!("[A17] ОШИБКА рендера панели: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Счётчики OMML в `word/document.xml` сохранённого docx.
+fn omml_counts(path: &str) -> Result<(usize, usize, usize, usize, usize, String), String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let mut xml = String::new();
+    {
+        use std::io::Read;
+        let mut entry = archive.by_name("word/document.xml").map_err(|e| e.to_string())?;
+        entry.read_to_string(&mut xml).map_err(|e| e.to_string())?;
+    }
+    let count = |needle: &str| xml.matches(needle).count();
+    let mut runs = Vec::new();
+    let mut rest = xml.as_str();
+    while let Some(index) = rest.find("<m:t") {
+        let after = &rest[index..];
+        let Some(open_end) = after.find('>') else { break };
+        let body = &after[open_end + 1..];
+        let Some(close) = body.find("</m:t>") else { break };
+        runs.push(body[..close].to_owned());
+        rest = &body[close..];
+    }
+    Ok((
+        count("<m:oMath"),
+        count("<m:oMathPara"),
+        count("<m:f>"),
+        count("<m:num>"),
+        count("<m:den>"),
+        runs.join("|"),
+    ))
+}

@@ -12,6 +12,36 @@
 
 ### Добавлено
 
+- **P0: исследование и проектирование формул/величин как объектов проекта** — кода не касались
+  (только docs). Спайки: (A) нативный LaTeX-редактор WordCraft (`insert.equation`, `equation.edit/
+  type/convert/inputFormat/get/exit`) управляется из `WordApp`-харнесса RDE, вкладка
+  `equation_tab::show`/`insert_button`
+  рисуется в egui-панели **без правок `vendor/wordcraft`**; OMML после сценария:
+  `m:oMath=3, m:oMathPara=1, m:f=2`; (B) OMML → WordCraft PDF (4 970 Б, **0 растров**,
+  `DejaVuMathTeXGyre` embedded) → `pdftocairo -svg` (2 777 Б, 0 `<image>`, глифы путями) → кроп
+  bbox (`pdftotext -bbox` + `viewBox`, 41,8×31,3 pt) → `asvg:svgBlip` + PNG-fallback (resvg, 830 Б) →
+  LibreOffice 26.2 → PDF: **0 растровых изображений** (контроль только-PNG: 2 строки растра);
+  WordCraft-writer при пересохранении **теряет `svgBlip`/svg-части** (RDE должен переприменять);
+  (C) константа со `source = rde://artifact/…/out/stats.json#/stats/x1/mean`: значение разрешено,
+  вставка обновлена после «пересчёта» артефакта (`insert_is_stale=true` → `update_insert_values`),
+  `formula.toml` в каталоге документа грузится без issues, каскад удаления документа переносит
+  формулы, `act_key` формулы стабилен и чувствителен к входу, цикл фрагментов детектируется.
+  Доказательства — [`docs/spikes/formulas-latex.md`](docs/spikes/formulas-latex.md),
+  скриншоты — `docs/spikes/assets/p0-*.png`, харнессы — `docs/spikes/harness/`.
+- [`docs/adr/0005-formulas-and-values-as-project-objects.md`](docs/adr/0005-formulas-and-values-as-project-objects.md) —
+  ADR: величины — расширение `ConstantValue` (`symbol/subscript/unit/display/style/format` +
+  `source` из выхода артефакта, `constant_hash`, rich-вставки, централизованная замена);
+  формулы — служебные объекты **документа** (`objects/documents/<id>/formulas/<fid>/formula.toml`:
+  LaTeX-источник, display, numbering, inputs[], fragments[], `[state]`), `act_key` из примитивов
+  §7.2, граф/каскад/откат, вставка `RdeInsert kind="formula"` (`render_mode = omml|svg`),
+  нативный редактор WordCraft в панели RDE, SVG-вектор (`asvg:svgBlip`+PNG, PDF-гейт «нет
+  растровых формул»), миграция `rde:doc` 1→2 и ленивое «принять как объект», границы
+  `rde-core/rde-hash/rde-dag/rde-doc/rde-docx/rde-ui` (новых крейтов нет), риски и 5 вопросов
+  владельцу (§12 ADR).
+- [`docs/tz-03.md`](docs/tz-03.md) — нормативные расширения P0 тем же коммитом: §4.2 (служебный
+  объект «формула», обозначение величины — расширение константы), §8.3 (`formulas/` внутри
+  каталога документа), R-DOC-11 (вид вставки `formula`, `render_mode`), §5.7.5 (LaTeX-реестр
+  формул — `[НЕ НАЧАТО]`), §0.1 (строка резюме v03).
 - `CHANGELOG.md` — журнал по Keep a Changelog: вехи M1–P9, тесты/теги, честные ограничения.
 - [`docs/adr/0003-deviations-from-tz02.md`](docs/adr/0003-deviations-from-tz02.md) — реестр 7 отклонений
   реализации от ТЗ v02: требование, как требует ТЗ, как сделано, доказательство, решение.

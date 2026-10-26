@@ -1,0 +1,671 @@
+//! ВРЕМЕННЫЙ файл P0.3/P0.4 (спайки B и C), не коммитится.
+//!
+//! Спайк B — векторная формула: WordCraft OMML → PDF (krilla) → `pdftocairo -svg` → SVG →
+//! вставка в docx как `asvg:svgBlip` + PNG-fallback (resvg) → LibreOffice headless → PDF →
+//! `pdfimages -list` / `pdffonts` (формула не растр) + контрольный вариант только-PNG.
+//! Дополнительно: чтение docx движком WordCraft и пересохранение (сохраняется ли svgBlip).
+//!
+//! Спайк C — значение из артефакта: константа-обозначение со `source` = JSON-pointer в
+//! `out/stats.json`, вставка значения в документ, «артефакт пересчитан → значение устарело →
+//! обновить». Плюс: хранение формулы в `objects/documents/<id>/formulas/`, допустимость
+//! лишнего каталога загрузчиком, каскадное удаление вместе с документом, стабильность
+//! формулы-`act_key` и детект цикла по фрагментам.
+//!
+//! Запуск из каталога `rde/`:
+//! `cargo run -q -p rde-doc --example spike_p0_vector -- <tmp-dir>`
+//! (каталог снаружи репозитория, например `../.cache-tmp/spikes/spike-p0`).
+
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde_json::json;
+use wordcraft_engine::doc::{Document, InlineObject};
+use wordcraft_engine::Session;
+
+fn main() {
+    let base = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "../.cache-tmp/spikes/spike-p0".to_owned()));
+    let stage = std::env::args().nth(2).unwrap_or_else(|| "bc".to_owned());
+    let b = base.join("b");
+    let c = base.join("c");
+    std::fs::create_dir_all(&b).expect("tmp b");
+    std::fs::create_dir_all(&c).expect("tmp c");
+    println!("== базовый каталог: {} (стадии: {stage}) ==", base.display());
+
+    if stage == "bc" || stage == "b" {
+        let _ = std::fs::remove_dir_all(&b);
+        std::fs::create_dir_all(&b).expect("tmp b");
+        if let Err(e) = spike_b(&b) {
+            eprintln!("СПАЙК B: ОШИБКА: {e}");
+            std::process::exit(1);
+        }
+    }
+    if stage == "bc" || stage == "c" {
+        let _ = std::fs::remove_dir_all(&c);
+        std::fs::create_dir_all(&c).expect("tmp c");
+        if let Err(e) = spike_c(&c) {
+            eprintln!("СПАЙК C: ОШИБКА: {e}");
+            std::process::exit(1);
+        }
+    }
+    println!("== всё готово: {} ==", base.display());
+}
+
+// ───────────────────────────────── спайк B ─────────────────────────────────
+
+fn spike_b(dir: &Path) -> Result<(), String> {
+    // 1. Мини-документ WordCraft с одной display-формулой → векторный PDF.
+    let mut s = Session::new(Document::new());
+    s.run("document.setText", &json!({"text": ""})).map_err(|e| e.to_string())?;
+    s.run("insert.equation", &json!({"latex": "\\sigma=\\frac{F}{A}", "display": true}))
+        .map_err(|e| e.to_string())?;
+    s.run("equation.exit", &json!({})).map_err(|e| e.to_string())?;
+    let pdf = wordcraft_engine::io::save_bytes_opts("formula.pdf", &s.doc, &Default::default())
+        .map_err(|e| format!("PDF движком: {e}"))?;
+    let pdf_path = dir.join("formula.pdf");
+    std::fs::write(&pdf_path, &pdf).map_err(|e| e.to_string())?;
+    println!("[B1] формула → PDF: {} Б ({})", pdf.len(), pdf_path.display());
+
+    // 2. PDF → SVG (poppler pdftocairo, вектор).
+    run_checked(Command::new("pdftocairo").arg("-svg").arg(&pdf_path).arg(dir.join("formula.svg")))?;
+    let svg = std::fs::read(dir.join("formula.svg")).map_err(|e| e.to_string())?;
+    let svg_text = String::from_utf8_lossy(&svg).to_string();
+    let count = |needle: &str| svg_text.matches(needle).count();
+    println!(
+        "[B2] pdftocairo -svg: {} Б, <image>={}, <path>={}, <text>={}, <use>={}",
+        svg.len(),
+        count("<image"),
+        count("<path"),
+        count("<text"),
+        count("<use")
+    );
+    let (svg_w, svg_h) = svg_size(&svg_text);
+    println!("[B2] размер SVG: {svg_w}×{svg_h} (единица — как в файле)");
+
+    // 2б. Кроп до bbox формулы: pdftocairo -svg не принимает -x/-y/-W/-H, поэтому
+    // bbox берём из pdftotext -bbox (глифы формулы — текст в PDF WordCraft) и
+    // переписываем viewBox/width/height в SVG. Проверяем, что после кропа рендер не пуст.
+    let (bx, by, bw, bh) = pdf_text_bbox(&pdf_path, 2.0)?;
+    let svg_cropped = crop_svg(&svg_text, bx, by, bw, bh)?;
+    let crop_path = dir.join("formula-crop.svg");
+    std::fs::write(&crop_path, &svg_cropped).map_err(|e| e.to_string())?;
+    let (crop_w, crop_h) = svg_size(&svg_cropped);
+    println!("[B2b] bbox формулы (pt): x={bx:.1} y={by:.1} w={bw:.1} h={bh:.1} → SVG {crop_w}×{crop_h}, {} Б", svg_cropped.len());
+
+    // 3. Анализ исходного PDF: формула векторная (текст/кривые, не растр)?
+    let pdfimages = run_capture(Command::new("pdfimages").arg("-list").arg(&pdf_path))?;
+    let pdffonts = run_capture(Command::new("pdffonts").arg(&pdf_path))?;
+    println!("[B3] pdfimages -list (PDF WordCraft):\n{pdfimages}");
+    println!("[B3] pdffonts (PDF WordCraft):\n{pdffonts}");
+    std::fs::write(dir.join("b3-pdfimages-wordcraft.txt"), &pdfimages).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("b3-pdffonts-wordcraft.txt"), &pdffonts).map_err(|e| e.to_string())?;
+
+    // 4. PNG-fallback из SVG (resvg) и docx с asvg:svgBlip — из кропнутого SVG.
+    let png = rde_doc::rasterize_svg(svg_cropped.as_bytes()).map_err(|e| format!("resvg: {e}"))?;
+    println!("[B4] SVG → PNG fallback (resvg): {} Б", png.len());
+
+    let docx_svg = build_svg_docx(svg_cropped.as_bytes(), &png, crop_w, crop_h)?;
+    let svg_docx_path = dir.join("formula-svg.docx");
+    write_zip(&svg_docx_path, &docx_svg)?;
+    println!("[B4] docx с asvg:svgBlip + PNG fallback: {}", svg_docx_path.display());
+
+    // Контрольный docx: тот же рисунок, но только PNG (без svgBlip).
+    let docx_png = build_png_only_docx(&png, crop_w, crop_h)?;
+    let png_docx_path = dir.join("formula-png-only.docx");
+    write_zip(&png_docx_path, &docx_png)?;
+    println!("[B4] контрольный docx только-PNG: {}", png_docx_path.display());
+
+    // 5. LibreOffice headless → PDF; проверки pdfimages/pdffonts.
+    lo_convert(dir, &svg_docx_path)?;
+    lo_convert(dir, &png_docx_path)?;
+    let lo_svg_pdf = dir.join("formula-svg.pdf");
+    let lo_png_pdf = dir.join("formula-png-only.pdf");
+    for (tag, pdf) in [("SVG+fallback", &lo_svg_pdf), ("PNG-only", &lo_png_pdf)] {
+        let images = run_capture(Command::new("pdfimages").arg("-list").arg(pdf))?;
+        let fonts = run_capture(Command::new("pdffonts").arg(pdf))?;
+        let images_count = images.lines().skip(2).filter(|line| !line.trim().is_empty()).count();
+        let fonts_count = fonts.lines().skip(2).filter(|line| !line.trim().is_empty()).count();
+        println!("[B5] LO PDF ({tag}): pdfimages строк={images_count}, pdffonts шрифтов={fonts_count}");
+        println!("[B5]   pdfimages ({tag}):\n{images}");
+        std::fs::write(dir.join(format!("b5-pdfimages-libreoffice-{tag}.txt")), &images).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(format!("b5-pdffonts-libreoffice-{tag}.txt")), &fonts).map_err(|e| e.to_string())?;
+    }
+    // Растровый предпросмотр страницы LO-PDF (для визуальной проверки, не растр ли).
+    run_checked(Command::new("pdftoppm").arg("-png").arg("-r").arg("110").arg(&lo_svg_pdf).arg(dir.join("lo-svg-preview")))?;
+    println!("[B5] предпросмотр: {}", dir.join("lo-svg-preview-1.png").display());
+
+    // 6. Читает ли WordCraft docx с svgBlip и сохраняет ли расширение при пересохранении.
+    let (doc, _) = wordcraft_engine::io::open_path_in(&svg_docx_path, None, &wordcraft_engine::Region::from_tag("ru-RU"))
+        .map_err(|e| format!("WordCraft не открыл docx с svgBlip: {e}"))?;
+    let images = doc.body.iter().map(|block| match &**block {
+        wordcraft_engine::doc::Block::Para(p) => p.objects.iter().filter(|o| matches!(o, InlineObject::Image { .. })).count(),
+        _ => 0,
+    }).sum::<usize>();
+    println!("[B6] WordCraft открыл docx с svgBlip: картинок в модели={images}");
+    let resaved = wordcraft_engine::io::save_bytes("formula-resaved.docx", &doc).map_err(|e| e.to_string())?;
+    let resaved_path = dir.join("formula-svg-resaved-by-wordcraft.docx");
+    std::fs::write(&resaved_path, &resaved).map_err(|e| e.to_string())?;
+    let resaved_entries = read_zip(&resaved_path)?;
+    let resaved_xml = String::from_utf8_lossy(resaved_entries.get("word/document.xml").ok_or("нет document.xml")?).to_string();
+    println!(
+        "[B6] пересохранение движком: svgBlip в document.xml={}, svg-часть в пакете={}",
+        resaved_xml.matches("svgBlip").count(),
+        resaved_entries.keys().any(|name| name.ends_with(".svg"))
+    );
+    Ok(())
+}
+
+/// Мини-docx (WordCraft) + один параграф с `asvg:svgBlip` (SVG) и PNG-fallback.
+fn build_svg_docx(svg: &[u8], png: &[u8], svg_w: f64, svg_h: f64) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut s = Session::new(Document::new());
+    s.run("document.setText", &json!({"text": "Формула как изображение (SVG):"}))
+        .map_err(|e| e.to_string())?;
+    let bytes = wordcraft_engine::io::save_bytes("base.docx", &s.doc).map_err(|e| e.to_string())?;
+    let tmp = std::env::temp_dir().join("rde-spike-b-base.docx");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    let mut entries = read_zip(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    entries.insert("word/media/rde-formula.svg".to_owned(), svg.to_vec());
+    entries.insert("word/media/rde-formula.png".to_owned(), png.to_vec());
+    // 1 px = 9525 EMU; SVG-размер в pt → EMU (1 pt = 12700 EMU) для extent.
+    let (cx, cy) = ((svg_w.max(1.0) * 12700.0) as u64, (svg_h.max(1.0) * 12700.0) as u64);
+    let rid_svg = "rIdRdeSvgFormula";
+    let rid_png = "rIdRdePngFormula";
+    add_relationship(&mut entries, rid_png, "media/rde-formula.png")?;
+    add_relationship(&mut entries, rid_svg, "media/rde-formula.svg")?;
+    ensure_default_content_type(&mut entries, "svg", "image/svg+xml")?;
+    ensure_default_content_type(&mut entries, "png", "image/png")?;
+    let paragraph = format!(
+        "<w:p><w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
+         <wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:docPr id=\"1001\" name=\"rde-formula-svg\"/>\
+         <a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+         <pic:pic><pic:nvPicPr><pic:cNvPr id=\"0\" name=\"rde-formula-svg\"/><pic:cNvPicPr/></pic:nvPicPr>\
+         <pic:blipFill><a:blip r:embed=\"{rid_png}\"><a:extLst>\
+         <a:ext uri=\"{{96DAC541-7B7A-43D3-8B79-37D633B846F1}}\">\
+         <asvg:svgBlip xmlns:asvg=\"http://schemas.microsoft.com/office/drawing/2016/SVG/main\" r:embed=\"{rid_svg}\"/>\
+         </a:ext></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
+         <pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
+         <a:prstGeom prst=\"rect\"/></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
+    );
+    insert_paragraph(&mut entries, &paragraph)?;
+    Ok(entries)
+}
+
+fn build_png_only_docx(png: &[u8], svg_w: f64, svg_h: f64) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut s = Session::new(Document::new());
+    s.run("document.setText", &json!({"text": "Формула как изображение (PNG):"}))
+        .map_err(|e| e.to_string())?;
+    let bytes = wordcraft_engine::io::save_bytes("base-png.docx", &s.doc).map_err(|e| e.to_string())?;
+    let tmp = std::env::temp_dir().join("rde-spike-b-base-png.docx");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    let mut entries = read_zip(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    entries.insert("word/media/rde-formula.png".to_owned(), png.to_vec());
+    let rid_png = "rIdRdePngFormula";
+    add_relationship(&mut entries, rid_png, "media/rde-formula.png")?;
+    ensure_default_content_type(&mut entries, "png", "image/png")?;
+    let (cx, cy) = ((svg_w.max(1.0) * 12700.0) as u64, (svg_h.max(1.0) * 12700.0) as u64);
+    let paragraph = format!(
+        "<w:p><w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
+         <wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:docPr id=\"1002\" name=\"rde-formula-png\"/>\
+         <a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+         <pic:pic><pic:nvPicPr><pic:cNvPr id=\"0\" name=\"rde-formula-png\"/><pic:cNvPicPr/></pic:nvPicPr>\
+         <pic:blipFill><a:blip r:embed=\"{rid_png}\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
+         <pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
+         <a:prstGeom prst=\"rect\"/></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
+    );
+    insert_paragraph(&mut entries, &paragraph)?;
+    Ok(entries)
+}
+
+fn insert_paragraph(entries: &mut BTreeMap<String, Vec<u8>>, paragraph: &str) -> Result<(), String> {
+    let xml = entries.get("word/document.xml").ok_or("нет word/document.xml")?;
+    let text = String::from_utf8_lossy(xml).to_string();
+    // Вставляем перед sectPr (последний блок тела), иначе после закрытия sectPr.
+    let updated = match text.rfind("<w:sectPr") {
+        Some(index) => format!("{}{}{}", &text[..index], paragraph, &text[index..]),
+        None => text.replacen("</w:body>", &format!("{paragraph}</w:body>"), 1),
+    };
+    entries.insert("word/document.xml".to_owned(), updated.into_bytes());
+    Ok(())
+}
+
+fn add_relationship(entries: &mut BTreeMap<String, Vec<u8>>, rid: &str, target: &str) -> Result<(), String> {
+    const PART: &str = "word/_rels/document.xml.rels";
+    let text = entries
+        .get(PART)
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .unwrap_or_else(|| {
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>".to_owned()
+        });
+    let relationship = format!(
+        "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"{target}\"/>"
+    );
+    let updated = match text.rfind("</Relationships>") {
+        Some(index) => format!("{}{}{}", &text[..index], relationship, &text[index..]),
+        None => format!("{text}{relationship}"),
+    };
+    entries.insert(PART.to_owned(), updated.into_bytes());
+    Ok(())
+}
+
+fn ensure_default_content_type(entries: &mut BTreeMap<String, Vec<u8>>, ext: &str, mime: &str) -> Result<(), String> {
+    const PART: &str = "[Content_Types].xml";
+    let text = entries.get(PART).map(|bytes| String::from_utf8_lossy(bytes).to_string()).ok_or("нет [Content_Types].xml")?;
+    if text.contains(&format!("Extension=\"{ext}\"")) {
+        return Ok(());
+    }
+    let default = format!("<Default Extension=\"{ext}\" ContentType=\"{mime}\"/>");
+    let updated = match text.rfind("</Types>") {
+        Some(index) => format!("{}{}{}", &text[..index], default, &text[index..]),
+        None => format!("{text}{default}"),
+    };
+    entries.insert(PART.to_owned(), updated.into_bytes());
+    Ok(())
+}
+
+fn lo_convert(dir: &Path, docx: &Path) -> Result<(), String> {
+    // Песочница DSH: $HOME вне воркспейса read-only → LO не может писать dconf/profile.
+    let home = dir.parent().map(|parent| parent.join("lo-home")).unwrap_or_else(|| dir.join("lo-home"));
+    let profile = dir.parent().map(|parent| parent.join("lo-profile")).unwrap_or_else(|| dir.join("lo-profile"));
+    std::fs::create_dir_all(home.join(".cache")).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
+    let mut command = Command::new("soffice");
+    command
+        .arg("--headless")
+        .arg("--norestore")
+        .arg(format!("-env:UserInstallation=file://{}", profile.display()))
+        .arg("--convert-to")
+        .arg("pdf")
+        .arg("--outdir")
+        .arg(dir)
+        .arg(docx)
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join(".cache"));
+    run_checked(&mut command)
+}
+
+// ───────────────────────────────── спайк C ─────────────────────────────────
+
+fn spike_c(dir: &Path) -> Result<(), String> {
+    // Копия демо-проекта (без .venv/.git): .rde-store нужен для ledger, out/ — значения.
+    copy_demo(dir)?;
+    let project = rde_core::load(dir).map_err(|e| format!("демо-копия не грузится: {e}"))?;
+    println!("[C1] копия демо: объектов={}, issues={}", project.object_count(), project.issues.len());
+
+    let stats_id = "01M5VJ1JG039MMV97SZGY6V9EQ"; // «Статистики реализаций» → out/stats.json
+    let constants_id = "01M5VJ1JG0T9NS5SEZX35HGNFY"; // «Константы проекта»
+    let doc_id = project.document_object().map(|o| o.id.clone()).ok_or("в демо нет документа")?;
+    let doc_package = project.document_path().ok_or("нет пути документа")?;
+    let mut store = rde_store::Store::open(dir).map_err(|e| e.to_string())?;
+
+    // 1. Константа со source: значение из JSON-pointer в out/stats.json.
+    let stats_object = project.artifact_object(stats_id).ok_or("нет артефакта статистик")?;
+    let stats_manifest = match &stats_object.data {
+        rde_core::ObjectData::Artifact(a) => a.clone(),
+        _ => return Err("статистики — не артефакт".into()),
+    };
+    let out_hash = stats_manifest.out_hash.clone().ok_or("у статистик нет out_hash")?;
+    let source_uri = format!("rde://artifact/{stats_id}@{out_hash}/out/stats.json#/stats/x1/mean");
+    let (value_text, source_digest) = rde_dag::resolve_insert_text(&project, &store, &source_uri)?;
+    println!("[C2] source={source_uri}");
+    println!("[C2] значение из артефакта: {value_text:?}, digest={}", &source_digest[..12]);
+    let display = format!("x̄₁ = {} м", trim_number(&value_text));
+    println!("[C2] rich-обозначение для вставки: {display:?}");
+
+    // 2. Расширение модели ConstantValue полем source: загрузчик не должен ругаться
+    //    (JSON Schema не запрещает дополнительные поля, serde их игнорирует).
+    let constants_dir = project.artifact_object(constants_id).map(|o| o.dir.clone()).ok_or("нет констант")?;
+    let manifest_path = constants_dir.join("artifact.toml");
+    let mut manifest_text = std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+    manifest_text.push_str(&format!(
+        "\n[values.x1_mean]\nvalue = {}\nunit = \"м\"\ndisplay = \"x̄₁\"\nstyle = \"italic-subscript\"\nsource = \"{source_uri}\"\n",
+        trim_number(&value_text)
+    ));
+    std::fs::write(&manifest_path, &manifest_text).map_err(|e| e.to_string())?;
+    let reloaded = rde_core::load(dir).map_err(|e| format!("проект с source не грузится: {e}"))?;
+    let accepted = reloaded
+        .artifact_object(constants_id)
+        .and_then(|o| match &o.data {
+            rde_core::ObjectData::Artifact(a) => a.values.get("x1_mean").map(|v| v.display.clone()),
+            _ => None,
+        });
+    println!(
+        "[C3] ConstantValue+source: issues={}, значение x1_mean.display={accepted:?} (старое чтение поле source игнорирует)",
+        reloaded.issues.len()
+    );
+
+    // 3. Вставка значения в документ (kind=value) и кэш из источника.
+    // Пакет уже лежит в копии проекта (каталог скопирован целиком) — правим его на месте.
+    let package_copy = doc_package.clone();
+    let target = format!("rde://constants/{constants_id}/x1_mean");
+    let report = rde_doc::add_insert(
+        &package_copy,
+        rde_doc::InsertRequest {
+            kind: "value".to_owned(),
+            target,
+            selector: String::new(),
+            value_kind: "number".to_owned(),
+            cached: display.clone(),
+            caption: String::new(),
+            style: String::new(),
+            format: "auto".to_owned(),
+            run_style: "italic-subscript".to_owned(),
+            anchor_block: None,
+        },
+    )
+    .map_err(|e| format!("add_insert: {e}"))?;
+    let inserted_hash = source_digest.clone();
+    println!(
+        "[C4] вставка value: id={}, hash={}, кэш={:?}",
+        report.insert.id,
+        &inserted_hash[..12],
+        report.insert.cached
+    );
+
+    // 4. «Артефакт пересчитан»: меняем stats.json и out_hash артефакта (как после update).
+    let stats_dir = project.artifact_object(stats_id).map(|o| o.dir.clone()).ok_or("нет каталога статистик")?;
+    let stats_path = stats_dir.join("out/stats.json");
+    let mut stats: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&stats_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let old_mean = stats.pointer("/stats/x1/mean").cloned().unwrap_or(json!(0.0));
+    stats["stats"]["x1"]["mean"] = json!(0.123456);
+    std::fs::write(&stats_path, serde_json::to_vec_pretty(&stats).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let new_out_hash = rde_hash::sha256(format!("recomputed:{old_mean}")).hex();
+    rde_core::record_artifact_out_hash(&stats_dir, &new_out_hash).map_err(|e| e.to_string())?;
+    println!("[C5] артефакт пересчитан: out_hash {:.12}… → {:.12}…", out_hash, new_out_hash);
+
+    let project_after = rde_core::load(dir).map_err(|e| e.to_string())?;
+    let (new_text, new_digest) = rde_dag::resolve_insert_text(
+        &project_after,
+        &store,
+        &format!("rde://artifact/{stats_id}@{new_out_hash}/out/stats.json#/stats/x1/mean"),
+    )?;
+    let rde_doc_before = rde_doc::load_rde_doc(&package_copy).map_err(|e| e.to_string())?;
+    let stale = rde_doc_before
+        .inserts
+        .iter()
+        .find(|insert| insert.id == report.insert.id)
+        .map(|insert| rde_doc::insert_is_stale(insert, &new_digest))
+        .unwrap_or(false);
+    println!("[C5] новое значение={new_text:?}, digest={}: вставка устарела={stale}", &new_digest[..12]);
+
+    // 5. «Обновить»: пересчёт кэша вставки транзакционно (значения + хеши + store-корень).
+    let new_display = format!("x̄₁ = {} м", trim_number(&new_text));
+    let mut values = BTreeMap::new();
+    values.insert(report.insert.id.clone(), new_display.clone());
+    let mut hashes = BTreeMap::new();
+    hashes.insert(report.insert.id.clone(), new_digest.clone());
+    let update = rde_doc::update_insert_values(&package_copy, &values, &hashes).map_err(|e| e.to_string())?;
+    let tx = rde_doc::commit_document(dir, &package_copy, &doc_id, &mut store, "spike C: value update")
+        .map_err(|e| e.to_string())?;
+    let doc_after = rde_doc::load_rde_doc(&package_copy).map_err(|e| e.to_string())?;
+    let insert_after = doc_after.inserts.iter().find(|insert| insert.id == report.insert.id).cloned();
+    let temp = std::env::temp_dir().join(format!("rde-spike-c-{}.docx", std::process::id()));
+    rde_doc::extract_docx(&package_copy, &temp).map_err(|e| e.to_string())?;
+    let entries = read_zip(&temp)?;
+    let _ = std::fs::remove_file(&temp);
+    let body = String::from_utf8_lossy(entries.get("word/document.xml").ok_or("нет document.xml")?).to_string();
+    println!(
+        "[C6] update_insert_values: обновлено={:?}, cached={:?}, старое значение в теле={}, новое в теле={}, tx={}",
+        update.updated,
+        insert_after.as_ref().map(|i| i.cached.clone()),
+        body.contains(&display),
+        body.contains(&new_display),
+        tx
+    );
+
+    // 6. Формула как объект документа: objects/documents/<doc-id>/formulas/<fid>/formula.toml.
+    let formulas_dir = dir.join("objects/documents").join(&doc_id).join("formulas");
+    let fid = rde_core::new_id();
+    let formula_dir = formulas_dir.join(&fid);
+    std::fs::create_dir_all(&formula_dir).map_err(|e| e.to_string())?;
+    std::fs::write(
+        formula_dir.join("formula.toml"),
+        format!(
+            "schema = \"rde/formula@1\"\nid = \"{fid}\"\ndocument = \"{doc_id}\"\ntitle = \"Закон Ома\"\n\
+             latex = \"\\\\sigma = \\\\frac{{F}}{{A}}\"\ndisplay = true\n\n[numbering]\nmode = \"auto\"\nnumber = 1\n\n\
+             [[inputs]]\nalias = \"F\"\nmode = \"hashed\"\nsource = \"{source_uri}\"\n\n\
+             [cache]\nomml_hash = \"\"\nsvg_hash = \"\"\ncomputed_at = 0\n"
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    let with_formula = rde_core::load(dir).map_err(|e| e.to_string())?;
+    println!(
+        "[C7] formula.toml в каталоге документа: issues={}, объект-документ на месте={}",
+        with_formula.issues.len(),
+        with_formula.object(&doc_id).is_some()
+    );
+
+    // 7. Стабильность и чувствительность формулы-act_key (прототип; формулы — вычисляемый узел).
+    let formula_key = |input_digest: &str| {
+        let members = vec![rde_hash::GroupMember {
+            target: "constants:x1_mean".to_owned(),
+            out: rde_hash::sha256(input_digest.as_bytes()),
+            selector: "x1_mean".to_owned(),
+        }];
+        let groups = vec![rde_hash::InGroup {
+            name: "inputs".to_owned(),
+            mode: "hashed".into(),
+            grp_hash: rde_hash::group_hash("inputs", "hashed", &members),
+        }];
+        let in_hash = rde_hash::in_hash(&groups);
+        let params = rde_hash::params_hash(&json!({"latex": "\\sigma=\\frac{F}{A}", "numbering": "auto", "display": true}))
+            .expect("params");
+        let env = rde_hash::env_hash("formula", "rendering", None, &BTreeMap::new());
+        rde_hash::act_key("formula", "rde/formula@1", in_hash, None, params, env)
+    };
+    let k1 = formula_key(&source_digest);
+    let k1_again = formula_key(&source_digest);
+    let k2 = formula_key(&new_digest);
+    println!(
+        "[C8] formula act_key стабилен={} ({}), меняется при смене входа={}",
+        k1 == k1_again,
+        &k1.hex()[..16],
+        k1 != k2
+    );
+
+    // 8. Циклы по фрагментам формул (A→B→A) — прототип детектора (в rde-core пока нет).
+    let cycle = fragment_cycle(&[("A", vec!["B"]), ("B", vec!["A"])]);
+    let acyclic = fragment_cycle(&[("A", vec!["B"]), ("B", vec![])]);
+    println!("[C9] цикл фрагментов A→B→A={cycle:?}, без цикла={acyclic:?}");
+
+    // 9. Каскад: удаление документа переносит формулы вместе с ним (scope = документ).
+    let victim = dir.join("objects/documents").join(&doc_id);
+    let trash = rde_core::ops::delete_object(&with_formula, &doc_id).map_err(|e| e.to_string())?;
+    let formula_moved = trash.join("formulas").join(&fid).join("formula.toml").is_file();
+    println!(
+        "[C10] delete_object(документ): {} → {}, formula.toml перенесён вместе с документом={formula_moved}",
+        victim.display(),
+        trash.display()
+    );
+    Ok(())
+}
+
+/// Детектор цикла по рёбрам «формула → фрагмент» (DFS-раскраска, как find_cycle в rde-core).
+fn fragment_cycle<'a>(edges: &[(&'a str, Vec<&'a str>)]) -> Option<Vec<String>> {
+    use std::collections::HashMap;
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        New,
+        Visiting,
+        Done,
+    }
+    fn visit(
+        node: &str,
+        adjacency: &HashMap<&str, Vec<&str>>,
+        state: &mut HashMap<String, State>,
+        stack: &mut Vec<String>,
+        found: &mut Option<Vec<String>>,
+    ) {
+        state.insert(node.to_owned(), State::Visiting);
+        stack.push(node.to_owned());
+        for next in adjacency.get(node).cloned().unwrap_or_default() {
+            match state.get(next).copied().unwrap_or(State::New) {
+                State::New => visit(next, adjacency, state, stack, found),
+                State::Visiting => {
+                    let start = stack.iter().position(|n| n == next).unwrap_or(0);
+                    let mut chain = stack[start..].to_vec();
+                    chain.push(next.to_owned());
+                    *found = Some(chain);
+                    return;
+                }
+                State::Done => {}
+            }
+        }
+        stack.pop();
+        state.insert(node.to_owned(), State::Done);
+    }
+    let adjacency: HashMap<&str, Vec<&str>> = edges.iter().map(|(node, next)| (*node, next.clone())).collect();
+    let mut state: HashMap<String, State> = HashMap::new();
+    let mut found = None;
+    for (node, _) in edges {
+        if state.get(*node).copied().unwrap_or(State::New) == State::New {
+            visit(node, &adjacency, &mut state, &mut Vec::new(), &mut found);
+        }
+    }
+    found
+}
+
+/// Копия demo-project без `.venv`/`.git`/`__pycache__` (с `.rde` и `out/`).
+fn copy_demo(target: &Path) -> Result<(), String> {
+    let demo = rde_core::demo_project_dir();
+    fn copy(src: &Path, dst: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+        for entry in std::fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if matches!(name.as_str(), ".venv" | ".git" | "__pycache__") {
+                continue;
+            }
+            let from = entry.path();
+            let to = dst.join(&name);
+            if from.is_dir() {
+                copy(&from, &to)?;
+            } else {
+                std::fs::copy(&from, &to).map_err(|e| format!("{}: {e}", from.display()))?;
+            }
+        }
+        Ok(())
+    }
+    copy(&demo, target)
+}
+
+// ─────────────────────────────── утилиты ───────────────────────────────────
+
+fn run_checked(cmd: &mut Command) -> Result<(), String> {
+    let output = cmd.output().map_err(|e| format!("запустить {:?}: {e}", cmd.get_program()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{:?} завершился с {}: {}",
+            cmd.get_program(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn run_capture(cmd: &mut Command) -> Result<String, String> {
+    let output = cmd.output().map_err(|e| format!("запустить {:?}: {e}", cmd.get_program()))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        text.push_str(&format!("\n[stderr] {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(text)
+}
+
+fn read_zip(path: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let mut entries = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
+        if entry.is_dir() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        entries.insert(entry.name().to_owned(), bytes);
+    }
+    Ok(entries)
+}
+
+fn write_zip(path: &Path, entries: &BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, bytes) in entries {
+        zip.start_file(name.clone(), options).map_err(|e| e.to_string())?;
+        zip.write_all(bytes).map_err(|e| e.to_string())?;
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Ширина/высота SVG из атрибутов (в тех единицах, что в файле; pdftocairo пишет pt).
+fn svg_size(svg: &str) -> (f64, f64) {
+    let attr = |name: &str| -> Option<f64> {
+        let index = svg.find(&format!("{name}=\""))?;
+        let rest = &svg[index + name.len() + 2..];
+        let end = rest.find('"')?;
+        rest[..end].trim_end_matches("pt").trim_end_matches("px").parse().ok()
+    };
+    (attr("width").unwrap_or(0.0), attr("height").unwrap_or(0.0))
+}
+
+/// Bbox текста формулы в PDF (pt): `pdftotext -bbox` → объединение xMin/yMin/xMax/yMax
+/// всех слов + отступ `pad`.
+fn pdf_text_bbox(pdf: &Path, pad: f64) -> Result<(f64, f64, f64, f64), String> {
+    let html = run_capture(Command::new("pdftotext").arg("-bbox").arg(pdf).arg("-"))?;
+    let attr = |line: &str, name: &str| -> Option<f64> {
+        let index = line.find(&format!("{name}=\""))?;
+        let rest = &line[index + name.len() + 2..];
+        let end = rest.find('"')?;
+        rest[..end].parse().ok()
+    };
+    let mut min = (f64::INFINITY, f64::INFINITY);
+    let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for line in html.lines().filter(|line| line.contains("<word ")) {
+        if let (Some(x0), Some(y0), Some(x1), Some(y1)) =
+            (attr(line, "xMin"), attr(line, "yMin"), attr(line, "xMax"), attr(line, "yMax"))
+        {
+            min.0 = min.0.min(x0);
+            min.1 = min.1.min(y0);
+            max.0 = max.0.max(x1);
+            max.1 = max.1.max(y1);
+        }
+    }
+    if !min.0.is_finite() || !max.0.is_finite() {
+        return Err("в PDF не найден текстовый bbox формулы".to_owned());
+    }
+    let x = (min.0 - pad).max(0.0);
+    let y = (min.1 - pad).max(0.0);
+    Ok((x, y, (max.0 - min.0 + 2.0 * pad).max(1.0), (max.1 - min.1 + 2.0 * pad).max(1.0)))
+}
+
+/// Обрезать SVG до bbox: `pdftocairo -svg` не принимает -x/-y/-W/-H, поэтому задаём
+/// `viewBox="x y w h"` и `width/height` — содержимое SVG остаётся в координатах страницы.
+fn crop_svg(svg: &str, x: f64, y: f64, w: f64, h: f64) -> Result<String, String> {
+    let start = svg.find("<svg").ok_or("в SVG нет корня <svg>")?;
+    let end = svg[start..].find('>').ok_or("корень <svg> не закрыт")? + start;
+    let header = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+         width=\"{w}pt\" height=\"{h}pt\" viewBox=\"{x} {y} {w} {h}\">"
+    );
+    Ok(format!("{}{}{}", &svg[..start], header, &svg[end + 1..]))
+}
+
+/// Число для подписи: целое без «.0», иначе до 4 знаков (как `rde_doc_format_number` в rde-dag).
+fn trim_number(text: &str) -> String {
+    let Ok(value) = text.trim().parse::<f64>() else { return text.trim().to_owned() };
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        let mut text = format!("{value:.4}");
+        while text.ends_with('0') && text.contains('.') {
+            text.pop();
+        }
+        text
+    }
+}

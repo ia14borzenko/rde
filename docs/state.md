@@ -438,3 +438,66 @@ cd rde
   docs/fidelity/gui-p10-document-dark.png document      # одна строка + узкий инспектор
 ```
 
+---
+
+## Обновление 2026-10-26 (P0 «формулы и величины — исследование и ADR»)
+
+Фаза **P0** (только исследование/проектирование; **продуктовый код не менялся**, коммит — docs):
+спайки нативного редактора формул, векторной SVG-вставки и значения из артефакта + **ADR-0005**.
+Канон требований не изменился по существу — ТЗ-03 дополнено нормативными расширениями (см. ниже).
+
+| Артефакт | Что внутри |
+|---|---|
+| [`docs/spikes/formulas-latex.md`](spikes/formulas-latex.md) | Спайки A/B/C: команды, транскрипты, цифры, ограничения, воспроизведение, 5 вопросов владельцу |
+| [`docs/adr/0005-formulas-and-values-as-project-objects.md`](adr/0005-formulas-and-values-as-project-objects.md) | ADR: модель величины (расширение `ConstantValue`: `symbol/subscript/unit/display/style/format` + `source`), модель формулы (document-scope, `formula.toml`, `act_key`, входы/фрагменты, кэши OMML/SVG), вставка `kind="formula"`/`render_mode`, граф/каскад/откат, нативный редактор WordCraft, SVG-вектор и гейты, миграция, границы компонентов, риски, план P1–P5 |
+| `docs/spikes/assets/p0-*.png` | Скриншоты-доказательства: вкладка Equation в egui-панели (без правок vendor); LO-рендер docx с SVG-формулой |
+| `docs/spikes/harness/*.rs.txt` | Исходники временных examples спайков (из воркспейса удалены — продуктовый код не менялся) |
+| [`docs/tz-03.md`](tz-03.md) | §4.2 (служебный объект «формула», величина — расширение константы), §8.3 (`formulas/` в документе), R-DOC-11 (`formula`, `render_mode`), §5.7.5 (LaTeX-реестр, `[НЕ НАЧАТО]`), §0.1 |
+
+**Ключевые результаты спайков (числа — в отчёте):**
+
+* **A**: `WordApp::run("insert.equation"/"equation.inputFormat"/"equation.type"/"equation.convert"/
+  "equation.get"/"equation.exit")` работает из RDE-харнесса; LaTeX↔linear↔OMML без потерь;
+  `equation.edit` требует существующей формулы под каретой; OMML в docx — `m:oMath=3,
+  m:oMathPara=1, m:f=2`; **вкладка `equation_tab` рисуется в egui-панели без правок
+  `vendor/wordcraft`** (нужны шрифты `medium`/`semibold` — `theme::install_fonts`).
+* **B**: WordCraft PDF формулы — вектор (0 растров, embedded `DejaVuMathTeXGyre`); `pdftocairo -svg`
+  даёт SVG без `<image>` (глифы путями); SVG в docx как `asvg:svgBlip`+PNG-fallback → LibreOffice
+  26.2 даёт **0 растров** (контроль только-PNG — 2 строки растра); WordCraft-writer при
+  пересохранении **теряет SVG-расширение** (RDE должен переприменять; Word 2016+ — по спецификации,
+  Word на стенде нет).
+* **C**: `source`-значение из `out/stats.json` разрешается, вставка «устарела → обновилась»
+  существующим механизмом (`insert_is_stale`/`update_insert_values`/store-транзакция),
+  `formula.toml` в каталоге документа грузится без issues, каскад удаления документа переносит
+  формулы, `act_key` формулы стабилен/чувствителен к входу, цикл фрагментов детектируется.
+
+**Что НЕ делалось (честно):** реализация P1–P5 (значения, объект формулы, вставки, UI-панель,
+векторный экспорт) — только проектирование; Word-совместимость `svgBlip` фактически не проверена
+(Word на стенде отсутствует); производительность компиляции формул не измерялась; `vendor/wordcraft`
+не менялся.
+
+**Тесты:** `cargo test --workspace` — зелёный: **188 passed, 0 failed** (187 тестов + 1 doctest),
+число не изменилось (продуктовый код P0 не менялся). Доказательство — `git diff --stat` (только docs).
+
+**Следующий шаг:** ответы владельца на 5 вопросов §12 ADR-0005 (document-scope, формат SVG-вставки,
+место формулы в дереве, `value` при `source`, миграция демо) → **P1** (величины) → P2 (объект
+формулы) → P3 (вставки) → P4 (редактор) → P5 (вектор/обмен).
+
+**Проверить руками (P0):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh test --workspace                      # регрессия: 188 passed (187 + doctest), 0 failed
+git log -1 --oneline && git status --short                # docs(formulas): P0 — спайки и ADR-0005
+# Харнесс спайка A (нативный редактор + вкладка Equation в egui-панели):
+cp docs/spikes/harness/spike_p0_equation.rs.txt crates/rde-ui/examples/spike_p0_equation.rs
+cargo run -q -p rde-ui --example spike_p0_equation -- /tmp/spike-a.docx /tmp/spike-a-panel.png
+# Харнесс спайка B/C (вектор SVG + значение из артефакта):
+cp docs/spikes/harness/spike_p0_vector.rs.txt crates/rde-doc/examples/spike_p0_vector.rs
+cargo run -q -p rde-doc --example spike_p0_vector -- /tmp/spike-p0 bc
+rm crates/rde-ui/examples/spike_p0_equation.rs crates/rde-doc/examples/spike_p0_vector.rs
+```
+
