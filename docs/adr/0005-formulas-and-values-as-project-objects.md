@@ -3,7 +3,7 @@
 | Поле | Значение |
 |---|---|
 | Дата | 2026-10-26 |
-| Статус | **принято владельцем** (2026-10-26): формулы — **project-level** объекты, SVG-вставки — фикс WordCraft-writer в форке (P2.5) вместо переприменения в RDE; **реализация: P1, P2 — готово (2026-10-26), P2.5 — готово (2026-10-27), P3–P5 — в работе** |
+| Статус | **принято владельцем** (2026-10-26): формулы — **project-level** объекты, SVG-вставки — фикс WordCraft-writer в форке (P2.5) вместо переприменения в RDE; **реализация: P1, P2 — готово (2026-10-26), P2.5 — готово (2026-10-27), P3 — готово (2026-10-27), P4–P5 — в работе** |
 | Контекст | решения владельца по формулам (нативный редактор WordCraft, SVG-вектор, формулы/величины — объекты с зависимостями, project-level хранение формул, фикс writer'а в форке) + спайки P0 |
 | Нормативная база | [`docs/tz-03.md`](../tz-03.md): §4.2, §7.2/7.3, §8.3, §8.5, §9.4, §9.7; R-DOC-11…13, R-DOC-19…24, R-ART-09, R-TREE-01/02; NFR-LIC-02 |
 | Связанные ADR | [ADR-0001](0001-repo-layout-and-build.md) — WordCraft-форк; [ADR-0002](0002-component-boundaries.md) — границы крейтов; [ADR-0003](0003-deviations-from-tz02.md) — отклонения (poppler §15-2) |
@@ -579,7 +579,7 @@ act_key     = rde_hash::act_key("formula", "rde/formula@1", in_hash, Some(src_ha
 | **P1** value — **ГОТОВО (2026-10-26)** | `ConstantValue`+ (symbol/subscript/format/source), `constant_hash`, `resolve_constant`, формат value+NBSP+unit, rich-вставка, централизованная замена, UI-редактор констант | core, hash, dag, doc, ui | golden-хеши (совместимость литералов), резолвер из артефакта, stale→update (как C4–C6), kittest |
 | **P2** formula — **ГОТОВО (2026-10-26)** | `FormulaManifest` в `objects/formulas/` + загрузка/валидация/циклы, `formula_edges`/топопорядок, compile OMML/SVG/PNG в CAS, `[state]`/ledger, статусы/причины, переиспользование в документах | core, hash, dag, doc | тесты модели/циклов, стабильность act_key, компиляция σ=F/A (как A16/B), откат кэшей |
 | **P2.5** writer fix — **ГОТОВО (2026-10-27)** | WordCraft `crates/docx` (форк `rde/main` `a33bb6ce`): `InlineObject::Image.blip_ext`; чтение `a:blip/a:extLst` через `keep_embedded` (svg-медиа + rels + Content_Types в `Document::passthrough`), запись через `embedded_xml`; namespace `asvg`/`a14`; регрессионный тест `crates/docx/tests/svg_blip.rs`; запись в [`docs/wordcraft-fork.md`](../wordcraft-fork.md); пин субмодуля `f85cb9c9` → `a33bb6ce` отдельным RDE-коммитом | vendor/wordcraft, rde-docx (гейт) | форк: `cargo test -p wordcraft-docx` + `wordcraft-doc/docbin/formats/engine` 1456 passed, clippy/fmt/check зелёные; RDE: `rde-docx/tests/svg_blip_roundtrip.rs` (engine roundtrip + LO-оракул), 204 passed; fidelity-гейты не сломаны; пин поднят |
-| **P3** вставка | `RdeInsert kind="formula"`+`render_mode`, `rde:doc` 1→2, sdt-оболочка/якоря, update-транзакция формул+документов, конфликты R-DOC-13, «где вставлено» по всем документам, документно-локальная нумерация, миграция демо явной командой | doc, dag, ui | roundtrip OMML/SVG через `.doc.rde`, обновление/откат, миграция демо, OMML-гейт, svgBlip сохраняется после engine save (после P2.5) |
+| **P3** вставка — **ГОТОВО (2026-10-27)** | `RdeInsert kind="formula"`+`render_mode`, `rde:doc` 1→2, block/inline sdt-оболочка (`rde:formula:<id>`): OMML из кэша или `w:drawing` с `asvg:svgBlip`+PNG; обновление вставок (`update_formula_inserts`: пересборка содержимого, документно-локальная нумерация), статусы (Fresh/Stale/MissingTarget/NotComputed/BodyModified), «где вставлено» (`formula_backlinks`), update-транзакция формул+документов (одна tx, корни `formula/*`+`document/<id>`, откат), миграция OMML вне реестра (`unregistered_formulas`/`migrate_formulas`, явная идемпотентная); UI: диалог вставки, инспектор формулы, служебная группа «Формулы» в дереве, «Принять формулы как объекты»; демо σ мигрирована (OMML+SVG) | doc, dag, docx, ui | `rde-doc/tests/formula_insert.rs` (omml/svg + engine roundtrip + LO-оракул; обновление при изменении формулы и входа из артефакта одной tx; статусы; ручная правка; откат; миграция+идемпотентность), `rde-docx/tests/formula_gate.rs` (гейт `svg_blip`), kittest UI; демо fidelity PASS (`omml 1→1`, `svg_blip 1→1`, LO valid); **215 passed** (+11); скриншоты `docs/fidelity/gui-p3-formula-{dialog,inspector}.png` |
 | **P4** редактор | панель `equation_tab` в DocView, LaTeX-поле+предпросмотр, правка существующей, нумерация из объекта, команды RDE | ui | kittest-панель (как спайк A), вставка/правка формулы из UI, headless-скриншоты |
 | **P5** вектор/обмен | export-mode «формулы как SVG», PDF-гейт «нет растровых формул», обмен LaTeX (.tex/буфер), повторное использование SVG-кэшей для экспорта; опц. vendor-кандидаты (SVG-экспорт формулы, номер полем) | docx, doc, ui, vendor | LO/PDF-гейты (как B5), docx с svgBlip (после P2.5), `.tex` roundtrip |
 
@@ -643,3 +643,29 @@ P5 после P2/P3 (частично параллельно P4). Порядок
   [`docs/wordcraft-fork.md`](../wordcraft-fork.md); всего **204 passed** (203 теста + 1 doctest; +1 к
   P2). Полный `cargo test --workspace` форка не прогнан: при компиляции всех тест-бинарников на
   стенде переполнился диск (~12 ГБ на 16 ГБ свободных) — ограничение окружения, не кода.
+* **P3 (2026-10-27)** — зелёный: `RdeInsert kind="formula"` (`target=rde://formula/<id>@<act_key>`,
+  `render_mode=omml|svg`, `number`, `hash`, `cached`, `body_hash`), `rde:doc` schema `1→2`;
+  `rde-doc::formula_insert`: sdt-вставки (block — таблица 1×2/абзац, inline — sdt в абзаце) с OMML
+  или `asvg:svgBlip`+PNG (медиа-части/rels/Content_Types), `add_formula_insert`,
+  `update_formula_inserts` (пересборка содержимого + документно-локальная перенумерация; ручная
+  правка → `BodyModified`, не перезаписывается), `formula_insert_statuses` (Fresh/Stale/
+  MissingTarget/NotComputed/BodyModified), `formula_backlinks` (R-DOC-19), `unregistered_formulas`/
+  `migrate_formulas` (явная идемпотентная миграция OMML вне реестра). `rde-dag`: `prepare_formula_update`/
+  `prepared_formula_roots`/`prepared_formulas_payload`, `formula_ledger` читает смешанные tx
+  `document-formula-update`. `update_document_transactional` пересчитывает формулы и заменяет
+  вставки, фиксируя кэши и документ **одной** транзакцией store (корни `formula/*`+`document/<id>`),
+  откат восстанавливает прежние вставки. `rde-docx`: гейт `svg_blip` (`FidelityReport::passed()`).
+  UI: диалог «Вставить формулу» (выбор объекта, режим OMML/SVG), инспектор формулы (статус,
+  act_key, «где вставлено»), служебная группа «Формулы» в дереве (использование+статус,
+  переключатель «Служебные объекты»), команда «Принять формулы как объекты». Демо: σ — объект
+  `objects/formulas/01M5Y11F…` + вставки OMML (номер 1) и SVG-вектор, fidelity PASS
+  (`omml 1→1`, `svg_blip` 1→1/части 1→1, LO PDF valid). Тесты: `rde-doc/tests/formula_insert.rs`
+  (6: omml/svg + engine roundtrip + LO-оракул, обновление при изменении формулы и входа из артефакта
+  одной tx, статусы «цель отсутствует»/«устарело»/ручная правка, откат, миграция+идемпотентность),
+  `rde-docx/tests/formula_gate.rs`, `rde-ui` (диалог/инспектор/бэклинки), всего **215 passed**
+  (214 теста + 1 doctest; +11 к P2.5), 0 failed; `cargo check`/`test` по rde-core/dag/doc/docx/ui —
+  зелёные. Скриншоты: `docs/fidelity/gui-p3-formula-dialog.png`,
+  `docs/fidelity/gui-p3-formula-inspector.png` (просмотрены). Ограничения: Word на стенде нет
+  (svgBlip-совместимость Word 2016+ — по MS-ODRAWXML, LO-оракул проходит; неизвестные namespace
+  внутри extLst не сохраняются); нет нативного редактора (P4) и векторного экспорт-режима/обмена
+  LaTeX (P5); смена display/render_mode после вставки — только переоформлением.

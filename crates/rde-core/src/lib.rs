@@ -113,9 +113,12 @@ mod tests {
         assert!(project.issues.is_empty(), "issues: {:?}", project.issues);
         assert_eq!(
             project.object_count(),
-            11,
-            "демо-проект: 1 документ + 5 артефактов + 4 источника + 1 заметка + 1 репозиторий"
+            12,
+            "демо-проект: 1 документ + 5 артефактов + 4 источника + 1 заметка + 1 репозиторий + 1 формула (P3)"
         );
+        // P3: формула σ из документа — project-level объект (ADR-0005), а не содержимое документа.
+        assert_eq!(project.formulas().count(), 1);
+        assert!(project.formulas().next().is_some_and(|formula| formula.latex.contains("sigma")));
         // compute-артефакты без выходов честно «устарели»; данные/источники/заметки — актуальны/внешние.
         assert_eq!(project.stale_count(), 3);
         assert!(project.document_path().is_some_and(|p| p.is_file()));

@@ -3713,6 +3713,7 @@ dependencies = [
  "rde-doc",
  "rde-docx",
  "rde-env",
+ "rde-hash",
  "rde-run",
  "rde-sources",
  "rde-store",

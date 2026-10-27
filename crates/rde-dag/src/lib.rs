@@ -2002,7 +2002,12 @@ pub fn formula_ledger(store: &Store) -> Result<HashMap<String, FormulaState>, St
     let mut txs: Vec<TxRecord> = store.list_txs().map_err(|e| e.to_string())?;
     txs.retain(|tx| {
         tx.status == TxStatus::Committed
-            && tx.data.as_ref().and_then(|data| data.get("kind")).and_then(|kind| kind.as_str()) == Some("formula-update")
+            && matches!(
+                tx.data.as_ref().and_then(|data| data.get("kind")).and_then(|kind| kind.as_str()),
+                // P2: пересчёт формулы своей транзакцией; P3: пересчёт формул вместе с документом
+                // (ADR-0005 §3.3 — одна транзакция с корнями formula/* и document/<id>).
+                Some("formula-update") | Some("document-formula-update")
+            )
     });
     txs.sort_by(|a, b| a.started_unix.cmp(&b.started_unix).then_with(|| a.id.cmp(&b.id)));
     let mut ledger = HashMap::new();
@@ -2512,6 +2517,40 @@ pub fn compile_and_update_formula<F>(
 where
     F: FnOnce(&str, bool) -> Result<FormulaCompiled, String>,
 {
+    let prepared = prepare_formula_update(project, store, formula_id, renderer, compile)?;
+    let tx = commit_formula_update(store, &prepared.state, prepared.cache_tree, &format!("formula update: {formula_id}"))?;
+    record_prepared_formula_state(project, &prepared)?;
+    Ok(FormulaUpdateReport {
+        formula_id: prepared.state.formula_id.clone(),
+        act_key: prepared.state.act_key.clone(),
+        tx,
+        omml_hash: prepared.state.omml_hash.clone().unwrap_or_default(),
+        svg_hash: prepared.state.svg_hash.clone(),
+        png_hash: prepared.state.png_hash.clone(),
+    })
+}
+
+/// Подготовленное (но ещё не зафиксированное) обновление формулы: состояние для ledger и корень
+/// кэшей в CAS. Позволяет зафиксировать пересчёт формул **одной** транзакцией с документом
+/// (ADR-0005 §3.3): [`prepare_formula_update`] → правка документа → транзакция с корнями
+/// `formula/*` + `document/<id>` → [`record_prepared_formula_state`].
+#[derive(Clone, Debug)]
+pub struct PreparedFormulaUpdate {
+    pub state: FormulaState,
+    pub cache_tree: Option<Hash>,
+}
+
+/// Вычислить формулу и положить кэши в CAS, **не** фиксируя транзакцию и `[state]`.
+pub fn prepare_formula_update<F>(
+    project: &Project,
+    store: &mut Store,
+    formula_id: &str,
+    renderer: &FormulaRenderer<'_>,
+    compile: F,
+) -> Result<PreparedFormulaUpdate, String>
+where
+    F: FnOnce(&str, bool) -> Result<FormulaCompiled, String>,
+{
     let artifact_ledger = ledger(store)?;
     let formula_ledger = formula_ledger(store)?;
     let resolved = resolve_formula(project, &artifact_ledger, &formula_ledger, formula_id, renderer)?;
@@ -2562,22 +2601,36 @@ where
         png_hash: png_hash.clone(),
         updated_unix: now,
     };
-    let tx = commit_formula_update(store, &state, Some(tree), &format!("formula update: {formula_id}"))?;
+    Ok(PreparedFormulaUpdate { state, cache_tree: Some(tree) })
+}
+
+/// Записать `[state]` подготовленных формул в `formula.toml` (после успешной транзакции).
+pub fn record_prepared_formula_state(project: &Project, prepared: &PreparedFormulaUpdate) -> Result<(), String> {
+    let formula_id = &prepared.state.formula_id;
+    let formula_object = project
+        .formula_object(formula_id)
+        .ok_or_else(|| format!("формула {formula_id} не найдена"))?;
     rde_core::record_formula_state(
         &formula_object.dir,
-        &state.act_key,
-        state.resolved_latex_hash.as_deref().unwrap_or(""),
-        state.omml_hash.as_deref().unwrap_or(""),
-        svg_hash.as_deref(),
-        png_hash.as_deref(),
-        now,
-    )?;
-    Ok(FormulaUpdateReport {
-        formula_id: formula_id.to_owned(),
-        act_key: state.act_key.clone(),
-        tx,
-        omml_hash: state.omml_hash.clone().unwrap_or_default(),
-        svg_hash,
-        png_hash,
-    })
+        &prepared.state.act_key,
+        prepared.state.resolved_latex_hash.as_deref().unwrap_or(""),
+        prepared.state.omml_hash.as_deref().unwrap_or(""),
+        prepared.state.svg_hash.as_deref(),
+        prepared.state.png_hash.as_deref(),
+        prepared.state.updated_unix,
+    )
+}
+
+/// Payload-фрагмент транзакции для подготовленных формул: `{"formulas": [states…]}`.
+pub fn prepared_formulas_payload(prepared: &[PreparedFormulaUpdate]) -> serde_json::Value {
+    let states: Vec<&FormulaState> = prepared.iter().map(|prepared| &prepared.state).collect();
+    serde_json::json!({ "formulas": states })
+}
+
+/// Корни `formula/<id>` → дерево кэшей для транзакции, фиксирующей пересчёт формул.
+pub fn prepared_formula_roots(prepared: &[PreparedFormulaUpdate]) -> std::collections::BTreeMap<String, Hash> {
+    prepared
+        .iter()
+        .filter_map(|prepared| prepared.cache_tree.map(|tree| (formula_root_name(&prepared.state.formula_id), tree)))
+        .collect()
 }

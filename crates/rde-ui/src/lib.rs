@@ -523,12 +523,16 @@ struct TrustDialogState {
     dependents: bool,
 }
 
-/// Диалог «Вставить в документ»: значение или рисунок из артефакта (R-DOC-11).
+/// Диалог «Вставить в документ»: значение/рисунок из артефакта (R-DOC-11) или формула (P3).
 #[derive(Clone, Debug)]
 struct InsertDialogState {
-    /// `value` | `figure`.
+    /// `value` | `figure` | `formula` | …
     kind: String,
     artifact_id: String,
+    /// Формула: id project-level объекта (P3).
+    formula_id: String,
+    /// Формула: `omml` (редактируемый Word-объект) | `svg` (векторная картинка).
+    render_mode: String,
     selector: String,
     pointer: String,
     caption: String,
@@ -539,6 +543,15 @@ struct InsertDialogState {
     precision: usize,
     /// Ошибка валидации, показываемая в диалоге (P8-B1).
     error: String,
+}
+
+/// Данные инспектора формулы (P3): живой статус, act_key и «где вставлено» (R-DOC-19).
+#[derive(Clone, Debug, Default)]
+struct FormulaInspectorData {
+    status: Option<rde_dag::FormulaLiveStatus>,
+    act_key: Option<String>,
+    backlinks: Vec<rde_doc::FormulaBacklink>,
+    unregistered: usize,
 }
 
 impl InsertDialogState {
@@ -655,6 +668,11 @@ pub struct RdeApp {
     backup_dialog: Option<Vec<PathBuf>>,
     /// Блок-якорь вставки: каретка в DocView или выбранный блок в «Структуре» (P8-B1).
     insert_anchor_block: Option<usize>,
+    /// Показывать служебные объекты в дереве (R-TREE-01/02): группа «Формулы» скрыта по
+    /// умолчанию, переключатель — вкладка «Вид» (P3).
+    show_service_objects: bool,
+    /// Подписи служебных объектов в дереве: id формулы → «N вставок · статус» (P3, R-DOC-19).
+    formula_labels: BTreeMap<String, String>,
 }
 
 impl RdeApp {
@@ -718,6 +736,8 @@ impl RdeApp {
             auto_updating: false,
             backup_dialog: None,
             insert_anchor_block: None,
+            show_service_objects: false,
+            formula_labels: BTreeMap::new(),
         };
         app.auto_update = app.project.manifest.document_auto_update;
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
@@ -1039,6 +1059,8 @@ impl RdeApp {
         let mut dialog = InsertDialogState {
             kind: kind.to_owned(),
             artifact_id: String::new(),
+            formula_id: String::new(),
+            render_mode: "omml".to_owned(),
             selector: String::new(),
             pointer: String::new(),
             caption: String::new(),
@@ -1048,6 +1070,17 @@ impl RdeApp {
             error: String::new(),
         };
         match kind {
+            "formula" => {
+                let Some(formula) = self.project.formulas().next() else {
+                    self.push_log(
+                        Level::Warn,
+                        "Вставка формулы: в проекте нет formulas-объектов (P3: миграция — «Принять формулы как объекты»)",
+                    );
+                    return;
+                };
+                dialog.formula_id = formula.id.clone();
+                dialog.format = "raw".to_owned();
+            }
             "table" => {
                 let artifact = self
                     .insertable_artifacts()
@@ -1182,6 +1215,13 @@ impl RdeApp {
             self.push_log(Level::Warn, "Вставка: хранилище проекта не открыто");
             return;
         }
+        // Формула (P3): кэши OMML/SVG — из formula-объекта (при необходимости пересчёт), затем
+        // вставка sdt-ссылки `rde://formula/<id>@<act_key>` с render_mode.
+        if dialog.kind == "formula" {
+            let result = self.formula_insert_from_dialog(&dialog, &package);
+            self.finish_insert(&package, result);
+            return;
+        }
         let pointer = dialog.pointer.trim().trim_start_matches('#');
         let artifact_uri = if pointer.is_empty() {
             format!("rde://artifact/{}/{}", dialog.artifact_id, dialog.selector)
@@ -1306,15 +1346,20 @@ impl RdeApp {
         if renumber {
             let _ = rde_doc::renumber_insert_captions(&package);
         }
+        self.finish_insert(&package, result);
+    }
+
+    /// Общий хвост вставки: версия документа в store, перезагрузка UI и журнал.
+    fn finish_insert(&mut self, package: &Path, result: Result<(rde_doc::InsertReport, String), String>) {
+        // Версия документа в store (транзакция с корнем document/<id>).
         match result {
             Ok((report, hash)) => {
-                // Версия документа в store (транзакция с корнем document/<id>).
                 let doc_id = self.project.document_object().and_then(|object| match &object.data {
                     ObjectData::Document(manifest) => Some(manifest.id.clone()),
                     _ => None,
                 });
                 if let (Some(store), Some(doc_id)) = (self.store.as_mut(), doc_id) {
-                    if let Err(error) = rde_doc::commit_document(&self.project.root, &package, &doc_id, store, "document insert") {
+                    if let Err(error) = rde_doc::commit_document(&self.project.root, package, &doc_id, store, "document insert") {
                         self.push_log(Level::Warn, format!("Вставка: версия документа не зафиксирована: {error}"));
                     }
                 }
@@ -1325,10 +1370,251 @@ impl RdeApp {
                 self.reload_project();
                 self.push_log(
                     Level::Ok,
-                    format!("Вставка {} ({}) добавлена в документ (hash {})", report.insert.id, report.insert.kind, hash.chars().take(10).collect::<String>()),
+                    format!(
+                        "Вставка {} ({}{}) добавлена в документ (hash {})",
+                        report.insert.id,
+                        report.insert.kind,
+                        if report.insert.render_mode.is_empty() { String::new() } else { format!(", {}", report.insert.render_mode) },
+                        hash.chars().take(10).collect::<String>()
+                    ),
                 );
             }
             Err(error) => self.push_log(Level::Warn, format!("Вставка не добавлена: {error}")),
+        }
+    }
+
+    /// Вставка формулы (P3): кэш-бандл из formula-объекта (при устаревании — пересчёт), затем
+    /// sdt-вставка с render_mode = omml|svg. Возвращает (отчёт, act_key).
+    fn formula_insert_from_dialog(
+        &mut self,
+        dialog: &InsertDialogState,
+        package: &Path,
+    ) -> Result<(rde_doc::InsertReport, String), String> {
+        let renderer = rde_dag::FormulaRenderer {
+            id: rde_doc::FORMULA_RENDERER_ID,
+            version: rde_doc::FORMULA_RENDERER_VERSION,
+        };
+        let formula_id = dialog.formula_id.clone();
+        let display = {
+            let object = self.project.formula_object(&formula_id).ok_or_else(|| format!("формула {formula_id} не найдена"))?;
+            let ObjectData::Formula(formula) = &object.data else { return Err("объект не формула".to_owned()) };
+            formula.display
+        };
+        {
+            let project = &self.project;
+            let store = self.store.as_mut().ok_or("хранилище проекта не открыто")?;
+            let artifact_ledger = rde_dag::ledger(store)?;
+            let formula_ledger = rde_dag::formula_ledger(store)?;
+            let resolved = rde_dag::resolve_formula(project, &artifact_ledger, &formula_ledger, &formula_id, &renderer)?;
+            let current = resolved.act_key.hex();
+            let stale = formula_ledger.get(&formula_id).map(|state| state.act_key != current).unwrap_or(true);
+            if stale {
+                rde_dag::compile_and_update_formula(project, store, &formula_id, &renderer, |latex, display| {
+                    let caches = rde_doc::compile_formula(latex, display)?;
+                    Ok(rde_dag::FormulaCompiled { omml: caches.omml, svg: caches.svg, png: caches.png })
+                })?;
+            }
+        }
+        let store = self.store.as_ref().ok_or("хранилище проекта не открыто")?;
+        let formula_ledger = rde_dag::formula_ledger(store)?;
+        let state = formula_ledger.get(&formula_id).ok_or_else(|| format!("формула {formula_id} не вычислена"))?;
+        let load = |hash: &Option<String>| -> Result<Vec<u8>, String> {
+            let hash = hash.as_deref().ok_or("нет кэша формулы")?;
+            let hash = rde_hash::Hash::from_hex(hash).map_err(|e| format!("хеш кэша формулы: {e}"))?;
+            store.get_blob(hash).map_err(|e| e.to_string())?.ok_or_else(|| "кэш формулы отсутствует в CAS".to_owned())
+        };
+        let body = rde_doc::FormulaBody {
+            formula_id: formula_id.clone(),
+            act_key: state.act_key.clone(),
+            latex: state.resolved_latex.clone(),
+            display,
+            numbered: display,
+            omml: load(&state.omml_hash)?,
+            svg: state.svg_hash.as_ref().map(|_| load(&state.svg_hash)).transpose()?,
+            png: state.png_hash.as_ref().map(|_| load(&state.png_hash)).transpose()?,
+        };
+        let report = rde_doc::add_formula_insert(
+            package,
+            rde_doc::FormulaInsertRequest {
+                body,
+                render_mode: dialog.render_mode.clone(),
+                anchor_block: self.insert_anchor_block,
+            },
+        )?;
+        Ok((report, state.act_key.clone()))
+    }
+
+    /// «Принять формулы как объекты» (P3, ADR-0005 §7): OMML вне реестра → project-level формулы +
+    /// вставки-ссылки. Явная команда; при открытии документа ничего не меняется. Идемпотентна.
+    pub fn migrate_document_formulas(&mut self) {
+        let Some(package) = self.project.document_path() else {
+            self.push_log(Level::Warn, "Миграция формул: в проекте нет документа");
+            return;
+        };
+        if !rde_doc::is_rde_package(&package) {
+            self.push_log(Level::Warn, "Миграция формул: документ ещё не в .doc.rde (сначала «Сохранить проект»)");
+            return;
+        }
+        if self.store.is_none() {
+            self.push_log(Level::Warn, "Миграция формул: хранилище проекта не открыто");
+            return;
+        }
+        let equations = match rde_doc::unregistered_formulas(&package) {
+            Ok(equations) => equations,
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Миграция формул: {error}"));
+                return;
+            }
+        };
+        if equations.is_empty() {
+            self.push_log(Level::Info, "Миграция формул: формул вне реестра нет");
+            return;
+        }
+        let renderer = rde_dag::FormulaRenderer { id: rde_doc::FORMULA_RENDERER_ID, version: rde_doc::FORMULA_RENDERER_VERSION };
+        let mut plans: Vec<rde_doc::FormulaMigrationPlan> = Vec::new();
+        let mut created = 0usize;
+        for equation in &equations {
+            // Та же формула (по LaTeX) уже может быть объектом проекта — не дублируем.
+            let existing = self
+                .project
+                .formulas()
+                .find(|formula| formula.latex.trim() == equation.latex.trim())
+                .map(|formula| formula.id.clone());
+            let formula_id = match existing {
+                Some(id) => id,
+                None => {
+                    let title: String = equation.latex.chars().take(40).collect();
+                    match rde_core::create_formula(&self.project.root, &title, &equation.latex) {
+                        Ok(dir) => {
+                            created += 1;
+                            self.reload_project();
+                            dir.file_name().and_then(|name| name.to_str()).map(str::to_owned).unwrap_or_default()
+                        }
+                        Err(error) => {
+                            self.push_log(Level::Warn, format!("Миграция формул: {error}"));
+                            return;
+                        }
+                    }
+                }
+            };
+            let prepared = {
+                let project = &self.project;
+                let Some(store) = self.store.as_mut() else { return };
+                match rde_dag::prepare_formula_update(project, store, &formula_id, &renderer, |latex, display| {
+                    let caches = rde_doc::compile_formula(latex, display)?;
+                    Ok(rde_dag::FormulaCompiled { omml: caches.omml, svg: caches.svg, png: caches.png })
+                }) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.push_log(Level::Warn, format!("Миграция формул ({formula_id}): {error}"));
+                        return;
+                    }
+                }
+            };
+            // Кэши и состояние формулы — отдельной транзакцией (формула нужна вставке как цель).
+            if let Some(store) = self.store.as_mut() {
+                if let Err(error) =
+                    rde_dag::commit_formula_update(store, &prepared.state, prepared.cache_tree, &format!("formula migrate: {formula_id}"))
+                {
+                    self.push_log(Level::Warn, format!("Миграция формул: {error}"));
+                    return;
+                }
+            }
+            let _ = rde_dag::record_prepared_formula_state(&self.project, &prepared);
+            let omml = {
+                let Some(store) = self.store.as_ref() else { return };
+                let hash = prepared.state.omml_hash.as_deref().unwrap_or_default();
+                rde_hash::Hash::from_hex(hash)
+                    .ok()
+                    .and_then(|hash| store.get_blob(hash).ok().flatten())
+                    .unwrap_or_default()
+            };
+            plans.push(rde_doc::FormulaMigrationPlan {
+                formula_id,
+                act_key: prepared.state.act_key.clone(),
+                latex: equation.latex.clone(),
+                omml,
+            });
+        }
+        match rde_doc::migrate_formulas(&package, &plans) {
+            Ok(report) => {
+                if let (Some(store), Some(doc_id)) = (
+                    self.store.as_mut(),
+                    self.project.document_object().and_then(|object| match &object.data {
+                        ObjectData::Document(manifest) => Some(manifest.id.clone()),
+                        _ => None,
+                    }),
+                ) {
+                    let _ = rde_doc::commit_document(&self.project.root, &package, &doc_id, store, "formula migrate");
+                }
+                self.doc = DocPreview::new(self.project.document_path());
+                self.structure_cache = None;
+                self.inserts_cache = None;
+                self.reload_project();
+                self.push_log(
+                    Level::Ok,
+                    format!(
+                        "Миграция формул: объектов создано {created}, вставок {} (таблиц {} · абзацев {} · inline {}); запустите «Обновить документ» для проверки статусов",
+                        report.insert_ids.len(),
+                        report.replaced_tables,
+                        report.replaced_blocks,
+                        report.replaced_inline
+                    ),
+                );
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Миграция формул: {error}")),
+        }
+    }
+
+    /// Подписи формул для дерева/дерева-служебных объектов: «N вставок · статус» (P3).
+    fn formula_tree_labels(&self) -> BTreeMap<String, String> {
+        let Some(store) = self.store.as_ref() else { return BTreeMap::new() };
+        let renderer = rde_dag::FormulaRenderer { id: rde_doc::FORMULA_RENDERER_ID, version: rde_doc::FORMULA_RENDERER_VERSION };
+        let Ok(statuses) = rde_dag::formula_statuses(&self.project, store, &renderer) else { return BTreeMap::new() };
+        let documents: Vec<(String, String, PathBuf)> = self.formula_documents();
+        let mut labels = BTreeMap::new();
+        for formula in self.project.formulas() {
+            let usage = rde_doc::formula_backlinks(&documents, &formula.id).map(|links| links.len()).unwrap_or(0);
+            let status = statuses
+                .get(&formula.id)
+                .map(|status| status.status.label_ru().to_owned())
+                .unwrap_or_else(|| "статус неизвестен".to_owned());
+            labels.insert(formula.id.clone(), format!("{usage} вст. · {status}"));
+        }
+        labels
+    }
+
+    /// Документы проекта для обратных ссылок формул: (id, заголовок, путь пакета).
+    fn formula_documents(&self) -> Vec<(String, String, PathBuf)> {
+        self.project
+            .documents()
+            .filter_map(|object| {
+                let ObjectData::Document(manifest) = &object.data else { return None };
+                Some((manifest.id.clone(), object.title.clone(), object.dir.join(&manifest.file)))
+            })
+            .collect()
+    }
+
+    /// Данные панели инспектора формулы: живой статус, обратные ссылки, «формулы вне реестра».
+    fn formula_inspector_data(&self, formula_id: &str) -> FormulaInspectorData {
+        let store = self.store.as_ref();
+        let renderer = rde_dag::FormulaRenderer { id: rde_doc::FORMULA_RENDERER_ID, version: rde_doc::FORMULA_RENDERER_VERSION };
+        let status = store
+            .and_then(|store| rde_dag::formula_statuses(&self.project, store, &renderer).ok())
+            .and_then(|statuses| statuses.get(formula_id).map(|status| (status.status.clone(), status.act_key.clone())));
+        let backlinks = rde_doc::formula_backlinks(&self.formula_documents(), formula_id).unwrap_or_default();
+        let unregistered = self
+            .project
+            .document_path()
+            .filter(|path| rde_doc::is_rde_package(path))
+            .and_then(|path| rde_doc::unregistered_formulas(&path).ok())
+            .map(|equations| equations.len())
+            .unwrap_or(0);
+        FormulaInspectorData {
+            status: status.as_ref().map(|(status, _)| status.clone()),
+            act_key: status.and_then(|(_, act_key)| act_key),
+            backlinks,
+            unregistered,
         }
     }
 
@@ -1516,6 +1802,8 @@ impl RdeApp {
         let mut images: std::collections::BTreeMap<String, (String, Vec<u8>)> = std::collections::BTreeMap::new();
         let mut tables: std::collections::BTreeMap<String, Vec<Vec<String>>> = std::collections::BTreeMap::new();
         let mut errors: Vec<String> = Vec::new();
+        // Формульные вставки документа: id формул-целей (P3, ADR-0005 §3.3).
+        let mut formula_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let source_ids: Vec<String> = self.project.sources().map(|source| source.id.clone()).collect();
         {
             let Some(store) = self.store.as_ref() else {
@@ -1574,6 +1862,13 @@ impl RdeApp {
                     }
                 } else if insert.kind == "date" {
                     values.insert(insert.id.clone(), today_iso_date());
+                } else if insert.kind == "formula" {
+                    // Формула (P3): цель — project-level объект; кэши/статус — через rde-dag.
+                    if let Some(target) = rde_doc::parse_formula_target(&insert.target) {
+                        formula_ids.insert(target.formula_id);
+                    } else {
+                        errors.push(format!("{}: некорректная ссылка на формулу", insert.id));
+                    }
                 }
             }
         }
@@ -1584,9 +1879,110 @@ impl RdeApp {
             self.push_log(Level::Warn, "Обновить документ: объект документа не найден");
             return;
         };
+        // Формулы: актуальность/пересчёт кэшей (ADR-0005 §3.3). Устаревшие/невычисленные формулы
+        // пересчитываются здесь, их кэши фиксируются ТОЙ ЖЕ транзакцией, что и документ.
+        let renderer = rde_dag::FormulaRenderer { id: rde_doc::FORMULA_RENDERER_ID, version: rde_doc::FORMULA_RENDERER_VERSION };
+        let mut formula_bodies: BTreeMap<String, rde_doc::FormulaBody> = BTreeMap::new();
+        let mut prepared_formulas: Vec<rde_dag::PreparedFormulaUpdate> = Vec::new();
+        let mut formula_availability: BTreeMap<String, rde_doc::FormulaAvailability> = BTreeMap::new();
+        {
+            let project = &self.project;
+            let Some(store) = self.store.as_mut() else { return };
+            let statuses = rde_dag::formula_statuses(project, store, &renderer).unwrap_or_default();
+            for formula_id in &formula_ids {
+                let Some(status) = statuses.get(formula_id) else {
+                    formula_availability.insert(formula_id.clone(), rde_doc::FormulaAvailability::Missing);
+                    errors.push(format!("формула {} не найдена (вставка «цель отсутствует»)", formula_id.chars().take(8).collect::<String>()));
+                    continue;
+                };
+                match &status.status {
+                    rde_dag::FormulaLiveStatus::NotComputable(reason) => {
+                        formula_availability.insert(formula_id.clone(), rde_doc::FormulaAvailability::NotComputed(reason.clone()));
+                        errors.push(format!("формула {}: {reason}", formula_id.chars().take(8).collect::<String>()));
+                    }
+                    rde_dag::FormulaLiveStatus::Fresh => {
+                        let ledger = rde_dag::formula_ledger(store).unwrap_or_default();
+                        let Some(state) = ledger.get(formula_id) else { continue };
+                        let display = project
+                            .formula_object(formula_id)
+                            .and_then(|object| match &object.data {
+                                ObjectData::Formula(formula) => Some(formula.display),
+                                _ => None,
+                            })
+                            .unwrap_or(true);
+                        match formula_body_from_state(store, formula_id, state, display) {
+                            Ok(body) => {
+                                formula_availability.insert(formula_id.clone(), rde_doc::FormulaAvailability::Current(state.act_key.clone()));
+                                formula_bodies.insert(formula_id.clone(), body);
+                            }
+                            Err(error) => errors.push(format!("формула {}: {error}", formula_id.chars().take(8).collect::<String>())),
+                        }
+                    }
+                    rde_dag::FormulaLiveStatus::Stale(_) | rde_dag::FormulaLiveStatus::NeverComputed => {
+                        let compiled = rde_dag::prepare_formula_update(project, store, formula_id, &renderer, |latex, display| {
+                            let caches = rde_doc::compile_formula(latex, display)?;
+                            Ok(rde_dag::FormulaCompiled { omml: caches.omml, svg: caches.svg, png: caches.png })
+                        });
+                        match compiled {
+                            Ok(prepared) => {
+                                let display = project
+                                    .formula_object(formula_id)
+                                    .and_then(|object| match &object.data {
+                                        ObjectData::Formula(formula) => Some(formula.display),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(true);
+                                match formula_body_from_state(store, formula_id, &prepared.state, display) {
+                                    Ok(body) => {
+                                        formula_availability
+                                            .insert(formula_id.clone(), rde_doc::FormulaAvailability::Current(prepared.state.act_key.clone()));
+                                        formula_bodies.insert(formula_id.clone(), body);
+                                        prepared_formulas.push(prepared);
+                                    }
+                                    Err(error) => errors.push(format!("формула {}: {error}", formula_id.chars().take(8).collect::<String>())),
+                                }
+                            }
+                            Err(error) => {
+                                formula_availability.insert(formula_id.clone(), rde_doc::FormulaAvailability::NotComputed(error.clone()));
+                                errors.push(format!("формула {}: {error}", formula_id.chars().take(8).collect::<String>()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let formula_roots = rde_dag::prepared_formula_roots(&prepared_formulas);
+        let formula_payload = if prepared_formulas.is_empty() {
+            None
+        } else {
+            let mut payload = rde_dag::prepared_formulas_payload(&prepared_formulas);
+            payload["kind"] = serde_json::json!("document-formula-update");
+            Some(payload)
+        };
         let Some(store) = self.store.as_mut() else { return };
-        match rde_doc::update_document_transactional(&self.project.root, &package, &doc_id, &values, &hashes, &images, &tables, store) {
+        match rde_doc::update_document_transactional(
+            &self.project.root,
+            &package,
+            &doc_id,
+            &values,
+            &hashes,
+            &images,
+            &tables,
+            &formula_bodies,
+            &formula_roots,
+            formula_payload,
+            store,
+        ) {
             Ok(report) => {
+                // `[state]` пересчитанных формул — зеркало ledger в formula.toml (после tx).
+                for prepared in &prepared_formulas {
+                    let _ = rde_dag::record_prepared_formula_state(&self.project, prepared);
+                }
+                let formula_statuses = rde_doc::formula_insert_statuses(&package, &formula_availability).unwrap_or_default();
+                let stale_count = formula_statuses
+                    .iter()
+                    .filter(|status| status.state == rde_doc::FormulaInsertState::Stale)
+                    .count();
                 self.editor = None;
                 self.doc = DocPreview::new(self.project.document_path());
                 self.structure_cache = None;
@@ -1594,15 +1990,34 @@ impl RdeApp {
                 self.push_log(
                     Level::Ok,
                     format!(
-                        "Документ обновлён: вставок {} (значения {} / рисунки {}), подписей изменено {}, diff: {}; транзакция {}",
-                        report.insert_updates.len() + report.figure_updates.len() + report.table_updates,
+                        "Документ обновлён: вставок {} (значения {} / рисунки {} / формулы {}), подписей изменено {}, diff: {}; транзакция {}",
+                        report.insert_updates.len() + report.figure_updates.len() + report.table_updates + report.formula_updates.len(),
                         report.insert_updates.len(),
                         report.figure_updates.len() + report.table_updates,
+                        report.formula_updates.len(),
                         report.caption_changes.len(),
                         report.diff.summary_ru(),
                         report.txid.as_deref().map(|txid| &txid[..10.min(txid.len())]).unwrap_or("—")
                     ),
                 );
+                for id in &report.formula_conflicts {
+                    self.push_log(
+                        Level::Warn,
+                        format!("Вставка {id}: тело правили вручную (R-DOC-13) — не перезаписано, «принять» вручную"),
+                    );
+                }
+                for id in &report.formula_missing {
+                    self.push_log(Level::Warn, format!("Вставка {id}: цель отсутствует — формула удалена/не найдена"));
+                }
+                for status in formula_statuses.iter().filter(|status| status.state != rde_doc::FormulaInsertState::Fresh) {
+                    self.push_log(
+                        Level::Warn,
+                        format!("Вставка {}: {} — {}", status.insert_id, status.state.label_ru(), status.detail),
+                    );
+                }
+                if stale_count > 0 {
+                    self.push_log(Level::Warn, format!("Формульных вставок устарело: {stale_count} — повторите «Обновить документ»"));
+                }
                 if let Some(backup) = &report.backup {
                     self.push_log(Level::Info, format!("Бэкап документа: {}", backup.display()));
                 }
@@ -1646,6 +2061,8 @@ impl RdeApp {
             }
         }
         self.dag_statuses = statuses;
+        // Подписи служебных формул для дерева: «N вставок · статус» (P3, R-DOC-19).
+        self.formula_labels = self.formula_tree_labels();
     }
 
     /// Перезагрузить проект с диска и обновить статусы/документ.
@@ -1864,9 +2281,15 @@ impl RdeApp {
         }
     }
 
-    /// Для демо/скриншотов: открыть диалог вставки (`value` или `figure`).
+    /// Для демо/скриншотов: открыть диалог вставки (`value`, `figure`, `formula`…).
     pub fn demo_open_insert_dialog(&mut self, kind: &str) {
         self.open_insert_dialog(kind);
+    }
+
+    /// Для демо/скриншотов: показать служебные объекты (формулы) в дереве (P3).
+    pub fn demo_show_service_objects(&mut self) {
+        self.show_service_objects = true;
+        self.formula_labels = self.formula_tree_labels();
     }
 
     /// Для демо/скриншотов: переключить нижнюю панель (0 — Журнал, 1 — Задачи, 2 — Агент).
@@ -2108,6 +2531,8 @@ impl RdeApp {
             Cmd::InsertCrossref => self.open_insert_dialog("crossref"),
             Cmd::InsertCitation => self.open_insert_dialog("citation"),
             Cmd::InsertDate => self.open_insert_dialog("date"),
+            Cmd::InsertFormula => self.open_insert_dialog("formula"),
+            Cmd::MigrateFormulas => self.migrate_document_formulas(),
             Cmd::ApplyGost => self.update_document_package(true, true),
             Cmd::InsertBibliography => self.update_document_package(false, true),
             Cmd::Zoom100 => self.run_editor_action("view.zoom100"),
@@ -2152,6 +2577,17 @@ impl RdeApp {
             Cmd::ToggleAgent => self.show_agent = !self.show_agent,
             Cmd::ToggleLogs => self.show_logs = !self.show_logs,
             Cmd::ToggleInspector => self.show_inspector = !self.show_inspector,
+            Cmd::ToggleServiceObjects => {
+                self.show_service_objects = !self.show_service_objects;
+                self.push_log(
+                    Level::Info,
+                    if self.show_service_objects {
+                        "Дерево: служебные объекты показаны (формулы проекта — использование и статус)"
+                    } else {
+                        "Дерево: служебные объекты скрыты"
+                    },
+                );
+            }
             Cmd::Audit => self.audit_dialog = Some(self.audit_lines()),
             Cmd::About => self.about_open = true,
         }
@@ -2181,6 +2617,7 @@ impl RdeApp {
             Cmd::ToggleAgent => self.show_agent,
             Cmd::ToggleLogs => self.show_logs,
             Cmd::ToggleInspector => self.show_inspector,
+            Cmd::ToggleServiceObjects => self.show_service_objects,
             Cmd::ToggleAutoUpdate => self.auto_update,
             _ => false,
         }
@@ -2538,6 +2975,10 @@ impl RdeApp {
         let object_count = self.project.object_count();
         let filter = self.tree_filter.to_lowercase();
         let selected = self.selected.clone();
+        // Служебные объекты (формулы, R-TREE-01/02): скрыты по умолчанию; подписи — «N вставок ·
+        // статус» (P3, R-DOC-19).
+        let show_service = self.show_service_objects;
+        let formula_labels = self.formula_labels.clone();
         let mut clicked: Option<String> = None;
         let mut action: Option<TreeAction> = None;
         let mut new_object = false;
@@ -2576,7 +3017,7 @@ impl RdeApp {
                 }
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().id_salt("rde_tree_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                    for group in groups.iter().filter(|group| !tree_group_hidden(group.kind)) {
+                    for group in groups.iter().filter(|group| show_service || !tree_group_hidden(group.kind)) {
                         let visible: Vec<&rde_core::Object> = group
                             .objects
                             .iter()
@@ -2590,14 +3031,19 @@ impl RdeApp {
                         egui::CollapsingHeader::new(header).default_open(true).show(ui, |ui| {
                             for obj in visible {
                                 let is_sel = selected.as_deref() == Some(obj.id.as_str());
+                                // Формулы (служебные объекты): в подписи — использование и статус.
+                                let row_title = formula_labels
+                                    .get(&obj.id)
+                                    .map(|label| format!("{} · {}", obj.title, label))
+                                    .unwrap_or_else(|| obj.title.clone());
                                 let resp = ui
                                     .horizontal(|ui| {
                                         ui.label(RichText::new("●").color(freshness_color(obj.freshness, pal)).size(FS_CAPTION));
                                         ui.label(RichText::new(kind_icon(obj.kind)).color(pal.muted).size(FS_BODY));
                                         // Панель можно сузить: длинные названия обрезаются с «…»,
                                         // полное название — в подсказке и в инспекторе.
-                                        ui.add(egui::Button::selectable(is_sel, RichText::new(&obj.title).size(FS_BODY)).truncate())
-                                            .on_hover_text(&obj.title)
+                                        ui.add(egui::Button::selectable(is_sel, RichText::new(&row_title).size(FS_BODY)).truncate())
+                                            .on_hover_text(&row_title)
                                     })
                                     .inner;
                                 // M6: контекстное меню объекта (правая кнопка мыши).
@@ -2906,6 +3352,7 @@ impl RdeApp {
         let mut bibliography_clicked = false;
         let mut word_copy_clicked = false;
         let mut review_import_clicked = false;
+        let mut migrate_formulas_clicked = false;
         // Инспектор (19-8): 340 px по умолчанию, перетаскивается в диапазоне 280–480 px —
         // центр документа и DAG не должны обрезаться. Ширины — константы раскладки выше.
         egui::Panel::right("rde_inspector")
@@ -3065,6 +3512,54 @@ impl RdeApp {
                             if formula.state.computed_at > 0 {
                                 field_row(ui, "вычислена", &format!("unix {}", formula.state.computed_at), false);
                             }
+                            // P3: живой статус формулы и «где вставлено» (R-DOC-19), плюс явная
+                            // миграция формул вне реестра (ADR-0005 §7).
+                            let panel = self.formula_inspector_data(&formula.id);
+                            ui.add_space(4.0);
+                            let (status_label, status_color) = match &panel.status {
+                                Some(rde_dag::FormulaLiveStatus::Fresh) => ("актуальна", pal.green),
+                                Some(rde_dag::FormulaLiveStatus::Stale(_)) => ("устарела", pal.amber),
+                                Some(rde_dag::FormulaLiveStatus::NeverComputed) => ("не вычислена", pal.amber),
+                                Some(rde_dag::FormulaLiveStatus::NotComputable(_)) => ("ошибка", pal.red),
+                                None => ("статус неизвестен", pal.muted),
+                            };
+                            field_row(ui, "статус", status_label, false);
+                            let _ = status_color;
+                            if let Some(reason) = panel.status.as_ref().and_then(|status| status.reason()) {
+                                ui.label(RichText::new(reason).small().color(pal.muted));
+                            }
+                            if let Some(act_key) = &panel.act_key {
+                                field_row(ui, "act_key (текущий)", &act_key.chars().take(20).collect::<String>(), true);
+                            }
+                            ui.add_space(6.0);
+                            section_caption(ui, &format!("где вставлено (вставок {})", panel.backlinks.len()));
+                            if panel.backlinks.is_empty() {
+                                ui.label(RichText::new("вставок нет").small().color(pal.muted));
+                            }
+                            for link in &panel.backlinks {
+                                let mode = if link.render_mode.is_empty() { "omml" } else { &link.render_mode };
+                                let number = link.number.map(|number| format!(" ({number})")).unwrap_or_default();
+                                let stale = if link.stale { " · устарела" } else { "" };
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} · {}{} · {}{}",
+                                        link.document_title, link.insert_id, number, mode, stale
+                                    ))
+                                    .small()
+                                    .color(if link.stale { pal.amber } else { pal.text }),
+                                );
+                            }
+                            if panel.unregistered > 0 {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(format!("формул вне реестра в документе: {}", panel.unregistered))
+                                        .small()
+                                        .color(pal.amber),
+                                );
+                                if ui.small_button("Принять как объекты формулы").clicked() {
+                                    migrate_formulas_clicked = true;
+                                }
+                            }
                         }
                         ObjectData::Source(source) => {
                             field_row(ui, "kind", &source.kind, false);
@@ -3188,6 +3683,9 @@ impl RdeApp {
             }
             if review_import_clicked {
                 self.import_review_from_exports();
+            }
+            if migrate_formulas_clicked {
+                self.migrate_document_formulas();
             }
         }
     }
@@ -4128,12 +4626,14 @@ impl RdeApp {
                 .filter(|path| rde_doc::is_rde_package(path))
                 .and_then(|path| rde_doc::list_document_styles(&path).ok())
                 .unwrap_or_default();
+            let formulas_list: Vec<rde_core::FormulaManifest> = self.project.formulas().cloned().collect();
             let mut confirm = false;
             let mut cancel = false;
             let title = match dialog.kind.as_str() {
                 "figure" => "Вставить рисунок из артефакта",
                 "table" => "Вставить таблицу из CSV-выхода артефакта",
                 "constant" => "Вставить константу проекта",
+                "formula" => "Вставить формулу (project-level, P3)",
                 "crossref" => "Вставить перекрёстную ссылку",
                 "citation" => "Вставить цитату на источник",
                 "date" => "Вставить дату",
@@ -4220,6 +4720,52 @@ impl RdeApp {
                         "date" => {
                             ui.label(RichText::new(format!("Будет вставлена дата: {}", today_iso_date())).small().color(pal.muted));
                         }
+                        "formula" => {
+                            let current = formulas_list
+                                .iter()
+                                .find(|formula| formula.id == dialog.formula_id)
+                                .map(|formula| {
+                                    format!(
+                                        "{} · {}",
+                                        formula.title,
+                                        if formula.latex.chars().count() > 48 {
+                                            format!("{}…", formula.latex.chars().take(48).collect::<String>())
+                                        } else {
+                                            formula.latex.clone()
+                                        }
+                                    )
+                                })
+                                .unwrap_or_else(|| "— выбрать —".to_owned());
+                            egui::ComboBox::from_label("формула проекта").selected_text(current).show_ui(ui, |ui| {
+                                for formula in &formulas_list {
+                                    ui.selectable_value(&mut dialog.formula_id, formula.id.clone(), &formula.title);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("режим вставки").small().color(pal.muted));
+                                ui.selectable_value(&mut dialog.render_mode, "omml".to_owned(), "Word-объект (OMML)");
+                                ui.selectable_value(&mut dialog.render_mode, "svg".to_owned(), "SVG-вектор (+PNG)");
+                            });
+                            if let Some(formula) = formulas_list.iter().find(|formula| formula.id == dialog.formula_id) {
+                                let mode = if formula.display { "display" } else { "inline" };
+                                let info = format!(
+                                    "{} · нумерация {} · кэши {}{}{}",
+                                    mode,
+                                    formula.numbering.mode,
+                                    if formula.state.omml_hash.is_empty() { "OMML: —" } else { "OMML: ✓" },
+                                    if formula.state.svg_hash.is_empty() { " · SVG: —" } else { " · SVG: ✓" },
+                                    if formula.state.png_hash.is_empty() { " · PNG: —" } else { " · PNG: ✓" }
+                                );
+                                ui.label(RichText::new(info).small().color(pal.muted));
+                                if dialog.render_mode == "svg" && formula.state.svg_hash.is_empty() {
+                                    ui.label(
+                                        RichText::new("SVG-кэш ещё не построен — он будет построен при вставке (poppler)")
+                                            .small()
+                                            .color(pal.amber),
+                                    );
+                                }
+                            }
+                        }
                         _ => {
                             let current_title = artifacts
                                 .iter()
@@ -4297,8 +4843,9 @@ impl RdeApp {
                             }
                         }
                     }
-                    // Стиль обычного текста шаблона — можно сменить (R-DOC-25).
-                    if dialog.kind != "date" {
+                    // Стиль обычного текста шаблона — можно сменить (R-DOC-25). Формула живёт в
+                    // своём sdt-обрамлении (номер — документно-локальный), стиль ей не нужен.
+                    if dialog.kind != "date" && dialog.kind != "formula" {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("стиль").small().color(pal.muted));
                             egui::ComboBox::from_id_salt("rde_insert_style")
@@ -4311,15 +4858,18 @@ impl RdeApp {
                                 });
                         });
                     }
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("подпись").small().color(pal.muted));
-                        ui.add(egui::TextEdit::singleline(&mut dialog.caption).hint_text("например, «Среднее x1»").desired_width(360.0));
-                    });
+                    if dialog.kind != "formula" {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("подпись").small().color(pal.muted));
+                            ui.add(egui::TextEdit::singleline(&mut dialog.caption).hint_text("например, «Среднее x1»").desired_width(360.0));
+                        });
+                    }
                     let uri = match dialog.kind.as_str() {
                         "constant" => format!("rde://constants/{}/{}", dialog.artifact_id, dialog.selector),
                         "crossref" => format!("rde://insert/{}", dialog.artifact_id),
                         "citation" => format!("rde://source/{}", dialog.artifact_id),
                         "date" => "rde://date/iso".to_owned(),
+                        "formula" => format!("rde://formula/{}@<act_key>", dialog.formula_id),
                         _ => format!("rde://artifact/{}/{}", dialog.artifact_id, dialog.selector),
                     };
                     ui.label(RichText::new(uri).monospace().small().color(pal.accent));
@@ -6716,6 +7266,30 @@ fn apply_app_theme(ctx: &egui::Context, theme: &str, ui_scale: f32) {
     });
 }
 
+/// Бандл кэшей формулы из ledger/CAS для вставки/обновления документа (ADR-0005 §2.4).
+fn formula_body_from_state(
+    store: &rde_store::Store,
+    formula_id: &str,
+    state: &rde_dag::FormulaState,
+    display: bool,
+) -> Result<rde_doc::FormulaBody, String> {
+    let load = |hash: &Option<String>| -> Result<Vec<u8>, String> {
+        let hash = hash.as_deref().ok_or("нет кэша формулы")?;
+        let hash = rde_hash::Hash::from_hex(hash).map_err(|e| format!("хеш кэша формулы: {e}"))?;
+        store.get_blob(hash).map_err(|e| e.to_string())?.ok_or_else(|| "кэш формулы отсутствует в CAS".to_owned())
+    };
+    Ok(rde_doc::FormulaBody {
+        formula_id: formula_id.to_owned(),
+        act_key: state.act_key.clone(),
+        latex: state.resolved_latex.clone(),
+        display,
+        numbered: display,
+        omml: load(&state.omml_hash)?,
+        svg: state.svg_hash.as_ref().map(|_| load(&state.svg_hash)).transpose()?,
+        png: state.png_hash.as_ref().map(|_| load(&state.png_hash)).transpose()?,
+    })
+}
+
 #[cfg(test)]
 mod theme_tests {
     use super::{apply_app_theme, dark_visuals, font_definitions, light_visuals, theme_colors, theme_preference_of};
@@ -7431,6 +8005,8 @@ mod docview_tests {
         app.confirm_insert(super::InsertDialogState {
             kind: "value".into(),
             artifact_id: STATS.into(),
+            formula_id: String::new(),
+            render_mode: "omml".into(),
             selector: "out/stats.json".into(),
             pointer: "#/stats/x1/mean".into(),
             caption: "Среднее x1".into(),
@@ -7504,6 +8080,8 @@ mod docview_tests {
         app.confirm_insert(super::InsertDialogState {
             kind: "figure".into(),
             artifact_id: plot.into(),
+            formula_id: String::new(),
+            render_mode: "omml".into(),
             selector: "out/plot.svg".into(),
             pointer: String::new(),
             caption: "График статистик".into(),
@@ -7596,6 +8174,8 @@ mod docview_tests {
         app.confirm_insert(super::InsertDialogState {
             kind: "value".into(),
             artifact_id: STATS.into(),
+            formula_id: String::new(),
+            render_mode: "omml".into(),
             selector: "out/stats.json".into(),
             pointer: String::new(),
             caption: "JSON".into(),
@@ -7607,6 +8187,44 @@ mod docview_tests {
         assert!(app.insert_dialog.as_ref().is_some_and(|dialog| !dialog.error.is_empty()), "ошибка в диалоге");
         let after = rde_doc::load_rde_doc(&package).unwrap().inserts.len();
         assert_eq!(before, after, "вставка без pointer отклонена (P8, DOC-05)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P3: формульные вставки в UI (диалог, инспектор, «где вставлено») ─────
+
+    #[test]
+    fn formula_insert_dialog_and_inspector_show_status_and_backlinks() {
+        // Копия демо без .rde (кэши/ledger не копируются) — для вставки нужен пересчёт
+        // (компиляция формулы требует poppler: честный skip, как у CLI-зависимых тестов).
+        if std::process::Command::new("pdftocairo").arg("-v").output().map(|output| !output.status.success()).unwrap_or(true) {
+            return;
+        }
+        let root = temp_demo_copy("formula-dialog");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        // Диалог формулы: выбран project-level объект, режим по умолчанию — OMML.
+        app.open_insert_dialog("formula");
+        let dialog = app.insert_dialog.as_ref().expect("диалог формулы");
+        assert_eq!(dialog.kind, "formula");
+        assert!(!dialog.formula_id.is_empty(), "формула выбрана по умолчанию");
+        assert_eq!(dialog.render_mode, "omml");
+        // Инспектор формулы (служебный объект в дереве): живой статус и «где вставлено» (R-DOC-19).
+        app.demo_show_service_objects();
+        app.demo_select_object("Формула");
+        let formula_id = app.selected.clone().expect("в демо выбрана формула");
+        let data = app.formula_inspector_data(&formula_id);
+        assert!(data.status.is_some(), "статус формулы считается из ledger: {:?}", data.status);
+        assert_eq!(data.backlinks.len(), 2, "демо: вставки omml и svg → {:?}", data.backlinks);
+        assert!(data.backlinks.iter().any(|link| link.render_mode == "svg"), "есть svg-вставка");
+        // Вставка из диалога: появляется третья формульная вставка (остальные — in place).
+        let package = app.project.document_path().unwrap();
+        let before = rde_doc::load_rde_doc(&package).unwrap().inserts.iter().filter(|insert| insert.kind == "formula").count();
+        let dialog = app.insert_dialog.take().expect("диалог формулы");
+        app.confirm_insert(dialog);
+        let doc = rde_doc::load_rde_doc(&package).unwrap();
+        let after = doc.inserts.iter().filter(|insert| insert.kind == "formula").count();
+        assert_eq!(after, before + 1, "формульная вставка добавлена");
+        assert!(doc.inserts.iter().any(|insert| insert.kind == "formula" && insert.render_mode == "omml"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

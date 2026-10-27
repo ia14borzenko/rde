@@ -22,7 +22,7 @@ fn main() {
     if let Some(logs_tab) = std::env::args().nth(4).and_then(|value| value.parse::<usize>().ok()) {
         state.demo_set_logs_tab(logs_tab);
     }
-    // 5-й аргумент — действие для снимка: update | insert-value | insert-figure.
+    // 5-й аргумент — действие для снимка: update | insert-value | insert-figure | insert-formula …
     match std::env::args().nth(5).as_deref() {
         Some("update") => state.request_update(None, true),
         Some("insert-value") => state.demo_open_insert_dialog("value"),
@@ -30,6 +30,14 @@ fn main() {
         Some("insert-table") => state.demo_open_insert_dialog("table"),
         Some("insert-constant") => state.demo_open_insert_dialog("constant"),
         Some("insert-crossref") => state.demo_open_insert_dialog("crossref"),
+        Some("insert-formula") => state.demo_open_insert_dialog("formula"),
+        Some("formula-inspector") => {
+            // P3: служебные объекты включены в дереве, выбран объект формулы — инспектор с
+            // живым статусом и «где вставлено» (R-DOC-19); центр — вкладка «Документ».
+            state.demo_show_service_objects();
+            state.demo_select_object("Формула");
+            state.demo_select_tab("document");
+        }
         Some("app-settings") => state.demo_open_app_settings(),
         Some("artifact-inputs") => state.demo_set_artifact_section("inputs"),
         Some("artifact-generation") => state.demo_set_artifact_section("generation"),
@@ -42,8 +50,11 @@ fn main() {
         state.demo_set_theme(&theme);
     }
 
+    // 7-й аргумент — высота окна: `tall` = 1400 (длинный инспектор), по умолчанию 1000.
+    let height = if std::env::args().nth(7).as_deref() == Some("tall") { 1400.0 } else { 1000.0 };
+
     let mut harness = egui_kittest::Harness::builder()
-        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_size(egui::vec2(1600.0, height))
         .with_pixels_per_point(1.5)
         .with_max_steps(100_000)
         .wgpu()

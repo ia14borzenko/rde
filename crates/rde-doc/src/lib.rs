@@ -38,8 +38,13 @@ pub use equation::*;
 pub mod formula;
 pub use formula::*;
 
+mod formula_insert;
+pub use formula_insert::*;
+
 pub const RDE_NS: &str = "https://rde.dev/ns/doc";
-pub const SCHEMA_VERSION: &str = "1";
+/// Версия схемы `rde:doc`: 2 — формульные вставки (`kind="formula"`, `render_mode`, `body_hash`).
+/// Пакеты версии 1 читаются (новые поля необязательны); при записи ставится 2 (ADR-0005 §7).
+pub const SCHEMA_VERSION: &str = "2";
 pub const RDE_DOC_PART: &str = "customXml/item1.xml";
 pub const RDE_ITEM_PROPS: &str = "customXml/itemProps1.xml";
 pub const RDE_ITEM_RELS: &str = "customXml/_rels/item1.xml.rels";
@@ -103,6 +108,14 @@ pub struct RdeInsert {
     /// `R_н`, R-ART-09); пусто — обычный текст.
     #[serde(default)]
     pub run_style: String,
+    /// Режим формульной вставки (ADR-0005 §3.1): `omml` — редактируемая формула, `svg` — векторная
+    /// картинка с PNG-fallback; пусто — не формула.
+    #[serde(default)]
+    pub render_mode: String,
+    /// Подпись содержимого `w:sdt` формулы (R-DOC-13): у `omml` — sha256 OMML-фрагмента, у `svg` —
+    /// sha256 пары PNG+SVG. Расхождение с телом = ручная правка, молча не перезаписываем.
+    #[serde(default)]
+    pub body_hash: Option<String>,
 }
 
 /// Сводка ревью (комментарии/правки; полноценно — M5).
@@ -311,6 +324,12 @@ pub fn render_rde_doc(doc: &RdeDoc) -> String {
         if !insert.run_style.is_empty() {
             out.push_str(&format!(" run_style=\"{}\"", escape_attr(&insert.run_style)));
         }
+        if !insert.render_mode.is_empty() {
+            out.push_str(&format!(" render_mode=\"{}\"", escape_attr(&insert.render_mode)));
+        }
+        if let Some(body_hash) = &insert.body_hash {
+            out.push_str(&format!(" body_hash=\"{}\"", escape_attr(body_hash)));
+        }
         out.push_str("/>\n");
     }
     out.push_str("  </rde:inserts>\n");
@@ -402,7 +421,9 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                             para_id: None,
                             style: String::new(),
                             format: String::new(),
-            run_style: String::new(),
+                            run_style: String::new(),
+                            render_mode: String::new(),
+                            body_hash: None,
                         };
                         for attr in event.attributes().flatten() {
                             let key = local_name(attr.key.as_ref());
@@ -422,6 +443,8 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                                 "style" => insert.style = value,
                                 "format" => insert.format = value,
                                 "run_style" => insert.run_style = value,
+                                "render_mode" => insert.render_mode = value,
+                                "body_hash" => insert.body_hash = Some(value),
                                 _ => {}
                             }
                         }
@@ -1513,6 +1536,8 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 style: String::new(),
                 format: String::new(),
                 run_style: String::new(),
+                render_mode: String::new(),
+                body_hash: None,
             });
         } else if block.kind == "caption" {
             inserts.push(RdeInsert {
@@ -1530,6 +1555,8 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 style: String::new(),
                 format: String::new(),
                 run_style: String::new(),
+                render_mode: String::new(),
+                body_hash: None,
             });
         }
     }
@@ -1584,6 +1611,14 @@ pub fn refresh_rde_doc(clean_docx: &Path, rde_doc: &mut RdeDoc) -> Result<(), St
     rde_doc.blocks = extract_blocks(&doc);
     rde_doc.body_hash = body_hash;
     rde_doc.updated_unix = now_unix();
+    // Формульные вставки: подпись тела перечитывается из фактического пакета (движок мог
+    // пересобрать OMML/svgBlip при сохранении — это не ручная правка; R-DOC-13 сравнивает
+    // текущее тело с этой подписью при обновлении).
+    for insert in rde_doc.inserts.iter_mut().filter(|insert| insert.kind == "formula") {
+        if let Some(signature) = formula_insert::body_signature(&entries, &insert.id) {
+            insert.body_hash = Some(signature);
+        }
+    }
     // Обновляем кэш подписей у вставок по свежим блокам.
     let captions: BTreeMap<&str, &str> = rde_doc.blocks.iter().map(|b| (b.id.as_str(), b.text.as_str())).collect();
     for insert in &mut rde_doc.inserts {
@@ -1720,6 +1755,8 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
         style,
         format: request.format,
         run_style: request.run_style,
+        render_mode: String::new(),
+        body_hash: None,
     };
     let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
     let document_xml = String::from_utf8_lossy(document).to_string();
@@ -1989,6 +2026,8 @@ pub fn add_table_insert(package: &Path, request: InsertRequest, rows: &[Vec<Stri
         style: request.style.clone(),
         format: String::new(),
         run_style: String::new(),
+        render_mode: String::new(),
+        body_hash: None,
     };
     rde_doc.inserts.push(insert.clone());
     let mut document_xml = {
@@ -2261,7 +2300,9 @@ pub fn add_figure_insert(
         para_id: Some(para_id.clone()),
         style: String::new(),
         format: String::new(),
-            run_style: String::new(),
+        run_style: String::new(),
+        render_mode: String::new(),
+        body_hash: None,
     };
     let document = entries.get(DOCUMENT_XML).ok_or_else(|| "в пакете нет word/document.xml".to_owned())?;
     let document_xml = String::from_utf8_lossy(document).to_string();
@@ -2489,12 +2530,18 @@ pub fn backup_package(project_root: &Path, package: &Path) -> Result<PathBuf, St
 }
 
 /// Зафиксировать версию пакета в store: blob + tree + транзакция с корнем `document/<doc_id>`.
-pub fn commit_document(
+///
+/// `extra_roots` и `payload_extra` позволяют атомарно зафиксировать документ вместе с кэшами
+/// пересчитанных формул (ADR-0005 §3.3): вызывающий слой уже положил деревья кэшей в CAS и передаёт
+/// `formula/<id>` → tree; `payload_extra` дополняет payload транзакции (`formulas`, `kind`).
+pub fn commit_document_with(
     project_root: &Path,
     package: &Path,
     doc_id: &str,
     store: &mut rde_store::Store,
     note: &str,
+    extra_roots: &BTreeMap<String, rde_hash::Hash>,
+    payload_extra: Option<serde_json::Value>,
 ) -> Result<String, String> {
     let bytes = fs::read(package).map_err(|e| format!("прочитать {}: {e}", package.display()))?;
     let blob = store.put_blob(&bytes).map_err(|e| e.to_string())?;
@@ -2502,13 +2549,36 @@ pub fn commit_document(
     let tree = store.put_tree(&entries).map_err(|e| e.to_string())?;
     let mut roots = store.current_roots().map_err(|e| e.to_string())?;
     roots.insert(document_root_name(doc_id), tree);
-    let payload = serde_json::json!({ "kind": "document-update", "doc_id": doc_id, "package": package.display().to_string() });
+    for (name, root) in extra_roots {
+        roots.insert(name.clone(), *root);
+    }
+    let mut payload = serde_json::json!({ "kind": "document-update", "doc_id": doc_id, "package": package.display().to_string() });
+    if let Some(extra) = payload_extra {
+        if let Some(object) = payload.as_object_mut() {
+            if let Some(extra_object) = extra.as_object() {
+                for (key, value) in extra_object {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
     let tx = store
         .begin_tx_with_roots(note, Some(payload), roots)
         .map_err(|e| e.to_string())?;
     store.commit_tx(&tx).map_err(|e| e.to_string())?;
     let _ = project_root;
     Ok(tx)
+}
+
+/// Зафиксировать версию пакета в store: blob + tree + транзакция с корнем `document/<doc_id>`.
+pub fn commit_document(
+    project_root: &Path,
+    package: &Path,
+    doc_id: &str,
+    store: &mut rde_store::Store,
+    note: &str,
+) -> Result<String, String> {
+    commit_document_with(project_root, package, doc_id, store, note, &BTreeMap::new(), None)
 }
 
 /// Восстановить пакет из текущего корня `document/<doc_id>` (после отката корней).
@@ -2548,6 +2618,12 @@ pub struct DocumentUpdateFullReport {
     pub caption_changes: Vec<CaptionChange>,
     pub insert_updates: Vec<String>,
     pub figure_updates: Vec<String>,
+    /// Формульные вставки: пересобраны из кэшей формулы (`v9`, …).
+    pub formula_updates: Vec<String>,
+    /// Формульные вставки, чьё тело правили вручную (R-DOC-13) — не перезаписаны.
+    pub formula_conflicts: Vec<String>,
+    /// Формульные вставки без цели: формула удалена/не найдена.
+    pub formula_missing: Vec<String>,
     pub diff: DocDiff,
     pub backup: Option<PathBuf>,
     pub txid: Option<String>,
@@ -2555,8 +2631,9 @@ pub struct DocumentUpdateFullReport {
     pub rde_doc: Option<RdeDoc>,
 }
 
-/// Обновить документ транзакционно: бэкап → значения/рисунки вставок → перенумерация подписей
-/// → пересохранение пакета → diff → версия в store (откат O(1) через корни).
+/// Обновить документ транзакционно: бэкап → значения/рисунки/таблицы/формулы вставок →
+/// перенумерация подписей и формул → пересохранение пакета → diff → версия в store (откат O(1)
+/// через корни; `extra_roots`/`payload_extra` — атомарно с кэшами пересчитанных формул).
 pub fn update_document_transactional(
     project_root: &Path,
     package: &Path,
@@ -2565,6 +2642,9 @@ pub fn update_document_transactional(
     hashes: &BTreeMap<String, String>,
     images: &BTreeMap<String, (String, Vec<u8>)>,
     tables: &BTreeMap<String, Vec<Vec<String>>>,
+    formulas: &BTreeMap<String, formula_insert::FormulaBody>,
+    extra_roots: &BTreeMap<String, rde_hash::Hash>,
+    payload_extra: Option<serde_json::Value>,
     store: &mut rde_store::Store,
 ) -> Result<DocumentUpdateFullReport, String> {
     let before = load_rde_doc(package)?;
@@ -2585,7 +2665,15 @@ pub fn update_document_transactional(
         update_table_inserts(package, tables)?;
         report.table_updates = tables.len();
     }
-    // 4) Перенумерация подписей/перекрёстных ссылок + refresh/сохранение пакета.
+    // 4) Формульные вставки (ADR-0005 §3.3): пересобрать содержимое sdt из кэшей формулы,
+    // перенумеровать документно-локальные номера; ручную правку не перезаписываем.
+    if !formulas.is_empty() {
+        let updated = update_formula_inserts(package, formulas)?;
+        report.formula_updates = updated.updated;
+        report.formula_conflicts = updated.conflicts;
+        report.formula_missing = updated.missing;
+    }
+    // 5) Перенумерация подписей/перекрёстных ссылок + refresh/сохранение пакета.
     renumber_insert_captions(package)?;
     let update = update_document_package(package)?;
     report.caption_changes = update.changes;
@@ -2594,8 +2682,16 @@ pub fn update_document_transactional(
         report.rde_doc = Some(rde_doc.clone());
     }
     report.package = update.package;
-    // 5) Транзакция store с корнем документа.
-    let txid = commit_document(project_root, package, doc_id, store, "document update")?;
+    // 6) Транзакция store: корень документа + корни кэшей формул (если пересчитывали).
+    let txid = commit_document_with(
+        project_root,
+        package,
+        doc_id,
+        store,
+        "document update",
+        extra_roots,
+        payload_extra,
+    )?;
     report.txid = Some(txid);
     Ok(report)
 }

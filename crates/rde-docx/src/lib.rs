@@ -78,6 +78,43 @@ pub struct OmmlCheck {
     pub errors: Vec<String>,
 }
 
+/// Проверка сохранности векторных вставок (`a:blip/a:extLst/asvg:svgBlip`, MS-ODRAWXML):
+/// P2.5 (writer сохраняет blip-extLst) + P3 (svg-режим формул). P3-гейт: количество `svgBlip`
+/// не уменьшается, SVG-части `word/media/*.svg` не пропадают.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SvgBlipCheck {
+    pub ok: bool,
+    /// Вхождений `svgBlip` в `word/document.xml` исходника/roundtrip.
+    pub source: usize,
+    pub roundtrip: usize,
+    /// SVG-частей (`word/media/*.svg`) в пакете исходника/roundtrip.
+    pub source_parts: usize,
+    pub roundtrip_parts: usize,
+    pub errors: Vec<String>,
+}
+
+/// Сравнить векторные вставки исходника и roundtrip-пакета (P3-гейт).
+pub fn check_svg_blip(
+    source_xml: &str,
+    roundtrip_xml: &str,
+    source_svg_parts: usize,
+    roundtrip_svg_parts: usize,
+) -> SvgBlipCheck {
+    let source = source_xml.matches("svgBlip").count();
+    let roundtrip = roundtrip_xml.matches("svgBlip").count();
+    let mut errors = Vec::new();
+    if source > 0 && source_svg_parts == 0 {
+        errors.push("svgBlip в исходнике без svg-части в word/media".to_owned());
+    }
+    if roundtrip < source {
+        errors.push(format!("svgBlip потеряны при roundtrip: {source} → {roundtrip}"));
+    }
+    if source > 0 && roundtrip_svg_parts < source_svg_parts {
+        errors.push(format!("svg-части потеряны при roundtrip: {source_svg_parts} → {roundtrip_svg_parts}"));
+    }
+    SvgBlipCheck { ok: errors.is_empty(), source, roundtrip, source_parts: source_svg_parts, roundtrip_parts: roundtrip_svg_parts, errors }
+}
+
 /// Содержательные элементы OMML (для структурной подписи). Свойства (`*Pr`, `m:ctrlPr`,
 /// `m:jc`, `m:rPr`, `w:*`) исключены: WordCraft вправе их нормализовать.
 const OMML_CONTENT_TAGS: [&str; 31] = [
@@ -329,6 +366,9 @@ pub struct FidelityReport {
     /// OMML-гейт (R-DOC-22): формулы до/после roundtrip (P10).
     #[serde(default)]
     pub omml: OmmlCheck,
+    /// Гейт векторных вставок (svgBlip + svg-части, P2.5/P3).
+    #[serde(default)]
+    pub svg_blip: SvgBlipCheck,
     pub generated_unix: u64,
 }
 
@@ -340,6 +380,7 @@ impl FidelityReport {
             && self.lo.pdf_is_valid
             && self.opc.ok
             && self.omml.ok
+            && self.svg_blip.ok
     }
 }
 
@@ -503,6 +544,10 @@ pub fn compare_gate(source_path: &Path, roundtrip_path: &Path, work_dir: &Path) 
     let paragraphs_source = paragraph_count(source_path)?;
     let paragraphs_roundtrip = paragraph_count(roundtrip_path)?;
     let omml = check_omml(source_path, roundtrip_path)?;
+    let svg_parts = |parts: &[PartInfo]| -> usize {
+        parts.iter().filter(|part| part.name.starts_with("word/media/") && part.name.to_ascii_lowercase().ends_with(".svg")).count()
+    };
+    let svg_blip = check_svg_blip(&document_xml(source_path)?, &document_xml(roundtrip_path)?, svg_parts(&source), svg_parts(&roundtrip_parts));
     let lo = lo_oracle(roundtrip_path, work_dir);
     let opc = validate_opc(roundtrip_path)?;
     Ok(FidelityReport {
@@ -519,6 +564,7 @@ pub fn compare_gate(source_path: &Path, roundtrip_path: &Path, work_dir: &Path) 
         lo,
         opc,
         omml,
+        svg_blip,
         generated_unix: now_unix(),
     })
 }

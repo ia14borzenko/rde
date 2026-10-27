@@ -671,3 +671,78 @@ git submodule status                                  # пин vendor/wordcraft 
 # форк-регрессия (нужны writable CARGO_HOME и CARGO_TARGET_DIR — ~/.cargo на стенде read-only):
 #   CARGO_HOME=$PWD/../.cache-tmp/cargo-home cargo test --manifest-path vendor/wordcraft/Cargo.toml -p wordcraft-docx
 ```
+
+---
+
+## Обновление 2026-10-27 (P3: вставки формул `omml|svg`, статусы, миграция; ADR-0005 §3/§7)
+
+Фаза **P3** по ADR-0005: формулы стали **вставками-ссылками** на project-level объект
+(`rde://formula/<id>@<act_key>`), с режимами `omml` (редактируемая формула Word) и `svg`
+(вектор + PNG-fallback, writer WordCraft сохраняет blip-extLst — P2.5), статусами актуальности,
+«где вставлено», транзакционным обновлением документа вместе с пересчётом кэшей и **явной
+идемпотентной миграцией** существующих OMML вне реестра. Ручная правка тела вставки не
+перезаписывается молча (R-DOC-13).
+
+| Что | Где |
+|---|---|
+| `RdeInsert kind="formula"`: `target`, `render_mode`, `number` (документно-локальный), `hash`=act_key, `cached`, `body_hash`; `rde:doc` schema `1→2` | [`crates/rde-doc/src/lib.rs`](../crates/rde-doc/src/lib.rs) |
+| Вставка: block-sdt (display: таблица 1×2 §9.4 или абзац) и inline-sdt с OMML из кэша либо `w:drawing` `asvg:svgBlip`+PNG (медиа/rels/Content_Types); обновление из кэшей, перенумерация, конфликты, бэклинки, миграция | [`crates/rde-doc/src/formula_insert.rs`](../crates/rde-doc/src/formula_insert.rs) |
+| Кэши формул до транзакции, корни `formula/*`, ledger смешанных транзакций `document-formula-update` | [`crates/rde-dag/src/lib.rs`](../crates/rde-dag/src/lib.rs) |
+| Транзакционное обновление: значения/рисунки/таблицы/**формулы** + одна tx (корни `formula/*`+`document/<id>`), откат | [`crates/rde-doc/src/lib.rs`](../crates/rde-doc/src/lib.rs) |
+| Гейт `svg_blip` (svgBlip ×N и `word/media/*.svg` не уменьшаются; в `FidelityReport::passed()`) | [`crates/rde-docx/src/lib.rs`](../crates/rde-docx/src/lib.rs) |
+| UI: «Вставка ▸ формула» и «Документ ▸ Формулы», диалог (выбор объекта, режим), инспектор формулы (статус/act_key/«где вставлено»), служебная группа «Формулы» + переключатель «Служебные объекты», «Принять формулы как объекты» | [`crates/rde-ui/src/lib.rs`](../crates/rde-ui/src/lib.rs), [`ribbon.rs`](../crates/rde-ui/src/ribbon.rs) |
+| Демо: σ — объект `objects/formulas/01M5Y11FQB13J9EEV3KQ3CRTS9` + вставки OMML (номер 1) и SVG; миграция — `cargo run -p rde-doc --example migrate-formula -- demo-project` (идемпотентно) | [`demo-project/`](../demo-project), [`crates/rde-doc/examples/migrate-formula.rs`](../crates/rde-doc/examples/migrate-formula.rs) |
+
+**Ключевые свойства:** вставка — content-control `w:sdt` с тегом `rde:formula:<insert-id>`;
+display-формула — блок-sdt вокруг канонической таблицы 1×2 (номер документно-локальный, порядок —
+по документу), inline — inline-sdt. `svg`-режим: `a:blip` с PNG-preview и
+`a:extLst/asvg:svgBlip` (MS-ODRAWXML) — SVG-часть/rels/Content_Types восстанавливает writer P2.5,
+RDE SVG не переприменяет. Обновление: `update_formula_inserts` пересобирает содержимое sdt из
+кэшей (при устаревании формулы кэши пересчитываются), пересчитывает номера; тело, изменённое
+вручную (`body_hash` ≠ подписи), не перезаписывается — `BodyModified`. Статусы: **Fresh**,
+**Stale** (act_key вставки ≠ текущему), **MissingTarget** (формула удалена), **NotComputed**
+(входы/кэши), **BodyModified**. `formula_backlinks` — по всем документам проекта (R-DOC-19).
+Пересчёт формул и правка документа фиксируются **одной** транзакцией store (ADR-0005 §3.3):
+корни `formula/*` (кэши) + `document/<id>`; откат восстанавливает пакет из CAS — вставки прежние.
+Миграция: `unregistered_formulas` (LaTeX из модели WordCraft, OMML вне `rde:formula:*`) →
+`migrate_formulas` (таблица 1×2 заменяется канонической формульной с тем же номером; inline —
+обёртка inline-sdt); повторный запуск ничего не меняет. Демо-документ: 12 объектов, 11 живых
+вставок; fidelity-гейт PASS (`omml 1→1`, `svg_blip 1→1`, SVG-части 1→1, LO PDF valid).
+
+**Тесты:** `cargo test --workspace` — **215 passed, 0 failed** (214 теста + 1 doctest; +11 к P2.5).
+Новое: `rde-doc/tests/formula_insert.rs` (6: вставка omml и svg → engine roundtrip (svgBlip и
+SVG-часть сохранены) + LO-оракул; обновление при изменении формулы и при изменении входа-артефакта
+(одна транзакция; ledger видит новый act_key); статусы «цель отсутствует»/«устарело»/ручная правка;
+откат транзакции восстанавливает прежнюю вставку; миграция «фазы 1» + идемпотентность),
+`rde-docx/tests/formula_gate.rs` (гейт на пакете с формулами omml+svg), юнит-тесты
+`formula_insert` (разбор target/номеров/сканера OMML), `rde-ui` (диалог/инспектор/бэклинки);
+`cargo check`/`test` по `rde-core`, `rde-dag`, `rde-doc`, `rde-docx`, `rde-ui` — зелёные.
+
+**Ограничения (честно):** нет нативного редактора формул `equation_tab` в RDE (P4) и
+визуального редактирования в панели; векторный экспорт-режим docx/PDF с гейтами
+(`pdfimages`/`pdffonts`) и обмен LaTeX (.tex/буфер) — P5; смена `display`/`render_mode` после
+вставки — только переоформлением (автосмены макета нет); Word на стенде нет (совместимость
+`svgBlip` — по MS-ODRAWXML, LO-оракул проходит; неизвестные namespace внутри extLst не
+сохраняются); ручная правка тела вставки, сделанная после последнего сохранения RDE, ловится
+статусом, но диалога «принять/сохранить/отложить» пока нет (статус + отказ от перезаписи).
+
+**Следующий шаг:** **P4** — нативный редактор `equation_tab` в RDE (LaTeX-ввод/предпросмотр,
+палитры, привязка входов, нумерация, правка существующей вставки) → P5 (векторный экспорт docx/PDF
++ гейты + обмен LaTeX).
+
+**Проверить руками (P3):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh test -p rde-core -p rde-dag -p rde-doc -p rde-docx -p rde-ui   # P3 + регрессия
+./scripts/build.sh test --workspace                                             # 215 passed
+# демо: формула σ — OMML (номер 1) + SVG-вектор; fidelity-гейт PASS
+cargo run -q -p rde-doc --example migrate-formula -- demo-project                # идемпотентно
+cargo run -q -p rde-docx --example fidelity -- demo-project/objects/documents/01M5VJ1JG04TFF59TDWH9EDD1R/report.doc.rde docs/fidelity/demo-report.json
+# скриншоты: диалог вставки формулы и инспектор формулы (статус + «где вставлено»)
+cargo run -q -p rde-ui --example screenshot -- docs/fidelity/gui-p3-formula-dialog.png document "" 0 insert-formula
+cargo run -q -p rde-ui --example screenshot -- docs/fidelity/gui-p3-formula-inspector.png document "Формула" 0 formula-inspector dark tall
+```

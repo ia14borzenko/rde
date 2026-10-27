@@ -12,6 +12,31 @@
 
 ### Добавлено
 
+- **P3: вставки формул в документ `omml|svg`, статусы и миграция (ADR-0005 §3/§7, 2026-10-27)** —
+  `RdeInsert kind="formula"` (`target = rde://formula/<id>@<act_key>`, `render_mode = omml|svg`,
+  документно-локальный `number`, `hash` = act_key, `cached`, `body_hash`), `rde:doc` schema `1→2`
+  (старые пакеты читаются); `rde-doc::formula_insert`: content-control `w:sdt`
+  (`rde:formula:<insert-id>`) — display — блок-sdt вокруг таблицы 1×2 (§9.4) или центрированного
+  абзаца, inline — inline-sdt; внутри OMML из кэша формулы (редактируется в Word) или `w:drawing`
+  с `asvg:svgBlip` + PNG-fallback (медиа-части, связи и Content_Types в пакете; сохранность —
+  P2.5). [`add_formula_insert`](crates/rde-doc/src/formula_insert.rs),
+  `update_formula_inserts` (пересборка из кэшей, документно-локальная перенумерация, ручная правка
+  тела не перезаписывается — R-DOC-13 `BodyModified`), `formula_insert_statuses`
+  (Fresh/Stale/MissingTarget/NotComputed/BodyModified), `formula_backlinks` («где вставлено»,
+  R-DOC-19), `unregistered_formulas`/`migrate_formulas` (явная идемпотентная миграция OMML вне
+  реестра; демо σ мигрирована в `objects/formulas/01M5Y11F…` — вставки OMML с номером `(1)` и
+  SVG-вектор). `rde-dag`: `prepare_formula_update`/`prepared_formula_roots`/
+  `prepared_formulas_payload`, `formula_ledger` читает смешанные транзакции
+  `document-formula-update`; `update_document_transactional` пересчитывает формулы и заменяет
+  вставки, фиксируя кэши и документ **одной** транзакцией store (корни `formula/*` +
+  `document/<id>`), откат восстанавливает прежние вставки. `rde-docx`: гейт `svg_blip`
+  (svgBlip ×N и `word/media/*.svg` не уменьшаются; учитывается в `FidelityReport::passed()`).
+  UI: диалог «Вставить формулу» (выбор объекта, режим Word-объект/SVG), инспектор формулы (статус,
+  act_key, «где вставлено»), служебная группа «Формулы» в дереве (использование+статус,
+  переключатель «Служебные объекты»), команда «Принять формулы как объекты». Демо: 12 объектов,
+  11 живых вставок, формула σ в режимах OMML и SVG; fidelity-гейт PASS (`omml 1→1`,
+  `svg_blip 1→1`, LO PDF valid). Скриншоты — `docs/fidelity/gui-p3-formula-{dialog,inspector}.png`.
+  Тесты: **215 passed** (214 теста + 1 doctest; +11 к P2.5), 0 failed.
 - **P2: project-level объект формулы (ADR-0005, 2026-10-26)** —
   [`FormulaManifest`/`FormulaInput`/`FormulaFragment`/`FormulaNumbering`/`FormulaState`](crates/rde-core/src/manifest.rs)
   (`schema = "rde/formula@1"`, `formula.toml`), `ManifestKind::Formula`, загрузка

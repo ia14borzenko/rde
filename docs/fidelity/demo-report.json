@@ -1,7 +1,7 @@
 {
-  "source": "/tmp/rde-docx-example-3/clean.docx",
-  "source_parts": 12,
-  "roundtrip_parts": 12,
+  "source": "/tmp/rde-docx-example-5/clean.docx",
+  "source_parts": 14,
+  "roundtrip_parts": 14,
   "missing": [],
   "extra": [],
   "changed": [
@@ -10,18 +10,18 @@
   ],
   "critical_missing": [],
   "media_preserved": true,
-  "paragraphs_source": 44,
-  "paragraphs_roundtrip": 44,
+  "paragraphs_source": 48,
+  "paragraphs_roundtrip": 48,
   "lo": {
     "available": true,
     "version": "LibreOffice 26.2.6.3 620(Build:3)",
-    "pdf_bytes": 181516,
+    "pdf_bytes": 190202,
     "pdf_is_valid": true,
     "error": null
   },
   "opc": {
     "ok": true,
-    "parts": 12,
+    "parts": 14,
     "xml_parts": 8,
     "errors": []
   },
@@ -45,5 +45,13 @@
     },
     "errors": []
   },
-  "generated_unix": 1793005575
+  "svg_blip": {
+    "ok": true,
+    "source": 1,
+    "roundtrip": 1,
+    "source_parts": 1,
+    "roundtrip_parts": 1,
+    "errors": []
+  },
+  "generated_unix": 1793082883
 }

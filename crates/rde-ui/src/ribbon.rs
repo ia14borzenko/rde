@@ -39,7 +39,9 @@ pub(crate) enum Cmd {
     InsertCrossref,
     InsertCitation,
     InsertDate,
+    InsertFormula,
     // Документ
+    MigrateFormulas,
     ApplyGost,
     InsertBibliography,
     Zoom100,
@@ -60,6 +62,8 @@ pub(crate) enum Cmd {
     ToggleAgent,
     ToggleLogs,
     ToggleInspector,
+    /// Показывать служебные объекты (формулы) в дереве (R-TREE-01/02, P3).
+    ToggleServiceObjects,
     // Агент / Помощь
     Audit,
     About,
@@ -158,6 +162,7 @@ const INSERT_SLOTS: &[Slot] = &[
     Slot::Icon { cmd: Cmd::InsertCrossref, icon: IC_CODE, tip: "Вставить перекрёстную ссылку на рисунок/таблицу…" },
     Slot::Icon { cmd: Cmd::InsertCitation, icon: IC_SOURCE, tip: "Вставить цитату на источник…" },
     Slot::Icon { cmd: Cmd::InsertDate, icon: IC_NOTE, tip: "Вставить дату…" },
+    Slot::Icon { cmd: Cmd::InsertFormula, icon: IC_CONST, tip: "Вставить формулу проекта (OMML / SVG)…" },
 ];
 
 /// Группы вкладки. Порядок групп и слотов — порядок отрисовки.
@@ -299,6 +304,26 @@ pub(crate) fn ribbon_groups(tab: RibbonTab) -> &'static [Group] {
                 ],
             },
             Group {
+                title: "Формулы",
+                // P3: вставка формулы и явная миграция OMML вне реестра (ADR-0005 §7).
+                slots: &[
+                    Slot::Button {
+                        cmd: Cmd::InsertFormula,
+                        icon: IC_CONST,
+                        label: "Вставить\nформулу…",
+                        tip: "Вставить формулу проекта: Word-объект (OMML) или SVG-вектор (P3)",
+                        primary: false,
+                    },
+                    Slot::Button {
+                        cmd: Cmd::MigrateFormulas,
+                        icon: IC_CODE,
+                        label: "Принять формулы\nкак объекты",
+                        tip: "Мигрировать OMML вне реестра в project-level формулы и вставки-ссылки (явная команда, идемпотентна)",
+                        primary: false,
+                    },
+                ],
+            },
+            Group {
                 title: "Масштаб",
                 // Весь кластер масштаба живёт на ленте (§19-7): в строке вкладок центра его нет.
                 slots: &[Slot::Zoom],
@@ -356,6 +381,12 @@ pub(crate) fn ribbon_groups(tab: RibbonTab) -> &'static [Group] {
                 Slot::Toggle { cmd: Cmd::ToggleAgent, icon: "", label: "Панель\nагента", tip: "Панель агента" },
                 Slot::Toggle { cmd: Cmd::ToggleLogs, icon: "", label: "Журнал и\nзадачи", tip: "Журнал и задачи" },
                 Slot::Toggle { cmd: Cmd::ToggleInspector, icon: IC_INSPECT, label: "Инспектор\nобъекта", tip: "Инспектор объекта" },
+                Slot::Toggle {
+                    cmd: Cmd::ToggleServiceObjects,
+                    icon: IC_CONST,
+                    label: "Служебные\nобъекты",
+                    tip: "Показать/скрыть служебные объекты (формулы проекта) в дереве",
+                },
             ],
         }],
         RibbonTab::Agent => &[Group {
@@ -388,6 +419,8 @@ pub(crate) const MENU_MODEL: &[(&str, &[Cmd])] = &[
             Cmd::InsertCrossref,
             Cmd::InsertCitation,
             Cmd::InsertDate,
+            Cmd::InsertFormula,
+            Cmd::MigrateFormulas,
             Cmd::UpdateDocument,
             Cmd::RollbackDocument,
         ],
@@ -437,11 +470,11 @@ mod tests {
         }
     }
 
-    /// Меню содержит ровно 33 пункта (не потерян ни один при переезде на ленту).
+    /// Меню содержит 35 пунктов: 33 исходных (P9) + 2 P3-команды формул.
     #[test]
     fn menu_model_keeps_all_original_items() {
         let total: usize = MENU_MODEL.iter().map(|(_, cmds)| cmds.len()).sum();
-        assert_eq!(total, 33);
+        assert_eq!(total, 35);
     }
 
     /// Вкладок девять, у каждой есть хотя бы одна группа с хотя бы одним слотом.
@@ -457,11 +490,11 @@ mod tests {
         }
     }
 
-    /// Вставка: все семь видов на вкладке «Вставка», у каждого иконка и подсказка.
+    /// Вставка: восемь видов на вкладке «Вставка» (с P3 — формула), у каждого иконка и подсказка.
     #[test]
     fn insert_tab_has_seven_kinds_with_icon_and_tip() {
         let slots: Vec<&Slot> = ribbon_groups(RibbonTab::Insert)[0].slots.iter().collect();
-        assert_eq!(slots.len(), 7);
+        assert_eq!(slots.len(), 8);
         for slot in slots {
             match slot {
                 Slot::Icon { icon, tip, .. } => {

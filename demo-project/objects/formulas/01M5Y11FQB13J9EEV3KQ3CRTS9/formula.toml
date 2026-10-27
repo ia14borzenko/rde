@@ -1,0 +1,17 @@
+schema = "rde/formula@1"
+id = "01M5Y11FQB13J9EEV3KQ3CRTS9"
+title = "Формула: \\sigma =\\sqrt{\\frac{1}{N-1}\\sum_"
+latex = "\\sigma =\\sqrt{\\frac{1}{N-1}\\sum_{i=1}^{N} {({x}_{i}}-\\bar{x}{)}^{2}}"
+display = true
+
+[numbering]
+mode = "auto"
+label = ""
+
+[state]
+act_key = "8670c847135622057a391706ed4d791fa236d5108950dc7e0d3753064862802e"
+resolved_latex_hash = "d74f909ea548e6e0082237d2d09990825a29a2614d7b5ec30361c4ca7af6f3f3"
+omml_hash = "cf5474b1fd1e98dafc657271a4b9aad4bd436c88e857d162be304d849066c94f"
+svg_hash = "cc94336c0efa9373b31b755f15786e00234b9829fb88c48f634b1d236af87a1f"
+png_hash = "a9c06650b58b037b644a047aba6ba7dfd9717e1d815f5832b61a18868764486d"
+computed_at = 1793082834

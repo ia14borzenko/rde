@@ -49,6 +49,8 @@ fn rde_doc_xml_roundtrip_handles_unicode_and_escapes() {
             style: "Normal".into(),
             format: "dec:1".into(),
             run_style: String::new(),
+            render_mode: String::new(),
+            body_hash: None,
         }],
         review: RdeReview { open: 2, resolved: 5 },
         updated_unix: 42,

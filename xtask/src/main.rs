@@ -63,11 +63,13 @@ fn main() {
         "demo" => {
             let update = run("cargo", &["run", "-q", "-p", "rde-dag", "--example", "update", "--", "demo-project"]);
             let link = run("cargo", &["run", "-q", "-p", "rde-doc", "--example", "link-demo", "--", "demo-project"]);
+            // P3 (ADR-0005): явная миграция OMML вне реестра в project-level формулы + svg-вставка.
+            let formula = run("cargo", &["run", "-q", "-p", "rde-doc", "--example", "migrate-formula", "--", "demo-project"]);
             let fidelity = match demo_document() {
                 Some(document) => run("cargo", &["run", "-q", "-p", "rde-docx", "--example", "fidelity", "--", &document, "docs/fidelity/demo-report.json"]),
                 None => false,
             };
-            update && link && fidelity
+            update && link && formula && fidelity
         }
         "help" | "--help" | "-h" => {
             println!("xtask: ci | check | schemas | docx-gates | fidelity | perf | demo");
