@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/rde", "crates/rde-core", "crates/rde-dag", "crates/rde-doc", "crates/rde-docx", "crates/rde-env", "crates/rde-hash", "crates/rde-run", "crates/rde-sources", "crates/rde-store", "crates/rde-templates", "crates/rde-ui", "crates/rde-vcs", "xtask"]
+members = ["apps/rde", "crates/rde-core", "crates/rde-dag", "crates/rde-doc", "crates/rde-docx", "crates/rde-env", "crates/rde-hash", "crates/rde-host", "crates/rde-mcp", "crates/rde-run", "crates/rde-sources", "crates/rde-store", "crates/rde-templates", "crates/rde-ui", "crates/rde-vcs", "xtask"]
 # WordCraft vendored as a submodule keeps its own Cargo workspace (workspace-inherited
 # dependencies like `chrono = { workspace = true }`); the outer workspace must not
 # claim it, or those fields would inherit from RDE's manifest.
@@ -28,6 +28,12 @@ zstd = "0.13"
 resvg = { version = "0.45", default-features = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
+# Агентная подсистема v0.3 (M1): MCP по официальному Rust SDK. Пин точный: контракт
+# генерации схем/`server/discover`-типов у rmcp меняется между минорными версиями.
+rmcp = { version = "=3.8.0", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "signal"] }
+async-trait = "0.1"
+
 egui = "0.36.2"
 eframe = { version = "0.36.2", default-features = false, features = [
     "wgpu",
@@ -48,6 +54,8 @@ rde-hash = { path = "crates/rde-hash" }
 rde-run = { path = "crates/rde-run" }
 rde-store = { path = "crates/rde-store" }
 rde-ui = { path = "crates/rde-ui" }
+rde-mcp = { path = "crates/rde-mcp" }
+rde-host = { path = "crates/rde-host" }
 wordcraft-engine = { path = "vendor/wordcraft/crates/engine" }
 
 # WordCraft pins krilla itself in its own workspace; patches of a dependency's

@@ -746,3 +746,92 @@ cargo run -q -p rde-docx --example fidelity -- demo-project/objects/documents/01
 cargo run -q -p rde-ui --example screenshot -- docs/fidelity/gui-p3-formula-dialog.png document "" 0 insert-formula
 cargo run -q -p rde-ui --example screenshot -- docs/fidelity/gui-p3-formula-inspector.png document "Формула" 0 formula-inspector dark tall
 ```
+
+---
+
+## Обновление 2026-10-27 (M1: независимый MCP-слой — `rde-mcp` + `rde-host`, stdio, read-only)
+
+Веха **M1** фазы v0.3 (ТЗ §5.10/§8.7/§10.3, [ADR-0006](../docs/adr/0006-mcp-independent-layer.md)):
+MCP-сервер RDE реализован **отдельным слоем** на официальном Rust SDK `rmcp` 3.8.0 по spec
+**MCP 2026-07-28** (stateless core: `server/discover`, без `initialize`/сессий, `_meta`
+версии/капабилити в каждом запросе, `ttlMs`/`cacheScope` в списках). Слой не зависит от
+библиотечных крейтов RDE и от GUI — стрелка зависимостей строго
+`apps/rde → rde-host → rde-mcp`; `rde-mcp` тестируется на mock-хосте, `rde-host` —
+headless-реализация контракта поверх `rde-core/dag/doc/store/vcs/templates`.
+
+| Что | Где |
+|---|---|
+| Контракт `RdeHost` (sync, dyn-safe, только DTO), `HostError`/`RdeErrorCode` (12 кодов `RDE_*`) | [`crates/rde-mcp/src/host.rs`](../crates/rde-mcp/src/host.rs), [`error.rs`](../crates/rde-mcp/src/error.rs) |
+| DTO + JSON-схемы (`schemars`), типизированные ошибки, лимиты/константы | [`crates/rde-mcp/src/model.rs`](../crates/rde-mcp/src/model.rs) |
+| Реестр **13 read-only** инструментов (детерминированный порядок, `readOnlyHint`, `outputSchema`, `deny_unknown_fields`) | [`crates/rde-mcp/src/tools.rs`](../crates/rde-mcp/src/tools.rs) |
+| Ресурсы `rde://project/tree`, `rde://templates`, `rde://doc/{id}/outline`, `rde://artifact/{id}/meta` (+2 resource-template), TTL/cacheScope | [`crates/rde-mcp/src/resources.rs`](../crates/rde-mcp/src/resources.rs) |
+| Политика fail-closed (`McpPolicy`, `authorize_tool_call`, rate-limit) и хуки (`ApprovalHook` async, `AuditSink` JSONL `.rde/agent/audit.log`, `EventSink`) | [`crates/rde-mcp/src/policy.rs`](../crates/rde-mcp/src/policy.rs), [`hooks.rs`](../crates/rde-mcp/src/hooks.rs) |
+| MCP-сервер на `rmcp` (`ServerHandler`: `discover`/`list_tools`/`call_tool`/resources), `serve_stdio`, изоляция паник/таймаутов, EOF/SIGINT | [`crates/rde-mcp/src/server.rs`](../crates/rde-mcp/src/server.rs) |
+| MCP-инструкции: карта проекта + политика + правила чтения, ≤32 KiB, детерминированы | [`crates/rde-mcp/src/instructions.rs`](../crates/rde-mcp/src/instructions.rs), [`crates/rde-host/src/instructions.rs`](../crates/rde-host/src/instructions.rs) |
+| `HeadlessHost`: песочница путей, документы (outline/read), артефакты (статус из ledger, без запуска), источники/заметки/шаблоны, git, поиск | [`crates/rde-host/src/lib.rs`](../crates/rde-host/src/lib.rs), [`sandbox.rs`](../crates/rde-host/src/sandbox.rs) |
+| Точка входа `rde mcp serve --project <dir>` (+`RDE_PROJECT`, `--policy read-only`) — до `eframe`, GUI не создаётся | [`apps/rde/src/main.rs`](../apps/rde/src/main.rs) |
+| Аддитивный API `rde_doc::document_blocks` — блоки с полным текстом для `doc_read` (реестр `rde:doc` хранит усечённые 400 символов) | [`crates/rde-doc/src/lib.rs`](../crates/rde-doc/src/lib.rs) |
+| E2E настоящим `rmcp`-клиентом по stdio (discover/tools/list/tree/doc/artifact/file/resources/аудит/EOF) | [`apps/rde/tests/mcp_stdio.rs`](../apps/rde/tests/mcp_stdio.rs) |
+
+**Ключевые свойства:** M1 — **только чтение** (мутации запрещены политикой, `allow_mutation=false`,
+fail-closed; в реестре нет ни одного мутирующего инструмента). Все пути из аргументов канонизируются
+в корень проекта (симлинки/`..`/абсолютные/`file://`/UNC → `RDE_PATH_ESCAPE`), `.rde/**` для
+`file_read` закрыт (`RDE_APPROVAL_DENIED`), наружу не печатается корень проекта и не уходят секреты.
+Каждый вызов (включая отказ/неизвестный инструмент) пишется в `.rde/agent/audit.log` — JSONL
+`{ts, tool, params_sha256, decision, ok, error_code, duration_ms}`; тела и аргументы не пишутся.
+`stdout` — только JSON-RPC, логи — `stderr` (`RDE_MCP_LOG=error|info|debug`). Ошибки инструментов —
+машиночитаемые: `isError: true` + `structuredContent.error.code = RDE_*` (неизвестный инструмент —
+JSON-RPC `-32602`). Паника/зависание инструмента не роняют сервер (`RDE_INTERNAL`/`RDE_TIMEOUT`).
+`ttlMs`/`cacheScope` зафиксированы в ADR-0006 (discover 5 с private; tools/list 300 с public;
+resources/list 5 с private; resources/templates 300 с public; чтение изменяемых ресурсов 2 с
+private, шаблонов — 300 с public). EOF stdin — штатный выход; SIGINT — graceful shutdown.
+
+**Замер контекста (R-AGT-08/§10.3):** `tools/list` — **26 825 байт** (≈6,7–7,7K токенов при
+байты/4…байты/3,5; из них `input_schema` 4 536 байт, описания 2 582 байта) — укладывается в
+ориентир ~4–9K и критерий ≤10K; 13 инструментов ≤32 (§18-3). Инструкции — 4 129 байт (≤32 KiB).
+`server/discover` — 4 454 байта, `resources/list` — 2 433 байта (8 ресурсов).
+
+**Тесты:** `cargo test --workspace` — **300 passed, 0 failed** (215 + 85). Новое:
+`rde-mcp` 58 unit (реестр/схемы/политика/аудит/сервер на mock-хосте, fail-closed синтетическим
+мутирующим инструментом, timeout/panic, лимиты/TTL), `rde-host` 23 (10 unit песочницы/парсинга +
+13 интеграционных на копии демо-проекта: дерево/поиск/файлы/документ/артефакты/списки/git/
+инструкции/`RDE_DOC_NOT_MIGRATED`), `apps/rde/tests/mcp_stdio.rs` 4 e2e (rmcp-клиент по stdio,
+stdout только JSON-RPC, EOF-завершение, код 2 при ошибке проекта). Старые тесты не ослаблялись.
+
+**Ограничения (честно):** M1 не делает мутаций и не показывает approvals в UI; HTTP/токены,
+ACP-панель чата, suggested edits/чекпоинты, URI-чипы §8.7.2 — M2+; `artifact_*` отдаёт статус
+**из ledger** без пересчёта `act_key`/env (read-only сервер не запускает `uv`/скрипты; `fresh` =
+`out_hash` манифеста совпадает с ledger, иначе `stale`/`never_run`/`unknown`); `doc_outline`/
+`doc_read` работают только с мигрированными `.doc.rde` (иначе `RDE_DOC_NOT_MIGRATED`, авто-миграции
+нет); у ресурсов — метаданные (тела — инструментами с диапазонами/лимитами); пагинации курсором нет
+(диапазоны/лимиты); `instructions` усекаются до 32 KiB для больших проектов.
+
+**Следующий шаг:** **M2 — мутирующие инструменты через те же хуки** (`ApprovalHook` + diff/
+чекпоинты, R-AGT-05/06): `doc_suggest_edit`/`update`, `artifact_write/run`, `git_commit` с
+approval; затем M3 — streamable HTTP (loopback + bearer-токен), M4 — GUI-хуки/ACP и URI-чипы.
+
+**Проверить руками (M1):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+# стенд: ~/.cargo read-only → writable CARGO_HOME; target локальный (этот снимок)
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export CARGO_HOME=/home/admin-pc/proj/rde-dev/.cache-tmp/cargo-home
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh build -p rde                                  # бинарь target/debug/rde
+./scripts/build.sh test -p rde-mcp -p rde-host                   # unit/integration слоя
+./scripts/build.sh test -p rde                                   # e2e stdio (rmcp-клиент)
+./scripts/build.sh test --workspace                              # 300 passed
+
+# MCP-сервер вручную (stdio, read-only): server/discover + tools/list
+META='{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}'
+{ printf '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":%s}}\n' "$META"
+  printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":%s}}\n' "$META"; } \
+  | ./target/debug/rde mcp serve --project demo-project 2>/tmp/rde-mcp.log | head -2
+# stdout — только JSON-RPC; аудит вызовов инструментов — demo-project/.rde/agent/audit.log
+
+# независимость слоёв (пусто = доказано)
+cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core|rde-dag|rde-doc|rde-store"
+cargo tree -p rde-host | grep -E "egui|eframe|rde-ui"
+```

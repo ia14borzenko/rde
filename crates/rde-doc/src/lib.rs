@@ -1437,7 +1437,26 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 /// Извлечь блоки из модели WordCraft (то же представление, что хранится в rde:doc).
+///
+/// Текст блока обрезается до 400 символов — это представление реестра (экономия места в
+/// `.doc.rde`). Полный текст для чтения — [`document_blocks`].
 pub fn extract_blocks(doc: &wordcraft_engine::doc::Document) -> Vec<RdeBlock> {
+    blocks_from_document(doc, Some(400))
+}
+
+/// Блоки открытого `.doc.rde`-пакета с **полным** текстом (без обрезки 400 символов).
+///
+/// Аддитивный API для headless-слоёв (MCP/агент, v0.3): MCP-инструменту `doc_read` нужен текст
+/// блоков целиком, а реестр `rde:doc` хранит усечённый вариант ради компактности пакета.
+/// Сигнатуры/поведение существующих функций не меняются; на не-`.doc.rde` файле — ошибка
+/// (пакет должен быть мигрирован, `RDE_DOC_NOT_MIGRATED` на стороне вызывающего).
+pub fn document_blocks(path: &Path) -> Result<Vec<RdeBlock>, String> {
+    let (doc, _is_rde) = open_document(path)?;
+    Ok(blocks_from_document(&doc, None))
+}
+
+/// Общая реализация извлечения блоков: `max_chars = None` — полный текст.
+fn blocks_from_document(doc: &wordcraft_engine::doc::Document, max_chars: Option<usize>) -> Vec<RdeBlock> {
     let story = wordcraft_engine::doc::StoryRef::Body;
     let mut blocks = Vec::new();
     for (index, path) in doc.para_paths(story).iter().enumerate() {
@@ -1464,11 +1483,15 @@ pub fn extract_blocks(doc: &wordcraft_engine::doc::Document) -> Vec<RdeBlock> {
         } else {
             "paragraph"
         };
+        let text = paragraph.text.trim();
         blocks.push(RdeBlock {
             id: format!("b{}", index + 1),
             path: path.to_string(),
             kind: kind.to_owned(),
-            text: truncate(paragraph.text.trim(), 400),
+            text: match max_chars {
+                Some(max) => truncate(text, max),
+                None => text.to_owned(),
+            },
             para_id: None,
         });
     }

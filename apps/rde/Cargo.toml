@@ -10,3 +10,12 @@ egui = { workspace = true }
 eframe = { workspace = true }
 rde-core = { workspace = true }
 rde-ui = { workspace = true }
+# M1: headless MCP-сервер (`rde mcp serve`) — протокольный слой + реализация контракта.
+rde-mcp = { workspace = true }
+rde-host = { workspace = true }
+
+[dev-dependencies]
+# E2E `mcp serve` по stdio настоящим rmcp-клиентом (spec 2026-07-28).
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+tokio = { workspace = true, features = ["macros", "process"] }
+serde_json = { workspace = true }

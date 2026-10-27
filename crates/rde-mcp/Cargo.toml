@@ -1,0 +1,18 @@
+[package]
+name = "rde-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDE MCP (v0.3/M1): независимый протокольный слой — контракт RdeHost, DTO, реестр инструментов/ресурсов, политика и хуки, сервер на rmcp"
+
+[dependencies]
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { workspace = true }

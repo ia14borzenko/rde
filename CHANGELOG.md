@@ -12,6 +12,33 @@
 
 ### Добавлено
 
+- **M1 «v0.3 — независимый MCP-слой»: `rde-mcp` + `rde-host`, stdio, read-only (ADR-0006,
+  2026-10-27)** — новый протокольный крейт [`rde-mcp`](crates/rde-mcp/src/lib.rs) (контракт
+  `RdeHost`, DTO/`schemars`-схемы, реестр 13 read-only инструментов, 4 ресурса
+  `rde://project/tree|templates|doc/{id}/outline|artifact/{id}/meta` + 2 resource-template,
+  политика fail-closed, хуки `ApprovalHook`/`AuditSink`/`EventSink`, MCP-сервер на `rmcp` 3.8.0,
+  spec **2026-07-28**: `server/discover`, stateless, `ttlMs`/`cacheScope`, MRTR-совместимые типы)
+  и headless-хост [`rde-host`](crates/rde-host/src/lib.rs) (`HeadlessHost` поверх библиотек RDE —
+  без `egui`/`rde-ui`). Зависимости строго `apps/rde → rde-host → rde-mcp`; `rde-mcp` не зависит
+  ни от одного `rde-*` (проверено `cargo tree`), поэтому тестируется на mock-хосте. Безопасность:
+  песочница путей (канонизация + `starts_with`, `..`/абсолютные/симлинки/UNC → `RDE_PATH_ESCAPE`,
+  `.rde/**` закрыт), лимиты размеров, rate-limit 120/мин, таймаут 10 с, изоляция паник, тексты
+  ошибок без путей вне проекта; `stdout` — только JSON-RPC. Аудит — JSONL
+  `.rde/agent/audit.log` (`ts, tool, params_sha256, decision, ok, error_code, duration_ms`;
+  тела/секреты не пишутся). Ошибки — машиночитаемые коды `RDE_*` (12), в `tools/call` —
+  `isError: true` + `structuredContent.error`, неизвестный инструмент — JSON-RPC `-32602`.
+  Точка входа: `rde mcp serve --project <dir>` (или `RDE_PROJECT`; `--policy read-only`), +79 строк
+  в [`apps/rde/src/main.rs`](apps/rde/src/main.rs); EOF/SIGINT — штатное завершение. Аддитивный API
+  [`rde_doc::document_blocks`](crates/rde-doc/src/lib.rs) — блоки с полным текстом для `doc_read`
+  (реестр `rde:doc` хранит усечённые 400 символов). Замер контекста: `tools/list` — 26 825 байт
+  ≈ 6,7–7,7K токенов (≤10K §10.3, ~4–9K R-AGT-08), инструкции — 4 129 байт (≤32 KiB).
+  Тесты: **300 passed** (215 + 85: rde-mcp 58, rde-host 23, e2e stdio 4), 0 failed; e2e — настоящий
+  `rmcp`-клиент по stdio на копии демо-проекта (`server/discover`, `tools/list`, tree/doc/artifact/
+  file/resource-сценарии, коды `RDE_*`, audit JSONL, EOF). Документы: [ADR-0006](docs/adr/0006-mcp-independent-layer.md),
+  ТЗ §0.2/§5.10/§10.3, [`docs/state.md`](docs/state.md). Ограничения M1: мутации/approvals GUI, HTTP,
+  ACP, URI-чипы — M2+; `artifact_*` — статус из ledger без пересчёта `act_key` (read-only сервер
+  ничего не запускает); `doc_*` — только `.doc.rde` (без авто-миграции).
+
 - **P3: вставки формул в документ `omml|svg`, статусы и миграция (ADR-0005 §3/§7, 2026-10-27)** —
   `RdeInsert kind="formula"` (`target = rde://formula/<id>@<act_key>`, `render_mode = omml|svg`,
   документно-локальный `number`, `hash` = act_key, `cached`, `body_hash`), `rde:doc` schema `1→2`
