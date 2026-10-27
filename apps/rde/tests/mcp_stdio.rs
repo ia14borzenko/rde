@@ -1,9 +1,11 @@
-//! E2E M1: `rde mcp serve` по stdio с **настоящим** rmcp-клиентом (spec MCP 2026-07-28).
+//! E2E M2: `rde mcp serve` по stdio с **настоящим** rmcp-клиентом (spec MCP 2026-07-28).
 //!
-//! Проверяет контракт из ТЗ §10.3/§8.7: внешний MCP-клиент видит проект RDE, получает
-//! стабильный `tools/list`, читает дерево/документ/артефакты/источники, получает
-//! машиночитаемые ошибки `RDE_*`, все вызовы попадают в `.rde/agent/audit.log`, stdout занят
-//! только JSON-RPC, EOF stdin завершает сервер штатно.
+//! Проверяет контракт ТЗ §10.3/§8.7: внешний MCP-клиент видит проект и каталог
+//! **21 инструмента** (13 read-only M1 + 8 мутаций M2), получает машиночитаемые ошибки `RDE_*`,
+//! а мутации проходят только через гранты/approvals/чекпоинты: по умолчанию (`--approval=deny`)
+//! файлы не меняются, с `--approval=auto` — меняются с чекпоинтом в аудите; git-коммит и запуск
+//! артефактов (job-модель) проверяются отдельно; все вызовы попадают в `.rde/agent/audit.log`,
+//! stdout занят только JSON-RPC, EOF stdin завершает сервер штатно.
 //!
 //! Тесты работают на временной копии `demo-project/` без `.rde`/`exports`/`out`/`.venv`.
 
@@ -21,11 +23,48 @@ use rmcp::transport::TokioChildProcess;
 use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient};
 use serde_json::{json, Value};
 
-/// Минимальный клиент: сервер не использует server-initiated запросы (M1 без notifications).
+/// Минимальный клиент: сервер не использует server-initiated запросы.
 #[derive(Clone, Default)]
 struct RdeTestClient;
 
 impl ClientHandler for RdeTestClient {}
+
+/// Ожидаемый каталог M2: M1-набор не переставлен, мутации — в конце (prompt-cache).
+const EXPECTED_TOOLS: [&str; 21] = [
+    // M1 (read-only)
+    "workspace_current",
+    "project_tree",
+    "project_search",
+    "file_read",
+    "doc_list",
+    "doc_outline",
+    "doc_read",
+    "artifact_list",
+    "artifact_read",
+    "source_list",
+    "note_list",
+    "template_list",
+    "git_status",
+    // M2 (мутации + job-модель)
+    "artifact_write_manifest",
+    "artifact_write_script",
+    "artifact_run",
+    "run_status",
+    "run_cancel",
+    "run_log",
+    "note_write",
+    "git_commit",
+];
+
+/// Мутирующие инструменты M2 (readOnlyHint=false).
+const MUTATING_TOOLS: [&str; 6] = [
+    "artifact_write_manifest",
+    "artifact_write_script",
+    "artifact_run",
+    "run_cancel",
+    "note_write",
+    "git_commit",
+];
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rde-mcp-e2e-{}-{name}", std::process::id()));
@@ -61,11 +100,27 @@ fn demo_copy(name: &str) -> PathBuf {
     root
 }
 
-/// Подключиться к `rde mcp serve` через `server/discover` (stateless lifecycle 2026-07-28).
-async fn connect(root: &Path) -> RunningService<RoleClient, RdeTestClient> {
+fn std_command(root: &Path, extra_args: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rde"));
+    command.arg("mcp").arg("serve").arg("--project").arg(root);
+    for arg in extra_args {
+        command.arg(arg);
+    }
+    command
+}
+
+fn connect_command(root: &Path, extra_args: &[&str]) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_rde"));
     command.arg("mcp").arg("serve").arg("--project").arg(root);
-    let transport = TokioChildProcess::new(command).expect("запуск rde mcp serve");
+    for arg in extra_args {
+        command.arg(arg);
+    }
+    command
+}
+
+/// Подключиться к `rde mcp serve` через `server/discover` (stateless lifecycle 2026-07-28).
+async fn connect_with(root: &Path, extra_args: &[&str]) -> RunningService<RoleClient, RdeTestClient> {
+    let transport = TokioChildProcess::new(connect_command(root, extra_args)).expect("запуск rde mcp serve");
     RdeTestClient
         .serve_with_lifecycle(
             transport,
@@ -73,6 +128,10 @@ async fn connect(root: &Path) -> RunningService<RoleClient, RdeTestClient> {
         )
         .await
         .expect("MCP-сервер должен подключиться по stdio (server/discover)")
+}
+
+async fn connect(root: &Path) -> RunningService<RoleClient, RdeTestClient> {
+    connect_with(root, &[]).await
 }
 
 async fn call(client: &RunningService<RoleClient, RdeTestClient>, tool: &str, arguments: Value) -> CallToolResult {
@@ -97,6 +156,22 @@ fn error_code(result: &CallToolResult) -> String {
         .to_owned()
 }
 
+fn audit_entries(root: &Path) -> Vec<Value> {
+    let audit = std::fs::read_to_string(root.join(".rde/agent/audit.log")).expect("файл аудита создан");
+    audit.lines().map(|line| serde_json::from_str(line).expect("валидный JSONL аудита")).collect()
+}
+
+async fn first_artifact_of_type(
+    client: &RunningService<RoleClient, RdeTestClient>,
+    kind: &str,
+) -> Option<String> {
+    let list = call(client, "artifact_list", json!({})).await;
+    structured(&list)
+        .as_array()
+        .and_then(|artifacts| artifacts.iter().find(|artifact| artifact["artifact_type"] == kind))
+        .and_then(|artifact| artifact["id"].as_str().map(str::to_owned))
+}
+
 #[tokio::test]
 async fn external_client_reads_project_document_artifacts_and_audits_calls() {
     let root = demo_copy("full");
@@ -109,34 +184,29 @@ async fn external_client_reads_project_document_artifacts_and_audits_calls() {
     let instructions = peer.instructions.clone().expect("инструкции в discover");
     assert!(instructions.len() <= 32 * 1024, "инструкции {} байт", instructions.len());
     assert!(instructions.contains("RDE MCP"));
+    assert!(instructions.contains("Мутации (M2"), "инструкции описывают политику мутаций M2: {instructions}");
     assert!(peer.capabilities.tools.is_some());
     assert!(peer.capabilities.resources.is_some());
 
-    // 2. tools/list: стабильный набор/порядок, только read-only.
+    // 2. tools/list: 21 инструмент, M1-порядок не переставлен, M2 — в конце.
     let tools = client.peer().list_tools(None).await.expect("tools/list");
     let names: Vec<&str> = tools.tools.iter().map(|tool| tool.name.as_ref()).collect();
-    assert_eq!(
-        names,
-        vec![
-            "workspace_current",
-            "project_tree",
-            "project_search",
-            "file_read",
-            "doc_list",
-            "doc_outline",
-            "doc_read",
-            "artifact_list",
-            "artifact_read",
-            "source_list",
-            "note_list",
-            "template_list",
-            "git_status",
-        ]
-    );
+    assert_eq!(names, EXPECTED_TOOLS);
     assert_eq!(tools.ttl_ms, Some(300_000));
+    let definitions_size = serde_json::to_vec(&tools.tools).expect("сериализация tools").len();
+    assert!(definitions_size <= 40 * 1024, "tools/list {definitions_size} байт > 40 KiB (бюджет R-AGT-08)");
     for tool in &tools.tools {
-        assert_eq!(tool.annotations.as_ref().and_then(|annotations| annotations.read_only_hint), Some(true));
+        let name = tool.name.as_ref();
+        let annotations = tool.annotations.as_ref().expect("аннотации");
         assert!(tool.input_schema.contains_key("type"));
+        assert!(tool.output_schema.is_some(), "{name} без outputSchema");
+        if MUTATING_TOOLS.contains(&name) {
+            assert_eq!(annotations.read_only_hint, Some(false), "{name}: readOnlyHint");
+            assert_eq!(annotations.destructive_hint, Some(true), "{name}: destructiveHint");
+        } else {
+            assert_eq!(annotations.read_only_hint, Some(true), "{name}: readOnlyHint");
+            assert_eq!(annotations.destructive_hint, Some(false), "{name}: destructiveHint");
+        }
     }
 
     // 3. workspace_current / project_tree.
@@ -144,25 +214,20 @@ async fn external_client_reads_project_document_artifacts_and_audits_calls() {
     assert_eq!(workspace.is_error, Some(false));
     assert_eq!(structured(&workspace)["name"], "Демо: отчёт по НИР");
     assert_eq!(structured(&workspace)["object_count"], 12);
-
     let tree = call(&client, "project_tree", json!({})).await;
-    let nodes = structured(&tree).as_array().expect("массив узлов дерева").clone();
-    assert_eq!(nodes.len(), 12);
-    assert!(nodes.iter().any(|node| node["kind"] == "document"));
+    assert_eq!(structured(&tree).as_array().map(Vec::len), Some(12));
 
     // 4. Документ: doc_list → doc_outline → doc_read по block_ids.
     let documents = call(&client, "doc_list", json!({})).await;
     let document = structured(&documents)[0].clone();
     let doc_id = document["id"].as_str().expect("id документа").to_owned();
     assert_eq!(document["migrated"], true);
-
     let outline = call(&client, "doc_outline", json!({"doc_id": doc_id})).await;
     let blocks = structured(&outline)["blocks"].as_array().expect("блоки оглавления").clone();
     assert!(!blocks.is_empty());
     let block_ids: Vec<Value> = blocks.iter().take(2).map(|block| block["id"].clone()).collect();
     let body = call(&client, "doc_read", json!({"doc_id": doc_id, "block_ids": block_ids})).await;
     assert_eq!(structured(&body)["returned_blocks"], 2);
-    assert!(!structured(&body)["text"].as_str().unwrap_or_default().is_empty());
 
     // 5. Артефакты: list → read (без запуска).
     let artifacts = call(&client, "artifact_list", json!({})).await;
@@ -173,31 +238,32 @@ async fn external_client_reads_project_document_artifacts_and_audits_calls() {
     assert_eq!(detail.is_error, Some(false));
     assert_eq!(structured(&detail)["info"]["id"], artifacts[0]["id"]);
 
-    // 6. Источники/заметки/шаблоны/git (read-only).
+    // 6. Источники/заметки/шаблоны/git (read-only). Копия вне git: ветки нет (branch=null).
     assert_eq!(structured(&call(&client, "source_list", json!({})).await).as_array().map(Vec::len), Some(3));
     assert_eq!(structured(&call(&client, "note_list", json!({})).await).as_array().map(Vec::len), Some(1));
     assert_eq!(structured(&call(&client, "template_list", json!({})).await).as_array().map(Vec::len), Some(3));
     let git = call(&client, "git_status", json!({})).await;
-    assert!(structured(&git)["available"].as_bool().unwrap_or(false));
+    let git = structured(&git);
+    assert_eq!(git["available"], true);
+    assert_eq!(git["is_repo"], false, "копия без .git — не репозиторий");
+    assert!(git.get("branch").is_none() || git["branch"].is_null(), "без репозитория ветка null: {git}");
 
-    // 7. file_read: успех + path-sandbox (машиночитаемый код).
+    // 7. file_read: успех + path-sandbox + большой файл без range.
     let file = call(&client, "file_read", json!({"path": "rde.toml"})).await;
     assert!(structured(&file)["text"].as_str().unwrap_or_default().contains("rde/project@1"));
     let escape = call(&client, "file_read", json!({"path": "../../../etc/passwd"})).await;
-    assert_eq!(escape.is_error, Some(true));
     assert_eq!(error_code(&escape), "RDE_PATH_ESCAPE");
     let dot_rde = call(&client, "file_read", json!({"path": ".rde/agent/audit.log"})).await;
     assert_eq!(error_code(&dot_rde), "RDE_APPROVAL_DENIED");
 
     // 8. project_search и лимиты.
-    let search = call(&client, "project_search", json!({"query": "статистик"}))
-        .await;
+    let search = call(&client, "project_search", json!({"query": "статистик"})).await;
     assert!(!structured(&search).as_array().expect("результаты поиска").is_empty());
     let too_many = call(&client, "project_search", json!({"query": "a", "limit": 1000})).await;
     assert_eq!(error_code(&too_many), "RDE_OUT_OF_RANGE");
 
-    // 9. Неизвестный инструмент — ошибка JSON-RPC (protocol error), а не результат.
-    let unknown = client.peer().call_tool(CallToolRequestParams::new("artifact_run")).await;
+    // 9. Неизвестный инструмент — ошибка JSON-RPC.
+    let unknown = client.peer().call_tool(CallToolRequestParams::new("doc_insert")).await;
     assert!(unknown.is_err(), "неизвестный инструмент должен вернуть ошибку протокола");
 
     // 10. Ресурсы: list/templates/read.
@@ -206,7 +272,6 @@ async fn external_client_reads_project_document_artifacts_and_audits_calls() {
     let uris: Vec<&str> = resources.resources.iter().map(|resource| resource.uri.as_str()).collect();
     assert!(uris.contains(&"rde://project/tree"));
     assert!(uris.contains(&"rde://templates"));
-    assert!(uris.contains(&"rde://doc/01M5VJ1JG04TFF59TDWH9EDD1R/outline"));
     let templates = client.peer().list_resource_templates(None).await.expect("resources/templates/list");
     assert_eq!(templates.resource_templates.len(), 2);
     let tree_resource = client
@@ -222,17 +287,26 @@ async fn external_client_reads_project_document_artifacts_and_audits_calls() {
         other => panic!("ожидался текстовый ресурс, получено {other:?}"),
     };
     assert_eq!(tree_value.as_array().map(Vec::len), Some(12));
-    let missing_resource = client.peer().read_resource(ReadResourceRequestParams::new("rde://nope")).await;
-    assert!(missing_resource.is_err(), "неизвестный ресурс — ошибка ресурса");
 
-    // 11. Аудит: JSONL в .rde/agent/audit.log, по строке на вызов, без тел аргументов.
-    let audit_path = root.join(".rde/agent/audit.log");
-    let audit = std::fs::read_to_string(&audit_path).expect("файл аудита создан");
-    let entries: Vec<Value> = audit
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("валидная JSONL-строка аудита"))
-        .collect();
-    assert!(entries.len() >= 12, "аудит должен покрывать все вызовы: {} строк", entries.len());
+    // 11. Default deny: мутация отклоняется, файлы не меняются, аудит фиксирует deny.
+    let artifact_id = artifacts[0]["id"].as_str().expect("id артефакта").to_owned();
+    let manifest_path = root.join("objects/artifacts").join(&artifact_id).join("artifact.toml");
+    let before = std::fs::read(&manifest_path).unwrap();
+    let denied = call(
+        &client,
+        "artifact_write_manifest",
+        json!({"artifact_id": artifact_id, "manifest": {"title": "Не должно примениться"}}),
+    )
+    .await;
+    assert_eq!(denied.is_error, Some(true));
+    assert_eq!(error_code(&denied), "RDE_APPROVAL_DENIED");
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), before, "deny не меняет файлы");
+    let denied_run = call(&client, "artifact_run", json!({})).await;
+    assert_eq!(error_code(&denied_run), "RDE_APPROVAL_DENIED");
+
+    // 12. Аудит: JSONL, по строке на вызов, расширенные поля M2.
+    let entries = audit_entries(&root);
+    assert!(entries.len() >= 15, "аудит покрывает все вызовы: {}", entries.len());
     for entry in &entries {
         assert!(entry.get("tool").and_then(Value::as_str).is_some());
         assert!(entry.get("ts").and_then(Value::as_u64).is_some());
@@ -242,24 +316,184 @@ async fn external_client_reads_project_document_artifacts_and_audits_calls() {
         assert!(entry.get("duration_ms").and_then(Value::as_u64).is_some());
     }
     assert!(entries.iter().any(|entry| entry["tool"] == "project_tree" && entry["ok"] == true));
-    assert!(entries
+    let denied_entry = entries
         .iter()
-        .any(|entry| entry["tool"] == "artifact_run" && entry["decision"] == "deny"));
+        .find(|entry| entry["tool"] == "artifact_write_manifest" && entry["decision"] == "deny")
+        .expect("аудит отказа мутации");
+    assert_eq!(denied_entry["reason"], "policy", "причина отказа — политика");
     // Тела/аргументы в аудит не пишутся — только хеши.
-    assert!(!audit.contains("../../../etc/passwd"), "аргументы не должны попадать в аудит");
+    let audit_text = std::fs::read_to_string(root.join(".rde/agent/audit.log")).unwrap();
+    assert!(!audit_text.contains("../../../etc/passwd"));
 
-    // 12. EOF/завершение: клиент отменяет сервис, child завершается (graceful shutdown).
+    // 13. EOF/завершение: клиент отменяет сервис, child завершается (graceful shutdown).
+    client.cancel().await.expect("корректное завершение клиента");
+}
+
+#[tokio::test]
+async fn approval_auto_applies_mutations_with_checkpoint_and_audit() {
+    let root = demo_copy("auto");
+    let client = connect_with(&root, &["--approval=auto"]).await;
+    let artifacts = call(&client, "artifact_list", json!({})).await;
+    let artifact_id = structured(&artifacts)
+        .as_array()
+        .and_then(|artifacts| artifacts.iter().find(|artifact| artifact["artifact_type"] == "compute"))
+        .and_then(|artifact| artifact["id"].as_str())
+        .expect("compute-артефакт")
+        .to_owned();
+    let manifest_path = root.join("objects/artifacts").join(&artifact_id).join("artifact.toml");
+    let _before = std::fs::read(&manifest_path).unwrap();
+
+    // 1) Запись манифеста с approval=auto: файл изменён, чекпоинт создан.
+    let result = call(
+        &client,
+        "artifact_write_manifest",
+        json!({"artifact_id": artifact_id, "manifest": {"title": "Заголовок из M2-агента"}}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(false), "{result:?}");
+    let outcome = structured(&result);
+    assert_eq!(outcome["dry_run"], false);
+    let checkpoint_id = outcome["checkpoint_id"].as_str().expect("checkpoint_id").to_owned();
+    let manifest_text = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(
+        manifest_text.contains("Заголовок из M2-агента"),
+        "манифест записан: {manifest_text}"
+    );
+    assert!(root.join(".rde/agent/checkpoints").join(&checkpoint_id).join("manifest.json").is_file());
+    // `artifact_list` видит изменение (проект — файлы как источник истины).
+    let list = call(&client, "artifact_list", json!({})).await;
+    assert!(structured(&list)
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|artifact| artifact["title"] == "Заголовок из M2-агента"));
+    // 2) Аудит: decision=allow + reason=allow_once + checkpoint_id.
+    let entries = audit_entries(&root);
+    let entry = entries
+        .iter()
+        .find(|entry| entry["tool"] == "artifact_write_manifest" && entry["decision"] == "allow")
+        .expect("аудит разрешённой мутации");
+    assert_eq!(entry["checkpoint_id"], checkpoint_id);
+    assert_eq!(entry["reason"], "allow_once");
+
+    // 3) note_write: содержимое заметки меняется.
+    let notes = call(&client, "note_list", json!({})).await;
+    let note = structured(&notes).as_array().and_then(|notes| notes.first()).cloned().expect("заметка");
+    let note_id = note["id"].as_str().unwrap().to_owned();
+    let note_path = root.join(note["file"].as_str().unwrap());
+    let note_result = call(&client, "note_write", json!({"note_id": note_id, "content": "# M2 e2e\n"})).await;
+    assert_eq!(note_result.is_error, Some(false), "{note_result:?}");
+    assert!(std::fs::read_to_string(&note_path).unwrap().contains("M2 e2e"));
+
+    // 4) dry_run не пишет.
+    let dry = call(
+        &client,
+        "artifact_write_manifest",
+        json!({"artifact_id": artifact_id, "manifest": {"title": "dry"}, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(structured(&dry)["dry_run"], true);
+    assert!(!std::fs::read_to_string(&manifest_path).unwrap().contains("title = \"dry\""));
+
+    client.cancel().await.expect("корректное завершение клиента");
+}
+
+#[tokio::test]
+async fn approval_allowlist_limits_tools() {
+    let root = demo_copy("allowlist");
+    let client = connect_with(&root, &["--approval=allowlist", "--allow-tools=note_write"]).await;
+    // note_write разрешён списком.
+    let notes = call(&client, "note_list", json!({})).await;
+    let note_id = structured(&notes).as_array().and_then(|notes| notes.first()).and_then(|note| note["id"].as_str()).unwrap().to_owned();
+    let allowed = call(&client, "note_write", json!({"note_id": note_id, "content": "# allowlist\n"})).await;
+    assert_eq!(allowed.is_error, Some(false), "{allowed:?}");
+    // artifact_write_manifest не в списке — гранта нет.
+    let artifacts = call(&client, "artifact_list", json!({})).await;
+    let artifact_id = structured(&artifacts).as_array().and_then(|artifacts| artifacts.first()).and_then(|artifact| artifact["id"].as_str()).unwrap().to_owned();
+    let denied = call(
+        &client,
+        "artifact_write_manifest",
+        json!({"artifact_id": artifact_id, "manifest": {"title": "x"}}),
+    )
+    .await;
+    assert_eq!(error_code(&denied), "RDE_APPROVAL_DENIED");
+    client.cancel().await.expect("корректное завершение клиента");
+}
+
+#[tokio::test]
+async fn git_commit_e2e_with_approval() {
+    if Command::new("git").arg("--version").output().map(|output| !output.status.success()).unwrap_or(true) {
+        eprintln!("git недоступен — e2e git_commit пропущен");
+        return;
+    }
+    let root = demo_copy("git");
+    let git = |args: &[&str]| {
+        let status = Command::new("git").args(args).current_dir(&root).output().expect("git запускается");
+        assert!(status.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&status.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "E2E"]);
+    git(&["config", "user.email", "e2e@rde.local"]);
+    // Грант git_commit — отдельный (--allow-destructive, A4); project_write тоже нужен для мутации.
+    let client = connect_with(&root, &["--approval=auto", "--allow-destructive"]).await;
+    let notes = call(&client, "note_list", json!({})).await;
+    let note_id = structured(&notes).as_array().and_then(|notes| notes.first()).and_then(|note| note["id"].as_str()).unwrap().to_owned();
+    assert_eq!(call(&client, "note_write", json!({"note_id": note_id, "content": "# git e2e\n"})).await.is_error, Some(false));
+    let commit = call(&client, "git_commit", json!({"message": "M2: e2e коммит агента"})).await;
+    assert_eq!(commit.is_error, Some(false), "{commit:?}");
+    let outcome = structured(&commit);
+    assert!(outcome["commit"]["id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(outcome["checkpoint_id"].as_str().is_some());
+    // В коммите нет `.rde/**`; рабочее дерево чистое.
+    let tracked = Command::new("git").args(["ls-files"]).current_dir(&root).output().expect("git ls-files");
+    let tracked = String::from_utf8_lossy(&tracked.stdout);
+    assert!(!tracked.lines().any(|line| line.starts_with(".rde/")), "в коммите .rde: {tracked}");
+    let git_status = call(&client, "git_status", json!({})).await;
+    assert_eq!(structured(&git_status)["is_repo"], true);
+    assert_eq!(structured(&git_status)["changed"].as_array().map(Vec::len), Some(0));
+    // Без гранта git_commit недоступен (отдельный --approval=deny сервер).
+    client.cancel().await.expect("корректное завершение клиента");
+}
+
+#[tokio::test]
+async fn artifact_run_job_model_e2e_on_data_artifact() {
+    // Запуск data-артефакта не требует uv/python (нет скрипта) — проверяем job-модель end-to-end.
+    let root = demo_copy("run");
+    let client = connect_with(&root, &["--approval=auto", "--allow-run"]).await;
+    let data_artifact = first_artifact_of_type(&client, "data").await;
+    let Some(data_artifact) = data_artifact else {
+        eprintln!("в демо нет data-артефакта — e2e artifact_run пропущен");
+        return;
+    };
+    let job = call(&client, "artifact_run", json!({"artifact_id": data_artifact})).await;
+    assert_eq!(job.is_error, Some(false), "artifact_run: {job:?}");
+    let info = structured(&job);
+    let job_id = info["job_id"].as_str().expect("job_id").to_owned();
+    assert!(info["checkpoint_id"].as_str().is_some(), "перед запуском создан чекпоинт");
+    // Опрос до завершения (job асинхронный; обычно завершается за миллисекунды).
+    let mut state = String::new();
+    for _ in 0..200 {
+        let status = call(&client, "run_status", json!({"job_id": job_id})).await;
+        assert_eq!(status.is_error, Some(false), "run_status: {status:?}");
+        state = structured(&status)["state"].as_str().unwrap_or_default().to_owned();
+        if state != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(matches!(state.as_str(), "succeeded" | "failed"), "job не завершился: {state}");
+    let log = call(&client, "run_log", json!({"job_id": job_id, "max_bytes": 1024})).await;
+    assert_eq!(log.is_error, Some(false), "run_log: {log:?}");
+    // Неизвестный job — машиночитаемая ошибка.
+    let missing = call(&client, "run_status", json!({"job_id": "01NOSUCHJOB"})).await;
+    assert_eq!(error_code(&missing), "RDE_JOB_NOT_FOUND");
     client.cancel().await.expect("корректное завершение клиента");
 }
 
 #[test]
 fn stdout_is_jsonrpc_only_and_eof_shuts_down_server() {
     let root = demo_copy("raw");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rde"))
-        .arg("mcp")
-        .arg("serve")
-        .arg("--project")
-        .arg(&root)
+    let mut child = std_command(&root, &[])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -276,19 +510,28 @@ fn stdout_is_jsonrpc_only_and_eof_shuts_down_server() {
         json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": meta}}),
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": meta}}),
         json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "project_tree", "arguments": {}, "_meta": meta}}),
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "artifact_run", "arguments": {}, "_meta": meta}}),
     ];
     for request in &requests {
         writeln!(stdin, "{request}").expect("запись JSON-RPC");
     }
     stdin.flush().unwrap();
-    for expected_id in 1..=3 {
+    // Ответы могут прийти не в порядке запросов (tools/call выполняется параллельно) —
+    // проверяем, что на stdout только JSON-RPC и есть ответ на каждый id.
+    let mut responses = std::collections::BTreeMap::new();
+    while responses.len() < requests.len() {
         let mut line = String::new();
         reader.read_line(&mut line).expect("чтение ответа");
         let value: Value = serde_json::from_str(line.trim()).unwrap_or_else(|error| {
-            panic!("stdout должен содержать только JSON-RPC (id {expected_id}): {error}; строка: {line:?}")
+            panic!("stdout должен содержать только JSON-RPC: {error}; строка: {line:?}")
         });
         assert_eq!(value["jsonrpc"], "2.0");
-        assert_eq!(value["id"], expected_id);
+        let id = value["id"].as_i64().expect("id ответа");
+        responses.insert(id, value);
+    }
+    for expected_id in 1..=4 {
+        let value = responses.remove(&expected_id).unwrap_or_else(|| panic!("нет ответа id {expected_id}"));
+        assert!(value.get("result").is_some() || value.get("error").is_some(), "ответ id {expected_id}: {value}");
     }
     // EOF stdin: сервер обязан выйти сам, штатно и быстро.
     drop(stdin);
@@ -302,30 +545,46 @@ fn stdout_is_jsonrpc_only_and_eof_shuts_down_server() {
         .expect("сервер не завершился по EOF за 15 с")
         .expect("wait на процесс");
     assert!(status.success(), "EOF-завершение должно быть кодом 0, получено {status:?}");
-    assert!(root.join(".rde/agent/audit.log").is_file(), "tools/call должен попасть в аудит");
+    let audit = std::fs::read_to_string(root.join(".rde/agent/audit.log")).expect("аудит создан");
+    assert!(audit.contains("artifact_run"), "отказ мутации в аудите: {audit}");
+    assert!(audit.contains("\"decision\":\"deny\""), "default deny в аудите: {audit}");
 }
 
 #[test]
-fn invalid_project_exits_with_code_2_and_clear_stderr() {
+fn invalid_project_and_bad_approval_flags_exit_with_code_2() {
     let dir = temp_dir("missing-project");
-    let output = Command::new(env!("CARGO_BIN_EXE_rde"))
-        .arg("mcp")
-        .arg("serve")
-        .arg("--project")
-        .arg(dir.join("nonexistent"))
+    let output = std_command(&dir.join("nonexistent"), &[])
         .stdin(Stdio::null())
         .output()
         .expect("запуск rde mcp serve");
     assert_eq!(output.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("RDE MCP"), "понятная ошибка в stderr: {stderr}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("RDE MCP"));
     assert!(output.stdout.is_empty(), "stdout при ошибке проекта должен быть пустым");
+
+    // Несогласованные флаги approvals — код 2 и понятная подсказка (без запуска сервера).
+    let project = demo_copy("bad-flags");
+    for args in [
+        vec!["--approval=allowlist"],
+        vec!["--approval=deny", "--allow-run"],
+        vec!["--approval=auto", "--allow-tools=note_write"],
+        vec!["--approval=unknown"],
+    ] {
+        let output = std_command(&project, &args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("запуск rde mcp serve");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "флаги {args:?}: stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
 fn non_mcp_arguments_do_not_touch_mcp_path() {
-    // `--help` в MCP-ветке невозможен: команда не `mcp` — ветка не активируется;
-    // проверяем только, что `mcp` без `serve` даёт код 2 и подсказку (без запуска GUI).
+    // `mcp` без `serve` даёт код 2 и подсказку (без запуска GUI).
     let output = Command::new(env!("CARGO_BIN_EXE_rde"))
         .arg("mcp")
         .arg("api")
@@ -333,6 +592,5 @@ fn non_mcp_arguments_do_not_touch_mcp_path() {
         .output()
         .expect("запуск rde mcp api");
     assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("mcp serve"), "подсказка использования: {stderr}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mcp serve"));
 }

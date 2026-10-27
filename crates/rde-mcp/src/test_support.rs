@@ -2,13 +2,20 @@
 //!
 //! Доказывает независимость слоя: `rde-mcp` тестируется на синтетическом хосте (A2/A8).
 
+use std::sync::{Arc, Mutex};
+
 use crate::error::HostError;
 use crate::host::RdeHost;
 use crate::model::{
-    ArtifactDetail, ArtifactInfo, ArtifactRuntimeInfo, DocInfo, DocOutline, DocReadRequest, DocText,
-    DocTextBlock, FileChunk, GitStatusInfo, NoteInfo, ObjectNode, OutlineBlock, SearchHit, SourceInfo,
-    TemplateInfo, WorkspaceInfo,
+    ArtifactDetail, ArtifactInfo, ArtifactManifestDto, ArtifactRuntimeInfo, DocInfo, DocOutline, DocReadRequest,
+    DocText, DocTextBlock, FileChunk, GitCommitInfo, GitCommitOutcome, GitStatusInfo, JobInfo, JobLog,
+    MutationOutcome, NoteInfo, ObjectNode, OutlineBlock, SearchHit, SourceInfo, TemplateInfo, WorkspaceInfo,
 };
+
+/// Id «job'а» mock-хоста (детерминированный; тесты tools/сервера).
+pub(crate) const MOCK_JOB_ID: &str = "01MOCKJOB000000000000000000";
+/// Id «чекпоинта» mock-хоста.
+pub(crate) const MOCK_CHECKPOINT_ID: &str = "01MOCKCHECKPOINT00000000000";
 
 /// Синтетический хост: стабильные данные о «проекте» из трёх объектов.
 #[derive(Clone, Debug)]
@@ -17,6 +24,8 @@ pub(crate) struct MockHost {
     pub instructions: String,
     /// Сколько узлов вернуть в `project_tree`.
     pub tree_len: usize,
+    /// Журнал мутаций (имя инструмента + id) — проверка «deny ничего не пишет».
+    pub mutations: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for MockHost {
@@ -24,6 +33,7 @@ impl Default for MockHost {
         Self {
             instructions: "RDE: mock-проект, политика read-only (M1)".to_owned(),
             tree_len: 3,
+            mutations: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -35,7 +45,66 @@ impl MockHost {
         while instructions.len() < bytes {
             instructions.push_str("строка карты проекта\n");
         }
-        Self { instructions, tree_len: 3 }
+        Self { instructions, tree_len: 3, mutations: Arc::new(Mutex::new(Vec::new())) }
+    }
+
+    /// Записать мутацию в журнал.
+    fn record(&self, what: impl Into<String>) {
+        match self.mutations.lock() {
+            Ok(mut log) => log.push(what.into()),
+            Err(poisoned) => poisoned.into_inner().push(what.into()),
+        }
+    }
+
+    /// Сколько мутаций было выполнено (deny обязан оставить 0).
+    pub(crate) fn mutation_count(&self) -> usize {
+        match self.mutations.lock() {
+            Ok(log) => log.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+
+    /// Журнал мутаций.
+    pub(crate) fn mutation_log(&self) -> Vec<String> {
+        match self.mutations.lock() {
+            Ok(log) => log.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+impl MockHost {
+    fn mutation_outcome(&self, what: &str, id: &str, dry_run: bool) -> MutationOutcome {
+        if !dry_run {
+            self.record(format!("{what}:{id}"));
+        }
+        MutationOutcome {
+            dry_run,
+            checkpoint_id: if dry_run { None } else { Some(MOCK_CHECKPOINT_ID.to_owned()) },
+            changed_files: if dry_run { Vec::new() } else { vec![format!("objects/{what}/{id}")] },
+            detail: None,
+        }
+    }
+
+    fn job_info(&self, state: &str) -> JobInfo {
+        JobInfo {
+            job_id: MOCK_JOB_ID.to_owned(),
+            state: state.to_owned(),
+            created_unix: 1_700_000_000,
+            finished_unix: if state == "running" { None } else { Some(1_700_000_010) },
+            targets: vec!["art-1".to_owned()],
+            include_dependents: false,
+            force: false,
+            total: 1,
+            ran: usize::from(state == "succeeded"),
+            skipped: 0,
+            failed: usize::from(state == "failed"),
+            errors: Vec::new(),
+            run_id: Some("run-1".to_owned()),
+            log_path: Some(".rde/runs/run-1/run.log".to_owned()),
+            checkpoint_id: Some(MOCK_CHECKPOINT_ID.to_owned()),
+            message: format!("mock job: {state}"),
+        }
     }
 }
 
@@ -241,11 +310,130 @@ impl RdeHost for MockHost {
         Ok(GitStatusInfo {
             available: true,
             is_repo: true,
-            branch: "main".to_owned(),
+            branch: Some("main".to_owned()),
             changed: Vec::new(),
             untracked: Vec::new(),
             last_commit: None,
             ahead: Some(0),
+        })
+    }
+
+    // --- M2: мутации/запуск (тесты слоя без ФС) ---------------------------------
+
+    fn artifact_write_manifest(
+        &self,
+        id: &str,
+        manifest: ArtifactManifestDto,
+        dry_run: bool,
+        _expected_sha256: Option<&str>,
+    ) -> Result<MutationOutcome, HostError> {
+        if id == "missing" {
+            return Err(HostError::not_found("артефакт не найден"));
+        }
+        let _ = manifest;
+        Ok(self.mutation_outcome("artifact_manifest", id, dry_run))
+    }
+
+    fn artifact_write_script(
+        &self,
+        id: &str,
+        file: &str,
+        _content: &str,
+        dry_run: bool,
+        _expected_sha256: Option<&str>,
+    ) -> Result<MutationOutcome, HostError> {
+        if file.contains("..") {
+            return Err(HostError::path_escape("путь выходит из каталога артефакта"));
+        }
+        Ok(self.mutation_outcome("artifact_script", id, dry_run))
+    }
+
+    fn note_write(
+        &self,
+        id: &str,
+        _content: Option<String>,
+        _title: Option<String>,
+        dry_run: bool,
+        _expected_sha256: Option<&str>,
+    ) -> Result<MutationOutcome, HostError> {
+        if id == "missing" {
+            return Err(HostError::not_found("заметка не найдена"));
+        }
+        Ok(self.mutation_outcome("note", id, dry_run))
+    }
+
+    fn artifact_run(
+        &self,
+        _targets: Option<Vec<String>>,
+        _include_dependents: bool,
+        _force: bool,
+    ) -> Result<JobInfo, HostError> {
+        self.record("artifact_run:mock");
+        Ok(self.job_info("succeeded"))
+    }
+
+    fn run_status(&self, job_id: &str) -> Result<JobInfo, HostError> {
+        if job_id != MOCK_JOB_ID {
+            return Err(HostError::job_not_found(format!("job `{job_id}` не найден")).with_hint("jobs живут в процессе сервера"));
+        }
+        Ok(self.job_info("succeeded"))
+    }
+
+    fn run_cancel(&self, job_id: &str) -> Result<JobInfo, HostError> {
+        if job_id != MOCK_JOB_ID {
+            return Err(HostError::job_not_found(format!("job `{job_id}` не найден")));
+        }
+        self.record("run_cancel:mock");
+        Ok(self.job_info("cancelled"))
+    }
+
+    fn run_log(&self, job_id: &str, offset: u64, max_bytes: usize) -> Result<JobLog, HostError> {
+        if job_id != MOCK_JOB_ID {
+            return Err(HostError::job_not_found(format!("job `{job_id}` не найден")));
+        }
+        let text = format!("mock log offset={offset} max={max_bytes}");
+        Ok(JobLog {
+            job_id: job_id.to_owned(),
+            offset,
+            next_offset: offset + text.len() as u64,
+            eof: true,
+            truncated: false,
+            text,
+        })
+    }
+
+    fn git_commit(&self, message: &str, dry_run: bool) -> Result<GitCommitOutcome, HostError> {
+        if message.trim().is_empty() {
+            return Err(HostError::invalid_argument("сообщение коммита пустое"));
+        }
+        if !dry_run {
+            self.record("git_commit:mock");
+        }
+        Ok(GitCommitOutcome {
+            dry_run,
+            checkpoint_id: if dry_run { None } else { Some(MOCK_CHECKPOINT_ID.to_owned()) },
+            commit: if dry_run {
+                None
+            } else {
+                Some(GitCommitInfo {
+                    id: "abc1234".to_owned(),
+                    summary: message.to_owned(),
+                    author: "Mock".to_owned(),
+                    time: "2026-10-27".to_owned(),
+                })
+            },
+            files: 1,
+            message: if dry_run { "будет закоммичен 1 файл".to_owned() } else { "коммит создан".to_owned() },
+        })
+    }
+
+    fn checkpoint_restore(&self, checkpoint_id: &str) -> Result<MutationOutcome, HostError> {
+        self.record(format!("checkpoint_restore:{checkpoint_id}"));
+        Ok(MutationOutcome {
+            dry_run: false,
+            checkpoint_id: Some(checkpoint_id.to_owned()),
+            changed_files: vec!["objects/artifacts/art-1/artifact.toml".to_owned()],
+            detail: Some("чекпоинт откачен".to_owned()),
         })
     }
 

@@ -12,6 +12,45 @@
 
 ### Добавлено
 
+- **M2 «v0.3 — мутации через хуки approvals/checkpoints»: grants, чекпоинты, job-модель (ADR-0007,
+  2026-10-27)** — в существующий слой `rde-mcp`/`rde-host` добавлены 8 мутирующих MCP-инструментов
+  через **те же хуки** (`ApprovalHook`/`AuditSink`/`EventSink`), без правок архитектуры M1:
+  [`artifact_write_manifest`](crates/rde-mcp/src/tools.rs) (патч `artifact.toml`; валидация схемы
+  `rde-core` до записи; `null params` канонизируется), `artifact_write_script` (только
+  `runtime.entry`/`script_files` python/data, ≤256 KiB, whitelist), `artifact_run`/`run_status`/
+  `run_cancel`/`run_log` (async job-модель поверх `rde-dag::update` + `rde-run::read_log_from`, отмена
+  SIGTERM→grace→SIGKILL, один активный job → `RDE_BUSY`), `note_write` (`note.md` + title в
+  `note.toml`), `git_commit` (автор — human из `rde.toml` → agent → «MCP client»; `.rde/**` в коммит
+  не попадает). Всего **21 инструмент ≤32** (§18-3), M1-набор не переставлен (prompt-cache):
+  [`tools.rs`](crates/rde-mcp/src/tools.rs). **Политика:** `McpPolicy` — grants
+  `project_write`/`run_script`/`git_commit` (дефолт false), `ToolSpec.grant`, `authorize_tool_call` =
+  whitelist → грант → сессионный кэш `AllowSession` (ключ `(tool, params_sha256)`) → `ApprovalHook`;
+  CLI `rde mcp serve --approval=deny|auto|allowlist` + `--allow-tools/--allow-run/--allow-destructive`
+  (без флагов любая мутация → `RDE_APPROVAL_DENIED`, файлы не меняются — e2e побайтово;
+  `artifact_run` дополнительно требует `trusted`-проект R-RUN-06).
+  [`policy.rs`](crates/rde-mcp/src/policy.rs), [+~150 строк](apps/rde/src/main.rs). **Чекпоинты
+  (R-AGT-05):** `.rde/agent/checkpoints/<ULID>/` — `manifest.json {id, ts, tool, args_sha256,
+  roots: RootSet, files:[{rel_path, existed, sha256, size, backup}], rolled_back}` + байт-в-байт копии
+  затронутых файлов; на ошибке — **авто-откат** файлов и корней store (`begin_tx_with_roots(roots_до)`),
+  на успехе — ретенция 50/32 MiB; ручной откат — `RdeHost::checkpoint_restore`;
+  [`checkpoints.rs`](crates/rde-host/src/checkpoints.rs). `RDE_CONFLICT` при внешней правке
+  (`expected_sha256`). **Job-модель (R-AGT-09):** `ArtifactExecutor`/`DagExecutor`, реестр (история 20,
+  отмена при shutdown, jobs не переживают рестарт), `RDE_BUSY`/`RDE_JOB_NOT_FOUND`;
+  [`jobs.rs`](crates/rde-host/src/jobs.rs). **Аудит:** JSONL расширен `reason`/`checkpoint_id` (старые
+  поля сохранены). **M1-review фиксы:** `with_store` без `expect` (ошибка вместо паники), `file_read`
+  не читает файл целиком (без range — 32 KiB/≤8 MiB → `RDE_OUT_OF_RANGE`; с range — `seek`/построчно),
+  `git_status.branch: Option<String>` (`null` вне репозитория), «read-only M1 = контент проекта,
+  `.rde/**` пишется локально» в [ADR-0006](docs/adr/0006-mcp-independent-layer.md)/README.
+  **Проверки:** `cargo test --workspace` — **355 passed, 0 failed** (M1 300 + 55: `rde-mcp` 75,
+  `rde-host` 57 = 28 unit + 15 headless + 14 mutations, e2e 8: default deny/auto/allowlist/git/job/
+  stdout purity/EOF/плохие флаги); `cargo tree -p rde-mcp`/`-p rde-host` — пусто; дифф — 0 файлов
+  в `rde-core`/`rde-dag`/`rde-doc`/`rde-docx`/`rde-store`/`rde-vcs`/`rde-sources`/`rde-templates`/
+  `rde-ui`/`xtask`/`vendor`. Замеры: `tools/list` — 39 146 Б (≈38,2 KiB, ориентир ≈40 KiB выполнен),
+  инструкции — 6 528 Б, `server/discover` — 6 837 Б. Документы: [ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md),
+  ТЗ §0.2/§5.10/§8.7.3/§8.7.4/§10.3/§16, [`docs/state.md`](docs/state.md). Ограничения M2:
+  doc-мутации/suggested edits — M2.5 (R-DOC-32), HTTP — M3, GUI/ACP/approvals-диалоги — M4,
+  `checkpoint_*`-инструментов нет, jobs не переживают рестарт, `tools/list` близко к ориентиру.
+
 - **M1 «v0.3 — независимый MCP-слой»: `rde-mcp` + `rde-host`, stdio, read-only (ADR-0006,
   2026-10-27)** — новый протокольный крейт [`rde-mcp`](crates/rde-mcp/src/lib.rs) (контракт
   `RdeHost`, DTO/`schemars`-схемы, реестр 13 read-only инструментов, 4 ресурса

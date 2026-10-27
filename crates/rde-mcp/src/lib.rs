@@ -1,4 +1,4 @@
-//! RDE MCP — независимый протокольный слой MCP-сервера RDE (v0.3, веха M1).
+//! RDE MCP — независимый протокольный слой MCP-сервера RDE (v0.3, вехи M1–M2).
 //!
 //! # Зачем отдельный крейт
 //!
@@ -13,29 +13,35 @@
 //! - хост переиспользуем в любом headless-режиме (CLI/ACP), не затаскивая UI;
 //! - стрелка зависимостей: `apps/rde → rde-host → rde-mcp`, `rde-mcp` ничего не знает про RDE.
 //!
-//! Архитектурное решение и границы — `docs/adr/0006-mcp-independent-layer.md`.
+//! Архитектурные решения и границы — `docs/adr/0006-mcp-independent-layer.md` (M1) и
+//! `docs/adr/0007-mutations-approvals-checkpoints.md` (M2: мутации через те же хуки).
 //!
-//! # Что внутри (M1)
+//! # Что внутри
 //!
-//! - [`host`] — контракт [`RdeHost`] (синхронный, dyn-совместимый) и [`HostError`];
-//! - [`model`] — DTO/схемы (только они пересекают границу слоя; доменные типы RDE не протекают);
-//! - [`tools`] — статический детерминированный реестр 13 read-only инструментов, их JSON-схемы,
-//!   аннотации и обработчики;
+//! - [`host`] — контракт [`RdeHost`] (синхронный, dyn-совместимый) и [`HostError`]; M2 добавляет
+//!   мутирующие методы аддитивно (default-реализации `RDE_UNSUPPORTED` — O1-a);
+//! - [`model`] — DTO/схемы (только они пересекают границу слоя; доменные типы RDE не протекают),
+//!   включая `MutationOutcome`/`JobInfo`/`JobLog`/`ArtifactManifestDto`;
+//! - [`tools`] — статический детерминированный реестр 21 инструмента (13 read-only M1 + 8 мутаций
+//!   M2), их JSON-схемы, аннотации, гранты политики и обработчики;
 //! - [`resources`] — ресурсы `rde://…` и resource-templates;
-//! - [`policy`] — [`McpPolicy`] (fail-closed: read-only по умолчанию) и авторизация вызовов;
-//! - [`hooks`] — [`ApprovalHook`], [`AuditSink`] (JSONL в `.rde/agent/audit.log`), [`EventSink`];
+//! - [`policy`] — [`McpPolicy`] (fail-closed: гранты `project_write`/`run_script`/`git_commit` по
+//!   умолчанию выключены), сессионный кэш approvals, [`authorize_tool_call`] и headless-режимы
+//!   approvals (`--approval=deny|auto|allowlist`);
+//! - [`hooks`] — [`ApprovalHook`] (+`AutoApproveHook`/`AllowlistHook`/`DenyAllHook`), [`AuditSink`]
+//!   (JSONL в `.rde/agent/audit.log`, поля `reason`/`checkpoint_id`), [`EventSink`];
 //! - [`server`] — [`McpServer`] на `rmcp` (spec MCP 2026-07-28: `server/discover`, stateless,
-//!   `ttlMs`/`cacheScope`) и [`serve_stdio`];
+//!   `ttlMs`/`cacheScope`), расширенный аудит решений/чекпоинтов и [`serve_stdio`];
 //! - [`instructions`] — карта проекта/политика для клиента (≤32 KiB, стабильный текст).
 //!
 //! # Пример запуска
 //!
 //! Реальный запуск — `rde mcp serve --project <dir>` (см. `apps/rde`): бинарь собирает
-//! `HeadlessHost` из крейта `rde-host` (он единственный знает библиотеки RDE), политику
-//! [`McpPolicy::read_only`] и [`HostHooks::jsonl`], затем вызывает [`serve_stdio_blocking`].
+//! `HeadlessHost` из крейта `rde-host` (он единственный знает библиотеки RDE), политику/хук
+//! approvals из CLI-флагов и [`HostHooks::jsonl`], затем вызывает [`serve_stdio_blocking`].
 //! Протокольный слой при этом остаётся независимым: в тестах он работает на mock-хосте.
 //!
-//! Транспорт M1 — только stdio (в R-MCP-02 HTTP — позже, loopback + токен). `stdout` занят
+//! Транспорт M1/M2 — только stdio (в R-MCP-02 HTTP — позже, loopback + токен). `stdout` занят
 //! JSON-RPC: все логи пишутся только в `stderr` (уровень — переменная `RDE_MCP_LOG`).
 
 #![forbid(unsafe_code)]
@@ -55,11 +61,14 @@ pub mod tools;
 
 pub use error::{HostError, RdeErrorCode};
 pub use hooks::{
-    ApprovalDecision, ApprovalHook, ApprovalRequest, AuditEntry, AuditSink, DenyAllHook, EventSink,
-    HostEvent, HostHooks, JsonlAuditSink, NullAuditSink, NullEventSink,
+    AllowlistHook, ApprovalDecision, ApprovalHook, ApprovalRequest, AuditEntry, AuditSink, AutoApproveHook,
+    DenyAllHook, EventSink, HostEvent, HostHooks, JsonlAuditSink, NullAuditSink, NullEventSink,
 };
 pub use host::{RdeHost, SharedHost};
-pub use policy::{authorize_tool_call, McpPolicy, RateLimiter};
+pub use policy::{
+    authorize_tool_call, build_policy_and_hook, ApprovalCache, ApprovalMode, ApprovalOptions, AuthDenial,
+    AuthOutcome, McpPolicy, RateLimiter, ToolGrant,
+};
 pub use resources::{parse_resource_uri, ResourceTarget};
 pub use server::{serve_stdio, serve_stdio_blocking, McpServer};
 pub use tools::{find_tool, tool_registry, ToolSpec};

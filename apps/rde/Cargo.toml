@@ -17,5 +17,6 @@ rde-host = { workspace = true }
 [dev-dependencies]
 # E2E `mcp serve` по stdio настоящим rmcp-клиентом (spec 2026-07-28).
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
-tokio = { workspace = true, features = ["macros", "process"] }
+tokio = { workspace = true, features = ["macros", "process", "time"] }
 serde_json = { workspace = true }
+

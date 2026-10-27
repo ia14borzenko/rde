@@ -835,3 +835,113 @@ META='{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextpr
 cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core|rde-dag|rde-doc|rde-store"
 cargo tree -p rde-host | grep -E "egui|eframe|rde-ui"
 ```
+
+## Обновление 2026-10-27 (M2: мутации через хуки approvals/checkpoints, grants, job-модель)
+
+Веха **M2** фазы v0.3 (ТЗ §5.10/§8.7.3/§8.7.4/§10.3, [ADR-0007](../docs/adr/0007-mutations-approvals-checkpoints.md)):
+в существующий слой `rde-mcp`/`rde-host` добавлены **мутирующие MCP-инструменты через те же хуки** —
+`ApprovalHook`/`AuditSink`/`EventSink`, без правок архитектуры M1. Мутации выполняются **только** по
+схеме «грант политики → approval → чекпоинт → библиотечная операция → аудит»; по умолчанию всё
+запрещено (fail-closed), файлы не меняются.
+
+| Что | Где |
+|---|---|
+| Контракт `RdeHost` + default-методы мутаций (`RDE_UNSUPPORTED`): `artifact_write_manifest`, `artifact_write_script`, `note_write`, `artifact_run`/`run_status`/`run_cancel`/`run_log`, `git_commit`, `checkpoint_restore`, `shutdown_jobs` | [`crates/rde-mcp/src/host.rs`](../crates/rde-mcp/src/host.rs) |
+| DTO M2 (`ArtifactManifestDto`, `MutationOutcome`, `JobInfo`, `JobLog`, `GitCommitOutcome`), лимиты (скрипт 256 KiB, заметка 1 MiB, лог 64 KiB, сообщение коммита 2000) | [`crates/rde-mcp/src/model.rs`](../crates/rde-mcp/src/model.rs) |
+| Реестр **21 инструмента** (13 read-only M1 не переставлены + 8 M2 в конце), `ToolGrant`, аннотации; бюджет `tools/list` 39 146 Б | [`crates/rde-mcp/src/tools.rs`](../crates/rde-mcp/src/tools.rs) |
+| Политика: grants `project_write`/`run_script`/`git_commit`, сессионный кэш `AllowSession`, `authorize_tool_call`, CLI-режимы `--approval=deny|auto|allowlist`, `build_policy_and_hook` | [`crates/rde-mcp/src/policy.rs`](../crates/rde-mcp/src/policy.rs); флаги — [`apps/rde/src/main.rs`](../apps/rde/src/main.rs) |
+| Хуки: `AutoApproveHook`/`AllowlistHook` (headless), `AuditEntry` + `reason`/`checkpoint_id`, `ApprovalRequest.args_sha256` | [`crates/rde-mcp/src/hooks.rs`](../crates/rde-mcp/src/hooks.rs) |
+| Сервер: расширенный аудит (`decision`/`reason`/`checkpoint_id`), политика сессии в инструкциях, `shutdown_jobs` при EOF/SIGINT | [`crates/rde-mcp/src/server.rs`](../crates/rde-mcp/src/server.rs) |
+| Чекпоинты: `.rde/agent/checkpoints/<ULID>/` (manifest.json + копии файлов + `RootSet`), create/restore/rollback/prune (50/32 MiB) | [`crates/rde-host/src/checkpoints.rs`](../crates/rde-host/src/checkpoints.rs) |
+| Job-модель: `ArtifactExecutor`/`DagExecutor`, реестр (1 активный job, история 20, отмена, shutdown), `RDE_BUSY`/`RDE_JOB_NOT_FOUND` | [`crates/rde-host/src/jobs.rs`](../crates/rde-host/src/jobs.rs) |
+| Мутации в хосте: манифест (патч+валидация до записи), скрипт (whitelist python/data, ≤256 KiB), `note_write`, `git_commit` (автор O7, `.rde` не коммитится), `RDE_CONFLICT` по `expected_sha256`, авто-откат | [`crates/rde-host/src/lib.rs`](../crates/rde-host/src/lib.rs) |
+| Песочница записи `resolve_for_write` (канонизация предка, `.rde/**` и симлинки наружу → отказ) | [`crates/rde-host/src/sandbox.rs`](../crates/rde-host/src/sandbox.rs) |
+| Инструкции M2: карта проекта + политика мутаций + grants/approvals/чекпоинты + фактическая политика сессии | [`crates/rde-host/src/instructions.rs`](../crates/rde-host/src/instructions.rs), [`crates/rde-mcp/src/policy.rs`](../crates/rde-mcp/src/policy.rs) |
+| E2E настоящим `rmcp`-клиентом (8 сценариев): default deny без записи, `--approval=auto` (запись+чекпоинт+аудит), allowlist, git-коммит, job-модель на data-артефакте, stdout purity/EOF, коды 2 на плохие флаги | [`apps/rde/tests/mcp_stdio.rs`](../apps/rde/tests/mcp_stdio.rs) |
+| M1-review фиксы: `with_store` без `expect` (ошибка вместо паники), `file_read` не читает файл целиком (32 KiB/≤8 MiB без range; `seek`/построчно с range), `git_status.branch: Option<String>` | [`crates/rde-host/src/lib.rs`](../crates/rde-host/src/lib.rs), модель |
+
+**Режимы approvals (CLI, headless, fail-closed).** По умолчанию `--approval=deny` — любая мутация
+возвращает `RDE_APPROVAL_DENIED`, файлы проекта не меняются (проверено побайтово в e2e). Явные флаги:
+`--approval=auto` (границы: `project_write` всегда, `run_script` только с `--allow-run`, `git_commit`
+только с `--allow-destructive`), `--approval=allowlist --allow-tools=a,b` (только перечисленные
+инструменты). `artifact_run` дополнительно требует `trusted = true` в `rde.toml` (R-RUN-06). Ввод с
+stdin для подтверждений запрещён (stdin — JSON-RPC); GUI/ACP-диалоги — M4 через тот же `ApprovalHook`.
+
+**Чекпоинты и откат (R-AGT-05).** Перед каждой мутацией: `manifest.json {id, ts, tool, args_sha256,
+roots: RootSet, files:[{rel_path, existed, sha256, size, backup}], rolled_back}` + байт-в-байт копии
+только затронутых файлов. На ошибке — авто-откат файлов и корней store
+(`begin_tx_with_roots(roots_до)` + `commit_tx`), чекпоинт помечается `rolled_back`; на успехе остаётся,
+ретенция — последние 50 и ≤32 MiB. Ручной откат — `RdeHost::checkpoint_restore` (внутренний API;
+MCP-инструментов `checkpoint_*` в M2 нет). Внешняя правка файла при заданном `expected_sha256` →
+`RDE_CONFLICT` (ручная правка не теряется). `.rde/**` в `.gitignore` и не попадает в `git_commit`
+(проверка до коммита → `RDE_CONFLICT`).
+
+**Аудит.** JSONL `.rde/agent/audit.log` на каждый вызов: `ts, tool, params_sha256, decision, ok,
+error_code, duration_ms` + новые `reason` (`read_only`/`policy`/`approval`/`allow_once`/`allow_session`/
+`session`/`allowlist`) и `checkpoint_id` (успешной мутации). Тела аргументов/секреты не пишутся.
+
+**Замер контекста (R-AGT-08/§10.3 п.5):** `tools/list` — **39 146 байт** (≈38,2 KiB; ≈9,8K токенов при
+байты/4, ≈11,2K при байты/3,5 — ориентир ≈40 KiB выполнен; схемы M2 сгенерированы из DTO с удалением
+полевых описаний, descriptions — в инструменте), 21 инструмент ≤32 (§18-3); инструкции — 6 528 Б
+(≤32 KiB), `server/discover` — 6 837 Б, `resources/list` — 8 ресурсов / 2 326 Б.
+
+**Тесты:** `cargo test --workspace` — **355 passed, 0 failed** (M1 300 + 55): `rde-mcp` 75 unit
+(+17: grants×approvals deny/auto/allowlist, сессионный кэш, расширенный аудит, схемы/порядок/бюджет
+21 инструмента, mock-мутации), `rde-host` 57 (+34: 28 unit — чекпоинты create/restore/roots/prune,
+job state machine success/fail/cancel/busy/shutdown на stub, песочница записи, auto-rollback,
+недоступный store; 15 headless — M1 + большие файлы/git branch; 14 mutations — манифест/скрипт/заметка/
+git/RDE_CONFLICT/успешный data-манифест), `apps/rde` e2e 8 (+4). Старые asserts не ослаблялись (кроме
+ожидаемого контракта M2: 13→21 инструмент и `branch: Option`).
+
+**Независимость слоёв:** `cargo tree -p rde-mcp` — без `rde-*`/`gui`/`wordcraft`; `-p rde-host` — без
+`egui`/`rde-ui`. Дифф минимальный: правки только `crates/rde-mcp/**`, `crates/rde-host/**`,
+`apps/rde/src/main.rs` (+~150 строк), `apps/rde/tests/**`, Cargo.toml слоёв/dev-фичи, docs; в
+`rde-core`/`rde-dag`/`rde-doc`/`rde-docx`/`rde-store`/`rde-vcs`/`rde-sources`/`rde-templates`/`rde-ui`/
+`xtask`/`vendor` — 0 файлов.
+
+**Ограничения (честно):** doc-мутации (`doc_insert`/`doc_replace_range`/`doc_suggest_edit`,
+suggestions/revisions/comments) — **не входят в M2** (R-DOC-32 `[НЕ НАЧАТО]`; R-AGT-05 запрещает молча
+перезаписывать пользовательский текст) → M2.5; HTTP/токены — M3; ACP/панель чата/GUI-approvals/URI-чипы —
+M4; jobs не переживают перезапуск процесса (M2, документировано; `RDE_JOB_NOT_FOUND`); MCP-инструментов
+`checkpoint_*` нет (O6-a); `artifact_write_script` — только python/data и только объявленные файлы;
+MRTR-approvals не основной режим (интерфейс `ApprovalHook` оставляет добавление позже); `tools/list`
+близко к ориентиру ≈40 KiB — следующий набор (M2.5/M3) потребует сокращения описаний.
+
+**Следующий шаг:** **M2.5 — doc suggested edits + checkpoints документа (R-DOC-32)**: `doc_insert`/
+`doc_replace_range`/`doc_suggest_edit`/`suggestion_*`/`revision_*` с грантом и чекпоинтами `.doc.rde`
+(файлы+roots документа), затем M3 — streamable HTTP (loopback+bearer), M4 — GUI-хуки/ACP/URI-чипы.
+
+**Проверить руками (M2):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export CARGO_HOME=/home/admin-pc/proj/rde-dev/.cache-tmp/cargo-home
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh build -p rde                                  # бинарь target/debug/rde
+./scripts/build.sh test -p rde-mcp -p rde-host                   # unit/integration M2-слоя
+./scripts/build.sh test -p rde                                   # e2e stdio (rmcp-клиент)
+./scripts/build.sh test --workspace                              # 355 passed
+
+# 1) default deny: мутация отклоняется, файлы НЕ меняются (manifest sha до/после совпадает)
+META='{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}'
+{ printf '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":%s}}\n' "$META"
+  printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":%s}}\n' "$META"; } \
+  | ./target/debug/rde mcp serve --project demo-project 2>/tmp/rde-mcp.log | head -2
+# в tools/list — 21 инструмент (13 read-only + 8 мутаций); stdout — только JSON-RPC
+
+# 2) auto: с явным флагом мутация выполняется, создаётся чекпоинт и аудит
+{ printf '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":%s}}\n' "$META"
+  printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"note_write","arguments":{"note_id":"<id из note_list>","content":"# M2 smoke\n"},"_meta":%s}}\n' "$META"; } \
+  | ./target/debug/rde mcp serve --project demo-project --approval=auto 2>/tmp/rde-mcp-auto.log | tail -1
+# проверьте: demo-project/.rde/agent/checkpoints/<ULID>/manifest.json, demo-project/.rde/agent/audit.log
+
+# 3) job-модель (data-артефакт не требует uv)
+#    artifact_run {"artifact_id":"<data-артефакт>"} → job_id → run_status/run_log
+
+# 4) независимость слоёв (пусто = доказано)
+cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core|rde-dag|rde-doc|rde-store"
+cargo tree -p rde-host | grep -E "egui|eframe|rde-ui"
+```
+

@@ -7,6 +7,10 @@
 | Контекст | v0.3, веха **M1** «скелет MCP-сервера»: ТЗ [`§5.10`](../tz-03.md) (R-MCP-01…06), [`§8.7`](../tz-03.md) (агентная подсистема), [`§10.3`](../tz-03.md) (критерий «внешний MCP-клиент выполняет 10 сценариев»), [`ADR-0002`](0002-component-boundaries.md) (границы крейтов, инвариант 8) |
 | Внешние опоры | `rmcp` 3.8.0 (Apache-2.0, rust-version 1.88; пин `=3.8.0`), MCP spec **2026-07-28** (stateless core: нет `initialize`/сессий, обязательный `server/discover`, `_meta` версии/капабилити в каждом запросе, `ttlMs`/`cacheScope` в списках, MRTR вместо sampling/elicitation); R-AGT-08 (бюджет контекста), R-AGT-06 (аудит) |
 
+> **M2 → [ADR-0007](0007-mutations-approvals-checkpoints.md):** мутирующие инструменты, grants/approvals,
+> чекпоинты, job-модель запуска и M1-review фиксы. ADR-0006 описывает слои/контракт/политику, которые
+> M2 переиспользует без изменения архитектуры.
+
 ## Контекст
 
 MCP-сервер RDE должен быть доступен **без GUI** (stdio для встроенного ACP-агента, позже HTTP для
@@ -64,7 +68,15 @@ pub trait RdeHost: Send + Sync { /* workspace_snapshot, project_tree, project_se
   `Project`, `Store`, `RdeDoc`, WordCraft-`Document` в контракт не протекают. Поэтому `rde-mcp`
   тестируется на mock-хосте без ФС (58 unit-тестов), а `rde-host` переиспользуем в любом
   headless-режиме.
-- M1 — только чтение. Мутации (M2) добавятся в тот же трейт и пойдут через те же хуки approvals/audit.
+- M1 — только чтение **контента проекта**: сервер не меняет объекты/документы/файлы проекта, но
+  локальное состояние `.rde/**` он пишет штатно (аудит `.rde/agent/audit.log`; `artifact_*`/`doc_*`
+  открывают `Store` и могут создать/обновить `.rde`-индекс). Это не нарушение read-only: store/аудит —
+  внутреннее состояние RDE, а не контент проекта; `.rde/**` закрыт для чтения инструментами
+  (`RDE_APPROVAL_DENIED`) и игнорируется git. Мутации контента (M2) — [ADR-0007](0007-mutations-approvals-checkpoints.md):
+  те же хуки approvals/audit + grants/чекпоинты, те же слои.
+- Инструкции/discover **фиксируются на старте сервера** (один расчёт на сессию, детерминированы по
+  проекту и флагам): `server/discover` имеет TTL 5 с, но состав инструкций за сессию не меняется —
+  это осознанно (prompt-cache, R-AGT-08); перезапуск сервера перечитывает карту проекта.
 
 ### 3. Реестр инструментов M1: 13 read-only, детерминированный порядок
 
@@ -198,16 +210,22 @@ pub trait RdeHost: Send + Sync { /* workspace_snapshot, project_tree, project_se
 
 ## Последствия
 
-- M2 (мутации) добавляет инструменты в тот же реестр и вызывает `authorize_tool_call`; approvals —
-  GUI-реализация `ApprovalHook` (diff/чекпоинты, R-AGT-05/06) без правок протокольного слоя.
+- **M2 (реализовано)** — [`ADR-0007`](0007-mutations-approvals-checkpoints.md): мутирующие инструменты
+  добавлены в тот же реестр (21 = 13 M1 + 8 M2), вызываются через тот же `authorize_tool_call`;
+  approvals — `ApprovalHook` (headless CLI-гранты в M2; GUI-диалог с diff — M4) без правок сервера/хуков.
+  M1-набор не переставлен (prompt-cache); контракт `RdeHost` расширен default-методами (read-only
+  реализации совместимы). Добавлены чекпоинты (`.rde/agent/checkpoints`), аудит расширен полями
+  `reason`/`checkpoint_id`, job-модель запуска (`artifact_run`/`run_status`/`run_cancel`/`run_log`).
 - M3 (streamable HTTP) реализует transport-слой `rmcp` + токен/аудит; `McpServer` от транспорта
   не зависит.
 - M4 (ACP/GUI) подключает `EventSink`/`ApprovalHook` и панель чата; URI-чипы §8.7.2 лягут на
   `rde://`-схему (`base URI` уже совпадает).
-- Известные ограничения M1: `artifact_*` отдаёт статус **из ledger** без пересчёта `act_key`/env
-  (никаких запусков `uv`/скриптов в read-only сервере); `doc_outline`/`doc_read` только для
-  мигрированных `.doc.rde`; материализация тел — через инструменты (resources — метаданные);
-  пагинации (`nextCursor`) нет — лимиты/диапазоны вместо курсоров.
+- Известные ограничения M1 (сняты/уточнены в M2): `artifact_*` в M1 отдавал статус **из ledger** без
+  пересчёта `act_key`/env — в M2 запуск артефактов делает `artifact_run` (job-модель, только `trusted`);
+  `doc_outline`/`doc_read` только для мигрированных `.doc.rde`; материализация тел — через инструменты
+  (resources — метаданные); пагинации (`nextCursor`) нет — лимиты/диапазоны вместо курсоров.
+- `file_read` в M2 не читает файл целиком (M1-review): без `range` — 32 KiB / ≤8 MiB, с `range` —
+  окно; `git_status.branch` — `Option<String>` (`null` вне git-репозитория).
 
 ## Проверки (DoD M1)
 

@@ -48,6 +48,15 @@ pub enum RdeErrorCode {
     /// Инструмент не уложился в таймаут (`McpPolicy::tool_timeout_ms`).
     #[serde(rename = "RDE_TIMEOUT")]
     Timeout,
+    /// Операция не выполнена: занято (идёт запуск артефактов/конкурентная мутация).
+    #[serde(rename = "RDE_BUSY")]
+    Busy,
+    /// Конфликт состояния: файл изменён вне RDE (устаревший `expected_sha256`/ручная правка).
+    #[serde(rename = "RDE_CONFLICT")]
+    Conflict,
+    /// Job запуска артефактов не найден (неизвестный job_id или перезапуск процесса).
+    #[serde(rename = "RDE_JOB_NOT_FOUND")]
+    JobNotFound,
     /// Внутренняя ошибка (panic в инструменте, повреждённые данные, ошибка ФС).
     #[serde(rename = "RDE_INTERNAL")]
     Internal,
@@ -68,6 +77,9 @@ impl RdeErrorCode {
             RdeErrorCode::RateLimited => "RDE_RATE_LIMITED",
             RdeErrorCode::NotReady => "RDE_NOT_READY",
             RdeErrorCode::Timeout => "RDE_TIMEOUT",
+            RdeErrorCode::Busy => "RDE_BUSY",
+            RdeErrorCode::Conflict => "RDE_CONFLICT",
+            RdeErrorCode::JobNotFound => "RDE_JOB_NOT_FOUND",
             RdeErrorCode::Internal => "RDE_INTERNAL",
         }
     }
@@ -157,6 +169,21 @@ impl HostError {
     /// `RDE_TIMEOUT`.
     pub fn timeout(message: impl Into<String>) -> Self {
         Self::new(RdeErrorCode::Timeout, message)
+    }
+
+    /// `RDE_BUSY`.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::new(RdeErrorCode::Busy, message)
+    }
+
+    /// `RDE_CONFLICT`.
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(RdeErrorCode::Conflict, message)
+    }
+
+    /// `RDE_JOB_NOT_FOUND`.
+    pub fn job_not_found(message: impl Into<String>) -> Self {
+        Self::new(RdeErrorCode::JobNotFound, message)
     }
 
     /// `RDE_INTERNAL`.

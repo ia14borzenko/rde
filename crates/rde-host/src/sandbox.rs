@@ -76,6 +76,86 @@ impl PathSandbox {
         Ok(canonical)
     }
 
+    /// Разрешить путь **записи** внутри проекта (M2, A7): тот же песочница, но путь может ещё
+    /// не существовать (файл создаётся мутацией).
+    ///
+    /// Правила:
+    /// - те же лексические проверки, что у [`Self::resolve`] (абсолютные пути/`..`/URL → `RDE_PATH_ESCAPE`);
+    /// - `.rde/**` запрещён и на запись: внутреннее состояние (store/аудит/чекпоинты) пишет только
+    ///   сам хост, инструменты проекта туда не ходят;
+    /// - канонизируется ближайший существующий предок: симлинк наружу отсекается
+    ///   (`RDE_PATH_ESCAPE`), для существующего конечного файла канонизируется он сам.
+    pub fn resolve_for_write(&self, rel_path: &str) -> Result<PathBuf, HostError> {
+        let rel_path = rel_path.trim();
+        if rel_path.is_empty() {
+            return Err(HostError::invalid_argument("путь не может быть пустым"));
+        }
+        if looks_like_escape(rel_path) {
+            return Err(HostError::path_escape("абсолютные пути, file://, UNC и Windows-диски запрещены"));
+        }
+        let candidate = Path::new(rel_path);
+        for component in candidate.components() {
+            match component {
+                Component::Normal(_) | Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(HostError::path_escape("`..` в путях проекта запрещён"));
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(HostError::path_escape("путь должен быть относительным путём проекта"));
+                }
+            }
+        }
+        let joined = self.root.join(rel_path);
+        if first_component_is_rde(&self.root, &joined) {
+            return Err(write_denied());
+        }
+        // Существующий конечный файл: канонизируем его (симлинк наружу → отказ).
+        if joined.exists() {
+            let canonical = std::fs::canonicalize(&joined).map_err(|error| {
+                HostError::not_ready(format!("файл `{rel_path}` недоступен: {error}"))
+            })?;
+            if !canonical.starts_with(&self.root) {
+                return Err(HostError::path_escape(format!("путь `{rel_path}` выходит за корень проекта")));
+            }
+            if first_component_is_rde(&self.root, &canonical) {
+                return Err(write_denied());
+            }
+            return Ok(canonical);
+        }
+        // Новый файл: канонизируем ближайший существующий предок и проверяем, что он внутри корня.
+        let mut tail: Vec<PathBuf> = Vec::new();
+        if let Some(name) = joined.file_name() {
+            tail.push(PathBuf::from(name));
+        }
+        let mut ancestor = joined.parent().map(Path::to_path_buf).unwrap_or_else(|| self.root.clone());
+        loop {
+            if ancestor.exists() {
+                break;
+            }
+            let Some(name) = ancestor.file_name().map(|name| PathBuf::from(name)) else {
+                return Err(HostError::not_found("каталог для записи не найден"));
+            };
+            tail.push(name);
+            let Some(parent) = ancestor.parent().map(Path::to_path_buf) else {
+                return Err(HostError::not_found("каталог для записи не найден"));
+            };
+            ancestor = parent;
+        }
+        let canonical = std::fs::canonicalize(&ancestor)
+            .map_err(|error| HostError::not_ready(format!("каталог для записи недоступен: {error}")))?;
+        if !canonical.starts_with(&self.root) {
+            return Err(HostError::path_escape(format!("путь `{rel_path}` выходит за корень проекта")));
+        }
+        if first_component_is_rde(&self.root, &canonical) {
+            return Err(write_denied());
+        }
+        let mut path = canonical;
+        for part in tail.into_iter().rev() {
+            path.push(part);
+        }
+        Ok(path)
+    }
+
     /// Относительный POSIX-путь внутри проекта для ответа клиенту.
     pub fn rel_posix(&self, path: &Path) -> String {
         let relative = path.strip_prefix(&self.root).unwrap_or(path);
@@ -94,6 +174,20 @@ fn rde_denied() -> HostError {
     HostError::approval_denied("каталог `.rde` закрыт для чтения инструментами").with_hint(
         "внутреннее состояние RDE (store/аудит) не отдаётся внешним клиентам; читайте объекты проекта",
     )
+}
+
+fn write_denied() -> HostError {
+    HostError::approval_denied("запись в `.rde/**` запрещена инструментам").with_hint(
+        "внутреннее состояние RDE (store/аудит/чекпоинты) пишет только сам хост; инструменты меняют объекты проекта",
+    )
+}
+
+/// Первый компонент пути — `.rde` (внутреннее состояние RDE).
+fn first_component_is_rde(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|first| first.as_os_str() == ".rde")
 }
 
 fn looks_like_escape(path: &str) -> bool {
@@ -169,5 +263,46 @@ mod tests {
         let error = sandbox.resolve("escape-link").expect_err("симлинк наружу запрещён");
         assert_eq!(error.code, rde_mcp::RdeErrorCode::PathEscape);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    // --- M2: запись (A7) -----------------------------------------------------
+
+    #[test]
+    fn resolve_for_write_allows_new_project_files() {
+        let root = project_dir("write-ok");
+        let sandbox = PathSandbox::new(root.clone());
+        let path = sandbox.resolve_for_write("objects/artifacts/01ART/artifact.toml").unwrap();
+        assert_eq!(path, root.join("objects/artifacts/01ART/artifact.toml"));
+        assert!(!path.exists(), "путь может ещё не существовать");
+        // Существующий файл тоже разрешён.
+        assert_eq!(sandbox.resolve_for_write("rde.toml").unwrap(), root.join("rde.toml"));
+    }
+
+    #[test]
+    fn resolve_for_write_rejects_escape_and_rde() {
+        let root = project_dir("write-deny");
+        let sandbox = PathSandbox::new(root);
+        for path in ["../secret", "/etc/passwd", "file:///etc/passwd", "C:\\x"] {
+            let error = sandbox.resolve_for_write(path).expect_err(path);
+            assert_eq!(error.code, rde_mcp::RdeErrorCode::PathEscape, "{path}: {error}");
+        }
+        let error = sandbox.resolve_for_write(".rde/agent/checkpoints/x/manifest.json").expect_err(".rde");
+        assert_eq!(error.code, rde_mcp::RdeErrorCode::ApprovalDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_for_write_rejects_symlink_escape() {
+        let root = project_dir("write-symlink");
+        let outside_dir = std::env::temp_dir().join(format!("rde-host-outside-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside_dir);
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let link = root.join("escape-dir");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&outside_dir, &link).unwrap();
+        let sandbox = PathSandbox::new(root);
+        let error = sandbox.resolve_for_write("escape-dir/new.txt").expect_err("симлинк наружу запрещён");
+        assert_eq!(error.code, rde_mcp::RdeErrorCode::PathEscape);
+        let _ = std::fs::remove_dir_all(&outside_dir);
     }
 }

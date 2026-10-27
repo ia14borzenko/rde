@@ -389,8 +389,9 @@ pub struct GitStatusInfo {
     pub available: bool,
     /// Каталог проекта внутри git-репозитория.
     pub is_repo: bool,
-    /// Ветка (`HEAD` в detached-состоянии).
-    pub branch: String,
+    /// Ветка (`HEAD` в detached-состоянии); `null`, если проект не является git-репозиторием.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Изменённые/удалённые файлы проекта.
     #[serde(default)]
     pub changed: Vec<String>,
@@ -403,6 +404,229 @@ pub struct GitStatusInfo {
     /// Сколько коммитов локально впереди upstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ahead: Option<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// M2: DTO мутаций, запуска артефактов и git-коммита (пересекают границу слоя)
+// ---------------------------------------------------------------------------
+
+/// Лимит `artifact_write_script`: размер содержимого файла скрипта (256 KiB).
+pub const ARTIFACT_SCRIPT_MAX_BYTES: usize = 256 * 1024;
+
+/// Лимит `note_write`: размер содержимого заметки (1 MiB).
+pub const NOTE_WRITE_MAX_BYTES: usize = 1024 * 1024;
+
+/// Лимит `run_log`: сколько байт лога отдавать за вызов по умолчанию.
+pub const JOB_LOG_DEFAULT_BYTES: usize = 16 * 1024;
+
+/// Лимит `run_log`: максимум байт лога за вызов.
+pub const JOB_LOG_MAX_BYTES: usize = 64 * 1024;
+
+/// Лимит `git_commit`: длина сообщения коммита в символах.
+pub const GIT_COMMIT_MESSAGE_MAX_CHARS: usize = 2_000;
+
+/// Runtime артефакта в DTO (патч манифеста).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactRuntimeDto {
+    /// `python` | `data` (shell/node/r политикой M2 запрещены: запуск — только python/данные).
+    pub kind: String,
+    /// Режим окружения: `project` (uv), `system`, `artifact`; по умолчанию `project`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// Относительный путь к исполняемому файлу внутри каталога артефакта.
+    pub entry: String,
+    /// Объявленные переменные окружения.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vars: Option<BTreeMap<String, String>>,
+}
+
+/// Вход артефакта в DTO (совпадает по JSON-форме с `rde-core::InputSpec`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ArtifactInputDto {
+    /// Выход другого артефакта (`selector` — путь/glob).
+    Artifact {
+        /// Id артефакта-источника.
+        artifact: String,
+        /// Селектор выхода внутри каталога артефакта.
+        #[serde(default)]
+        selector: String,
+    },
+    /// Файл внутри каталога артефакта.
+    File {
+        /// Относительный путь файла.
+        file: String,
+    },
+    /// Заметка проекта.
+    Note {
+        /// Id заметки.
+        note: String,
+    },
+    /// Источник проекта.
+    Source {
+        /// Id источника.
+        source: String,
+    },
+    /// Типизированные константы проекта.
+    Constants {
+        /// Id артефакта типа `constants`.
+        constants: String,
+        /// Имя конкретной величины (пусто — весь набор).
+        #[serde(default)]
+        selector: String,
+    },
+}
+
+/// Группа зависимостей артефакта в DTO.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactGroupDto {
+    /// Имя группы.
+    pub name: String,
+    /// `hashed` (влияет на хеш/каскад) или `ref`; по умолчанию `hashed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Входы группы.
+    #[serde(default)]
+    pub inputs: Vec<ArtifactInputDto>,
+}
+
+/// DTO манифеста артефакта: **патч** поверх текущего `artifact.toml` (поле `None` — не менять).
+///
+/// Агент присылает только изменяемые поля; `id`/`schema` подставляет хост, `out_hash` не
+/// пишется вручную (его владелец — RDE после успешного обновления).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactManifestDto {
+    /// Заголовок артефакта.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Тип: `compute` | `data` | `constants`.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Политика пересборки: `manual` | `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuild: Option<String>,
+    /// Runtime артефакта (заменяется целиком).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<ArtifactRuntimeDto>,
+    /// Произвольные параметры запуска.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    /// Объявленные выходы (относительные пути/glob внутри каталога артефакта).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<String>>,
+    /// Дополнительные файлы скрипта (входят в `script_hash`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_files: Option<Vec<String>>,
+    /// Таймаут запуска, секунды.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
+    /// Разрешена ли артефакту сеть (политику задаёт проект; по умолчанию запрещена).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_allow: Option<bool>,
+    /// Группы hashed/ref-входов (заменяются целиком).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<ArtifactGroupDto>>,
+    /// Для `type = "constants"`: значения (`{имя: {value, unit, …}}`, форматы — `artifact_read`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<serde_json::Value>,
+}
+
+/// Результат мутирующего инструмента (запись манифеста/скрипта/заметки, откат чекпоинта).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MutationOutcome {
+    /// Операция только проверена (`true`) — файлы не изменены.
+    pub dry_run: bool,
+    /// Id чекпоинта, созданного перед мутацией (`null` у `dry_run`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    /// Изменённые относительные пути внутри проекта (отсортированы).
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    /// Человекочитаемая деталь (например, «заголовок заметки обновлён»).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Информация о job'е запуска артефактов (R-AGT-09: асинхронная модель).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JobInfo {
+    /// Идентификатор job'а (ULID; не переживает перезапуск процесса/M2).
+    pub job_id: String,
+    /// Состояние: `running` | `succeeded` | `failed` | `cancelled`.
+    pub state: String,
+    /// Unix-время создания.
+    pub created_unix: u64,
+    /// Unix-время завершения (для `running` — `null`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_unix: Option<u64>,
+    /// Цели запуска (пусто — все устаревшие артефакты).
+    #[serde(default)]
+    pub targets: Vec<String>,
+    /// Включены транзитивно зависимые артефакты.
+    pub include_dependents: bool,
+    /// Принудительный пересчёт целей.
+    pub force: bool,
+    /// Всего артефактов в отчёте.
+    pub total: usize,
+    /// Запущено.
+    pub ran: usize,
+    /// Пропущено (актуальны).
+    pub skipped: usize,
+    /// Ошибок/неудач.
+    pub failed: usize,
+    /// Ошибки (без путей вне проекта, кратко).
+    #[serde(default)]
+    pub errors: Vec<String>,
+    /// Id последнего запуска (`rde-run`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Относительный путь лога последнего артефакта.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    /// Чекпоинт, созданный перед запуском (для отката ledger-корней).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    /// Короткое сообщение/итог.
+    pub message: String,
+}
+
+/// Кусок лога job'а (`run_log`: диапазонное чтение по байтовому смещению).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JobLog {
+    /// Идентификатор job'а.
+    pub job_id: String,
+    /// Запрошенное байтовое смещение.
+    pub offset: u64,
+    /// Смещение для следующего чтения.
+    pub next_offset: u64,
+    /// Достигнут конец файла лога.
+    pub eof: bool,
+    /// Ответ обрезан лимитом `max_bytes`.
+    pub truncated: bool,
+    /// Текст лога (UTF-8; невалидные байты заменяются).
+    #[serde(default)]
+    pub text: String,
+}
+
+/// Результат `git_commit`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitCommitOutcome {
+    /// Только проверка (`true`) — коммит не создавался.
+    pub dry_run: bool,
+    /// Чекпоинт перед коммитом (`null` у `dry_run`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    /// Созданный коммит (`null` у `dry_run`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<GitCommitInfo>,
+    /// Файлов в коммите.
+    #[serde(default)]
+    pub files: usize,
+    /// Короткое сообщение (при `dry_run` — план, что будет закоммичено).
+    pub message: String,
 }
 
 #[cfg(test)]

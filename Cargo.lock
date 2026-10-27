@@ -3754,12 +3754,15 @@ dependencies = [
  "rde-core",
  "rde-dag",
  "rde-doc",
+ "rde-hash",
  "rde-mcp",
+ "rde-run",
  "rde-store",
  "rde-templates",
  "rde-vcs",
  "serde",
  "serde_json",
+ "toml",
  "ulid",
 ]
 

@@ -3,19 +3,19 @@ name = "rde-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RDE host (v0.3/M1): headless-реализация контракта rde-mcp поверх библиотечных крейтов RDE (без egui/rde-ui)"
+description = "RDE host (v0.3/M2): headless-реализация контракта rde-mcp поверх библиотечных крейтов RDE (чтение + мутации через approvals/checkpoints/jobs, без egui/rde-ui)"
 
 [dependencies]
 rde-mcp = { workspace = true }
 rde-core = { workspace = true }
 rde-dag = { workspace = true }
 rde-doc = { workspace = true }
+rde-hash = { workspace = true }
+rde-run = { workspace = true }
 rde-store = { workspace = true }
 rde-templates = { workspace = true }
 rde-vcs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-# для тестов на копии demo-project; GUI не тянем
+toml = { workspace = true }
 ulid = { workspace = true }

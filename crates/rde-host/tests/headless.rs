@@ -257,8 +257,55 @@ fn git_status_is_read_only_snapshot() {
     let (host, _root) = demo_host("git");
     let status = host.git_status().unwrap();
     assert!(status.available);
-    // Временная копия вне git-репозитория (если /tmp не внутри репозитория).
-    assert!(!status.is_repo || !status.branch.is_empty());
+    // Временная копия вне git-репозитория (если /tmp не внутри репозитория): ветки нет.
+    if !status.is_repo {
+        assert!(status.branch.is_none(), "без репозитория ветка не отдаётся: {status:?}");
+    } else {
+        assert!(status.branch.as_deref().is_some_and(|branch| !branch.is_empty()));
+    }
+}
+
+#[test]
+fn file_read_does_not_load_huge_files_whole() {
+    let (host, root) = demo_host("huge-file");
+    // «Большой» файл (9 MiB текста): без `range` файл целиком в память не читается —
+    // RDE_OUT_OF_RANGE; с `range` (байты/строки) читается только запрошенное окно.
+    let path = root.join("big.txt");
+    let line = "0123456789abcdef0123456789abcdef\n";
+    let mut content = String::with_capacity(9 * 1024 * 1024 + line.len());
+    while content.len() < 9 * 1024 * 1024 {
+        content.push_str(line);
+    }
+    std::fs::write(&path, &content).unwrap();
+    let total = content.len() as u64;
+
+    let error = host.read_project_file("big.txt", None).expect_err("большой файл без range");
+    expect_code(error, RdeErrorCode::OutOfRange);
+
+    let chunk = host
+        .read_project_file("big.txt", Some(rde_mcp::model::FileRange::Bytes { offset: 1_000, limit: 16 }))
+        .unwrap();
+    assert_eq!(chunk.total_bytes, total);
+    assert_eq!(chunk.text.len(), 16);
+    assert!(chunk.truncated);
+
+    let lines = host
+        .read_project_file("big.txt", Some(rde_mcp::model::FileRange::Lines { start: 2, count: 3 }))
+        .unwrap();
+    assert_eq!(lines.mode, "lines");
+    assert_eq!(lines.text, format!("{line}{line}{line}").trim_end_matches('\n'));
+}
+
+/// `.rde` не открывается (например, файл вместо каталога) — ошибка `RDE_NOT_READY`,
+/// а не паника в протокольном слое (M1-review: без `expect` в production-пути).
+#[test]
+fn unavailable_store_is_error_not_panic() {
+    let root = temp_dir("store-broken");
+    copy_project(&rde_core::demo_project_dir(), &root);
+    std::fs::write(root.join(".rde"), "не каталог").unwrap();
+    let host = HeadlessHost::open(&root).expect("проект открывается без store");
+    let error = host.store_roots().expect_err("store недоступен — ошибка");
+    expect_code(error, RdeErrorCode::NotReady);
 }
 
 #[test]

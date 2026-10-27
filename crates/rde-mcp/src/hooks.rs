@@ -1,15 +1,16 @@
 //! Хуки независимого слоя: approvals, аудит, события.
 //!
 //! Объявлены здесь (в протокольном слое), а реализации подключаются **снаружи** — GUI,
-//! `rde-host`, позже `rde-agent`/DSH-политика — без правок инструментов и сервера (A4).
+//! `rde-host`, `rde-agent`/DSH — без правок инструментов и сервера (A4).
 //!
-//! M1 использует:
-//! - [`ApprovalHook`] — только для мутирующих инструментов (в M1 их нет; `DenyAllHook`
-//!   доказывает fail-closed синтетическим тестом);
+//! M1/M2 используют:
+//! - [`ApprovalHook`] — только для мутирующих инструментов (M2): `DenyAllHook` — дефолт
+//!   (fail-closed), headless [`AutoApproveHook`]/[`AllowlistHook`] — явные CLI-режимы, GUI/ACP
+//!   в M4 добавят диалог с diff без правок протокольного слоя;
 //! - [`AuditSink`] — на **каждый** вызов инструмента (включая отказанные/неизвестные):
-//!   JSONL-строка в `.rde/agent/audit.log` (R-AGT-06);
-//! - [`EventSink`] — интерфейс уведомлений (M1 не отправляет notifications; интерфейс объявлен,
-//!   чтобы GUI/ACP подключились позже без изменения протокольного слоя).
+//!   JSONL-строка в `.rde/agent/audit.log` (R-AGT-06) с `decision`/`reason`/`checkpoint_id`;
+//! - [`EventSink`] — интерфейс уведомлений (M1/M2 не отправляет notifications; интерфейс
+//!   объявлен, чтобы GUI/ACP подключились позже без изменения протокольного слоя).
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -30,6 +31,8 @@ pub struct ApprovalRequest {
     pub tool: String,
     /// Краткая выжимка аргументов (без тел/секретов; обрезана).
     pub args_summary: String,
+    /// SHA-256 канонизированного JSON аргументов (ключ сессионного кэша разрешений).
+    pub args_sha256: String,
     /// Действие деструктивно (перезапись/удаление/commit/run).
     pub destructive: bool,
     /// Кто просит (`mcp`/`agent`/…).
@@ -65,6 +68,53 @@ impl ApprovalHook for DenyAllHook {
     }
 }
 
+/// Headless-хук `--approval=auto`: разрешает всё, что уже допущено грантами политики.
+///
+/// Используется только при явном флаге CLI (`auto`); без флагов сервер собирает
+/// [`DenyAllHook`] и не включает гранты — мутации запрещены (fail-closed, A4). Для
+/// `artifact_run` дополнительно требуется `trusted`-проект (проверка в хосте, R-RUN-06).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AutoApproveHook;
+
+#[async_trait]
+impl ApprovalHook for AutoApproveHook {
+    async fn request(&self, _request: ApprovalRequest) -> ApprovalDecision {
+        ApprovalDecision::AllowOnce
+    }
+}
+
+/// Headless-хук `--approval=allowlist`: разрешает только перечисленные инструменты.
+///
+/// Гранты политики при этом тоже включаются только для них; всё остальное — `Deny`
+/// (fail-closed). GUI/ACP в M4 заменят хук диалогом с diff, ничего в сервере не меняя.
+#[derive(Clone, Debug, Default)]
+pub struct AllowlistHook {
+    tools: std::collections::BTreeSet<String>,
+}
+
+impl AllowlistHook {
+    /// Хук по списку разрешённых инструментов (имена уже провалидированы политикой).
+    pub fn new(tools: impl IntoIterator<Item = String>) -> Self {
+        Self { tools: tools.into_iter().collect() }
+    }
+
+    /// Разрешён ли инструмент хуком.
+    pub fn allows(&self, tool: &str) -> bool {
+        self.tools.contains(tool)
+    }
+}
+
+#[async_trait]
+impl ApprovalHook for AllowlistHook {
+    async fn request(&self, request: ApprovalRequest) -> ApprovalDecision {
+        if self.tools.contains(&request.tool) {
+            ApprovalDecision::AllowOnce
+        } else {
+            ApprovalDecision::Deny
+        }
+    }
+}
+
 /// Запись аудита вызова инструмента (R-AGT-06).
 ///
 /// Поля стабильны; тела аргументов/секреты не пишутся — только SHA-256 канонизированного
@@ -87,6 +137,12 @@ pub struct AuditEntry {
     pub error_code: Option<String>,
     /// Длительность вызова, мс.
     pub duration_ms: u64,
+    /// Причина решения политики/approval (`policy`/`approval`/`session`/`allow_once`/…).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Чекпоинт, созданный мутирующим инструментом (R-AGT-05, для отката/аудита).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
 }
 
 impl AuditEntry {
@@ -100,6 +156,8 @@ impl AuditEntry {
             ok,
             error_code: None,
             duration_ms: 0,
+            reason: None,
+            checkpoint_id: None,
         }
     }
 
@@ -114,6 +172,20 @@ impl AuditEntry {
     #[must_use]
     pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
         self.duration_ms = duration_ms;
+        self
+    }
+
+    /// Проставить причину решения (`policy`/`approval`/`session`/…).
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Проставить id чекпоинта, созданного мутацией.
+    #[must_use]
+    pub fn with_checkpoint_id(mut self, checkpoint_id: impl Into<String>) -> Self {
+        self.checkpoint_id = Some(checkpoint_id.into());
         self
     }
 }
@@ -350,10 +422,48 @@ pub(crate) mod tests {
             .request(ApprovalRequest {
                 tool: "artifact_run".to_owned(),
                 args_summary: "{}".to_owned(),
+                args_sha256: "0".repeat(64),
                 destructive: true,
                 requested_by: "mcp".to_owned(),
             })
             .await;
         assert_eq!(decision, ApprovalDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn headless_approval_hooks_are_fail_closed_by_default() {
+        let request = |tool: &str| ApprovalRequest {
+            tool: tool.to_owned(),
+            args_summary: "{}".to_owned(),
+            args_sha256: "0".repeat(64),
+            destructive: true,
+            requested_by: "mcp".to_owned(),
+        };
+        // --approval=auto: разрешает всё, что допустила политика грантов.
+        assert_eq!(AutoApproveHook.request(request("artifact_run")).await, ApprovalDecision::AllowOnce);
+        // --approval=allowlist: только перечисленные инструменты, остальное — Deny.
+        let hook = AllowlistHook::new(vec!["note_write".to_owned()]);
+        assert!(hook.allows("note_write"));
+        assert!(!hook.allows("artifact_run"));
+        assert_eq!(hook.request(request("note_write")).await, ApprovalDecision::AllowOnce);
+        assert_eq!(hook.request(request("artifact_run")).await, ApprovalDecision::Deny);
+    }
+
+    #[test]
+    fn audit_entry_extended_fields_are_optional() {
+        let entry = AuditEntry::new("artifact_write_manifest", "a".repeat(64), "allow", true)
+            .with_reason("allow_once")
+            .with_checkpoint_id("01CHECKPOINT");
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["reason"], "allow_once");
+        assert_eq!(value["checkpoint_id"], "01CHECKPOINT");
+        // Старые поля аудита не изменились.
+        for key in ["ts", "tool", "params_sha256", "decision", "ok", "duration_ms"] {
+            assert!(value.get(key).is_some(), "в аудите нет поля {key}");
+        }
+        let plain = AuditEntry::new("project_tree", "b".repeat(64), "allow", true);
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(value.get("reason").is_none(), "reason опционален");
+        assert!(value.get("checkpoint_id").is_none(), "checkpoint_id опционален");
     }
 }

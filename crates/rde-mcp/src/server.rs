@@ -1,17 +1,19 @@
-//! MCP-сервер RDE на `rmcp` 3.8 (spec 2026-07-28, stateless core, A6/R-MCP-01).
+//! MCP-сервер RDE на `rmcp` 3.8 (spec 2026-07-28, stateless core, A6/R-MCP-01) — M1/M2.
 //!
 //! Что делает слой:
 //! - рекламирует протокол `2026-07-28` и capabilities `tools`+`resources` через `server/discover`
 //!   (без `initialize`/сессий — stateless core);
-//! - отдаёт детерминированный `tools/list` и выполняет read-only инструменты через
-//!   [`RdeHost`]; мутации запрещены политикой (fail-closed);
+//! - отдаёт детерминированный `tools/list` (21 инструмент) и выполняет инструменты через
+//!   [`RdeHost`]: read-only — сразу, мутации — только после гранта политики и `ApprovalHook`
+//!   (fail-closed: по умолчанию всё запрещено, A4);
 //! - отдаёт ресурсы `rde://…` с `ttlMs`/`cacheScope`;
-//! - на **каждый** вызов пишет аудит; аргументы — только SHA-256; stdout занят JSON-RPC
-//!   (логи — stderr через `RDE_MCP_LOG`);
+//! - на **каждый** вызов пишет аудит (`decision`/`reason`/`checkpoint_id`); аргументы — только
+//!   SHA-256; stdout занят JSON-RPC (логи — stderr через `RDE_MCP_LOG`);
 //! - изолирует сбои: `spawn_blocking` + `tokio::time::timeout` (паника/зависание инструмента
-//!   не роняют сервер — `RDE_INTERNAL`/`RDE_TIMEOUT`).
+//!   не роняют сервер — `RDE_INTERNAL`/`RDE_TIMEOUT`);
+//! - при shutdown отменяет активные job'ы запуска артефактов (`RdeHost::shutdown_jobs`).
 //!
-//! Транспорт M1 — stdio ([`serve_stdio`]); HTTP — позже (loopback + token, R-MCP-02).
+//! Транспорт M1/M2 — stdio ([`serve_stdio`]); HTTP — позже (loopback + token, R-MCP-02).
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -34,7 +36,7 @@ use crate::hooks::{self, AuditEntry, HostEvent, HostHooks};
 use crate::host::SharedHost;
 use crate::instructions;
 use crate::model::{ArtifactInfo, DocInfo};
-use crate::policy::{authorize_tool_call, McpPolicy, RateLimiter};
+use crate::policy::{authorize_tool_call, ApprovalCache, AuthDenial, McpPolicy, RateLimiter};
 use crate::resources::{self, ResourceTarget};
 use crate::tools::{self, ToolSpec};
 use crate::{
@@ -72,7 +74,7 @@ impl From<HostError> for ServeError {
     }
 }
 
-/// MCP-сервер RDE: хост + хуки + политика + кэш инструкций.
+/// MCP-сервер RDE: хост + хуки + политика + кэш инструкций/разрешений.
 ///
 /// Создаётся один раз на процесс (`rde mcp serve`); [`ServerHandler`] реализован ниже.
 pub struct McpServer {
@@ -81,18 +83,25 @@ pub struct McpServer {
     policy: McpPolicy,
     instructions: String,
     limiter: RateLimiter,
+    /// Сессионный кэш `AllowSession`-разрешений (только мутации M2; ключ — инструмент+хеш аргументов).
+    approval_cache: ApprovalCache,
 }
 
 impl McpServer {
     /// Собрать сервер: получить у хоста инструкции (≤32 KiB) и инициализировать rate-limit.
     ///
+    /// К инструкциям хоста добавляется раздел с фактической политикой грантов этой сессии
+    /// (детерминирован по флагам `rde mcp serve`), затем текст усекается до 32 KiB.
+    ///
     /// # Errors
     ///
     /// [`RdeErrorCode::NotReady`], если хост не может отдать карту проекта/инструкции.
     pub fn new(host: SharedHost, hooks: HostHooks, policy: McpPolicy) -> Result<Self, HostError> {
-        let instructions = instructions::for_host(host.as_ref())?;
+        let mut text = instructions::for_host(host.as_ref())?;
+        text.push_str(&policy.instructions_section());
+        let instructions = instructions::clamp(&text);
         let limiter = RateLimiter::new(policy.rate_limit_per_min);
-        Ok(Self { host, hooks, policy, instructions, limiter })
+        Ok(Self { host, hooks, policy, instructions, limiter, approval_cache: ApprovalCache::new() })
     }
 
     /// Политика сервера.
@@ -242,7 +251,8 @@ impl McpServer {
         }
     }
 
-    /// Полный путь `tools/call`: политика → rate-limit → выполнение → лимит ответа → аудит.
+    /// Полный путь `tools/call`: политика/гранты/approvals → rate-limit → выполнение → лимит
+    /// ответа → аудит (R-AGT-06; `decision`, `reason`, `checkpoint_id`).
     ///
     /// Неизвестный инструмент — ошибка JSON-RPC (`-32602`), остальные отказы — результат
     /// инструмента с `isError: true` и `structuredContent.error.code = RDE_*`.
@@ -255,7 +265,7 @@ impl McpServer {
         let params_hash = hooks::params_sha256(&args);
         let Some(tool) = tools::find_tool(name) else {
             let error = HostError::unsupported(format!("неизвестный инструмент `{name}`"));
-            self.audit(name, &params_hash, "deny", false, Some(error.code), started);
+            self.audit(name, &params_hash, "deny", false, Some(error.code), Some("unknown_tool"), None, started);
             return Err(McpError::invalid_params(
                 format!("неизвестный инструмент `{name}`"),
                 Some(serde_json::json!({ "code": error.code.as_str() })),
@@ -267,13 +277,19 @@ impl McpServer {
                 self.policy.rate_limit_per_min
             ))
             .with_hint("повторите позже или поднимите rate_limit_per_min");
-            self.audit(name, &params_hash, "deny", false, Some(error.code), started);
+            self.audit(name, &params_hash, "deny", false, Some(error.code), Some("rate_limit"), None, started);
             return Ok(error_result(&error));
         }
-        if let Err(error) = authorize_tool_call(&self.policy, &self.hooks, tool, &args).await {
-            self.audit(name, &params_hash, "deny", false, Some(error.code), started);
-            return Ok(error_result(&error));
-        }
+        // Грант политики → кэш AllowSession → ApprovalHook (fail-closed: DenyAllHook по умолчанию).
+        let authorization =
+            match authorize_tool_call(&self.policy, &self.hooks, &self.approval_cache, tool, &args).await {
+                Ok(authorization) => authorization,
+                Err(AuthDenial { error, reason }) => {
+                    log_debug(format!("tools/call {name} → авторизация отклонена ({reason}): {}", error.code));
+                    self.audit(name, &params_hash, "deny", false, Some(error.code), Some(reason), None, started);
+                    return Ok(error_result(&error));
+                }
+            };
         let result = self.run_tool_spec(tool, args).await;
         let duration_ms = started.elapsed().as_millis() as u64;
         match result {
@@ -285,29 +301,57 @@ impl McpServer {
                         self.policy.max_response_bytes
                     ))
                     .with_hint("используйте диапазоны/лимиты инструмента");
-                    self.audit(name, &params_hash, "allow", false, Some(error.code), started);
+                    self.audit(
+                        name,
+                        &params_hash,
+                        "allow",
+                        false,
+                        Some(error.code),
+                        Some(authorization.reason),
+                        None,
+                        started,
+                    );
                     return Ok(error_result(&error));
                 }
+                // Мутирующие инструменты возвращают checkpoint_id верхним полем — фиксируем его
+                // в аудите для отката/расследования (R-AGT-05).
+                let checkpoint_id = value
+                    .get("checkpoint_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .filter(|id| !id.is_empty());
                 log_debug(format!("tools/call {name} ok, {bytes} байт, {duration_ms} мс"));
-                self.hooks.audit.record(
-                    &AuditEntry::new(name, params_hash, "allow", true).with_duration_ms(duration_ms),
+                self.audit(
+                    name,
+                    &params_hash,
+                    "allow",
+                    true,
+                    None,
+                    Some(authorization.reason),
+                    checkpoint_id,
+                    started,
                 );
-                self.hooks.events.emit(HostEvent::ToolCallFinished {
-                    tool: name.to_owned(),
-                    ok: true,
-                    duration_ms,
-                });
                 Ok(success_result(value))
             }
             Err(error) => {
                 log_debug(format!("tools/call {name} → {}", error.code));
-                self.audit(name, &params_hash, "allow", false, Some(error.code), started);
+                self.audit(
+                    name,
+                    &params_hash,
+                    "allow",
+                    false,
+                    Some(error.code),
+                    Some(authorization.reason),
+                    None,
+                    started,
+                );
                 Ok(error_result(&error))
             }
         }
     }
 
-    /// Записать аудит вызова (решение политики/окончание).
+    /// Записать аудит вызова (решение политики/approval + чекпоинт мутации).
+    #[allow(clippy::too_many_arguments)]
     fn audit(
         &self,
         tool: &str,
@@ -315,12 +359,20 @@ impl McpServer {
         decision: &str,
         ok: bool,
         code: Option<RdeErrorCode>,
+        reason: Option<&str>,
+        checkpoint_id: Option<String>,
         started: Instant,
     ) {
         let mut entry = AuditEntry::new(tool, params_hash.to_owned(), decision, ok)
             .with_duration_ms(started.elapsed().as_millis() as u64);
         if let Some(code) = code {
             entry = entry.with_error(code);
+        }
+        if let Some(reason) = reason {
+            entry = entry.with_reason(reason);
+        }
+        if let Some(checkpoint_id) = checkpoint_id {
+            entry = entry.with_checkpoint_id(checkpoint_id);
         }
         self.hooks.audit.record(&entry);
         self.hooks.events.emit(HostEvent::ToolCallFinished {
@@ -506,9 +558,13 @@ pub fn serve_stdio_blocking(host: SharedHost, hooks: HostHooks, policy: McpPolic
 /// [`ServeError`] — если проект/инструкции недоступны или сервис завершился с ошибкой.
 pub async fn serve_stdio(host: SharedHost, hooks: HostHooks, policy: McpPolicy) -> Result<(), ServeError> {
     let tools_count = tools::tool_registry().len();
+    let mutating_count = tools::tool_registry().iter().filter(|tool| !tool.annotations.read_only).count();
+    // Хост нужен после завершения сервиса: отменить активные jobs запуска (A6: graceful).
+    let shutdown_host = Arc::clone(&host);
     let server = McpServer::new(host, hooks, policy)?;
     log_info(format!(
-        "stdio-сервер запущен: инструментов {tools_count}, ресурсов rde:// (spec {MCP_PROTOCOL_VERSION})"
+        "stdio-сервер запущен: инструментов {tools_count} (мутирующих {mutating_count}, режим approvals `{}`), ресурсов rde:// (spec {MCP_PROTOCOL_VERSION})",
+        server.policy().approval_mode
     ));
     let service = match server.serve(stdio()).await {
         Ok(service) => service,
@@ -516,9 +572,13 @@ pub async fn serve_stdio(host: SharedHost, hooks: HostHooks, policy: McpPolicy) 
         // это штатный EOF, а не ошибка сервера (A6: EOF → корректный выход).
         Err(ServerInitializeError::ConnectionClosed(_)) => {
             log_info("stdin закрыт до lifecycle — корректный выход");
+            shutdown_host.shutdown_jobs();
             return Ok(());
         }
-        Err(error) => return Err(ServeError::Startup(error.to_string())),
+        Err(error) => {
+            shutdown_host.shutdown_jobs();
+            return Err(ServeError::Startup(error.to_string()));
+        }
     };
     // SIGINT → отмена сервиса (graceful): ждём штатного завершения транспорта.
     let cancellation = service.cancellation_token();
@@ -528,13 +588,16 @@ pub async fn serve_stdio(host: SharedHost, hooks: HostHooks, policy: McpPolicy) 
             cancellation.cancel();
         }
     });
-    match service.waiting().await {
+    let result = match service.waiting().await {
         Ok(_reason) => {
             log_info("stdio-сервер завершён");
             Ok(())
         }
         Err(join_error) => Err(ServeError::Runtime(format!("ожидание сервиса: {join_error}"))),
-    }
+    };
+    // Активные jobs не должны пережить сервер: ставим флаг отмены и ждём завершения потоков.
+    shutdown_host.shutdown_jobs();
+    result
 }
 
 #[cfg(test)]
@@ -588,6 +651,7 @@ mod tests {
             input_schema: || serde_json::json!({"type": "object"}),
             output_schema: || serde_json::json!({"type": "object"}),
             annotations: crate::tools::ToolAnnotationsSpec::read_only(),
+            grant: None,
             handler: panic_handler,
         }
     }
@@ -600,6 +664,7 @@ mod tests {
             input_schema: || serde_json::json!({"type": "object"}),
             output_schema: || serde_json::json!({"type": "object"}),
             annotations: crate::tools::ToolAnnotationsSpec::read_only(),
+            grant: None,
             handler: slow_handler,
         }
     }
@@ -652,7 +717,17 @@ mod tests {
             "порядок инструментов стабилен"
         );
         for tool in &first.tools {
-            assert_eq!(tool.annotations.as_ref().and_then(|a| a.read_only_hint), Some(true));
+            // M1 read-only инструменты не изменились; M2-мутации — readOnlyHint=false.
+            let spec = tools::find_tool(tool.name.as_ref()).expect("инструмент из реестра");
+            assert_eq!(
+                tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+                Some(spec.annotations.read_only),
+                "{}: readOnlyHint",
+                tool.name
+            );
+            if !spec.annotations.read_only {
+                assert_eq!(tool.annotations.as_ref().and_then(|a| a.destructive_hint), Some(true), "{}", tool.name);
+            }
             assert!(tool.output_schema.is_some(), "{} без outputSchema", tool.name);
             assert!(!tool.input_schema.is_empty(), "{} без inputSchema", tool.name);
         }
@@ -762,11 +837,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_is_protocol_error_and_audited() {
         let (server, sink) = recording_server();
-        let error = server.call_tool_impl("artifact_run", serde_json::json!({})).await.expect_err("неизвестный инструмент");
+        let error = server.call_tool_impl("doc_insert", serde_json::json!({})).await.expect_err("неизвестный инструмент");
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
         let entries = sink.entries();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].tool, "artifact_run");
+        assert_eq!(entries[0].tool, "doc_insert");
         assert_eq!(entries[0].decision, "deny");
         assert_eq!(entries[0].error_code.as_deref(), Some("RDE_UNSUPPORTED"));
     }
@@ -878,5 +953,121 @@ mod tests {
     fn audit_sink_trait_object_is_usable() {
         let sink: Arc<dyn AuditSink> = Arc::new(RecordingAuditSink::default());
         sink.record(&AuditEntry::new("x", "0".repeat(64), "allow", true));
+    }
+
+    // --- M2: approvals/grants/checkpoint в аудите (A4/A5/A8) -----------------
+
+    #[tokio::test]
+    async fn mutating_tool_denied_by_default_and_writes_nothing() {
+        let host = Arc::new(MockHost::default());
+        let sink = Arc::new(RecordingAuditSink::default());
+        let hooks = HostHooks::silent().with_audit(sink.clone());
+        let server = McpServer::new(host.clone(), hooks, McpPolicy::read_only()).expect("сервер");
+        let result = server
+            .call_tool_impl(
+                "artifact_write_manifest",
+                serde_json::json!({"artifact_id": "art-1", "manifest": {"title": "T"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(error_code_of(&result), "RDE_APPROVAL_DENIED");
+        assert_eq!(host.mutation_count(), 0, "deny по умолчанию ничего не пишет");
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].decision, "deny");
+        assert_eq!(entries[0].reason.as_deref(), Some("policy"));
+    }
+
+    #[tokio::test]
+    async fn approved_mutation_is_audited_with_reason_and_checkpoint() {
+        use crate::hooks::{AutoApproveHook, NullEventSink};
+        let host = Arc::new(MockHost::default());
+        let sink = Arc::new(RecordingAuditSink::default());
+        let hooks = HostHooks::new(Arc::new(AutoApproveHook), sink.clone(), Arc::new(NullEventSink));
+        let mut policy = McpPolicy::read_only();
+        policy.allow_project_write = true;
+        policy.approval_mode = "auto".to_owned();
+        let server = McpServer::new(host.clone(), hooks, policy).expect("сервер");
+        let result = server
+            .call_tool_impl(
+                "artifact_write_manifest",
+                serde_json::json!({"artifact_id": "art-1", "manifest": {"title": "T"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(host.mutation_count(), 1, "с грантом и approval мутация выполняется");
+        let structured = result.structured_content.expect("structuredContent");
+        assert_eq!(structured["checkpoint_id"], crate::test_support::MOCK_CHECKPOINT_ID);
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].decision, "allow");
+        assert_eq!(entries[0].reason.as_deref(), Some("allow_once"));
+        assert_eq!(
+            entries[0].checkpoint_id.as_deref(),
+            Some(crate::test_support::MOCK_CHECKPOINT_ID),
+            "checkpoint_id мутации должен попасть в аудит (R-AGT-05)"
+        );
+    }
+
+    struct SessionApprovalHook;
+
+    #[async_trait::async_trait]
+    impl crate::hooks::ApprovalHook for SessionApprovalHook {
+        async fn request(
+            &self,
+            _request: crate::hooks::ApprovalRequest,
+        ) -> crate::hooks::ApprovalDecision {
+            crate::hooks::ApprovalDecision::AllowSession
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_session_is_cached_for_equal_args() {
+        let host = Arc::new(MockHost::default());
+        let sink = Arc::new(RecordingAuditSink::default());
+        let hooks = HostHooks::new(
+            Arc::new(SessionApprovalHook),
+            sink.clone(),
+            Arc::new(crate::hooks::NullEventSink),
+        );
+        let mut policy = McpPolicy::read_only();
+        policy.allow_project_write = true;
+        let server = McpServer::new(host.clone(), hooks, policy).expect("сервер");
+        let args = serde_json::json!({"artifact_id": "art-1", "manifest": {"title": "T"}});
+        server.call_tool_impl("artifact_write_manifest", args.clone()).await.unwrap();
+        server.call_tool_impl("artifact_write_manifest", args).await.unwrap();
+        let entries = sink.entries();
+        assert_eq!(entries[0].reason.as_deref(), Some("allow_session"));
+        assert_eq!(entries[1].reason.as_deref(), Some("session"), "повтор с теми же аргументами — из кэша");
+        assert_eq!(host.mutation_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_cancel_requires_run_grant_but_status_is_read_only() {
+        use crate::test_support::MOCK_JOB_ID;
+        let host = Arc::new(MockHost::default());
+        let server = McpServer::new(host, HostHooks::silent(), McpPolicy::read_only()).expect("сервер");
+        let status = server
+            .call_tool_impl("run_status", serde_json::json!({"job_id": MOCK_JOB_ID}))
+            .await
+            .unwrap();
+        assert_eq!(status.is_error, Some(false), "run_status — read-only, без гранта");
+        let cancel = server
+            .call_tool_impl("run_cancel", serde_json::json!({"job_id": MOCK_JOB_ID}))
+            .await
+            .unwrap();
+        assert_eq!(error_code_of(&cancel), "RDE_APPROVAL_DENIED", "run_cancel требует грант run_script");
+    }
+
+    #[test]
+    fn instructions_include_session_mutation_policy() {
+        let host = Arc::new(MockHost::default());
+        let server = McpServer::new(host, HostHooks::silent(), McpPolicy::read_only()).unwrap();
+        assert!(server.instructions().contains("Политика мутаций этой сессии"));
+        assert!(server.instructions().contains("`deny`"));
+        assert!(server.instructions().contains("RDE_APPROVAL_DENIED"));
+        assert!(server.instructions().len() <= crate::MAX_INSTRUCTIONS_BYTES);
     }
 }

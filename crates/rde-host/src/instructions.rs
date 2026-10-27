@@ -15,7 +15,7 @@ const MAX_LISTED_OBJECTS: usize = 60;
 pub fn build(project: &Project) -> String {
     let policy = rde_mcp::McpPolicy::read_only();
     let mut out = String::with_capacity(4096);
-    out.push_str("# RDE MCP server (M1, read-only)\n\n");
+    out.push_str("# RDE MCP server (M2: read-only + управляемые мутации)\n\n");
     out.push_str("RDE — среда разработки отчёта. Проект — каталог с TOML-манифестами объектов; ");
     out.push_str("документ — `.doc.rde` (OOXML + `rde:doc`), артефакты — скрипты с хешами/CAS/ledger.\n\n");
 
@@ -37,10 +37,10 @@ pub fn build(project: &Project) -> String {
     out.push_str(&format!("- доверенный проект: {}\n", if project.manifest.trusted { "да" } else { "нет" }));
     out.push_str(&format!("- шаблон по умолчанию: {}\n\n", project.manifest.default_template));
 
-    out.push_str("## Политика M1 (fail-closed)\n");
-    out.push_str("- только чтение: мутирующие инструменты, запуск скриптов, git commit запрещены;\n");
+    out.push_str("## Политика безопасности (fail-closed)\n");
+    out.push_str("- read-only инструменты разрешены; мутации — только с грантом политики и approval (см. раздел ниже);\n");
     out.push_str(&format!(
-        "- вызовы аудируются (`.rde/agent/audit.log`, аргументы — SHA-256); rate-limit {} вызовов/мин;\n",
+        "- вызовы аудируются (`.rde/agent/audit.log`: решение, причина, `checkpoint_id`; аргументы — SHA-256); rate-limit {} вызовов/мин;\n",
         policy.rate_limit_per_min
     ));
     out.push_str(&format!(
@@ -50,6 +50,15 @@ pub fn build(project: &Project) -> String {
     ));
     out.push_str("- пути — только внутри корня проекта; `.rde/**` закрыт; ошибки — машиночитаемые коды `RDE_*`;\n");
     out.push_str(&format!("- инструкции ≤{} KiB (эти).\n\n", rde_mcp::MAX_INSTRUCTIONS_BYTES / 1024));
+
+    out.push_str("## Мутации (M2: grants + approvals + checkpoints)\n");
+    out.push_str("- без гранта CLI (`--approval=deny` по умолчанию) мутация возвращает `RDE_APPROVAL_DENIED` и НЕ меняет файлы;\n");
+    out.push_str("- перед каждой мутацией создаётся чекпоинт `.rde/agent/checkpoints/<id>/` (копии файлов + корни store); при ошибке — авто-откат;\n");
+    out.push_str("- `checkpoint_id` возвращается в ответе и пишется в аудит; ручной откат — `RDE`/UI (MCP `checkpoint_*` в M2 не публикуются);\n");
+    out.push_str("- `expected_sha256` (где есть) защищает от перезаписи ручной правки: расхождение → `RDE_CONFLICT`;\n");
+    out.push_str("- `dry_run: true` — только проверка, файлы не пишутся; `artifact_run` требует `trusted`-проект (R-RUN-06), один job за раз (`RDE_BUSY`);\n");
+    out.push_str("- jobs (`artifact_run` → `run_status`/`run_log`/`run_cancel`) живут в процессе сервера и не переживают рестарт;\n");
+    out.push_str("- doc-мутации (insert/suggested edits) в M2 не публикуются — R-DOC-32/M2.5; общего `file_write` нет.\n\n");
 
     out.push_str("## Объекты проекта\n");
     let listed: Vec<&Object> = project.objects.iter().take(MAX_LISTED_OBJECTS).collect();
@@ -64,7 +73,7 @@ pub fn build(project: &Project) -> String {
     }
     out.push('\n');
 
-    out.push_str("## Инструменты (13, read-only)\n");
+    out.push_str("## Инструменты (13 read-only + 8 мутаций)\n");
     let names: Vec<&str> = rde_mcp::tool_registry().iter().map(|tool| tool.name).collect();
     out.push_str(&format!("{}\n\n", names.join(", ")));
 
@@ -80,7 +89,7 @@ pub fn build(project: &Project) -> String {
     out.push_str("- ответы помечают `truncated` при упоре в лимит — запрашивайте следующий диапазон;\n");
     out.push_str("- используйте стабильные id из ответов (`doc_list`/`artifact_list`/…), не придумывайте пути;\n");
     out.push_str("- `doc_*` работают только с `.doc.rde`; на непреобразованном документе — `RDE_DOC_NOT_MIGRATED`;\n");
-    out.push_str("- git — только `git_status` (чтение); ledger-статусы артефактов не означают запуск.\n");
+    out.push_str("- git — `git_status` (чтение) и `git_commit` (мутация с approval); ledger-статусы артефактов не означают запуск.\n");
 
     rde_mcp::instructions::clamp(&out)
 }

@@ -14,15 +14,22 @@ DocView. Ещё: [светлая тема](docs/fidelity/gui-p10-document-light.
 
 ## Состояние
 
-Текущая веха — **M1 «v0.3: независимый MCP-слой»** (2026-10-27, [ADR-0006](docs/adr/0006-mcp-independent-layer.md)):
-`rde-mcp` (протокол на `rmcp` 3.8.0, spec MCP **2026-07-28**, stdio, read-only) + `rde-host`
-(headless-реализация контракта поверх библиотек RDE) + `rde mcp serve`; внешний MCP-клиент видит
-проект, 13 инструментов и 4 ресурса, ошибки — коды `RDE_*`, все вызовы — в
-`.rde/agent/audit.log`. До M1 — **P9 «Интерфейс»** и **P10 «UI-долги»**: закрыты дефекты §19-7
-(«одна линия» панелей) и §19-8 (ширина инспектора). Прототип **v0.1** закрыт по
-[`docs/exit-v0.1.md`](docs/exit-v0.1.md) (P5, теги `p5-gates` / `v0.1-prototype`) и отполирован в P6–P8.
+Текущая веха — **M2 «v0.3: мутации через хуки approvals/checkpoints»** (2026-10-27,
+[ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md)): к независимому MCP-слою
+([ADR-0006](docs/adr/0006-mcp-independent-layer.md): `rde-mcp` на `rmcp` 3.8.0, spec MCP
+**2026-07-28**, stdio; `rde-host` — headless-реализация) добавлены **8 мутирующих инструментов** через
+те же хуки approvals/аудита: `artifact_write_manifest`, `artifact_write_script`, `artifact_run` +
+`run_status`/`run_cancel`/`run_log` (async job-модель), `note_write`, `git_commit`. Мутации —
+**только** через гранты политики + approval + чекпоинт (`.rde/agent/checkpoints`, авто-откат при
+ошибке, `RDE_CONFLICT` при внешней правке); **по умолчанию всё запрещено** (`--approval=deny`, файлы
+не меняются), `--approval=auto|allowlist` — явные флаги CLI (headless, fail-closed). Внешний
+MCP-клиент видит 21 инструмент и 4 ресурса; ошибки — коды `RDE_*`, все вызовы (decision/reason/
+checkpoint_id) — в `.rde/agent/audit.log`. До M2 — **M1** (read-only MCP-слой), **P9 «Интерфейс»** и
+**P10 «UI-долги»**: закрыты дефекты §19-7 («одна линия» панелей) и §19-8 (ширина инспектора).
+Прототип **v0.1** закрыт по [`docs/exit-v0.1.md`](docs/exit-v0.1.md) (P5, теги `p5-gates` /
+`v0.1-prototype`) и отполирован в P6–P8.
 
-- **300 тестов** (`#[test]`) в 15 пакетах, 16 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
+- **355 тестов** (`#[test]`) в 15 пакетах, 16 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
 - Демо-проект [`demo-project/`](demo-project): 12 объектов (вкл. project-level формулу σ, P3),
   документ с 11 живыми вставками; формула σ — режимы **OMML** (номер `(1)`,
   [`docs/fidelity/demo-formula.png`](docs/fidelity/demo-formula.png)) и **SVG-вектор** (P3),
@@ -55,7 +62,7 @@ DocView. Ещё: [светлая тема](docs/fidelity/gui-p10-document-light.
 | Источники, PDF/OCR, ревью | импорт BibTeX/RIS/CSL-JSON, PDF-текст/рендер, OCR страницы, комментарии Word и импорт внешнего ревью; веб-архив — при наличии `monolith` |
 | VCS, настройки, гейты | git init/status/commit/revert/log, `.gitignore`/`.gitattributes`, настройки приложения и авторы, i18n-каркас ru/en, экспорт диагностики, OPC-гейт, корпус docx, `xtask`/CI, перф 10k |
 | Структура и Код документа | **реальные**: блоки/paraId/вставки из `.doc.rde`; манифест объекта + RDE-часть `customXml/item1.xml` |
-| Агент / MCP / ACP | **MCP-сервер — M1** (v0.3): `rde mcp serve` — stdio, read-only, 13 инструментов + 4 ресурса `rde://…`, `server/discover` spec 2026-07-28, аудит `.rde/agent/audit.log`, коды `RDE_*` ([ADR-0006](docs/adr/0006-mcp-independent-layer.md)); мутации/approvals GUI, HTTP и ACP — M2+; панель агента — честная заглушка «не подключён» |
+| Агент / MCP / ACP | **MCP-сервер — M2** (v0.3): `rde mcp serve` — stdio, spec 2026-07-28, **21 инструмент** (13 read-only + 8 мутаций: манифест/скрипт/запуск/статус/отмена/лог/заметка/git-коммит) + 4 ресурса `rde://…`, grants+approvals (по умолчанию deny, CLI `--approval=deny\|auto\|allowlist`), чекпоинты `.rde/agent/checkpoints` с авто-откатом, аудит `.rde/agent/audit.log` (`decision`/`reason`/`checkpoint_id`), коды `RDE_*` ([ADR-0006](docs/adr/0006-mcp-independent-layer.md), [ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md)); doc-мутации (suggested edits) — M2.5, HTTP — M3, GUI-approvals/ACP — M4; панель агента — честная заглушка «не подключён» |
 
 ## Сборка и запуск
 
@@ -105,31 +112,60 @@ RDE_PROJECT=/путь/к/проекту ./scripts/build.sh run -p rde
 ### Тесты
 
 ```bash
-./scripts/build.sh test --workspace   # 300 тестов (#[test]) в 15 пакетах
+./scripts/build.sh test --workspace   # 355 тестов (#[test]) в 15 пакетах
 ```
 
 Разбивка: core 31, dag 28, ui 51, doc 38, run 14, hash 13, store 12, docx 11, sources 6,
-templates 5, env 4, vcs 2, **mcp 58, host 23, apps/rde (e2e MCP stdio) 4**. Тесты, которым нужны
+templates 5, env 4, vcs 2, **mcp 75, host 57 (28 unit + 15 headless + 14 mutations),
+apps/rde (e2e MCP stdio) 8**. Тесты, которым нужны
 внешние инструменты (LibreOffice, poppler, tesseract), проверяют наличие и пропускают проверку,
 если инструмента нет.
 
-### MCP-сервер (stdio, v0.3/M1)
+### MCP-сервер (stdio, v0.3/M2)
 
 `rde mcp serve --project <dir>` (или `RDE_PROJECT`) — headless MCP-сервер RDE: транспорт stdio,
-spec **2026-07-28** (`server/discover`, stateless, `ttlMs`/`cacheScope`), 13 read-only инструментов и
-4 ресурса `rde://…`, политика fail-closed, аудит `.rde/agent/audit.log`. Архитектура и TTL —
-[ADR-0006](docs/adr/0006-mcp-independent-layer.md); независимость слоёв проверяется
-`cargo tree -p rde-mcp` (не должно быть `rde-*`/`egui`).
+spec **2026-07-28** (`server/discover`, stateless, `ttlMs`/`cacheScope`), **21 инструмент**
+(13 read-only M1 + 8 мутаций M2), 4 ресурса `rde://…`, **grants + approvals + чекпоинты**,
+аудит `.rde/agent/audit.log`. Мутации выполняются только по схеме «грант политики → approval →
+чекпоинт → библиотечная операция → аудит»; **по умолчанию (`--approval=deny`) любые мутации
+отклоняются (`RDE_APPROVAL_DENIED`), файлы проекта не меняются**. Архитектура/TTL —
+[ADR-0006](docs/adr/0006-mcp-independent-layer.md), мутации/approvals/чекпоинты/job-модель/
+parity-матрица UI↔MCP — [ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md); независимость
+слоёв проверяется `cargo tree -p rde-mcp` (не должно быть `rde-*`/`egui`).
+
+Флаги approvals (headless, fail-closed; интерактивных подтверждений в stdin нет):
+
+| Флаг | Что разрешает |
+|---|---|
+| (по умолчанию) | ничего: все мутации → `RDE_APPROVAL_DENIED`, файлы не меняются |
+| `--approval=auto` | `project_write` (манифест/скрипт/заметка); `run_script` — только с `--allow-run`; `git_commit` — только с `--allow-destructive` |
+| `--approval=allowlist --allow-tools=a,b,c` | только перечисленные мутирующие инструменты |
+| `--policy read-only` | совместимость с M1 (= deny) |
+
+`artifact_run` дополнительно требует `trusted = true` в `rde.toml` (R-RUN-06) и один активный job
+(`RDE_BUSY`); jobs не переживают рестарт сервера. Чекпоинты — `.rde/agent/checkpoints/<ULID>/`
+(manifest + копии файлов + корни store); на ошибке — авто-откат; внешняя правка файла при
+`expected_sha256` → `RDE_CONFLICT`.
 
 ```bash
 ./scripts/build.sh test -p rde-mcp -p rde-host   # unit/integration слоя
 ./scripts/build.sh test -p rde                   # e2e: настоящий rmcp-клиент по stdio
 
-# ручной smoke: server/discover + tools/list (stdout — только JSON-RPC, логи — stderr)
+# 1) default deny: мутация отклоняется, файлы не меняются (stdout — только JSON-RPC)
 META='{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}'
 { printf '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":%s}}\n' "$META"
   printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":%s}}\n' "$META"; } \
   | ./target/debug/rde mcp serve --project demo-project 2>/tmp/rde-mcp.log | head -2
+# tools/list: 21 инструмент (13 read-only + 8 мутаций), M1-порядок не переставлен
+
+# 2) auto: явный флаг → мутация выполняется, создаётся чекпоинт и аудит
+{ printf '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":%s}}\n' "$META"
+  printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"note_write","arguments":{"note_id":"<id из note_list>","content":"# M2 smoke\n"},"_meta":%s}}\n' "$META"; } \
+  | ./target/debug/rde mcp serve --project demo-project --approval=auto 2>/tmp/rde-mcp-auto.log | tail -1
+# demo-project/.rde/agent/checkpoints/<ULID>/manifest.json, demo-project/.rde/agent/audit.log
+
+# 3) job-модель запуска (data-артефакт не требует uv: job сразу завершается skipped/succeeded)
+#    artifact_run {"artifact_id":"<data-артефакт>"} → job_id → run_status / run_log
 
 # независимость (пусто = доказано)
 cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core|rde-dag|rde-doc|rde-store"
@@ -181,14 +217,14 @@ rde/
   crates/rde-templates/# ГОСТ 7.32-2017 и профили, библиография ГОСТ 7.0.100
   crates/rde-sources/  # импорт цитат, PDF-текст/рендер, OCR, веб-архив
   crates/rde-vcs/      # git init/status/commit/revert/log/diff, .gitignore/.gitattributes
-  crates/rde-mcp/      # MCP-слой (v0.3): контракт RdeHost, DTO/схемы, 13 инструментов, ресурсы, хуки, rmcp-сервер (stdlib)
-  crates/rde-host/     # headless-реализация контракта поверх библиотек RDE (без egui/rde-ui)
+  crates/rde-mcp/      # MCP-слой (v0.3/M2): контракт RdeHost, DTO/схемы, 21 инструмент, ресурсы, grants/approvals, хуки, rmcp-сервер (stdlib)
+  crates/rde-host/     # headless-реализация контракта поверх библиотек RDE (чтение, мутации+чекпоинты, jobs; без egui/rde-ui)
   crates/rde-ui/       # лента, панели, вкладки, DocView, темы, шрифты, иконки
   demo-project/        # демо-проект: rde.toml, objects/**; документ — .doc.rde
   docs/schema/         # сгенерированные JSON Schema манифестов
   docs/fidelity/       # отчёты docx-гейтов и актуальные скриншоты интерфейса
   docs/tz-03.md        # ТЗ v03 — канон (истина последней инстанции)
-  docs/adr/            # архитектурные решения (0001–0003, 0005–0006)
+  docs/adr/            # архитектурные решения (0001–0003, 0005–0007)
   scripts/build.sh     # cargo-обёртка: target на /srv/yocto/rde-target + guard
   .cargo/config.toml   # target-dir на внешний диск
   vendor/wordcraft/    # git-субмодуль форка ia14borzenko/wordcraft-rde, ветка rde/main
@@ -203,7 +239,9 @@ rde/
   (репозиторий/сборка/форк), [0002](docs/adr/0002-component-boundaries.md) (границы крейтов),
   [0003](docs/adr/0003-deviations-from-tz02.md) (7 отклонений от ТЗ v02 и решения),
   [0005](docs/adr/0005-formulas-and-values-as-project-objects.md) (формулы как объекты проекта),
-  [0006](docs/adr/0006-mcp-independent-layer.md) (независимый MCP-слой `rde-mcp`/`rde-host`).
+  [0006](docs/adr/0006-mcp-independent-layer.md) (независимый MCP-слой `rde-mcp`/`rde-host`),
+  [0007](docs/adr/0007-mutations-approvals-checkpoints.md) (M2: мутации — grants/approvals/чекпоинты,
+  job-модель, parity-матрица UI↔MCP).
 - [`CHANGELOG.md`](CHANGELOG.md) — история вех M1–P10 и v0.3-M1: что добавлено/изменено/исправлено.
 - [`docs/exit-v0.1.md`](docs/exit-v0.1.md) — exit-критерий v0.1 и что осталось за фазой.
 - [`docs/milestones.md`](docs/milestones.md) — критерии и доказательства вех.
@@ -230,11 +268,14 @@ rde/
   docx/PDF с гейтами и обмена LaTeX (P5); Word-совместимость svgBlip — по спецификации (Word на
   стенде нет), проверено LO-оракулом; подробности — [ТЗ §5.7.5](docs/tz-03.md) и
   [`docs/state.md`](docs/state.md).
-- **MCP-сервер** — **M1 готов** (v0.3, [ADR-0006](docs/adr/0006-mcp-independent-layer.md)):
-  `rde mcp serve` (stdio, read-only, 13 инструментов, 4 ресурса, аудит, spec 2026-07-28).
-  Не входит в M1 и запланировано: мутирующие инструменты + approvals GUI (M2), streamable HTTP с
-  loopback+bearer-токеном (M3), ACP-агент/панель чата и URI-чипы (M4); панель агента в GUI — честная
-  заглушка «не подключён», быстрые действия работают без агента.
+- **MCP-сервер** — **M2 готов** (v0.3, [ADR-0006](docs/adr/0006-mcp-independent-layer.md),
+  [ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md)): `rde mcp serve` (stdio, spec
+  2026-07-28, 21 инструмент = 13 read-only + 8 мутаций, 4 ресурса, grants/approvals/чекпоинты, аудит,
+  job-модель запуска). Не входит в M2 и запланировано: doc-мутации/suggested edits и ревизии
+  документа (M2.5, R-DOC-32), streamable HTTP с loopback+bearer-токеном (M3), ACP-агент/панель чата,
+  GUI-диалог approval с diff и URI-чипы (M4); MCP-инструментов `checkpoint_*` нет (откат — API хоста/
+  UI), jobs не переживают рестарт; панель агента в GUI — честная заглушка «не подключён», быстрые
+  действия работают без агента.
 - **За пределами v0.1** — `.rde`-пакет шаринга (R-ART-10), ГОСТ 2.105 (рамки/штампы) и вузовские
   профили, OCR-гейты — v0.2; полная XSD-валидация ECMA-376 — v1.0.
 - **Word** — Microsoft Word/Word COM на стенде отсутствует: открываемость проверяется LO-оракулом
