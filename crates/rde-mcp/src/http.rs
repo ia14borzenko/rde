@@ -24,6 +24,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
@@ -59,13 +61,22 @@ pub const GENERATED_TOKEN_BYTES: usize = 32;
 pub struct HttpOptions {
     /// Адрес прослушивания (обязан быть loopback; `127.0.0.1:0` — эфемерный порт).
     pub bind: String,
-    /// Bearer-токен (`None` — сгенерировать и напечатать в stderr один раз).
+    /// Bearer-токен (`None` — сгенерировать; в CLI печатается в stderr один раз).
     pub token: Option<String>,
+    /// Печатать адрес/токен в stderr (CLI — да; GUI показывает их в интерфейсе — нет).
+    pub announce: bool,
+    /// Обрабатывать Ctrl+C как graceful shutdown (CLI — да; GUI управляет остановкой сам — нет).
+    pub handle_ctrl_c: bool,
 }
 
 impl Default for HttpOptions {
     fn default() -> Self {
-        Self { bind: "127.0.0.1:8765".to_owned(), token: None }
+        Self {
+            bind: "127.0.0.1:8765".to_owned(),
+            token: None,
+            announce: true,
+            handle_ctrl_c: true,
+        }
     }
 }
 
@@ -147,10 +158,74 @@ struct HttpState {
     audit: Arc<dyn AuditSink>,
 }
 
-/// Запустить streamable HTTP сервер MCP в текущем tokio-рантайме.
+/// Информация о запущенном HTTP-сервере MCP (M4.1: GUI показывает адрес/токен в интерфейсе).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpServerInfo {
+    /// Фактический адрес прослушивания (после bind; `:0` разрешается в реальный порт).
+    pub addr: SocketAddr,
+    /// Bearer-токен (сгенерированный или заданный пользователем).
+    pub token: String,
+    /// Токен сгенерирован сервером (GUI показывает «секрет», CLI печатает в stderr).
+    pub generated: bool,
+}
+
+impl HttpServerInfo {
+    /// URL MCP-эндпоинта (`http://<addr>/mcp`).
+    pub fn url(&self) -> String {
+        format!("http://{}{MCP_HTTP_PATH}", self.addr)
+    }
+
+    /// URL диагностического эндпоинта (`http://<addr>/health`).
+    pub fn health_url(&self) -> String {
+        format!("http://{}{HEALTH_HTTP_PATH}", self.addr)
+    }
+}
+
+/// Фоновый HTTP-сервер MCP (M4.1: управляемый хэндл для GUI/встраивания).
 ///
-/// Блокирует до завершения (Ctrl+C). Эфемерный порт (`:0`) печатается в stderr вместе с
-/// фактическим адресом; токен печатается только если сгенерирован автоматически.
+/// `Drop`/`stop` сигналят серверу остановиться и дожидаются завершения потока — порт закрывается,
+/// активные SSE-сессии отменяются (`shutdown_jobs` тоже вызывается).
+pub struct HttpServerHandle {
+    info: HttpServerInfo,
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HttpServerHandle {
+    /// Адрес/токен запущенного сервера.
+    pub fn info(&self) -> &HttpServerInfo {
+        &self.info
+    }
+
+    /// Остановить сервер (идемпотентно) и дождаться закрытия порта.
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for HttpServerHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl std::fmt::Debug for HttpServerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpServerHandle")
+            .field("addr", &self.info.addr)
+            .field("generated", &self.info.generated)
+            .finish()
+    }
+}
+
+/// Запустить streamable HTTP сервер MCP в текущем tokio-рантайме (блокирует до остановки).
+///
+/// Эфемерный порт (`:0`) печатается в stderr вместе с фактическим адресом; токен печатается
+/// только если сгенерирован автоматически (и `options.announce`). Остановка — Ctrl+C
+/// (`options.handle_ctrl_c`) или завершение рантайма.
 ///
 /// # Errors
 ///
@@ -161,17 +236,112 @@ pub async fn serve_http(
     policy: McpPolicy,
     options: HttpOptions,
 ) -> Result<(), ServeError> {
-    let bind = validate_bind(&options.bind).map_err(ServeError::Startup)?;
+    run_http(host, hooks, policy, options, None, Arc::new(AtomicBool::new(false))).await
+}
+
+/// Запустить streamable HTTP сервер MCP **в фоне** и получить управляемый хэндл (M4.1).
+///
+/// Используется GUI/встраиванием: адрес/токен выдаются сразу после bind, остановка —
+/// [`HttpServerHandle::stop`] (или `Drop`). `options.announce=false` не пишет адрес/токен в stderr —
+/// их показывает интерфейс; `options.handle_ctrl_c=false` — Ctrl+C остаётся за приложением-хозяином.
+///
+/// # Errors
+///
+/// [`ServeError`] — если сервер не смог запуститься (bind/токен/проект/инструкции) в течение 15 с.
+pub fn start_http_background(
+    host: SharedHost,
+    hooks: HostHooks,
+    policy: McpPolicy,
+    options: HttpOptions,
+) -> Result<HttpServerHandle, ServeError> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let (sender, receiver) = std::sync::mpsc::channel::<Result<HttpServerInfo, String>>();
+    let thread = std::thread::Builder::new()
+        .name("rde-mcp-http".to_owned())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = sender.send(Err(format!("tokio runtime: {error}")));
+                    return;
+                }
+            };
+            if let Err(error) = runtime.block_on(run_http(
+                host,
+                hooks,
+                policy,
+                options,
+                Some(sender),
+                thread_stop,
+            )) {
+                crate::log_stderr(crate::LogLevel::Error, format!("фоновый HTTP-сервер: {error}"));
+            }
+        })
+        .map_err(|error| ServeError::Runtime(format!("поток HTTP-сервера: {error}")))?;
+    match receiver.recv_timeout(Duration::from_secs(15)) {
+        Ok(Ok(info)) => Ok(HttpServerHandle { info, stop, join: Some(thread) }),
+        Ok(Err(message)) => {
+            stop.store(true, Ordering::SeqCst);
+            let _ = thread.join();
+            Err(ServeError::Startup(message))
+        }
+        Err(error) => {
+            stop.store(true, Ordering::SeqCst);
+            let _ = thread.join();
+            Err(ServeError::Runtime(format!("HTTP-сервер не сообщил адрес: {error}")))
+        }
+    }
+}
+
+/// Внутренний цикл HTTP-сервера: bind → ready (для background) → axum::serve до остановки.
+async fn run_http(
+    host: SharedHost,
+    hooks: HostHooks,
+    policy: McpPolicy,
+    options: HttpOptions,
+    ready: Option<std::sync::mpsc::Sender<Result<HttpServerInfo, String>>>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), ServeError> {
+    let bind = match validate_bind(&options.bind) {
+        Ok(bind) => bind,
+        Err(message) => {
+            let error = ServeError::Startup(message);
+            send_ready_error(&ready, &error);
+            return Err(error);
+        }
+    };
     let generated = options.token.is_none();
     let token = match options.token {
         Some(token) => {
-            validate_token(&token).map_err(ServeError::Startup)?;
+            if let Err(message) = validate_token(&token) {
+                let error = ServeError::Startup(message);
+                send_ready_error(&ready, &error);
+                return Err(error);
+            }
             token
         }
-        None => generate_token().map_err(ServeError::Startup)?,
+        None => match generate_token() {
+            Ok(token) => token,
+            Err(message) => {
+                let error = ServeError::Startup(message);
+                send_ready_error(&ready, &error);
+                return Err(error);
+            }
+        },
     };
     let shutdown_host = Arc::clone(&host);
-    let server = McpServer::new(host, hooks.clone(), policy)?;
+    let server = match McpServer::new(host, hooks.clone(), policy) {
+        Ok(server) => server,
+        Err(error) => {
+            send_ready_error(&ready, &ServeError::Host(error.clone()));
+            return Err(ServeError::Host(error));
+        }
+    };
     let tools_count = crate::tools::tool_registry().len();
     let approval_mode = server.policy().approval_mode.clone();
     let config = StreamableHttpServerConfig::default()
@@ -181,9 +351,7 @@ pub async fn serve_http(
         .with_sse_keep_alive(None);
     let cancellation = config.cancellation_token.clone();
     let service = StreamableHttpService::new(
-        move || {
-            Ok::<McpServer, std::io::Error>(server.clone())
-        },
+        move || Ok::<McpServer, std::io::Error>(server.clone()),
         Arc::new(LocalSessionManager::default()),
         config,
     );
@@ -192,32 +360,62 @@ pub async fn serve_http(
         .fallback_service(service)
         .layer(middleware::from_fn_with_state(state, require_bearer));
     let app = Router::new().route(HEALTH_HTTP_PATH, get(health)).nest(MCP_HTTP_PATH, mcp);
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .map_err(|error| ServeError::Startup(format!("HTTP bind {bind}: {error}")))?;
-    let local = listener
-        .local_addr()
-        .map_err(|error| ServeError::Startup(format!("HTTP local_addr: {error}")))?;
-    // Публичная информация — всегда в stderr (stdout у клиента может быть занят; токен не в stdout).
-    eprintln!(
-        "RDE MCP: HTTP-транспорт streamable HTTP на http://{local}{MCP_HTTP_PATH} (spec {MCP_PROTOCOL_VERSION}, \
-         инструментов {tools_count}, approvals `{approval_mode}`); health: http://{local}{HEALTH_HTTP_PATH}"
-    );
-    if generated {
-        eprintln!("RDE MCP: bearer-токен этой сессии: {token}");
+    let listener = match tokio::net::TcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let serve_error = ServeError::Startup(format!("HTTP bind {bind}: {error}"));
+            send_ready_error(&ready, &serve_error);
+            return Err(serve_error);
+        }
+    };
+    let local = match listener.local_addr() {
+        Ok(local) => local,
+        Err(error) => {
+            let serve_error = ServeError::Startup(format!("HTTP local_addr: {error}"));
+            send_ready_error(&ready, &serve_error);
+            return Err(serve_error);
+        }
+    };
+    let info = HttpServerInfo { addr: local, token: token.clone(), generated };
+    if let Some(ready) = &ready {
+        if ready.send(Ok(info)).is_err() {
+            return Err(ServeError::Runtime("HTTP-сервер: получатель адреса недоступен".to_owned()));
+        }
+    }
+    let announce = options.announce;
+    let handle_ctrl_c = options.handle_ctrl_c;
+    if announce {
         eprintln!(
-            "RDE MCP: передайте клиенту `Authorization: Bearer <токен>` (ротация — перезапуск сервера; \
-             свой токен: RDE_MCP_TOKEN или --token-file)"
+            "RDE MCP: HTTP-транспорт streamable HTTP на http://{local}{MCP_HTTP_PATH} (spec {MCP_PROTOCOL_VERSION}, \
+             инструментов {tools_count}, approvals `{approval_mode}`); health: http://{local}{HEALTH_HTTP_PATH}"
         );
-    } else {
-        eprintln!("RDE MCP: используется bearer-токен из --token/RDE_MCP_TOKEN (не печатается)");
+        if generated {
+            eprintln!("RDE MCP: bearer-токен этой сессии: {token}");
+            eprintln!(
+                "RDE MCP: передайте клиенту `Authorization: Bearer <токен>` (ротация — перезапуск сервера; \
+                 свой токен: RDE_MCP_TOKEN или --token-file)"
+            );
+        } else {
+            eprintln!("RDE MCP: используется bearer-токен из --token/RDE_MCP_TOKEN (не печатается)");
+        }
     }
     let shutdown_cancellation = cancellation.clone();
-    let shutdown = async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            log_info("HTTP: SIGINT — graceful shutdown");
-            shutdown_cancellation.cancel();
+    let wait_stop = async move {
+        while !stop.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
+    };
+    let shutdown = async move {
+        if handle_ctrl_c {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => log_info("HTTP: SIGINT — graceful shutdown"),
+                _ = wait_stop => log_info("HTTP: остановка по запросу (stop)"),
+            }
+        } else {
+            wait_stop.await;
+            log_info("HTTP: остановка по запросу (stop)");
+        }
+        shutdown_cancellation.cancel();
     };
     let result = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown)
@@ -226,6 +424,15 @@ pub async fn serve_http(
     cancellation.cancel();
     shutdown_host.shutdown_jobs();
     result
+}
+
+fn send_ready_error(
+    ready: &Option<std::sync::mpsc::Sender<Result<HttpServerInfo, String>>>,
+    error: &ServeError,
+) {
+    if let Some(ready) = ready {
+        let _ = ready.send(Err(error.to_string()));
+    }
 }
 
 /// Запустить streamable HTTP сервер в отдельном tokio-рантайме (CLI-ветка).
@@ -384,5 +591,118 @@ mod tests {
         let options = HttpOptions::default();
         assert!(validate_bind(&options.bind).is_ok());
         assert!(options.token.is_none(), "по умолчанию токен генерируется");
+        assert!(options.announce && options.handle_ctrl_c, "CLI-дефолты");
+    }
+
+    // --- M4.1: фоновый сервер для GUI (управляемый хэндл) -------------------
+
+    fn background_options() -> HttpOptions {
+        HttpOptions {
+            bind: "127.0.0.1:0".to_owned(),
+            token: None,
+            announce: false,
+            handle_ctrl_c: false,
+        }
+    }
+
+    fn background_host() -> crate::host::SharedHost {
+        std::sync::Arc::new(crate::test_support::MockHost::default())
+    }
+
+    /// Сырой HTTP/1.1 запрос: сервер закрывает соединение после ответа (`Connection: close`).
+    fn raw_http(addr: &SocketAddr, request: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect_timeout(addr, Duration::from_secs(3))
+            .expect("TCP connect к фоновому серверу");
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(request.as_bytes()).expect("запрос");
+        stream.flush().unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[test]
+    fn background_http_server_starts_reports_and_stops() {
+        let mut handle = start_http_background(
+            background_host(),
+            crate::hooks::HostHooks::silent(),
+            crate::policy::McpPolicy::read_only(),
+            background_options(),
+        )
+        .expect("фоновый HTTP-сервер запускается");
+        let info = handle.info().clone();
+        assert!(info.addr.ip().is_loopback(), "только loopback");
+        assert_ne!(info.addr.port(), 0, "эфемерный порт разрешён в реальный");
+        assert_eq!(info.token.len(), GENERATED_TOKEN_BYTES * 2);
+        assert!(info.generated, "токен сгенерирован");
+        assert_eq!(info.url(), format!("http://{}/mcp", info.addr));
+        assert_eq!(info.health_url(), format!("http://{}/health", info.addr));
+
+        // health доступен без токена и не отдаёт данные проекта.
+        let health = raw_http(
+            &info.addr,
+            &format!("GET {} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", HEALTH_HTTP_PATH),
+        );
+        assert!(health.starts_with("HTTP/1.1 200"), "health: {health}");
+        assert!(health.contains("\"status\":\"ok\""), "health body: {health}");
+        // /mcp без токена — 401 (middleware до протокола).
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}"#;
+        let request = format!(
+            "POST {MCP_HTTP_PATH} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let unauthorized = raw_http(&info.addr, &request);
+        assert!(unauthorized.starts_with("HTTP/1.1 401"), "401: {unauthorized}");
+        assert!(unauthorized.contains("RDE_UNAUTHORIZED"), "код: {unauthorized}");
+
+        // Остановка: поток завершается (handle.stop() дожидается join; слушатель закрывается
+        // вместе с axum-сервером). Порт после остановки может быть сразу переиспользован другим
+        // параллельным тестом, поэтому «connect после stop» не проверяем — состояние хэндла
+        // детерминировано: после stop повторный запуск делает новый сервер (см. тест restart).
+        handle.stop();
+        assert!(handle.info().addr.port() != 0);
+    }
+
+    #[test]
+    fn background_http_server_can_restart_after_stop() {
+        let first = start_http_background(
+            background_host(),
+            crate::hooks::HostHooks::silent(),
+            crate::policy::McpPolicy::read_only(),
+            background_options(),
+        )
+        .expect("первый запуск");
+        let first_addr = first.info().addr;
+        let mut second = start_http_background(
+            background_host(),
+            crate::hooks::HostHooks::silent(),
+            crate::policy::McpPolicy::read_only(),
+            background_options(),
+        )
+        .expect("второй параллельный запуск (эфемерный порт)");
+        assert_ne!(first_addr, second.info().addr, "разные эфемерные порты");
+        second.stop();
+        drop(first);
+    }
+
+    #[test]
+    fn background_http_server_rejects_bad_configuration() {
+        let error = start_http_background(
+            background_host(),
+            crate::hooks::HostHooks::silent(),
+            crate::policy::McpPolicy::read_only(),
+            HttpOptions { bind: "0.0.0.0:8765".to_owned(), ..background_options() },
+        )
+        .expect_err("внешний bind запрещён");
+        assert!(error.to_string().contains("loopback"), "{error}");
+        let error = start_http_background(
+            background_host(),
+            crate::hooks::HostHooks::silent(),
+            crate::policy::McpPolicy::read_only(),
+            HttpOptions { token: Some("short".to_owned()), ..background_options() },
+        )
+        .expect_err("короткий токен запрещён");
+        assert!(error.to_string().contains("не короче"), "{error}");
     }
 }

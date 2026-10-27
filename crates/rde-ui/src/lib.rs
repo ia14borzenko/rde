@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 pub mod i18n;
+/// M4.1: встроенный MCP-сервер (streamable HTTP) для внешних агентов.
+pub mod agent_server;
 mod ribbon;
 
 use i18n::{Lang, tr};
@@ -673,6 +675,12 @@ pub struct RdeApp {
     show_service_objects: bool,
     /// Подписи служебных объектов в дереве: id формулы → «N вставок · статус» (P3, R-DOC-19).
     formula_labels: BTreeMap<String, String>,
+    /// M4.1: встроенный MCP-сервер по streamable HTTP для внешних агентов (R-MCP-02).
+    external_agents: agent_server::ExternalAgentServer,
+    /// Авто-запуск внешних агентов уже пробовали в этой сессии (только при разрешении в настройках).
+    external_agents_attempted: bool,
+    /// Показывать bearer-токен в панели «Агент» (секрет; по умолчанию скрыт).
+    show_agent_token: bool,
 }
 
 impl RdeApp {
@@ -738,6 +746,9 @@ impl RdeApp {
             insert_anchor_block: None,
             show_service_objects: false,
             formula_labels: BTreeMap::new(),
+            external_agents: agent_server::ExternalAgentServer::new(),
+            external_agents_attempted: false,
+            show_agent_token: false,
         };
         app.auto_update = app.project.manifest.document_auto_update;
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
@@ -757,6 +768,72 @@ impl RdeApp {
     /// Обновить состояние git-репозитория (для статус-бара/«Проверить»).
     pub fn refresh_git_status(&mut self) {
         self.git_status = rde_vcs::status(&self.project.root).ok();
+    }
+
+    // ── M4.1: внешние агенты (встроенный MCP HTTP-сервер) ────────────────────
+
+    /// Авто-запуск встроенного MCP HTTP-сервера при старте, если пользователь разрешил внешних
+    /// агентов (R-MCP-02, настройка `allow_external_mcp`, по умолчанию выключена).
+    ///
+    /// В unit-тестах авто-старт отключён (не плодим фоновые порты в тестах оболочки); явное
+    /// включение тестируется через [`Self::apply_external_agents_setting`].
+    fn ensure_external_agents(&mut self) {
+        if self.external_agents_attempted {
+            return;
+        }
+        self.external_agents_attempted = true;
+        if !self.app_settings.allow_external_mcp || cfg!(test) {
+            return;
+        }
+        let root = self.project.root.clone();
+        match self.external_agents.start(&root) {
+            Ok(()) => {
+                if let agent_server::ExternalAgentStatus::Running(info) = self.external_agents.status(true) {
+                    self.push_log(
+                        Level::Info,
+                        format!(
+                            "Внешние агенты: MCP HTTP {} (loopback, только чтение; токен — в панели «Агент») — R-MCP-02",
+                            info.url()
+                        ),
+                    );
+                }
+            }
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Внешние агенты (MCP HTTP): {error}"));
+                // Fail-closed: не оставляем «разрешено», если сервер не поднялся.
+                self.app_settings.allow_external_mcp = false;
+            }
+        }
+    }
+
+    /// Применить настройку «Разрешить внешним агентам»: поднять/остановить встроенный сервер.
+    ///
+    /// Ошибка запуска — в журнал + настройка выключается (fail-closed, R-MCP-05).
+    pub fn apply_external_agents_setting(&mut self) {
+        let enabled = self.app_settings.allow_external_mcp;
+        let root = self.project.root.clone();
+        self.external_agents_attempted = true;
+        match self.external_agents.apply(enabled, &root) {
+            Ok(()) => {
+                if let agent_server::ExternalAgentStatus::Running(info) = self.external_agents.status(enabled) {
+                    self.push_log(
+                        Level::Info,
+                        format!("Внешние агенты: MCP HTTP {} (loopback, только чтение) — R-MCP-02", info.url()),
+                    );
+                } else if !enabled {
+                    self.push_log(Level::Info, "Внешние агенты: доступ по MCP HTTP выключен".to_owned());
+                }
+            }
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Внешние агенты (MCP HTTP): {error}"));
+                self.app_settings.allow_external_mcp = false;
+            }
+        }
+    }
+
+    /// Текущее состояние внешних агентов (для панели «Агент»).
+    pub fn external_agents_status(&self) -> agent_server::ExternalAgentStatus {
+        self.external_agents.status(self.app_settings.allow_external_mcp)
     }
 
     /// Инициализировать git-репозиторий проекта (R-VCS-01) и сделать начальный коммит.
@@ -2412,6 +2489,7 @@ impl RdeApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.poll_update_job();
         self.maybe_auto_boot_update();
+        self.ensure_external_agents();
         self.ui_frames += 1;
         if !self.fonts_installed {
             install_fonts(ui.ctx());
@@ -2820,6 +2898,24 @@ impl RdeApp {
     // ── статус-бар ──────────────────────────────────────────────────────────
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let pal = theme_colors(ui.ctx().theme());
+        // M4.1: состояние внешних агентов — в строке статуса (видно на всех вкладках).
+        let (agent_label, mcp_label, agent_color) = match self.external_agents_status() {
+            agent_server::ExternalAgentStatus::Running(info) => (
+                format!("Агент: MCP HTTP :{}", info.addr.port()),
+                format!("MCP: on :{}", info.addr.port()),
+                pal.green,
+            ),
+            agent_server::ExternalAgentStatus::NotRunning => (
+                "Агент: MCP HTTP остановлен".to_owned(),
+                "MCP: off".to_owned(),
+                pal.amber,
+            ),
+            agent_server::ExternalAgentStatus::Disabled => (
+                tr(self.lang, "status.agent_offline").to_owned(),
+                "MCP: off".to_owned(),
+                pal.muted,
+            ),
+        };
         egui::Panel::bottom("rde_status")
             .frame(egui::Frame::new().fill(pal.panel_hi).inner_margin(Margin::symmetric(12, 3)))
             .exact_size(24.0)
@@ -2848,9 +2944,9 @@ impl RdeApp {
                         ui.separator();
                         ui.label(RichText::new(format!("• {} {}", self.project.stale_count(), tr(self.lang, "status.stale"))).small().color(pal.amber));
                         ui.separator();
-                        ui.label(RichText::new(tr(self.lang, "status.agent_offline")).small().color(pal.muted));
+                        ui.label(RichText::new(agent_label).small().color(agent_color));
                         ui.separator();
-                        ui.label(RichText::new("MCP: off").small().color(pal.muted));
+                        ui.label(RichText::new(mcp_label).small().color(agent_color));
                         ui.separator();
                         // «Обновить всё» — в строке статуса: видна на всех вкладках и в любом режиме,
                         // не конкурирует с вкладками центральной области за ширину.
@@ -2932,8 +3028,8 @@ impl RdeApp {
                                 }
                             }
                             2 => {
-                                ui.label(RichText::new("Агент не подключён (MCP/ACP — v0.3).").strong().color(pal.text));
-                                ui.label(RichText::new("Пока доступны быстрые действия без агента — они в правой панели «Агент».").small().color(pal.muted));
+                                ui.label(RichText::new("Внешний доступ — MCP HTTP (M4.1): включается в настройках.").strong().color(pal.text));
+                                ui.label(RichText::new("Статус, адрес и токен — в правой панели «Агент»; встроенный ACP-агент — M4.3.").small().color(pal.muted));
                                 ui.add_space(4.0);
                                 ui.label(RichText::new("Когда появится: запуск артефактов и обновление вставок по запросу, проверка проекта, оформление по ГОСТ — с approvals и аудитом действий.").small().color(pal.muted));
                             }
@@ -3224,6 +3320,13 @@ impl RdeApp {
         let mut update = false;
         let mut gost = false;
         let mut review = false;
+        // M4.1: встроенный MCP-сервер для внешних агентов (R-MCP-02).
+        let external_status = self.external_agents_status();
+        let external_error = self.external_agents.last_error().map(str::to_owned);
+        let show_agent_token = self.show_agent_token;
+        let mut start_external = false;
+        let mut stop_external = false;
+        let mut toggle_agent_token = false;
         egui::Panel::right("rde_agent")
             .resizable(true)
             .default_size(AGENT_WIDTH)
@@ -3232,7 +3335,12 @@ impl RdeApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("АГЕНТ").small().strong().color(pal.muted));
-                    ui.label(RichText::new("• не подключён").small().color(pal.amber));
+                    let (status_text, status_color) = match &external_status {
+                        agent_server::ExternalAgentStatus::Running(_) => ("• MCP HTTP", pal.green),
+                        agent_server::ExternalAgentStatus::NotRunning => ("• MCP HTTP: остановлен", pal.amber),
+                        agent_server::ExternalAgentStatus::Disabled => ("• не подключён", pal.amber),
+                    };
+                    ui.label(RichText::new(status_text).small().color(status_color));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("×").on_hover_text("Скрыть панель (вернуть — меню «Вид»)").clicked() {
                             hide_agent = true;
@@ -3243,12 +3351,81 @@ impl RdeApp {
                 ui.separator();
                 egui::ScrollArea::vertical().id_salt("rde_agent_scroll").auto_shrink([false, false]).show(ui, |ui| {
                     ui.add_space(4.0);
-                    ui.label(RichText::new("Встроенный агент появится в v0.3").strong().color(pal.text));
+                    // ── M4.1: внешние агенты по MCP streamable HTTP (R-MCP-02) ──
+                    ui.label(RichText::new("ВНЕШНИЕ АГЕНТЫ (MCP, HTTP)").small().strong().color(pal.muted));
+                    ui.add_space(4.0);
+                    match &external_status {
+                        agent_server::ExternalAgentStatus::Running(info) => {
+                            ui.label(
+                                RichText::new("Доступ разрешён: только loopback + bearer-токен, режим только чтения.")
+                                    .small()
+                                    .color(pal.muted),
+                            );
+                            let mut url = info.url();
+                            ui.add(
+                                egui::TextEdit::singleline(&mut url)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .interactive(false),
+                            );
+                            if show_agent_token {
+                                let mut token = info.token.clone();
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut token)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .interactive(false),
+                                );
+                            } else {
+                                ui.label(RichText::new("токен скрыт").small().color(pal.muted));
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button(if show_agent_token { "Скрыть токен" } else { "Показать токен" }).clicked() {
+                                    toggle_agent_token = true;
+                                }
+                                if ui.small_button("Копировать адрес").clicked() {
+                                    ui.ctx().copy_text(info.url());
+                                }
+                                if ui.small_button("Копировать токен").clicked() {
+                                    ui.ctx().copy_text(info.token.clone());
+                                }
+                            });
+                            if ui.small_button("Остановить доступ").clicked() {
+                                stop_external = true;
+                            }
+                            ui.label(
+                                RichText::new(
+                                    "Подключение клиента: MCP HTTP URL + заголовок Authorization: Bearer <токен> \
+                                     (spec 2026-07-28). Аудит — .rde/agent/audit.log.",
+                                )
+                                .small()
+                                .color(pal.muted),
+                            );
+                        }
+                        agent_server::ExternalAgentStatus::NotRunning => {
+                            ui.label(RichText::new("Разрешено, но сервер не запущен.").small().color(pal.amber));
+                            if ui.small_button("Запустить доступ").clicked() {
+                                start_external = true;
+                            }
+                        }
+                        agent_server::ExternalAgentStatus::Disabled => {
+                            ui.label(RichText::new("Внешний доступ выключен (fail-closed).").small().color(pal.muted));
+                            ui.label(
+                                RichText::new("Включить: Настройки → «Внешние агенты».")
+                                    .small()
+                                    .color(pal.muted),
+                            );
+                        }
+                    }
+                    if let Some(error) = &external_error {
+                        ui.label(RichText::new(format!("Ошибка: {error}")).small().color(pal.red));
+                    }
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("ВСТРОЕННЫЙ АГЕНТ (ACP)").small().strong().color(pal.muted));
                     ui.label(
                         RichText::new(
-                            "Планируется: MCP-сервер (инструменты, ресурсы, approvals) и ACP-агент, \
-                             который сможет запускать артефакты, обновлять вставки документа, проверять проект \
-                             и оформлять по ГОСТ — с аудитом и откатом.",
+                            "M4.3: чат с агентом через ACP, approvals с diff и откатом. \
+                             Пока доступны только быстрые действия без агента.",
                         )
                         .small()
                         .color(pal.muted),
@@ -3274,7 +3451,7 @@ impl RdeApp {
                 ui.add_space(4.0);
                 ui.add_enabled(
                     false,
-                    egui::TextEdit::singleline(&mut String::new()).hint_text("Чат с агентом — появится в v0.3").desired_width(f32::INFINITY),
+                    egui::TextEdit::singleline(&mut String::new()).hint_text("Чат с агентом — M4.3").desired_width(f32::INFINITY),
                 );
             });
         if hide_agent {
@@ -3291,6 +3468,17 @@ impl RdeApp {
         }
         if review {
             self.import_review_from_exports();
+        }
+        if toggle_agent_token {
+            self.show_agent_token = !self.show_agent_token;
+        }
+        if start_external {
+            self.app_settings.allow_external_mcp = true;
+            self.apply_external_agents_setting();
+        }
+        if stop_external {
+            self.app_settings.allow_external_mcp = false;
+            self.apply_external_agents_setting();
         }
     }
 
@@ -3793,6 +3981,13 @@ impl RdeApp {
                 self.refresh_dag_statuses();
                 self.push_log(Level::Ok, format!("Проект открыт: {} ({} объектов)", self.project.name, self.project.object_count()));
                 self.check_external_edit_on_startup();
+                // M4.1: внешние агенты привязаны к проекту — перезапустить (или остановить).
+                let enabled = self.app_settings.allow_external_mcp;
+                let project_root = self.project.root.clone();
+                if let Err(error) = self.external_agents.on_project_switched(enabled, &project_root) {
+                    self.push_log(Level::Warn, format!("Внешние агенты (MCP HTTP): {error}"));
+                    self.app_settings.allow_external_mcp = false;
+                }
             }
             Err(error) => self.push_log(Level::Warn, format!("Не удалось открыть проект {}: {error}", root.display())),
         }
@@ -4432,6 +4627,23 @@ impl RdeApp {
                         ui.label(RichText::new("email").color(pal.muted));
                         ui.add(egui::TextEdit::singleline(&mut settings.author_email).desired_width(280.0));
                         ui.end_row();
+                        ui.label(RichText::new("Внешние агенты").color(pal.muted));
+                        ui.vertical(|ui| {
+                            ui.checkbox(
+                                &mut settings.allow_external_mcp,
+                                "Разрешить доступ внешним агентам (MCP, streamable HTTP)",
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "Только loopback (127.0.0.1) + обязательный bearer-токен; сервер — \
+                                     только чтение (approvals=deny, R-MCP-02/R-MCP-05). Адрес и токен — \
+                                     в панели «Агент».",
+                                )
+                                .small()
+                                .color(pal.muted),
+                            );
+                        });
+                        ui.end_row();
                     });
                     ui.horizontal(|ui| {
                         if ui.button(tr(self.lang, "action.save")).clicked() {
@@ -4458,6 +4670,7 @@ impl RdeApp {
                         } else {
                             self.app_settings = settings;
                         }
+                        self.apply_external_agents_setting();
                         self.ui_scale = ui_scale.clamp(0.5, 2.5);
                         self.push_log(Level::Ok, format!("Настройки приложения сохранены: {}", path.display()));
                     }
@@ -7290,6 +7503,13 @@ fn formula_body_from_state(
     })
 }
 
+impl Drop for RdeApp {
+    fn drop(&mut self) {
+        // M4.1: не оставляем открытым встроенный MCP HTTP-порт после закрытия окна/теста.
+        self.external_agents.stop();
+    }
+}
+
 #[cfg(test)]
 mod theme_tests {
     use super::{apply_app_theme, dark_visuals, font_definitions, light_visuals, theme_colors, theme_preference_of};
@@ -8870,5 +9090,82 @@ mod shell_tests {
         assert_eq!(super::display_text("Среднее значение x1: \u{FFFC}-7.598·10^-4\u{FFFC}"), "Среднее значение x1: -7.598·10^-4");
         assert_eq!(super::display_text("\u{FFFC}"), "");
         assert_eq!(super::display_text("FIG·1 — σ"), "FIG·1 — σ");
+    }
+}
+
+#[cfg(test)]
+mod agent_server_ui_tests {
+    use super::RdeApp;
+
+    fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(&*name, ".rde" | "exports" | "out" | "__pycache__" | ".venv" | "target") {
+                continue;
+            }
+            let from = entry.path();
+            let to = dst.join(&*name);
+            if from.is_dir() {
+                copy_tree(&from, &to);
+            } else {
+                std::fs::copy(&from, &to).unwrap();
+            }
+        }
+    }
+
+    fn temp_demo_copy(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rde-ui-agent-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        copy_tree(&rde_core::demo_project_dir(), &root);
+        root
+    }
+
+    /// M4.1: настройка «Разрешить внешним агентам» запускает/останавливает встроенный MCP HTTP.
+    #[test]
+    fn external_agents_setting_starts_and_stops_embedded_server() {
+        let root = temp_demo_copy("toggle");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        // По умолчанию — выключено (fail-closed), сервер не поднят.
+        assert!(!app.app_settings.allow_external_mcp);
+        assert!(!app.external_agents_status().is_running());
+        // Включаем через настройку → сервер работает на loopback с bearer-токеном.
+        app.app_settings.allow_external_mcp = true;
+        app.apply_external_agents_setting();
+        let status = app.external_agents_status();
+        assert!(status.is_running(), "статус: {status:?}");
+        let info = match status {
+            super::agent_server::ExternalAgentStatus::Running(info) => info,
+            other => panic!("ожидался Running, получено {other:?}"),
+        };
+        assert!(info.addr.ip().is_loopback());
+        assert_eq!(info.token.len(), 64, "сгенерированный токен");
+        assert!(info.url().ends_with("/mcp"));
+        // /health отвечает без токена — сервер действительно слушает loopback-порт.
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect_timeout(&info.addr, std::time::Duration::from_secs(3))
+            .expect("TCP connect");
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+        // Выключаем настройку → сервер остановлен (stop() дожидается потока и закрытия слушателя;
+        // «connect после stop» не проверяем — эфемерный порт может быть сразу переиспользован
+        // другим параллельным тестом).
+        app.app_settings.allow_external_mcp = false;
+        app.apply_external_agents_setting();
+        assert!(!app.external_agents_status().is_running());
+        // Повторное включение поднимает новый сервер (lifecycle не залипает).
+        app.app_settings.allow_external_mcp = true;
+        app.apply_external_agents_setting();
+        assert!(app.external_agents_status().is_running());
+        app.app_settings.allow_external_mcp = false;
+        app.apply_external_agents_setting();
+        assert!(!app.external_agents_status().is_running());
     }
 }

@@ -13,8 +13,11 @@
 >
 > **M2.5 → [ADR-0008](0008-document-suggested-edits-and-revisions.md)** (документные suggested
 > edits/ревизии), **M2.6 → [ADR-0010](0010-m26-insert-delete-paragraphs.md)** (вставка/удаление
-> абзацев) и **M3 → [ADR-0009](0009-m3-streamable-http-transport.md)** (streamable HTTP — второй
-> транспорт того же `McpServer`, opt-in loopback+bearer): архитектура M1 не меняется.
+> абзацев), **M3 → [ADR-0009](0009-m3-streamable-http-transport.md)** (streamable HTTP — второй
+> транспорт того же `McpServer`, opt-in loopback+bearer) и **M4.1 →
+> [ADR-0011](0011-m41-gui-external-agents.md)** (GUI-настройка «Разрешить внешним агентам»: встроенный
+> фоновый сервер, read-only, токен в панели): архитектура M1 не меняется; `rde-ui → rde-host → rde-mcp`
+> — новые стрелки в GUI-ветке, доменные крейты по-прежнему не знают про UI.
 
 ## Контекст
 

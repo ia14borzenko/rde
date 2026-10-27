@@ -3984,6 +3984,8 @@ dependencies = [
  "rde-docx",
  "rde-env",
  "rde-hash",
+ "rde-host",
+ "rde-mcp",
  "rde-run",
  "rde-sources",
  "rde-store",

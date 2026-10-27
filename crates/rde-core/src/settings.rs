@@ -39,6 +39,10 @@ pub struct AppSettings {
     /// Показывать ли служебные объекты (R-TREE-01).
     #[serde(default)]
     pub show_service_objects: bool,
+    /// Разрешить внешним агентам подключаться к RDE по MCP streamable HTTP (M4.1, R-MCP-02):
+    /// по умолчанию выключено; сервер поднимается только на loopback с bearer-токеном.
+    #[serde(default)]
+    pub allow_external_mcp: bool,
 }
 
 fn default_language() -> String {
@@ -65,6 +69,7 @@ impl Default for AppSettings {
             author_name: String::new(),
             author_email: String::new(),
             show_service_objects: false,
+            allow_external_mcp: false,
         }
     }
 }
@@ -160,6 +165,7 @@ mod tests {
         let settings = load_from(&path);
         assert_eq!(settings.language, "ru");
         assert_eq!(settings.keep_runs, 200);
+        assert!(!settings.allow_external_mcp, "внешние агенты по умолчанию запрещены (fail-closed)");
         save_to(&settings, &path).unwrap();
         let loaded = load_from(&path);
         assert_eq!(loaded, settings);
@@ -170,6 +176,9 @@ mod tests {
         bad.normalize();
         assert_eq!(bad.language, "ru");
         assert_eq!(bad.keep_runs, 10);
+        // Старый settings.toml без поля allow_external_mcp → false (аддитивная миграция).
+        std::fs::write(&path, "schema = \"rde/settings@1\"\nlanguage = \"ru\"\n").unwrap();
+        assert!(!load_from(&path).allow_external_mcp);
         // Повреждённый файл → defaults, не паника.
         std::fs::write(&path, "not toml [").unwrap();
         assert_eq!(load_from(&path).language, "ru");

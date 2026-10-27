@@ -12,6 +12,28 @@
 
 ### Добавлено
 
+- **M4.1 «v0.3 — внешние агенты из GUI»: встроенный MCP HTTP + настройка «Разрешить» (ADR-0011,
+  2026-10-27)** — первый срез «человеческого UX» R-MCP-02: в настройках приложения появился чекбокс
+  **«Разрешить доступ внешним агентам (MCP, streamable HTTP)»** (по умолчанию выключен). При включении
+  RDE поднимает **встроенный фоновый** MCP-сервер на **loopback** с обязательным **bearer-токеном**
+  и политикой **read-only** (мутации через внешний HTTP запрещены до интерактивных GUI-approvals — M4.2).
+  Адрес/токен показываются в панели «Агент» (скрыт по умолчанию, «Показать»/«Копировать адрес»/
+  «Копировать токен»/«Остановить доступ»), статус-бар — `MCP: on :порт`; выключение настройки/смена
+  проекта/закрытие окна останавливают сервер (порт закрывается). API: `rde-mcp::start_http_background` +
+  [`HttpServerHandle`/`HttpServerInfo`](crates/rde-mcp/src/http.rs) (stop/Drop дожидаются закрытия;
+  `HttpOptions.announce/handle_ctrl_c` — CLI-поведение M3 не изменилось); `rde-core::AppSettings`
+  — аддитивное `allow_external_mcp` (default false, старые settings.toml читаются). GUI-менеджер —
+  [`agent_server.rs`](crates/rde-ui/src/agent_server.rs) (`ExternalAgentServer` lifecycle, project switch,
+  ошибки fail-closed), панель/настройки — [`lib.rs`](crates/rde-ui/src/lib.rs). Новая стрелка
+  `rde-ui → rde-host → rde-mcp` (GUI только оркестрирует headless-сервер; доменные крейты не тронуты,
+  `rde-mcp`/`rde-host` независимы от UI). **Тесты: 399 passed, 0 failed** (392 + 7: `rde-mcp` +3 —
+  фоновый сервер старт/статус/health/401/stop, restart, ошибки конфигурации; `rde-ui` +4 — менеджер
+  lifecycle/смена проекта/ошибка + GUI-настройка старт/стоп). Инструменты/бюджет MCP не менялись
+  (29 / 38 103 Б / инструкции 8 886 Б). Документы: [ADR-0011](docs/adr/0011-m41-gui-external-agents.md),
+  ТЗ §5.10(R-MCP-02)/§10.3/§16, [`docs/state.md`](docs/state.md), README. Ограничения M4.1: мутации
+  через внешний HTTP — после M4.2 (GUI-approvals с diff); ACP-чат — M4.3; URI-чипы/diff-UI — M4.4;
+  токен не сохраняется между запусками (для CI — CLI `--token-file`).
+
 - **M2.6 «v0.3 — вставка/удаление абзацев документа» (ADR-0010, 2026-10-27)** — завершён документный
   каталог мутаций: агент может **вставить новый абзац** (`doc_insert`: якорь/конец, `after|before`,
   текст, опциональный стиль) и **удалить абзац** (`doc_delete`: по `block_id`+`expected_text`). Оба — под

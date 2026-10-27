@@ -19,6 +19,9 @@ rde-sources = { workspace = true }
 zip = { workspace = true }
 rde-run = { workspace = true }
 rde-store = { workspace = true }
+# M4.1: встроенный MCP-сервер (streamable HTTP) для внешних агентов.
+rde-mcp = { workspace = true }
+rde-host = { workspace = true }
 wordcraft-engine = { workspace = true }
 wordcraft-ui-egui = { path = "../../vendor/wordcraft/crates/ui-egui", features = ["rde-docview"] }
 serde_json = { workspace = true }

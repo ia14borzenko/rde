@@ -70,8 +70,9 @@ pub use hooks::{
 };
 pub use host::{RdeHost, SharedHost};
 pub use http::{
-    bearer_authorized, generate_token, serve_http, serve_http_blocking, validate_bind, validate_token,
-    HttpOptions, HEALTH_HTTP_PATH, MCP_HTTP_PATH, MIN_TOKEN_LEN,
+    bearer_authorized, generate_token, serve_http, serve_http_blocking, start_http_background,
+    validate_bind, validate_token, HttpOptions, HttpServerHandle, HttpServerInfo, HEALTH_HTTP_PATH,
+    MCP_HTTP_PATH, MIN_TOKEN_LEN,
 };
 pub use policy::{
     authorize_tool_call, build_policy_and_hook, ApprovalCache, ApprovalMode, ApprovalOptions, AuthDenial,

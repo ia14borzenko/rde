@@ -246,7 +246,7 @@ fn run_mcp_serve(args: &[String]) -> Result<(), ServeFailure> {
             if let Some(token) = &token {
                 rde_mcp::validate_token(token).map_err(ServeFailure::usage)?;
             }
-            Some(rde_mcp::HttpOptions { bind, token })
+            Some(rde_mcp::HttpOptions { bind, token, ..Default::default() })
         }
         other => {
             return Err(ServeFailure::usage(format!(

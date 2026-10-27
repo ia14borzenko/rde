@@ -1191,3 +1191,64 @@ cd rde
 cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core|rde-dag|rde-doc|rde-store"
 cargo tree -p rde-host | grep -E "egui|eframe|rde-ui"
 ```
+
+## Обновление 2026-10-27 (M4.1: внешние агенты из GUI — встроенный MCP HTTP, настройка «Разрешить»)
+
+Веха **M4.1** фазы v0.3 (ТЗ §5.10 R-MCP-02/R-MCP-05, §10.3 п.6,
+[ADR-0011](../docs/adr/0011-m41-gui-external-agents.md)): первый срез «человеческого UX» внешних
+агентов. R-MCP-02 требует настройку «Разрешить внешним агентам»; теперь она есть в приложении:
+пользователь включает доступ, RDE поднимает **встроенный фоновый** MCP-сервер по streamable HTTP
+(loopback + bearer-токен), показывает адрес/токен в панели «Агент». Политика — **read-only**: мутации
+через внешний доступ запрещены до интерактивных GUI-approvals (M4.2); включение остаётся fail-closed.
+
+| Что | Где |
+|---|---|
+| `rde-mcp`: управляемый фоновый API — `start_http_background` → `HttpServerHandle` (addr/token, `stop()`/`Drop` дожидаются закрытия порта), `HttpServerInfo`; `HttpOptions.announce/handle_ctrl_c` (CLI — печать/Ctrl+C, GUI — нет) | [`crates/rde-mcp/src/http.rs`](../crates/rde-mcp/src/http.rs), [`lib.rs`](../crates/rde-mcp/src/lib.rs) |
+| `rde-core`: аддитивное `AppSettings.allow_external_mcp` (default false; старые settings.toml читаются) | [`crates/rde-core/src/settings.rs`](../crates/rde-core/src/settings.rs) |
+| `rde-ui`: менеджер `ExternalAgentServer` (start/stop/apply/on_project_switched, статус `Disabled|NotRunning|Running`, `last_error`, `Drop`-остановка; read-only policy + `HostHooks::jsonl` + loopback `127.0.0.1:0`) | [`crates/rde-ui/src/agent_server.rs`](../crates/rde-ui/src/agent_server.rs) |
+| GUI: настройка «Разрешить доступ внешним агентам» (чекбокс + пояснение) и применение при «Сохранить»; авто-старт при включённой настройке (кроме unit-тестов); панель «Агент» — статус/URL/токен (скрыт, показать/копировать)/старт-стоп/ошибка; статус-бар `Агент: MCP HTTP :порт`; смена проекта/выход останавливают сервер | [`crates/rde-ui/src/lib.rs`](../crates/rde-ui/src/lib.rs) |
+| Тесты: `rde-mcp` +3 (фон. сервер старт/статус/health/401/stop, restart, ошибки конфигурации); `rde-ui` +4 (менеджер lifecycle, смена проекта, ошибка запуска; настройка GUI старт/стоп) | [`crates/rde-mcp/src/http.rs`](../crates/rde-mcp/src/http.rs), [`crates/rde-ui/src/agent_server.rs`](../crates/rde-ui/src/agent_server.rs), [`lib.rs`](../crates/rde-ui/src/lib.rs) |
+
+**Безопасность (fail-closed):** настройка по умолчанию выключена — без неё порт не открывается; сервер
+только на loopback (эфемерный порт), обязательный bearer-токен (CSPRNG, **не сохраняется**, ротация —
+перезапуск; в stderr при GUI не печатается), токен показывается только в панели; внешний доступ —
+**только чтение** (мутации/запуск скриптов → `RDE_APPROVAL_DENIED`); аудит — `.rde/agent/audit.log`
+(JSONL, как в M3); выключение настройки/смена проекта/закрытие окна останавливают сервер (порт
+закрывается); ошибка запуска → журнал + настройка сбрасывается в «выключено».
+
+**Архитектура:** новая стрелка GUI-ветки `rde-ui → rde-host → rde-mcp` — GUI только оркестрирует
+headless-сервер; `rde-mcp` по-прежнему не зависит от `rde-*`/GUI, `rde-host` — без `egui`;
+доменная логика не дублируется (инвариант 8 ADR-0002, ADR-0011).
+
+**Числа M4.1:** инструменты/бюджет MCP не менялись (29 / `tools/list` 38 103 Б / инструкции 8 886 Б);
+`cargo test --workspace` — **399 passed, 0 failed** (392 + 7). Headless-скриншот `document` подтверждает
+панель: «ВНЕШНИЕ АГЕНТЫ (MCP, HTTP): внешний доступ выключен (fail-closed); Включить: Настройки →
+«Внешние агенты»», статус-бар — `Агент: не подключён (v0.3)`/`MCP: off`.
+
+**Ограничения (честно):** мутации через внешний HTTP пока запрещены — интерактивный GUI-approval с diff
+и чекпоинтами (M4.2); встроенный ACP-агент/чат — M4.3; URI-чипы/diff-UI — M4.4; токен живёт только в
+памяти GUI (не воспроизводим между запусками — для CI используйте CLI `--token-file`).
+
+**Следующий шаг:** **M4.2** — интерактивный `ApprovalHook` в GUI (диалог «разрешить/отклонить» с diff и
+чекпоинтом; сервер с грантами project_write/run_script/git_commit и GUI-хуком), затем M4.3 (ACP-агент/
+панель чата) и M4.4 (URI-чипы §8.7.2, diff-UI suggested edits); отдельная веха — track changes R-DOC-32.
+
+**Проверить руками (M4.1):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export CARGO_HOME=/home/admin-pc/proj/rde-dev/.cache-tmp/cargo-home
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh test -p rde-mcp -p rde-ui -p rde-host   # фон. сервер + GUI-менеджер
+./scripts/build.sh test --workspace                         # 399 passed
+./scripts/build.sh run -p rde                               # GUI: Настройки → «Внешние агенты»
+
+# 1) по умолчанию порт не открыт (настройка выключена, fail-closed) — панель «Агент»: «не подключён».
+# 2) включить «Разрешить доступ внешним агентам» → «Сохранить» → в панели «Агент» появится URL
+#    http://127.0.0.1:<порт>/mcp и токен (по кнопке «Показать токен»); curl -s http://127.0.0.1:<порт>/health → 200.
+# 3) внешним клиентом (Claude Code и др.): MCP HTTP URL + Authorization: Bearer <токен>;
+#    доступны 29 инструментов, мутации → RDE_APPROVAL_DENIED (read-only до M4.2); аудит — .rde/agent/audit.log.
+# 4) выключить настройку/сменить проект/закрыть RDE → сервер остановлен, порт закрыт.
+```
