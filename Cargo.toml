@@ -28,11 +28,18 @@ zstd = "0.13"
 resvg = { version = "0.45", default-features = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
-# Агентная подсистема v0.3 (M1): MCP по официальному Rust SDK. Пин точный: контракт
+# Агентная подсистема v0.3 (M1–M3): MCP по официальному Rust SDK. Пин точный: контракт
 # генерации схем/`server/discover`-типов у rmcp меняется между минорными версиями.
-rmcp = { version = "=3.8.0", default-features = false, features = ["server", "transport-io"] }
+# M3: streamable HTTP-транспорт (server) — opt-in, loopback + bearer-токен (R-MCP-02).
+rmcp = { version = "=3.8.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "signal"] }
 async-trait = "0.1"
+# M3: HTTP-транспорт MCP — сервер на axum (тот же стек, что рекомендуют примеры rmcp).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# M3: клиент для e2e (rmcp-клиент streamable HTTP использует reqwest; TLS на loopback не нужен).
+reqwest = { version = "0.13", default-features = false }
+# M3: криптостойкий токен сессии (getrandom — тот же источник, что у rand/ring).
+getrandom = "0.3"
 
 egui = "0.36.2"
 eframe = { version = "0.36.2", default-features = false, features = [

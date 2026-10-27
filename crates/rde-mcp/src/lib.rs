@@ -42,8 +42,10 @@
 //! approvals из CLI-флагов и [`HostHooks::jsonl`], затем вызывает [`serve_stdio_blocking`].
 //! Протокольный слой при этом остаётся независимым: в тестах он работает на mock-хосте.
 //!
-//! Транспорт M1/M2 — только stdio (в R-MCP-02 HTTP — позже, loopback + токен). `stdout` занят
-//! JSON-RPC: все логи пишутся только в `stderr` (уровень — переменная `RDE_MCP_LOG`).
+//! Транспорты: **stdio** — дефолт (M1/M2/M2.5, встроенный агент); **streamable HTTP** — opt-in
+//! для внешних агентов (M3, R-MCP-02): только loopback + обязательный bearer-токен, `/mcp` +
+//! `/health` ([`http`]). `stdout` занят JSON-RPC: все логи пишутся только в `stderr`
+//! (уровень — переменная `RDE_MCP_LOG`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -51,6 +53,7 @@
 pub mod error;
 pub mod hooks;
 pub mod host;
+pub mod http;
 pub mod instructions;
 pub mod model;
 pub mod policy;
@@ -66,6 +69,10 @@ pub use hooks::{
     DenyAllHook, EventSink, HostEvent, HostHooks, JsonlAuditSink, NullAuditSink, NullEventSink,
 };
 pub use host::{RdeHost, SharedHost};
+pub use http::{
+    bearer_authorized, generate_token, serve_http, serve_http_blocking, validate_bind, validate_token,
+    HttpOptions, HEALTH_HTTP_PATH, MCP_HTTP_PATH, MIN_TOKEN_LEN,
+};
 pub use policy::{
     authorize_tool_call, build_policy_and_hook, ApprovalCache, ApprovalMode, ApprovalOptions, AuthDenial,
     AuthOutcome, McpPolicy, RateLimiter, ToolGrant,

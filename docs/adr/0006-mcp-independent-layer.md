@@ -10,6 +10,10 @@
 > **M2 → [ADR-0007](0007-mutations-approvals-checkpoints.md):** мутирующие инструменты, grants/approvals,
 > чекпоинты, job-модель запуска и M1-review фиксы. ADR-0006 описывает слои/контракт/политику, которые
 > M2 переиспользует без изменения архитектуры.
+>
+> **M2.5 → [ADR-0008](0008-document-suggested-edits-and-revisions.md)** (документные suggested
+> edits/ревизии) и **M3 → [ADR-0009](0009-m3-streamable-http-transport.md)** (streamable HTTP —
+> второй транспорт того же `McpServer`, opt-in loopback+bearer): архитектура M1 не меняется.
 
 ## Контекст
 
@@ -216,8 +220,8 @@ pub trait RdeHost: Send + Sync { /* workspace_snapshot, project_tree, project_se
   M1-набор не переставлен (prompt-cache); контракт `RdeHost` расширен default-методами (read-only
   реализации совместимы). Добавлены чекпоинты (`.rde/agent/checkpoints`), аудит расширен полями
   `reason`/`checkpoint_id`, job-модель запуска (`artifact_run`/`run_status`/`run_cancel`/`run_log`).
-- M3 (streamable HTTP) реализует transport-слой `rmcp` + токен/аудит; `McpServer` от транспорта
-  не зависит.
+- M3 (streamable HTTP) — **реализовано** ([ADR-0009](0009-m3-streamable-http-transport.md)): transport-слой
+  `rmcp` + loopback + bearer-токен/аудит; `McpServer` от транспорта не зависит.
 - M4 (ACP/GUI) подключает `EventSink`/`ApprovalHook` и панель чата; URI-чипы §8.7.2 лягут на
   `rde://`-схему (`base URI` уже совпадает).
 - Известные ограничения M1 (сняты/уточнены в M2): `artifact_*` в M1 отдавал статус **из ledger** без

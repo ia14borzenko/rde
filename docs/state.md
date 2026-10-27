@@ -1043,4 +1043,88 @@ cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core
 cargo tree -p rde-host | grep -E "egui|eframe|rde-ui"
 ```
 
+## Обновление 2026-10-27 (M3: streamable HTTP — opt-in, loopback + bearer-токен)
+
+Веха **M3** фазы v0.3 (ТЗ §5.10 R-MCP-02/R-MCP-05/R-MCP-06, §8.7, §10.3 п.6,
+[ADR-0009](../docs/adr/0009-m3-streamable-http-transport.md)): у MCP-сервера появился второй транспорт —
+**streamable HTTP** (spec MCP 2026-07-28, stateless) — для **внешних** агентов. Это транспорт, а не
+новый слой: реестр 27 инструментов, ресурсы, политика/гранты/approvals, аудит и инструкции — те же,
+что у stdio. HTTP **выключен по умолчанию** (stdio — дефолт), включается только явным флагом и
+**только на loopback** с обязательным bearer-токеном.
+
+| Что | Где |
+|---|---|
+| HTTP-транспорт: `serve_http`/`serve_http_blocking`, `HttpOptions`, `validate_bind` (loopback-only), токен (`generate_token` CSPRNG, `validate_token`, constant-time `bearer_authorized`), axum-router `/mcp` (auth) + `/health`, graceful shutdown | [`crates/rde-mcp/src/http.rs`](../crates/rde-mcp/src/http.rs) |
+| `McpServer: Clone` (Arc rate-limit/approval-cache, инструкции один раз) — один сервер на процесс для всех HTTP-клиентов | [`crates/rde-mcp/src/server.rs`](../crates/rde-mcp/src/server.rs) |
+| Новый код ошибки `RDE_UNAUTHORIZED` (16-й; 401) | [`crates/rde-mcp/src/error.rs`](../crates/rde-mcp/src/error.rs) |
+| CLI: `--transport stdio\|http`, `--bind`, `--token`/`--token-file`/`RDE_MCP_TOKEN`, валидация конфигурации (код 2), выбор транспорта | [`apps/rde/src/main.rs`](../apps/rde/src/main.rs) |
+| E2E: настоящий rmcp-клиент по streamable HTTP (discover/tools/call/чтение), 401 без/неверный токен + аудит, `/health` без токена/данных, отказ не-loopback bind/плохих флагов, автогенерированный токен, stdio — дефолт | [`apps/rde/tests/mcp_http.rs`](../apps/rde/tests/mcp_http.rs) |
+| Unit: токен/constant-time/bearer-парсинг, loopback-bind, `401`-ответ, дефолт `HttpOptions` | [`crates/rde-mcp/src/http.rs`](../crates/rde-mcp/src/http.rs) |
+| Зависимости: `axum 0.8` (http1/tokio), `getrandom 0.3`, feature rmcp `transport-streamable-http-server`; dev: `reqwest 0.13` + rmcp-client | [`Cargo.toml`](../Cargo.toml), [`crates/rde-mcp/Cargo.toml`](../crates/rde-mcp/Cargo.toml) |
+
+**Запуск HTTP (opt-in):**
+```bash
+rde mcp serve --project <dir> --transport http --bind 127.0.0.1:8765
+# без --token: сервер сгенерирует 32-байтовый токен (hex) и напечатает его в stderr ОДИН раз;
+# свой токен: --token-file <путь 0600> или RDE_MCP_TOKEN=<токен>; --token виден в `ps` — не для продакшена.
+# клиент: POST http://127.0.0.1:8765/mcp  (Authorization: Bearer <токен>, spec 2026-07-28);
+# диагностика: GET http://127.0.0.1:8765/health (без токена; только имя/версия/протокол).
+```
+
+**Гарантии безопасности (fail-closed):** bind только loopback (`0.0.0.0`/LAN/`[::]`/имя хоста → код 2
+до открытия порта); без токена/с неверным токеном — `401` + `RDE_UNAUTHORIZED` + `WWW-Authenticate`,
+отказ аудируется (`tool="http"`, `decision="deny"`, `reason="auth"`, `error_code="RDE_UNAUTHORIZED"`;
+сам токен/его хеш не пишутся); токен сравнивается constant-time, передаётся только заголовком
+`Authorization: Bearer` (не в URL/query), не пишется на диск и не логируется; `/health` не отдаёт
+данные проекта; stdout не используется (JSON-RPC идёт по HTTP), логи — stderr (`RDE_MCP_LOG`).
+
+**Числа M3:** инструментов 27 (без изменений), `tools/list` 37 175 Б (без изменений), инструкции
+**8 423 Б** (≤32 KiB); новый код ошибки `RDE_UNAUTHORIZED`; `cargo test --workspace` — **383 passed,
+0 failed** (371 + `rde-mcp` +7 unit HTTP, `apps/rde` +5 e2e HTTP). Независимость слоёв: `rde-mcp`
+по-прежнему без `rde-*`/GUI; `rde-host` без `egui`/`rde-ui`. Дифф: `crates/rde-mcp/**`,
+`apps/rde/{src/main.rs,tests/mcp_http.rs,Cargo.toml}`, корневые `Cargo.toml`/`Cargo.lock` (новые
+HTTP-зависимости), docs; `rde-core`/`rde-dag`/`rde-doc`/`rde-docx`/`rde-store`/`rde-vcs`/`rde-sources`/
+`rde-templates`/`rde-ui`/`xtask`/`vendor` — 0 файлов.
+
+**Ограничения (честно):** GUI-настройка «Разрешить внешним агентам»/показ адреса и токена — M4
+(серверный слой `serve_http` готов); TLS и внешние интерфейсы — вне scope M3 (R-MCP-02: только
+loopback; внешний доступ — туннель/reverse-proxy пользователя); legacy-сессии MCP (<2026-07-28) и
+MRTR-approvals не включены; токен `--token` может быть виден в списке процессов (`--token-file`/
+env — рекомендуемые способы).
+
+**Следующий шаг:** **M4** — GUI/ACP-хуки: панель чата/агента, интерактивный approval с diff
+(`ApprovalHook` готов), настройка «Разрешить внешним агентам» (включение HTTP, показ адреса/токена),
+diff-UI suggested edits, URI-чипы §8.7.2; параллельно — **M2.6** (`doc_insert`/`doc_delete`,
+символьные диапазоны) и отдельная веха полных track changes Word (R-DOC-32).
+
+**Проверить руками (M3):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export CARGO_HOME=/home/admin-pc/proj/rde-dev/.cache-tmp/cargo-home
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh build -p rde                                  # бинарь target/debug/rde
+./scripts/build.sh test -p rde-mcp -p rde-host                   # unit/integration слоя
+./scripts/build.sh test -p rde                                   # e2e stdio + HTTP (rmcp-клиент)
+./scripts/build.sh test --workspace                              # 383 passed
+
+# 1) HTTP выключен по умолчанию: без --transport порт не открывается (stdio)
+# 2) HTTP с автогенерированным токеном: адрес и токен печатаются в stderr один раз
+./target/debug/rde mcp serve --project demo-project --transport http --bind 127.0.0.1:8765 &
+#   curl -s http://127.0.0.1:8765/health                          # 200, без данных проекта
+#   curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8765/mcp -H 'Content-Type: application/json' -d '{}'  # 401
+#   с токеном (из stderr) и заголовками spec 2026-07-28 — server/discover:
+#   curl -s -X POST http://127.0.0.1:8765/mcp -H "Authorization: Bearer <токен>" \
+#        -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+#        -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: server/discover' -d '<JSON-RPC discover>'
+# 3) отказ внешнего интерфейса: --bind 0.0.0.0:8765 → код 2 (loopback-only, R-MCP-02)
+# 4) аудит отказов: demo-project/.rde/agent/audit.log → tool="http", reason="auth"
+
+# независимость слоёв (пусто = доказано)
+cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core|rde-dag|rde-doc|rde-store"
+cargo tree -p rde-host | grep -E "egui|eframe|rde-ui"
+```
+
 

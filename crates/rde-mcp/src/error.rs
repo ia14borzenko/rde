@@ -57,6 +57,9 @@ pub enum RdeErrorCode {
     /// Job запуска артефактов не найден (неизвестный job_id или перезапуск процесса).
     #[serde(rename = "RDE_JOB_NOT_FOUND")]
     JobNotFound,
+    /// HTTP-запрос без валидного bearer-токена (M3: streamable HTTP, R-MCP-02).
+    #[serde(rename = "RDE_UNAUTHORIZED")]
+    Unauthorized,
     /// Внутренняя ошибка (panic в инструменте, повреждённые данные, ошибка ФС).
     #[serde(rename = "RDE_INTERNAL")]
     Internal,
@@ -80,6 +83,7 @@ impl RdeErrorCode {
             RdeErrorCode::Busy => "RDE_BUSY",
             RdeErrorCode::Conflict => "RDE_CONFLICT",
             RdeErrorCode::JobNotFound => "RDE_JOB_NOT_FOUND",
+            RdeErrorCode::Unauthorized => "RDE_UNAUTHORIZED",
             RdeErrorCode::Internal => "RDE_INTERNAL",
         }
     }
@@ -184,6 +188,11 @@ impl HostError {
     /// `RDE_JOB_NOT_FOUND`.
     pub fn job_not_found(message: impl Into<String>) -> Self {
         Self::new(RdeErrorCode::JobNotFound, message)
+    }
+
+    /// `RDE_UNAUTHORIZED` (M3: HTTP без валидного bearer-токена).
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(RdeErrorCode::Unauthorized, message)
     }
 
     /// `RDE_INTERNAL`.

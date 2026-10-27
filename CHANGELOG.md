@@ -12,6 +12,35 @@
 
 ### Добавлено
 
+- **M3 «v0.3 — транспорт streamable HTTP»: opt-in, loopback + bearer-токен (ADR-0009, 2026-10-27)** —
+  у MCP-сервера появился второй транспорт для **внешних** агентов: **streamable HTTP** (spec MCP
+  **2026-07-28**, stateless core) на штатном `rmcp::StreamableHttpService` (tower) поверх `axum 0.8`;
+  используется **тот же** `McpServer` — реестр 27 инструментов, ресурсы `rde://…`, политика
+  grants/approvals, аудит и инструкции не изменились (rate-limit и сессионный кэш approvals — общие
+  на процесс). **Выключено по умолчанию:** stdio остаётся дефолтом, HTTP включается только
+  `--transport http` (без флага порт не открывается). **Безопасность (R-MCP-02/R-MCP-05):** bind
+  **только loopback** (`0.0.0.0`/LAN/`[::]`/имя хоста → код 2 до открытия порта); **обязательный
+  bearer-токен** (32+ символа; источники `--token`/`--token-file`/`RDE_MCP_TOKEN`, иначе CSPRNG
+  (`getrandom`) 32 байта hex и печать в stderr **один раз**; на диск/в аудит не пишется; сравнение
+  constant-time; передача только заголовком `Authorization: Bearer`, не URL); без/с неверным токеном
+  — `401` + `RDE_UNAUTHORIZED` (16-й код) + `WWW-Authenticate`, отказ аудируется в
+  `.rde/agent/audit.log` (`tool="http"`, `reason="auth"`; токен не логируется); `/health` — без
+  токена и без данных проекта; graceful shutdown (SIGINT → отмена SSE-сессий + `shutdown_jobs`).
+  Точка входа: `rde mcp serve --transport http --bind 127.0.0.1:8765 [--token|--token-file]`
+  ([`http.rs`](crates/rde-mcp/src/http.rs), [+~120 строк](apps/rde/src/main.rs)); `McpServer: Clone`
+  (Arc-поля) — инструкции считаются один раз; новый код [error.rs](crates/rde-mcp/src/error.rs).
+  Зависимости: `axum 0.8` (http1/tokio, без дефолтов), `getrandom 0.3`, feature rmcp
+  `transport-streamable-http-server`; dev — `reqwest 0.13` + rmcp-client для e2e (лицензии
+  MIT/Apache-2.0/ISC — NFR-LIC-01). **Тесты: 383 passed, 0 failed** (371 + `rde-mcp` +7 unit HTTP:
+  bearer-парсинг/constant-time/токен/loopback-bind/401-ответ; `apps/rde` +5 e2e HTTP — настоящий
+  rmcp-клиент по streamable HTTP (discover/tools/list 27/tools/call/чтение), 401 без/неверный токен
+  + аудит, `/health` без токена/данных, отказ не-loopback bind и плохих флагов, автогенерированный
+  токен, stdio — дефолт). Инструменты/`tools/list` (37 175 Б) не менялись; инструкции — 8 423 Б.
+  Документы: [ADR-0009](docs/adr/0009-m3-streamable-http-transport.md), ТЗ §0.2/§5.10(R-MCP-02/05/06)/
+  §8.7.3/§10.3/§16, [`docs/state.md`](docs/state.md), README. Ограничения M3: GUI-настройка
+  «Разрешить внешним агентам»/показ токена — M4; TLS/внешние интерфейсы — вне scope (loopback +
+  туннель пользователя); legacy-сессии MCP/MRTR — не включены.
+
 - **M2.5 «v0.3 — документные мутации: suggested edits/ревизии» (ADR-0008, 2026-10-27)** — к MCP-слою
   добавлены **6 документных инструментов через те же grants/approvals/чекпоинты/аудит M2**: агент
   не перезаписывает пользовательский текст молча (R-AGT-05) — правка является **changeset-предложением**:

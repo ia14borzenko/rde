@@ -3,11 +3,13 @@ name = "rde-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RDE MCP (v0.3/M1): независимый протокольный слой — контракт RdeHost, DTO, реестр инструментов/ресурсов, политика и хуки, сервер на rmcp"
+description = "RDE MCP (v0.3/M3): независимый протокольный слой — контракт RdeHost, DTO, реестр инструментов/ресурсов, политика и хуки, сервер на rmcp (stdio + streamable HTTP)"
 
 [dependencies]
 rmcp = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+axum = { workspace = true }
+getrandom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }

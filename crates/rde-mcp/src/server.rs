@@ -77,14 +77,17 @@ impl From<HostError> for ServeError {
 /// MCP-сервер RDE: хост + хуки + политика + кэш инструкций/разрешений.
 ///
 /// Создаётся один раз на процесс (`rde mcp serve`); [`ServerHandler`] реализован ниже.
+/// `Clone` — дешёвая копия для streamable HTTP (M3): один сервер на процесс обслуживает все
+/// HTTP-запросы; rate-limit и сессионный кэш approvals общие (Arc), инструкции считаются один раз.
+#[derive(Clone)]
 pub struct McpServer {
     host: SharedHost,
     hooks: HostHooks,
     policy: McpPolicy,
     instructions: String,
-    limiter: RateLimiter,
+    limiter: Arc<RateLimiter>,
     /// Сессионный кэш `AllowSession`-разрешений (только мутации M2; ключ — инструмент+хеш аргументов).
-    approval_cache: ApprovalCache,
+    approval_cache: Arc<ApprovalCache>,
 }
 
 impl McpServer {
@@ -100,8 +103,15 @@ impl McpServer {
         let mut text = instructions::for_host(host.as_ref())?;
         text.push_str(&policy.instructions_section());
         let instructions = instructions::clamp(&text);
-        let limiter = RateLimiter::new(policy.rate_limit_per_min);
-        Ok(Self { host, hooks, policy, instructions, limiter, approval_cache: ApprovalCache::new() })
+        let limiter = Arc::new(RateLimiter::new(policy.rate_limit_per_min));
+        Ok(Self {
+            host,
+            hooks,
+            policy,
+            instructions,
+            limiter,
+            approval_cache: Arc::new(ApprovalCache::new()),
+        })
     }
 
     /// Политика сервера.

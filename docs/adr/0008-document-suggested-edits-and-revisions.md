@@ -154,8 +154,8 @@ CLI-режимы approvals/M2 не менялись. DTO: `SuggestedEditInfo`, `
 
 - **M2.6**: `doc_insert` (вставка новых абзацев/блоков со стабильными id на paraId), `doc_delete`,
   символьные диапазоны, отображение diff в UI — на базе `text_edit`/suggestions.
-- **M3 (HTTP)**: документные инструменты доступны внешним агентам через тот же реестр/policy; токены —
-  отдельное решение (R-MCP-02).
+- **M3 (HTTP) — реализовано** ([ADR-0009](0009-m3-streamable-http-transport.md)): документные инструменты
+  доступны внешним агентам через тот же реестр/policy; транспорт — opt-in, loopback + bearer-токен.
 - **M4 (GUI/ACP)**: diff-панель предложений (`suggestion_list` + UI), интерактивный approval с diff,
   кнопки accept/reject/откат ревизии; сервер/реестр не меняются (`EventSink`/`ApprovalHook` уже есть).
 - Ревизии переживают рестарт (store), предложения тоже (`.rde` файлы); чекпоинты — 50/32 MiB (M2).

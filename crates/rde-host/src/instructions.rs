@@ -15,7 +15,7 @@ const MAX_LISTED_OBJECTS: usize = 60;
 pub fn build(project: &Project) -> String {
     let policy = rde_mcp::McpPolicy::read_only();
     let mut out = String::with_capacity(4096);
-    out.push_str("# RDE MCP server (M2: read-only + управляемые мутации)\n\n");
+    out.push_str("# RDE MCP server (M2.5: read-only + управляемые мутации; транспорт stdio/HTTP)\n\n");
     out.push_str("RDE — среда разработки отчёта. Проект — каталог с TOML-манифестами объектов; ");
     out.push_str("документ — `.doc.rde` (OOXML + `rde:doc`), артефакты — скрипты с хешами/CAS/ledger.\n\n");
 

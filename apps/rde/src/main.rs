@@ -65,7 +65,7 @@ impl eframe::App for RdeFrame {
     }
 }
 
-const MCP_USAGE: &str = "использование: rde mcp serve --project <dir> [--approval=deny|auto|allowlist] [--allow-tools=a,b] [--allow-run] [--allow-destructive] | RDE_PROJECT=<dir> rde mcp serve (по умолчанию --approval=deny, fail-closed)";
+const MCP_USAGE: &str = "использование: rde mcp serve --project <dir> [--transport stdio|http] [--bind 127.0.0.1:8765] [--token <…>|--token-file <…>] [--approval=deny|auto|allowlist] [--allow-tools=a,b] [--allow-run] [--allow-destructive]\n  stdio — дефолт (встроенный агент); http — streamable HTTP только на loopback + обязательный bearer-токен (M3/R-MCP-02), по умолчанию выключен; approvals по умолчанию deny (fail-closed)";
 
 /// Ошибка MCP-ветки: сообщение в stderr + код возврата (2 — проект/аргументы, 1 — сервер).
 struct ServeFailure {
@@ -111,11 +111,15 @@ fn flag_value(args: &[String], index: usize, name: &str) -> Result<(String, usiz
     Ok((value.clone(), index + 2))
 }
 
-/// `rde mcp serve --project <dir>`: headless MCP-сервер (stdio; M2 — мутации через approvals).
+/// `rde mcp serve --project <dir>`: headless MCP-сервер (stdio по умолчанию; M3 — streamable HTTP).
 ///
 /// Approvals — **headless и fail-closed** (A4, O2-a): по умолчанию `--approval=deny` (никаких
 /// мутаций), `auto` включает гранты (явный флаг!), `allowlist` — только перечисленные инструменты.
 /// Интерактивных prompt'ов нет (stdin занят JSON-RPC); GUI/ACP-диалоги — M4 через тот же хук.
+///
+/// Транспорт M3 (`--transport http`) — streamable HTTP **только на loopback** и только с
+/// bearer-токеном (R-MCP-02): без `--token`/`--token-file`/`RDE_MCP_TOKEN` токен генерируется и
+/// печатается в stderr один раз; HTTP выключен по умолчанию (никаких открытых портов без флага).
 fn run_mcp_serve(args: &[String]) -> Result<(), ServeFailure> {
     if args.first().map(String::as_str) != Some("serve") {
         return Err(ServeFailure::usage("неизвестная команда"));
@@ -126,6 +130,10 @@ fn run_mcp_serve(args: &[String]) -> Result<(), ServeFailure> {
     let mut allow_run = false;
     let mut allow_destructive = false;
     let mut legacy_read_only = false;
+    let mut transport = "stdio".to_owned();
+    let mut bind: Option<String> = None;
+    let mut token: Option<String> = None;
+    let mut token_file: Option<PathBuf> = None;
     let mut index = 1;
     while index < args.len() {
         let arg = args[index].clone();
@@ -134,6 +142,26 @@ fn run_mcp_serve(args: &[String]) -> Result<(), ServeFailure> {
             "--project" => {
                 let (value, next) = flag_value(args, index, "--project")?;
                 project = Some(PathBuf::from(value));
+                index = next;
+            }
+            "--transport" => {
+                let (value, next) = flag_value(args, index, "--transport")?;
+                transport = value;
+                index = next;
+            }
+            "--bind" => {
+                let (value, next) = flag_value(args, index, "--bind")?;
+                bind = Some(value);
+                index = next;
+            }
+            "--token" => {
+                let (value, next) = flag_value(args, index, "--token")?;
+                token = Some(value);
+                index = next;
+            }
+            "--token-file" => {
+                let (value, next) = flag_value(args, index, "--token-file")?;
+                token_file = Some(PathBuf::from(value));
                 index = next;
             }
             "--approval" => {
@@ -178,6 +206,54 @@ fn run_mcp_serve(args: &[String]) -> Result<(), ServeFailure> {
     if legacy_read_only && (approval_mode.is_some() || !allow_tools.is_empty() || allow_run || allow_destructive) {
         return Err(ServeFailure::usage("--policy read-only не сочетается с флагами approvals"));
     }
+    let transport = transport.trim().to_ascii_lowercase();
+    let http_options = match transport.as_str() {
+        "stdio" => {
+            if bind.is_some() || token.is_some() || token_file.is_some() {
+                return Err(ServeFailure::usage(
+                    "--bind/--token/--token-file применимы только с --transport http",
+                ));
+            }
+            None
+        }
+        "http" => {
+            if token.is_some() && token_file.is_some() {
+                return Err(ServeFailure::usage("укажите что-то одно: --token или --token-file"));
+            }
+            let token = match (token, token_file) {
+                (Some(token), _) => Some(token),
+                (None, Some(path)) => {
+                    let text = std::fs::read_to_string(&path).map_err(|error| {
+                        ServeFailure::project(format!(
+                            "не удалось прочитать --token-file {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                    let text = text.trim().to_owned();
+                    if text.is_empty() {
+                        return Err(ServeFailure::project(format!(
+                            "файл токена {} пуст",
+                            path.display()
+                        )));
+                    }
+                    Some(text)
+                }
+                (None, None) => std::env::var("RDE_MCP_TOKEN").ok().filter(|token| !token.trim().is_empty()),
+            };
+            let bind = bind.unwrap_or_else(|| "127.0.0.1:8765".to_owned());
+            // Конфигурационные ошибки — код 2 (до открытия проекта); сервер проверяет ещё раз.
+            rde_mcp::validate_bind(&bind).map_err(ServeFailure::usage)?;
+            if let Some(token) = &token {
+                rde_mcp::validate_token(token).map_err(ServeFailure::usage)?;
+            }
+            Some(rde_mcp::HttpOptions { bind, token })
+        }
+        other => {
+            return Err(ServeFailure::usage(format!(
+                "неизвестный транспорт `{other}` (stdio|http)"
+            )));
+        }
+    };
     let options = rde_mcp::ApprovalOptions {
         mode: Some(approval_mode.unwrap_or(rde_mcp::ApprovalMode::Deny)),
         allow_tools,
@@ -201,6 +277,11 @@ fn run_mcp_serve(args: &[String]) -> Result<(), ServeFailure> {
         }
     }
     let hooks = rde_mcp::HostHooks::jsonl(host.root()).with_approvals(approval_hook);
-    rde_mcp::serve_stdio_blocking(std::sync::Arc::new(host), hooks, policy)
-        .map_err(|error| ServeFailure::server(error.to_string()))
+    let host = std::sync::Arc::new(host);
+    match http_options {
+        None => rde_mcp::serve_stdio_blocking(host, hooks, policy)
+            .map_err(|error| ServeFailure::server(error.to_string())),
+        Some(http) => rde_mcp::serve_http_blocking(host, hooks, policy, http)
+            .map_err(|error| ServeFailure::server(error.to_string())),
+    }
 }

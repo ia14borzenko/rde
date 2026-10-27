@@ -15,8 +15,9 @@ rde-mcp = { workspace = true }
 rde-host = { workspace = true }
 
 [dev-dependencies]
-# E2E `mcp serve` по stdio настоящим rmcp-клиентом (spec 2026-07-28).
-rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+# E2E `mcp serve` настоящим rmcp-клиентом: stdio (M1/M2/M2.5) и streamable HTTP (M3).
+rmcp = { workspace = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 tokio = { workspace = true, features = ["macros", "process", "time"] }
 serde_json = { workspace = true }
-
+# Клиент streamable HTTP для e2e (rmcp-клиент принимает reqwest::Client).
+reqwest = { workspace = true }
