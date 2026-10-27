@@ -160,6 +160,24 @@
 
 ### Исправлено
 
+- **P2.5: SVG-вектор в docx переживает open/save (ADR-0005, 2026-10-27, форк WordCraft
+  `rde/main` `a33bb6ce`)** — writer вендоренного WordCraft терял `a:blip/a:extLst`
+  (`asvg:svgBlip`, MS-ODRAWXML) и `word/media/*.svg` при пересохранении (спайк B6: 0 вхождений,
+  svg-части нет). В форке: `InlineObject::Image.blip_ext`
+  ([`crates/doc/src/para.rs`](vendor/wordcraft/crates/doc/src/para.rs)); на чтении extLst
+  сохраняется общим механизмом вложенных объектов — части, их relationship'ы и Content_Types уходят
+  в `Document::passthrough` (`EMBEDDED_PARTS`), на записи возвращаются в `a:blip` с новыми `r:id`
+  ([`read/story.rs`](vendor/wordcraft/crates/docx/src/read/story.rs),
+  [`write/story.rs`](vendor/wordcraft/crates/docx/src/write/story.rs)); namespace `asvg`/`a14`
+  канонические ([`xml.rs`](vendor/wordcraft/crates/docx/src/xml.rs)). RDE **не** переприменяет SVG.
+  Регрессии: форк `crates/docx/tests/svg_blip.rs` (docx с `svgBlip` → open → save → `svgBlip` и
+  svg-часть сохранены; повторный save тоже), форк `wordcraft-docx` — вся crate зелёная,
+  `wordcraft-doc/docbin/formats/engine` — 1456 passed; RDE
+  [`crates/rde-docx/tests/svg_blip_roundtrip.rs`](crates/rde-docx/tests/svg_blip_roundtrip.rs) —
+  roundtrip через `wordcraft_engine::io` с проверкой SVG-части/rels/Content_Types + LO-оракул.
+  Пин субмодуля `f85cb9c9` → `a33bb6ce`; журнал — [`docs/wordcraft-fork.md`](docs/wordcraft-fork.md).
+  Всего тестов RDE: **204 passed** (203 + 1 doctest; +1 к P2). Ограничение: extLst в неизвестных
+  namespace не сохраняется (для Word-2016+ SVG покрыты `asvg`/`a14`).
 - **§19-7 «одна линия»:** строка вкладок центра и строка режимов/масштаба переносились на две строки
   при 1600×1000 (попытка `db48a58` не влезала: вкладки + режимы + масштаб не помещались в колонку).
   Теперь строка одна: режимы — сегментами в строке вкладок, масштаб — на ленте; адаптивность

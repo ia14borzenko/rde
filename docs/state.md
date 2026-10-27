@@ -615,3 +615,59 @@ cargo run -q -p rde-core --example dump-schemas -- docs/schema                 #
 # компиляция формулы (OMML+SVG+PNG) проверяется тестом rde-doc/tests/formula_pipeline.rs
 ```
 
+
+---
+
+## Обновление 2026-10-27 (P2.5: фикс WordCraft-writer — blip-extLst/`asvg:svgBlip`, ADR-0005)
+
+Фаза **P2.5** по ADR-0005: фикс writer'а WordCraft в **форке** (`vendor/wordcraft`, ветка
+`rde/main`, коммит `a33bb6ce`) — docx-картинка с векторным источником (`a:blip/a:extLst` →
+`asvg:svgBlip`, MS-ODRAWXML) сохраняет SVG-часть, relationship и Content_Types при open/save;
+RDE-переприменение SVG не нужно. RDE-коммит поднимает пин субмодуля (+ запись в журнале форка по
+ADR-0001 §4) и добавляет интеграционный тест через движок.
+
+| Что | Где |
+|---|---|
+| Форк `rde/main`: `InlineObject::Image.blip_ext` (`Option<Arc<Embedded>>`); на чтении `a:blip/a:extLst` сохраняется `keep_embedded` (части → `Document::passthrough`, relationship'ы, Content_Types), на записи список возвращается в `a:blip` с новыми `r:id` (`embedded_xml`); namespace `asvg`/`a14` канонические | [`vendor/wordcraft/crates/doc/src/para.rs`](../vendor/wordcraft/crates/doc/src/para.rs), [`crates/docx/src/read/story.rs`](../vendor/wordcraft/crates/docx/src/read/story.rs), [`write/story.rs`](../vendor/wordcraft/crates/docx/src/write/story.rs), [`xml.rs`](../vendor/wordcraft/crates/docx/src/xml.rs) |
+| Регрессия форка: docx с `svgBlip` → open → save → `svgBlip` и SVG-часть сохранены; повторный open/save тоже | [`vendor/wordcraft/crates/docx/tests/svg_blip.rs`](../vendor/wordcraft/crates/docx/tests/svg_blip.rs) |
+| RDE-гейт: roundtrip через `wordcraft_engine::io` (как сохраняет движок RDE), проверка blip-extLst, SVG-части, rels, Content_Types + LO-оракул | [`crates/rde-docx/tests/svg_blip_roundtrip.rs`](../crates/rde-docx/tests/svg_blip_roundtrip.rs) |
+| Журнал форка (правило ADR-0001 §4) и описание механизма/ограничений | [`docs/wordcraft-fork.md`](wordcraft-fork.md) |
+
+**Ключевые свойства:** механизм **общий** — `a:blip/a:extLst` сохраняется целиком (не спец-случай
+формулы), части идут через существующий `EMBEDDED_PARTS`-manifest, rels/Content_Types восстанавливает
+движок вложенных объектов; содержимое списка пишется с новыми `r:id`, PNG-fallback остаётся на месте.
+Пустой extLst не пишется; serde-поле `skip_serializing_if` — `.doc.rde`/JSON и native-форма картинок
+без расширений не меняются (roundtrip байт-в-байт по модели).
+
+**Тесты:** RDE `cargo test --workspace` — **204 passed, 0 failed** (203 теста + 1 doctest; +1 к P2:
+`rde-docx/tests/svg_blip_roundtrip.rs`). Форк: `cargo test -p wordcraft-docx` — вся crate, включая
+`tests/svg_blip.rs`; `wordcraft-doc/docbin/formats/engine` — **1456 passed, 0 failed**;
+`cargo check --workspace --tests`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --check` — зелёные. Полный `cargo test --workspace` форка не прогнан: на стенде
+переполнился диск при компиляции всех тест-бинарников (~12 ГБ на 16 ГБ свободных) — ограничение
+окружения, не кода.
+
+**Ограничения (честно):** расширения в *неизвестных* namespace внутри extLst при сериализации не
+сохраняются (для SVG-сценария Word покрыты `asvg`/`a14`: `svgBlip`, `imgProps`, `useLocalDpi`);
+Word 2016+ совместимость — по MS-ODRAWXML (Word на стенде нет, независимый оракул — LibreOffice);
+в демо-документе SVG-картинок/формул пока нет — фактическая SVG-вставка формулы в docx появится в
+P3/P5 (тогда же — PDF-гейт «нет растровых формул»).
+
+**Следующий шаг:** **P3** — вставки формул в документ (`RdeInsert kind="formula"`,
+`target = rde://formula/<id>@<act_key>`, `render_mode = omml|svg`), обновление транзакцией
+(корни `formula/*` + затронутые `document/<id>`), R-DOC-13 (ручная правка не перезаписывается),
+статусы «цель отсутствует/устарело», миграция inline-формулы демо явной командой → P4 → P5.
+
+**Проверить руками (P2.5):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+git submodule status                                  # пин vendor/wordcraft = a33bb6ce
+./scripts/build.sh test -p rde-docx                   # вкл. svg_blip_roundtrip (engine roundtrip)
+./scripts/build.sh test --workspace                   # 204 passed (203 + doctest)
+# форк-регрессия (нужны writable CARGO_HOME и CARGO_TARGET_DIR — ~/.cargo на стенде read-only):
+#   CARGO_HOME=$PWD/../.cache-tmp/cargo-home cargo test --manifest-path vendor/wordcraft/Cargo.toml -p wordcraft-docx
+```

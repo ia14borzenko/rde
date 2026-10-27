@@ -3,7 +3,7 @@
 | Поле | Значение |
 |---|---|
 | Дата | 2026-10-26 |
-| Статус | **принято владельцем** (2026-10-26): формулы — **project-level** объекты, SVG-вставки — фикс WordCraft-writer в форке (P2.5) вместо переприменения в RDE; **реализация: P1, P2 — готово (2026-10-26), P2.5–P5 — в работе** |
+| Статус | **принято владельцем** (2026-10-26): формулы — **project-level** объекты, SVG-вставки — фикс WordCraft-writer в форке (P2.5) вместо переприменения в RDE; **реализация: P1, P2 — готово (2026-10-26), P2.5 — готово (2026-10-27), P3–P5 — в работе** |
 | Контекст | решения владельца по формулам (нативный редактор WordCraft, SVG-вектор, формулы/величины — объекты с зависимостями, project-level хранение формул, фикс writer'а в форке) + спайки P0 |
 | Нормативная база | [`docs/tz-03.md`](../tz-03.md): §4.2, §7.2/7.3, §8.3, §8.5, §9.4, §9.7; R-DOC-11…13, R-DOC-19…24, R-ART-09, R-TREE-01/02; NFR-LIC-02 |
 | Связанные ADR | [ADR-0001](0001-repo-layout-and-build.md) — WordCraft-форк; [ADR-0002](0002-component-boundaries.md) — границы крейтов; [ADR-0003](0003-deviations-from-tz02.md) — отклонения (poppler §15-2) |
@@ -475,15 +475,18 @@ act_key     = rde_hash::act_key("formula", "rde/formula@1", in_hash, Some(src_ha
   Word 2016+ — по MS-ODRAWXML; **Word на стенде нет** → статус «по спецификации, фактически не
   проверено»; WordCraft читает PNG-fallback (на экране редактора — растр, это приемлемо).
 * **Фикс WordCraft-writer (P2.5, решение владельца; вариант «RDE переприменяет SVG» отклонён)**:
-  сейчас writer теряет `a:extLst`/`asvg:svgBlip` и `word/media/*.svg` при пересохранении
-  (спайк B6: 0 вхождений, svg-части нет). В форке (`rde/main`) добавляется сохранение blip-extLst:
-  на чтении — запоминать `a:blip/a:extLst` (с `asvg:svgBlip`), медиа-svg, relationship и
-  Content_Types; на записи — восстанавливать их вместе с PNG-fallback (общий механизм
-  blip-extLst, не специальный случай формулы). Обязательный регрессионный тест форка: «docx с
-  `svgBlip` → open → save → `svgBlip` и svg-часть сохранены»; запись в
-  [`docs/wordcraft-fork.md`](../wordcraft-fork.md); коммит в `rde/main`; в RDE — отдельный
-  коммит, поднимающий пин субмодуля (ADR-0001 §4). После фикса RDE **не** переприменяет SVG:
-  движок сам сохраняет вставку при open/save.
+  до фикса writer терял `a:extLst`/`asvg:svgBlip` и `word/media/*.svg` при пересохранении
+  (спайк B6: 0 вхождений, svg-части нет). **Сделано в P2.5 (2026-10-27, форк `rde/main` `a33bb6ce`):**
+  сохранение blip-extLst как общего механизма — на чтении `a:blip/a:extLst` (с `asvg:svgBlip`),
+  медиа-svg, relationship и Content_Types кладутся в модель (`InlineObject::Image.blip_ext`) и
+  `Document::passthrough` (`EMBEDDED_PARTS`); на записи список возвращается в `a:blip` с новыми
+  `r:id` вместе с PNG-fallback, части/rels/Content_Types восстанавливаются; namespace `asvg`/`a14`
+  канонические. Регрессионный тест форка: [`crates/docx/tests/svg_blip.rs`](../../vendor/wordcraft/crates/docx/tests/svg_blip.rs)
+  («docx с `svgBlip` → open → save → `svgBlip` и svg-часть сохранены», повторный save тоже); запись
+  в [`docs/wordcraft-fork.md`](../wordcraft-fork.md); пин субмодуля поднят отдельным RDE-коммитом
+  (ADR-0001 §4). После фикса RDE **не** переприменяет SVG: движок сам сохраняет вставку при
+  open/save. Ограничение: extLst в неизвестных namespace не сохраняется (для Word-2016+ SVG покрыты
+  `asvg`/`a14`); Word-совместимость — по MS-ODRAWXML (Word на стенде нет; LO-оракул проходит).
 * **PDF-гейт «нет растровых формул»** (`rde-docx`): для выходного PDF (Word или LO) —
   `pdfimages -list` не должен содержать изображений в областях формул (сверка bbox вставок или
   эвристика «число растров = число figure-вставок»); `pdffonts` — math-шрифт или пути.
@@ -575,7 +578,7 @@ act_key     = rde_hash::act_key("formula", "rde/formula@1", in_hash, Some(src_ha
 |---|---|---|---|
 | **P1** value — **ГОТОВО (2026-10-26)** | `ConstantValue`+ (symbol/subscript/format/source), `constant_hash`, `resolve_constant`, формат value+NBSP+unit, rich-вставка, централизованная замена, UI-редактор констант | core, hash, dag, doc, ui | golden-хеши (совместимость литералов), резолвер из артефакта, stale→update (как C4–C6), kittest |
 | **P2** formula — **ГОТОВО (2026-10-26)** | `FormulaManifest` в `objects/formulas/` + загрузка/валидация/циклы, `formula_edges`/топопорядок, compile OMML/SVG/PNG в CAS, `[state]`/ledger, статусы/причины, переиспользование в документах | core, hash, dag, doc | тесты модели/циклов, стабильность act_key, компиляция σ=F/A (как A16/B), откат кэшей |
-| **P2.5** writer fix | WordCraft `crates/docx`: сохранение blip-extLst/`svgBlip` + `word/media/*.svg` + rels + Content_Types при open/save; регрессионный тест форка; docs/wordcraft-fork.md; коммит `rde/main`; пин субмодуля отдельным RDE-коммитом | vendor/wordcraft, rde-docx (гейт) | тест форка «svgBlip → open → save → сохранён»; RDE fidelity-гейты не сломаны; пин |
+| **P2.5** writer fix — **ГОТОВО (2026-10-27)** | WordCraft `crates/docx` (форк `rde/main` `a33bb6ce`): `InlineObject::Image.blip_ext`; чтение `a:blip/a:extLst` через `keep_embedded` (svg-медиа + rels + Content_Types в `Document::passthrough`), запись через `embedded_xml`; namespace `asvg`/`a14`; регрессионный тест `crates/docx/tests/svg_blip.rs`; запись в [`docs/wordcraft-fork.md`](../wordcraft-fork.md); пин субмодуля `f85cb9c9` → `a33bb6ce` отдельным RDE-коммитом | vendor/wordcraft, rde-docx (гейт) | форк: `cargo test -p wordcraft-docx` + `wordcraft-doc/docbin/formats/engine` 1456 passed, clippy/fmt/check зелёные; RDE: `rde-docx/tests/svg_blip_roundtrip.rs` (engine roundtrip + LO-оракул), 204 passed; fidelity-гейты не сломаны; пин поднят |
 | **P3** вставка | `RdeInsert kind="formula"`+`render_mode`, `rde:doc` 1→2, sdt-оболочка/якоря, update-транзакция формул+документов, конфликты R-DOC-13, «где вставлено» по всем документам, документно-локальная нумерация, миграция демо явной командой | doc, dag, ui | roundtrip OMML/SVG через `.doc.rde`, обновление/откат, миграция демо, OMML-гейт, svgBlip сохраняется после engine save (после P2.5) |
 | **P4** редактор | панель `equation_tab` в DocView, LaTeX-поле+предпросмотр, правка существующей, нумерация из объекта, команды RDE | ui | kittest-панель (как спайк A), вставка/правка формулы из UI, headless-скриншоты |
 | **P5** вектор/обмен | export-mode «формулы как SVG», PDF-гейт «нет растровых формул», обмен LaTeX (.tex/буфер), повторное использование SVG-кэшей для экспорта; опц. vendor-кандидаты (SVG-экспорт формулы, номер полем) | docx, doc, ui, vendor | LO/PDF-гейты (как B5), docx с svgBlip (после P2.5), `.tex` roundtrip |
@@ -591,7 +594,7 @@ P5 после P2/P3 (частично параллельно P4). Порядок
 | # | Вопрос | Решение владельца |
 |---|---|---|
 | 1 | scope формул | **Project-level**: `objects/formulas/<ULID>/formula.toml` — как артефакты/константы. Переиспользование между документами — штатное (одна формула в нескольких документах); номер формулы **документно-локальный** (объект хранит политику `auto/none` и метку, фактический номер назначается при вставке/обновлении документа); удаление — проверка «используется в N документах», вставки без цели получают статус «цель отсутствует»; в дереве — группа «Формулы» в служебных объектах, скрыта по умолчанию. |
-| 2 | формат SVG-вставки | **Фикс WordCraft-writer в форке (P2.5)**, а не переприменение SVG в RDE: сохранять `a:extLst`/`asvg:svgBlip`, `word/media/*.svg`, relationship и Content_Types на open/save; обязательный регрессионный тест форка «docx с `svgBlip` → open → save → `svgBlip` и svg-часть сохранены»; запись в `docs/wordcraft-fork.md`; коммит в `rde/main`; отдельный RDE-коммит с пином субмодуля. Чинить на чтении **и** записи, по возможности общим механизмом сохранения blip-extLst. |
+| 2 | формат SVG-вставки | **Фикс WordCraft-writer в форке (P2.5)**, а не переприменение SVG в RDE: сохранять `a:extLst`/`asvg:svgBlip`, `word/media/*.svg`, relationship и Content_Types на open/save; обязательный регрессионный тест форка «docx с `svgBlip` → open → save → `svgBlip` и svg-часть сохранены»; запись в `docs/wordcraft-fork.md`; коммит в `rde/main`; отдельный RDE-коммит с пином субмодуля. Чинить на чтении **и** записи, по возможности общим механизмом сохранения blip-extLst. **Выполнено в P2.5 (2026-10-27):** форк `rde/main` `a33bb6ce`, общий механизм blip-extLst (поле `blip_ext`, `EMBEDDED_PARTS`), пин + запись в журнале форка. |
 | 3 | место формулы в дереве | Подтверждено: скрытые служебные объекты, группа «Формулы» (реализовывать, больше не спрашивать). |
 | 4 | `value` при `source` (константы) | Делаем **оба поля**: optional `source` (значение из выхода артефакта) + `value` как обязательный кэш последнего разрешённого значения; схема `rde/artifact@1` без повышения версии; при заданном `source` источник истины — артефакт. |
 | 5 | миграция inline-формулы демо | Не вопрос: миграцию в объект формулы + вставку-ссылку выполнить в рамках реализации (явной командой/пересборкой демо, без молчаливого изменения при открытии). |
@@ -628,5 +631,15 @@ P5 после P2/P3 (частично параллельно P4). Порядок
   digest в хеше, ledger `out_hash`, digest источника в `in_hash`, sentinel при недоступном
   источнике, совместимость литералов). Схема `docs/schema/artifact.schema.json` перегенерирована
   (аддитивно); документ-независимый `resolve_insert_constant` проверен существующим тестом вставок.
-* P2.5 (фикс writer'а) обязан добавить: регрессионный тест форка «svgBlip → open → save → сохранён»
-  + запись в `docs/wordcraft-fork.md` + пин субмодуля; доказательства — в отчёте фазы P2.5.
+* **P2.5 (2026-10-27)** — зелёный: фикс writer'а в форке `vendor/wordcraft` (`rde/main`, коммит
+  `a33bb6ce`): `InlineObject::Image.blip_ext`; чтение `a:blip/a:extLst` через `keep_embedded`
+  (части/rels/Content_Types → `Document::passthrough`), запись через `embedded_xml`; namespace
+  `asvg`/`a14`. Форк: `cargo test -p wordcraft-docx` — вся crate, вкл. `tests/svg_blip.rs`
+  («docx с `svgBlip` → open → save → `svgBlip` и svg-часть сохранены», повторный save тоже);
+  `wordcraft-doc/docbin/formats/engine` — **1456 passed, 0 failed**; `cargo check --workspace --tests`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` — зелёные. RDE:
+  `rde-docx/tests/svg_blip_roundtrip.rs` (roundtrip через `wordcraft_engine::io`, проверка SVG-части,
+  rels, Content_Types + LO-оракул), пин субмодуля `f85cb9c9` → `a33bb6ce`, запись в
+  [`docs/wordcraft-fork.md`](../wordcraft-fork.md); всего **204 passed** (203 теста + 1 doctest; +1 к
+  P2). Полный `cargo test --workspace` форка не прогнан: при компиляции всех тест-бинарников на
+  стенде переполнился диск (~12 ГБ на 16 ГБ свободных) — ограничение окружения, не кода.
