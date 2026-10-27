@@ -681,6 +681,10 @@ pub struct RdeApp {
     external_agents_attempted: bool,
     /// Показывать bearer-токен в панели «Агент» (секрет; по умолчанию скрыт).
     show_agent_token: bool,
+    /// M4.2: очередь GUI-approvals встроенного MCP-сервера (решения пользователя).
+    agent_approvals: std::sync::Arc<agent_server::GuiApprovals>,
+    /// Текущий диалог подтверждения действия внешнего агента.
+    agent_approval_dialog: Option<agent_server::PendingApproval>,
 }
 
 impl RdeApp {
@@ -749,6 +753,8 @@ impl RdeApp {
             external_agents: agent_server::ExternalAgentServer::new(),
             external_agents_attempted: false,
             show_agent_token: false,
+            agent_approvals: std::sync::Arc::new(agent_server::GuiApprovals::new()),
+            agent_approval_dialog: None,
         };
         app.auto_update = app.project.manifest.document_auto_update;
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
@@ -786,7 +792,8 @@ impl RdeApp {
             return;
         }
         let root = self.project.root.clone();
-        match self.external_agents.start(&root) {
+        let options = self.external_agent_options();
+        match self.external_agents.start(&root, &options) {
             Ok(()) => {
                 if let agent_server::ExternalAgentStatus::Running(info) = self.external_agents.status(true) {
                     self.push_log(
@@ -806,19 +813,38 @@ impl RdeApp {
         }
     }
 
-    /// Применить настройку «Разрешить внешним агентам»: поднять/остановить встроенный сервер.
+    /// Параметры встроенного сервера по настройкам приложения (M4.2: мутации через GUI-approvals).
+    fn external_agent_options(&self) -> agent_server::ExternalAgentOptions {
+        agent_server::ExternalAgentOptions {
+            // Мутации — только если пользователь разрешил И доступ включён (иначе read-only).
+            allow_mutations: self.app_settings.allow_external_mcp && self.app_settings.allow_agent_mutations,
+            approvals: std::sync::Arc::clone(&self.agent_approvals),
+        }
+    }
+
+    /// Применить настройку «Разрешить внешним агентам»: поднять/остановить/перезапустить сервер.
     ///
     /// Ошибка запуска — в журнал + настройка выключается (fail-closed, R-MCP-05).
     pub fn apply_external_agents_setting(&mut self) {
         let enabled = self.app_settings.allow_external_mcp;
+        if !enabled {
+            // Выключение доступа отклоняет ожидающие подтверждения (fail-closed).
+            self.deny_pending_agent_approvals();
+        }
         let root = self.project.root.clone();
+        let options = self.external_agent_options();
         self.external_agents_attempted = true;
-        match self.external_agents.apply(enabled, &root) {
+        match self.external_agents.apply(enabled, &root, &options) {
             Ok(()) => {
                 if let agent_server::ExternalAgentStatus::Running(info) = self.external_agents.status(enabled) {
+                    let mode = if self.external_agents.mutations_enabled() {
+                        "чтение+правки с подтверждением"
+                    } else {
+                        "только чтение"
+                    };
                     self.push_log(
                         Level::Info,
-                        format!("Внешние агенты: MCP HTTP {} (loopback, только чтение) — R-MCP-02", info.url()),
+                        format!("Внешние агенты: MCP HTTP {} (loopback, {mode}) — R-MCP-02", info.url()),
                     );
                 } else if !enabled {
                     self.push_log(Level::Info, "Внешние агенты: доступ по MCP HTTP выключен".to_owned());
@@ -834,6 +860,40 @@ impl RdeApp {
     /// Текущее состояние внешних агентов (для панели «Агент»).
     pub fn external_agents_status(&self) -> agent_server::ExternalAgentStatus {
         self.external_agents.status(self.app_settings.allow_external_mcp)
+    }
+
+    // ── M4.2: GUI-approvals внешних агентов ─────────────────────────────────
+
+    /// Забрать из очереди ожидающий запрос агента и показать диалог (один за раз).
+    pub fn poll_agent_approvals(&mut self) {
+        if self.agent_approval_dialog.is_some() {
+            return;
+        }
+        if let Some(pending) = self.agent_approvals.take_pending() {
+            self.agent_approval_dialog = Some(pending);
+        }
+    }
+
+    /// Ответ пользователя на текущий запрос агента (allow once/session/deny).
+    pub fn decide_agent_approval(&mut self, decision: rde_mcp::ApprovalDecision) {
+        if let Some(mut pending) = self.agent_approval_dialog.take() {
+            let tool = pending.tool().to_owned();
+            pending.decide(decision);
+            let label = match decision {
+                rde_mcp::ApprovalDecision::AllowOnce => "разрешено один раз",
+                rde_mcp::ApprovalDecision::AllowSession => "разрешено в сессии",
+                rde_mcp::ApprovalDecision::Deny => "отклонено",
+            };
+            self.push_log(Level::Info, format!("Агент: действие `{tool}` — {label}"));
+        }
+    }
+
+    /// Закрыть/отклонить все ожидающие approvals (выключение доступа/выход — fail-closed).
+    fn deny_pending_agent_approvals(&mut self) {
+        if let Some(mut pending) = self.agent_approval_dialog.take() {
+            pending.decide(rde_mcp::ApprovalDecision::Deny);
+        }
+        self.agent_approvals.deny_all();
     }
 
     /// Инициализировать git-репозиторий проекта (R-VCS-01) и сделать начальный коммит.
@@ -2490,6 +2550,7 @@ impl RdeApp {
         self.poll_update_job();
         self.maybe_auto_boot_update();
         self.ensure_external_agents();
+        self.poll_agent_approvals();
         self.ui_frames += 1;
         if !self.fonts_installed {
             install_fonts(ui.ctx());
@@ -2902,7 +2963,11 @@ impl RdeApp {
         let (agent_label, mcp_label, agent_color) = match self.external_agents_status() {
             agent_server::ExternalAgentStatus::Running(info) => (
                 format!("Агент: MCP HTTP :{}", info.addr.port()),
-                format!("MCP: on :{}", info.addr.port()),
+                if self.external_agents.mutations_enabled() {
+                    format!("MCP: on :{} (rw)", info.addr.port())
+                } else {
+                    format!("MCP: on :{}", info.addr.port())
+                },
                 pal.green,
             ),
             agent_server::ExternalAgentStatus::NotRunning => (
@@ -3401,6 +3466,24 @@ impl RdeApp {
                                 .small()
                                 .color(pal.muted),
                             );
+                            ui.add_space(4.0);
+                            if self.external_agents.mutations_enabled() {
+                                ui.label(
+                                    RichText::new("Режим: чтение + правки с подтверждением (M4.2)")
+                                        .small()
+                                        .color(pal.amber),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        "Каждое изменение агента приходит запросом в RDE — подтвердите или \
+                                         отклоните в диалоге; создаётся чекпоинт (откат — «Задачи»/чекпоинты).",
+                                    )
+                                    .small()
+                                    .color(pal.muted),
+                                );
+                            } else {
+                                ui.label(RichText::new("Режим: только чтение").small().color(pal.muted));
+                            }
                         }
                         agent_server::ExternalAgentStatus::NotRunning => {
                             ui.label(RichText::new("Разрешено, но сервер не запущен.").small().color(pal.amber));
@@ -3411,7 +3494,7 @@ impl RdeApp {
                         agent_server::ExternalAgentStatus::Disabled => {
                             ui.label(RichText::new("Внешний доступ выключен (fail-closed).").small().color(pal.muted));
                             ui.label(
-                                RichText::new("Включить: Настройки → «Внешние агенты».")
+                                RichText::new("Включить: Настройки → «Внешние агенты» (чтение; правки — отдельная галочка с подтверждением).")
                                     .small()
                                     .color(pal.muted),
                             );
@@ -3984,7 +4067,8 @@ impl RdeApp {
                 // M4.1: внешние агенты привязаны к проекту — перезапустить (или остановить).
                 let enabled = self.app_settings.allow_external_mcp;
                 let project_root = self.project.root.clone();
-                if let Err(error) = self.external_agents.on_project_switched(enabled, &project_root) {
+                let agent_options = self.external_agent_options();
+                if let Err(error) = self.external_agents.on_project_switched(enabled, &project_root, &agent_options) {
                     self.push_log(Level::Warn, format!("Внешние агенты (MCP HTTP): {error}"));
                     self.app_settings.allow_external_mcp = false;
                 }
@@ -4635,9 +4719,23 @@ impl RdeApp {
                             );
                             ui.label(
                                 RichText::new(
-                                    "Только loopback (127.0.0.1) + обязательный bearer-токен; сервер — \
-                                     только чтение (approvals=deny, R-MCP-02/R-MCP-05). Адрес и токен — \
-                                     в панели «Агент».",
+                                    "Только loopback (127.0.0.1) + обязательный bearer-токен; адрес и \
+                                     токен — в панели «Агент» (R-MCP-02).",
+                                )
+                                .small()
+                                .color(pal.muted),
+                            );
+                            ui.add_enabled_ui(settings.allow_external_mcp, |ui| {
+                                ui.checkbox(
+                                    &mut settings.allow_agent_mutations,
+                                    "Разрешить агенту изменения в проекте",
+                                );
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "Каждое изменение подтверждается диалогом в RDE; создаётся чекпоинт \
+                                     (авто-откат при ошибке), решение пишется в аудит. Без этой галочки — \
+                                     только чтение (fail-closed, R-MCP-05).",
                                 )
                                 .small()
                                 .color(pal.muted),
@@ -5201,9 +5299,79 @@ impl RdeApp {
         }
     }
 
+    /// M4.2: диалог подтверждения действия внешнего агента (разрешить/отклонить).
+    fn agent_approval_dialog(&mut self, ctx: &egui::Context) {
+        let pal = theme_colors(ctx.theme());
+        let Some(pending) = self.agent_approval_dialog.as_ref() else { return };
+        let tool = pending.tool.clone();
+        let destructive = pending.destructive;
+        let requested_by = pending.requested_by.clone();
+        let preview = pending.preview();
+        let args_summary = pending.args_json_summary();
+        let id = pending.id;
+        let mut decision: Option<rde_mcp::ApprovalDecision> = None;
+        egui::Window::new("Запрос внешнего агента")
+            .id(egui::Id::new(("rde_agent_approval", id)))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0))
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("Инструмент: {tool}")).strong().color(pal.text));
+                ui.label(RichText::new(format!("Запрос от: {requested_by}")).small().color(pal.muted));
+                if destructive {
+                    ui.label(RichText::new("внимание: деструктивное действие").small().color(pal.amber));
+                }
+                ui.add_space(6.0);
+                if let Some((before, after)) = &preview {
+                    if let Some(before) = before {
+                        ui.label(RichText::new("Было:").small().strong().color(pal.muted));
+                        egui::ScrollArea::vertical().id_salt(("rde_approval_before", id)).max_height(80.0).show(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(before).monospace()).wrap());
+                        });
+                    }
+                    ui.label(RichText::new("Станет:").small().strong().color(pal.muted));
+                    egui::ScrollArea::vertical().id_salt(("rde_approval_after", id)).max_height(140.0).show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(after).monospace()).wrap());
+                    });
+                } else {
+                    ui.label(RichText::new("Аргументы:").small().strong().color(pal.muted));
+                    egui::ScrollArea::vertical().id_salt(("rde_approval_args", id)).max_height(180.0).show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(args_summary).monospace()).wrap());
+                    });
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Перед изменением создаётся чекпоинт (при ошибке — авто-откат); решение пишется в \
+                         аудит. Без ответа через 5 минут — отказ (fail-closed).",
+                    )
+                    .small()
+                    .color(pal.muted),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Разрешить один раз").clicked() {
+                        decision = Some(rde_mcp::ApprovalDecision::AllowOnce);
+                    }
+                    if ui.button("Разрешить в сессии").clicked() {
+                        decision = Some(rde_mcp::ApprovalDecision::AllowSession);
+                    }
+                    if ui.button("Отклонить").clicked() {
+                        decision = Some(rde_mcp::ApprovalDecision::Deny);
+                    }
+                });
+            });
+        if let Some(decision) = decision {
+            self.decide_agent_approval(decision);
+        }
+    }
+
     /// Окна диалогов создания/переименования/удаления.
     fn dialogs(&mut self, ctx: &egui::Context) {
         let pal = theme_colors(ctx.theme());
+        // M4.2: подтверждение действия внешнего агента — модальный диалог поверх остальных.
+        self.agent_approval_dialog(ctx);
         if let Some(mut dialog) = self.create_dialog.take() {
             let mut create = false;
             let mut cancel = false;
@@ -7505,7 +7673,9 @@ fn formula_body_from_state(
 
 impl Drop for RdeApp {
     fn drop(&mut self) {
-        // M4.1: не оставляем открытым встроенный MCP HTTP-порт после закрытия окна/теста.
+        // M4.1/M4.2: не оставляем открытым встроенный MCP HTTP-порт после закрытия окна/теста;
+        // ожидающие approvals отклоняются (fail-closed).
+        self.deny_pending_agent_approvals();
         self.external_agents.stop();
     }
 }
@@ -9121,6 +9291,48 @@ mod agent_server_ui_tests {
         std::fs::create_dir_all(&root).unwrap();
         copy_tree(&rde_core::demo_project_dir(), &root);
         root
+    }
+
+    /// M4.2: запрос агента попадает в диалог, решение пользователя доходит до сервера.
+    #[test]
+    fn gui_approval_dialog_polls_and_decides() {
+        let root = temp_demo_copy("approvals-dialog");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        assert!(app.agent_approval_dialog.is_none());
+        // Сервер (в тесте — напрямую) ставит запрос в очередь approvals.
+        let receiver = app.agent_approvals.enqueue(rde_mcp::ApprovalRequest {
+            tool: "note_write".to_owned(),
+            args_summary: "{\"note_id\":\"01NOTE\"}".to_owned(),
+            args_sha256: "0".repeat(64),
+            destructive: true,
+            requested_by: "mcp".to_owned(),
+            args: Some(serde_json::json!({"note_id": "01NOTE", "content": "# Текст"})),
+        });
+        app.poll_agent_approvals();
+        let dialog = app.agent_approval_dialog.as_ref().expect("диалог показан");
+        assert_eq!(dialog.tool(), "note_write");
+        assert!(dialog.destructive);
+        assert_eq!(dialog.preview().map(|(_, after)| after), Some("# Текст".to_owned()));
+        assert!(dialog.args_json_summary().contains("01NOTE"));
+        // Пользователь разрешает один раз — решение уходит серверу, диалог закрывается.
+        app.decide_agent_approval(rde_mcp::ApprovalDecision::AllowOnce);
+        assert!(app.agent_approval_dialog.is_none());
+        assert_eq!(
+            receiver.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            rde_mcp::ApprovalDecision::AllowOnce
+        );
+        // Отклонение всех ожидающих (выход/выключение доступа) — fail-closed.
+        let _ = app.agent_approvals.enqueue(rde_mcp::ApprovalRequest {
+            tool: "doc_delete".to_owned(),
+            args_summary: "{}".to_owned(),
+            args_sha256: "1".repeat(64),
+            destructive: true,
+            requested_by: "mcp".to_owned(),
+            args: None,
+        });
+        app.deny_pending_agent_approvals();
+        assert_eq!(app.agent_approvals.pending_count(), 0);
     }
 
     /// M4.1: настройка «Разрешить внешним агентам» запускает/останавливает встроенный MCP HTTP.

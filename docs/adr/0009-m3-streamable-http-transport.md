@@ -112,7 +112,7 @@ R-MCP-02 упоминает настройку в UI. В M3 HTTP включае�
 
 - **M4.1 — реализовано** ([ADR-0011](0011-m41-gui-external-agents.md)): GUI-настройка «Разрешить
   внешним агентам» (встроенный HTTP-сервер, показ адреса/токена, старт/стоп) — через
-  `start_http_background`; **M4.2–M4.4**: панель чата/ACP, интерактивные approvals с diff, URI-чипы.
+  `start_http_background`; **M4.2 — реализовано** ([ADR-0012](0012-m42-gui-interactive-approvals.md)): интерактивные GUI-approvals; **M4.3–M4.4**: панель чата/ACP, URI-чипы.
 - **Docker/CI**: `--bind 127.0.0.1:8765 --token-file /run/secrets/rde-mcp-token`; токен не попадает
   в `ps` (в отличие от `--token`).
 - **Внешние клиенты**: Claude Code/др. по streamable HTTP; документация-сниппет (R-MCP-06) — ниже и в README.

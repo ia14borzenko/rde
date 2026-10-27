@@ -210,7 +210,7 @@ Jobs **не переживают перезапуск** процесса (M2, д
 | Настройки/авторы проекта | — | ✗ M3 |
 | Откат транзакции store | — | ✗ M3 |
 | HTTP-доступ внешних агентов | streamable HTTP (transport, не инструмент) | ✓ M3 (loopback+bearer, ADR-0009) |
-| GUI-диалог approval с diff | — (headless grants) | ✗ M4 (`ApprovalHook` готов) |
+| GUI-диалог approval с превью | `ApprovalHook` в GUI (`GuiApprovalHook`) | ✓ M4.2 (AllowOnce/AllowSession/Deny; ADR-0012) |
 
 ## Отклонённые альтернативы
 

@@ -3975,6 +3975,7 @@ dependencies = [
 name = "rde-ui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "egui",
  "egui_kittest",
  "image",
@@ -3992,6 +3993,7 @@ dependencies = [
  "rde-templates",
  "rde-vcs",
  "serde_json",
+ "tokio",
  "toml",
  "ttf-parser",
  "wordcraft-engine",

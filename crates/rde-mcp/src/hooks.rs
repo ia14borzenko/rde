@@ -37,6 +37,10 @@ pub struct ApprovalRequest {
     pub destructive: bool,
     /// Кто просит (`mcp`/`agent`/…).
     pub requested_by: String,
+    /// Полные аргументы вызова (только для in-process approval-хуков: GUI показывает diff/превью;
+    /// в аудит/логи не попадают). `None` — хуку достаточно `args_summary` (CLI-режимы).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
 }
 
 /// Решение по запросу разрешения.
@@ -425,6 +429,7 @@ pub(crate) mod tests {
                 args_sha256: "0".repeat(64),
                 destructive: true,
                 requested_by: "mcp".to_owned(),
+                args: None,
             })
             .await;
         assert_eq!(decision, ApprovalDecision::Deny);
@@ -438,6 +443,7 @@ pub(crate) mod tests {
             args_sha256: "0".repeat(64),
             destructive: true,
             requested_by: "mcp".to_owned(),
+            args: None,
         };
         // --approval=auto: разрешает всё, что допустила политика грантов.
         assert_eq!(AutoApproveHook.request(request("artifact_run")).await, ApprovalDecision::AllowOnce);

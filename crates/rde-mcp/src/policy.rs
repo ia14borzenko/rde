@@ -325,6 +325,8 @@ pub async fn authorize_tool_call(
         args_sha256: args_sha256.clone(),
         destructive: tool.annotations.destructive,
         requested_by: "mcp".to_owned(),
+        // Полные аргументы видит только in-process хук (GUI-диалог с diff); аудит — лишь SHA-256.
+        args: Some(args.clone()),
     };
     match hooks.approvals.request(request).await {
         ApprovalDecision::AllowOnce => Ok(AuthOutcome { reason: "allow_once" }),

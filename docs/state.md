@@ -1252,3 +1252,62 @@ cd rde
 #    доступны 29 инструментов, мутации → RDE_APPROVAL_DENIED (read-only до M4.2); аудит — .rde/agent/audit.log.
 # 4) выключить настройку/сменить проект/закрыть RDE → сервер остановлен, порт закрыт.
 ```
+
+## Обновление 2026-10-27 (M4.2: интерактивные GUI-approvals внешних агентов — мутации с подтверждением)
+
+Веха **M4.2** фазы v0.3 (ТЗ §5.10 R-MCP-05, §8.7.3 R-AGT-05/06,
+[ADR-0012](../docs/adr/0012-m42-gui-interactive-approvals.md)): внешние агенты из GUI могут **менять
+проект**, но только через **интерактивный диалог подтверждения**: пользователь видит, что изменится
+(превью «Было/Станет»), разрешает один раз/в сессии или отклоняет; перед мутацией — чекпоинт, решение —
+в аудит. Fail-closed: таймаут 300 с, закрытие окна, выключение доступа, смена проекта → `Deny`.
+
+| Что | Где |
+|---|---|
+| `rde-mcp`: `ApprovalRequest.args` (полные аргументы — только in-process хуку для превью; аудит по-прежнему SHA-256) | [`crates/rde-mcp/src/hooks.rs`](../crates/rde-mcp/src/hooks.rs), [`policy.rs`](../crates/rde-mcp/src/policy.rs) |
+| `rde-ui`: `GuiApprovals` (очередь `PendingApproval`, `deny_all`), `GuiApprovalHook` (async, ожидание в `tokio::task::spawn_blocking`, таймаут 300 с → `Deny`), `ExternalAgentOptions { allow_mutations, approvals }`; сервер с грантом `project_write` только при двух явных настройках; остановка/перезапуск по режиму | [`crates/rde-ui/src/agent_server.rs`](../crates/rde-ui/src/agent_server.rs) |
+| GUI: вторая галочка «Разрешить агенту изменения в проекте» (доступна при включённом внешнем доступе), диалог «Запрос внешнего агента» с превью «Было/Станет»/аргументами и кнопками «Разрешить один раз/в сессии/Отклонить», `poll_agent_approvals`/`decide_agent_approval`, `deny_all` при выключении/выходе, режим в панели «Агент», статус-бар `MCP: on :порт (rw)` | [`crates/rde-ui/src/lib.rs`](../crates/rde-ui/src/lib.rs) |
+| `rde-core`: `AppSettings.allow_agent_mutations` (default false; старые settings.toml читаются) | [`crates/rde-core/src/settings.rs`](../crates/rde-core/src/settings.rs) |
+| Тесты: `rde-ui` +5 (read-only deny без вызова хука; allow → мутация+чекпоинт на диске; deny → файл байт-в-байт; timeout → deny; GUI-диалог poll/decide) — интеграция через настоящий `start_http_background` + сырой MCP-HTTP `tools/call` | [`crates/rde-ui/src/agent_server.rs`](../crates/rde-ui/src/agent_server.rs), [`lib.rs`](../crates/rde-ui/src/lib.rs) |
+
+**Поток:** внешний агент вызывает мутирующий инструмент → сервер: грант есть → `GuiApprovalHook` →
+запрос в очередь → главный поток egui показывает диалог (tool/деструктивность/превью/аргументы) →
+пользователь решает → сервер выполняет M2-схему (чекпоинт → библиотечная операция → версия в store →
+аудит `decision/reason/checkpoint_id`) или возвращает `RDE_APPROVAL_DENIED`. `AllowSession` кэшируется
+M2-кэшем `(tool, args_sha256)`; `AllowOnce` спрашивает каждый раз. В GUI включён только грант
+`project_write` (документные/заметки/манифесты); `run_script`/`git_commit` из GUI — M4.2b.
+
+**Числа M4.2:** `cargo test --workspace` — **404 passed, 0 failed** (399 + 5); инструменты/бюджет MCP
+не менялись (29 / `tools/list` 38 103 Б / инструкции 8 886 Б); CLI-поведение M2/M3 не изменилось
+(`ApprovalRequest.args` игнорируется CLI-хуками). Headless-скриншот `document` — панель «Агент» без
+регрессий (в выключенном состоянии подсказка про «правки — отдельная галочка»).
+
+**Ограничения (честно):** `run_script`/`git_commit` из GUI не включены (M4.2b: запуск требует
+trusted-проекта и показа кода/окружения, git — сообщения/автора); ACP-агент/чат — M4.3; URI-чипы/
+diff-UI — M4.4; approvals работают только при открытом окне RDE (таймаут → Deny); токен/очередь
+approvals не сохраняются между запусками.
+
+**Следующий шаг:** **M4.2b** — GUI-гранты run/git с подтверждением; **M4.3** — встроенный ACP-агент/
+панель чата (тот же механизм approvals и `EventSink`); **M4.4** — URI-чипы §8.7.2 и diff-UI suggested
+edits; отдельная веха — полные track changes R-DOC-32; M2.7 — run-aware символьные диапазоны.
+
+**Проверить руками (M4.2):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export CARGO_HOME=/home/admin-pc/proj/rde-dev/.cache-tmp/cargo-home
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh test -p rde-mcp -p rde-ui -p rde-host   # хуки + GUI-approvals
+./scripts/build.sh test --workspace                         # 404 passed
+./scripts/build.sh run -p rde                               # GUI: Настройки → «Внешние агенты»
+
+# 1) включить «Разрешить доступ внешним агентам» и «Разрешить агенту изменения в проекте» → «Сохранить»;
+#    панель «Агент»: режим «чтение + правки с подтверждением», статус-бар «MCP: on :порт (rw)».
+# 2) внешним клиентом вызвать мутирующий инструмент (например, note_write или doc_replace_range):
+#    в RDE появится диалог «Запрос внешнего агента» с превью «Было/Станет» → «Разрешить один раз»;
+#    мутация применится, в ответе будет checkpoint_id, чекпоинт — в .rde/agent/checkpoints,
+#    решение — в .rde/agent/audit.log (decision/reason/checkpoint_id).
+# 3) «Отклонить» → RDE_APPROVAL_DENIED, файл не изменён; без ответа 5 мин → отказ (fail-closed).
+# 4) выключить доступ/сменить проект/закрыть RDE → сервер остановлен, ожидающие запросы отклонены.
+```

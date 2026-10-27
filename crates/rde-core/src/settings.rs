@@ -43,6 +43,11 @@ pub struct AppSettings {
     /// по умолчанию выключено; сервер поднимается только на loopback с bearer-токеном.
     #[serde(default)]
     pub allow_external_mcp: bool,
+    /// Разрешить внешним агентам **изменять проект** через MCP — каждое действие подтверждается
+    /// диалогом GUI (M4.2, `ApprovalHook`), с чекпоинтом и аудитом. По умолчанию выключено:
+    /// без него доступ только на чтение (fail-closed, R-MCP-05).
+    #[serde(default)]
+    pub allow_agent_mutations: bool,
 }
 
 fn default_language() -> String {
@@ -70,6 +75,7 @@ impl Default for AppSettings {
             author_email: String::new(),
             show_service_objects: false,
             allow_external_mcp: false,
+            allow_agent_mutations: false,
         }
     }
 }
@@ -166,6 +172,7 @@ mod tests {
         assert_eq!(settings.language, "ru");
         assert_eq!(settings.keep_runs, 200);
         assert!(!settings.allow_external_mcp, "внешние агенты по умолчанию запрещены (fail-closed)");
+        assert!(!settings.allow_agent_mutations, "мутации агента по умолчанию запрещены (fail-closed)");
         save_to(&settings, &path).unwrap();
         let loaded = load_from(&path);
         assert_eq!(loaded, settings);
@@ -179,6 +186,7 @@ mod tests {
         // Старый settings.toml без поля allow_external_mcp → false (аддитивная миграция).
         std::fs::write(&path, "schema = \"rde/settings@1\"\nlanguage = \"ru\"\n").unwrap();
         assert!(!load_from(&path).allow_external_mcp);
+        assert!(!load_from(&path).allow_agent_mutations);
         // Повреждённый файл → defaults, не паника.
         std::fs::write(&path, "not toml [").unwrap();
         assert_eq!(load_from(&path).language, "ru");
