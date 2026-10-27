@@ -717,7 +717,8 @@ mod tests {
             "порядок инструментов стабилен"
         );
         for tool in &first.tools {
-            // M1 read-only инструменты не изменились; M2-мутации — readOnlyHint=false.
+            // M1 read-only инструменты не изменились; M2/M2.5 — readOnlyHint/destructiveHint
+            // из аннотаций реестра (есть мутации неразрушающие: предложения правок).
             let spec = tools::find_tool(tool.name.as_ref()).expect("инструмент из реестра");
             assert_eq!(
                 tool.annotations.as_ref().and_then(|a| a.read_only_hint),
@@ -725,9 +726,12 @@ mod tests {
                 "{}: readOnlyHint",
                 tool.name
             );
-            if !spec.annotations.read_only {
-                assert_eq!(tool.annotations.as_ref().and_then(|a| a.destructive_hint), Some(true), "{}", tool.name);
-            }
+            assert_eq!(
+                tool.annotations.as_ref().and_then(|a| a.destructive_hint),
+                Some(spec.annotations.destructive),
+                "{}: destructiveHint",
+                tool.name
+            );
             assert!(tool.output_schema.is_some(), "{} без outputSchema", tool.name);
             assert!(!tool.input_schema.is_empty(), "{} без inputSchema", tool.name);
         }

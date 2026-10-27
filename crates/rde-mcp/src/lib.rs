@@ -1,4 +1,4 @@
-//! RDE MCP — независимый протокольный слой MCP-сервера RDE (v0.3, вехи M1–M2).
+//! RDE MCP — независимый протокольный слой MCP-сервера RDE (v0.3, вехи M1–M2.5).
 //!
 //! # Зачем отдельный крейт
 //!
@@ -18,12 +18,13 @@
 //!
 //! # Что внутри
 //!
-//! - [`host`] — контракт [`RdeHost`] (синхронный, dyn-совместимый) и [`HostError`]; M2 добавляет
+//! - [`host`] — контракт [`RdeHost`] (синхронный, dyn-совместимый) и [`HostError`]; M2/M2.5 добавляют
 //!   мутирующие методы аддитивно (default-реализации `RDE_UNSUPPORTED` — O1-a);
 //! - [`model`] — DTO/схемы (только они пересекают границу слоя; доменные типы RDE не протекают),
-//!   включая `MutationOutcome`/`JobInfo`/`JobLog`/`ArtifactManifestDto`;
-//! - [`tools`] — статический детерминированный реестр 21 инструмента (13 read-only M1 + 8 мутаций
-//!   M2), их JSON-схемы, аннотации, гранты политики и обработчики;
+//!   включая `MutationOutcome`/`JobInfo`/`JobLog`/`ArtifactManifestDto` (M2) и
+//!   `SuggestedEditInfo`/`DocMutationOutcome`/`DocRevisionInfo` (M2.5);
+//! - [`tools`] — статический детерминированный реестр 27 инструментов (13 read-only M1 + 8 мутаций
+//!   M2 + 6 документных M2.5), их JSON-схемы, аннотации, гранты политики и обработчики;
 //! - [`resources`] — ресурсы `rde://…` и resource-templates;
 //! - [`policy`] — [`McpPolicy`] (fail-closed: гранты `project_write`/`run_script`/`git_commit` по
 //!   умолчанию выключены), сессионный кэш approvals, [`authorize_tool_call`] и headless-режимы

@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use crate::error::HostError;
 use crate::model::{
-    ArtifactDetail, ArtifactInfo, ArtifactManifestDto, DocInfo, DocOutline, DocReadRequest, DocText,
-    FileChunk, FileRange, GitCommitOutcome, GitStatusInfo, JobInfo, JobLog, MutationOutcome, NoteInfo,
-    ObjectNode, SearchHit, SourceInfo, TemplateInfo, WorkspaceInfo,
+    ArtifactDetail, ArtifactInfo, ArtifactManifestDto, DocInfo, DocMutationOutcome, DocOutline, DocReadRequest,
+    DocRevisionInfo, DocText, FileChunk, FileRange, GitCommitOutcome, GitStatusInfo, JobInfo, JobLog,
+    MutationOutcome, NoteInfo, ObjectNode, SearchHit, SourceInfo, SuggestedEditInfo, TemplateInfo, WorkspaceInfo,
 };
 
 /// Хост проекта для MCP-слоя: чтение модели проекта/документов/артефактов/источников,
@@ -163,6 +163,74 @@ pub trait RdeHost: Send + Sync {
     /// публикуются — O6-a). Восстанавливает файлы и корни store; чекпоинт помечается откаченным.
     fn checkpoint_restore(&self, _checkpoint_id: &str) -> Result<MutationOutcome, HostError> {
         Err(unsupported("откат чекпоинта"))
+    }
+
+    // -----------------------------------------------------------------------
+    // M2.5: suggested edits документа, правки блоков и ревизии (R-DOC-32/R-AGT-05).
+    // Правки текста — только по блокам и только с чекпоинтом .doc.rde (A5).
+    // -----------------------------------------------------------------------
+
+    /// Создать предложение правки блока документа (`pending`; документ не меняется).
+    fn doc_suggest_edit(
+        &self,
+        _doc_id: &str,
+        _block_id: &str,
+        _expected_text: &str,
+        _new_text: &str,
+        _note: Option<&str>,
+    ) -> Result<SuggestedEditInfo, HostError> {
+        Err(unsupported("предложение правки документа"))
+    }
+
+    /// Список предложений правок (фильтры необязательные; `limit` уже провалидирован).
+    fn suggestion_list(
+        &self,
+        _doc_id: Option<&str>,
+        _status: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<SuggestedEditInfo>, HostError> {
+        Err(unsupported("список предложений правок"))
+    }
+
+    /// Применить предложение к документу: чекпоинт `.doc.rde` → правка блока → версия в store.
+    fn suggestion_accept(&self, _suggestion_id: &str) -> Result<DocMutationOutcome, HostError> {
+        Err(unsupported("применение предложения правки"))
+    }
+
+    /// Отклонить предложение (документ не меняется).
+    fn suggestion_reject(
+        &self,
+        _suggestion_id: &str,
+        _reason: Option<&str>,
+    ) -> Result<SuggestedEditInfo, HostError> {
+        Err(unsupported("отклонение предложения правки"))
+    }
+
+    /// Прямая правка текста блока (destructive; approval + чекпоинт + версия в store).
+    ///
+    /// `expected_text` — защита от устаревшего чтения, `expected_body_hash` — от внешней правки
+    /// (R-DOC-13). `dry_run` — проверки без записи.
+    #[allow(clippy::too_many_arguments)]
+    fn doc_replace_range(
+        &self,
+        _doc_id: &str,
+        _block_id: &str,
+        _expected_text: &str,
+        _new_text: &str,
+        _expected_body_hash: Option<&str>,
+        _dry_run: bool,
+    ) -> Result<DocMutationOutcome, HostError> {
+        Err(unsupported("правка текста блока документа"))
+    }
+
+    /// История версий документа (ревизии в store, R-DOC-41).
+    fn revision_list(&self, _doc_id: &str, _limit: usize) -> Result<Vec<DocRevisionInfo>, HostError> {
+        Err(unsupported("история версий документа"))
+    }
+
+    /// Восстановить версию документа по ревизии (интерфейс хоста; MCP-инструмента в M2.5 нет).
+    fn revision_restore(&self, _doc_id: &str, _revision_id: &str) -> Result<DocMutationOutcome, HostError> {
+        Err(unsupported("восстановление версии документа"))
     }
 
     /// Отменить активные jobs при shutdown сервера (graceful, A6). По умолчанию — ничего.

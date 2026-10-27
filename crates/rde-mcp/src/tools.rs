@@ -26,7 +26,8 @@ use serde_json::Value;
 use crate::error::HostError;
 use crate::host::RdeHost;
 use crate::model::{
-    ArtifactManifestDto, FileRange, ARTIFACT_SCRIPT_MAX_BYTES, DOC_READ_MAX_BLOCKS, FILE_READ_MAX_BYTES,
+    ArtifactManifestDto, FileRange, ARTIFACT_SCRIPT_MAX_BYTES, DOC_EDIT_MAX_TEXT_CHARS,
+    DOC_LIST_DEFAULT_LIMIT, DOC_LIST_MAX_LIMIT, DOC_READ_MAX_BLOCKS, FILE_READ_MAX_BYTES,
     FILE_READ_MAX_LINES, GIT_COMMIT_MESSAGE_MAX_CHARS, JOB_LOG_DEFAULT_BYTES, JOB_LOG_MAX_BYTES,
     NOTE_WRITE_MAX_BYTES, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT,
 };
@@ -335,6 +336,88 @@ pub struct GitCommitArgs {
     pub dry_run: bool,
 }
 
+/// `doc_suggest_edit`: предложение правки блока документа (changeset, R-AGT-05).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocSuggestEditArgs {
+    /// Стабильный id документа из `doc_list`.
+    pub doc_id: String,
+    /// Стабильный id блока (`b1`, …) из `doc_outline`/`doc_read`.
+    pub block_id: String,
+    /// Ожидаемый текущий текст блока (из `doc_read`; защита от устаревания).
+    pub expected_text: String,
+    /// Предложенный текст блока (непустой, без переводов строк).
+    pub new_text: String,
+    /// Комментарий автора предложения (необязательный).
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `suggestion_list`: список предложений правок.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionListArgs {
+    /// Фильтр по документу.
+    #[serde(default)]
+    pub doc_id: Option<String>,
+    /// Фильтр по статусу: `pending|accepted|rejected`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Сколько вернуть (по умолчанию 20, максимум 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `suggestion_accept`/`suggestion_reject`: id предложения.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionIdArgs {
+    /// Идентификатор предложения из `suggestion_list`.
+    pub suggestion_id: String,
+}
+
+/// `suggestion_reject`: id + причина.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionRejectArgs {
+    /// Идентификатор предложения.
+    pub suggestion_id: String,
+    /// Причина отклонения (необязательная).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `doc_replace_range`: прямая правка текста блока (destructive, approval+checkpoint).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocReplaceRangeArgs {
+    /// Стабильный id документа.
+    pub doc_id: String,
+    /// Стабильный id блока.
+    pub block_id: String,
+    /// Ожидаемый текущий текст блока (R-DOC-13: чужую правку не перезаписываем).
+    pub expected_text: String,
+    /// Новый текст блока (непустой, без переводов строк).
+    pub new_text: String,
+    /// Ожидаемый `body_hash` документа (из `doc_list`): расхождение → `RDE_CONFLICT`.
+    #[serde(default)]
+    pub expected_body_hash: Option<String>,
+    /// Только проверить (документ не меняется).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `revision_list`: история версий документа.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionListArgs {
+    /// Стабильный id документа.
+    pub doc_id: String,
+    /// Сколько версий вернуть (по умолчанию 20, максимум 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // Обработчики
 // ---------------------------------------------------------------------------
@@ -637,6 +720,125 @@ fn git_commit(host: &dyn RdeHost, args: Value) -> Result<Value, HostError> {
     to_json(host.git_commit(message, args.dry_run)?)
 }
 
+// --- M2.5: suggested edits документа / правка блоков / ревизии --------------
+
+/// Проверить текст блока для правки (непустой, ≤4000 chars, без переводов строк).
+fn validate_block_text(what: &str, text: &str) -> Result<(), HostError> {
+    if text.trim().is_empty() {
+        return Err(HostError::invalid_argument(format!("{what} не может быть пустым")));
+    }
+    if text.chars().count() > DOC_EDIT_MAX_TEXT_CHARS {
+        return Err(HostError::out_of_range(format!(
+            "{what}: {} символов больше лимита {DOC_EDIT_MAX_TEXT_CHARS}",
+            text.chars().count()
+        )));
+    }
+    if text.contains('\n') || text.contains('\r') {
+        return Err(HostError::invalid_argument(format!(
+            "{what}: переводы строк не поддерживаются (M2.5 правит один абзац)"
+        ))
+        .with_hint("вставка новых абзацев/переносов — отдельная операция M2.6"));
+    }
+    Ok(())
+}
+
+fn validate_doc_list_limit(limit: Option<usize>) -> Result<usize, HostError> {
+    let limit = limit.unwrap_or(DOC_LIST_DEFAULT_LIMIT);
+    if limit == 0 {
+        return Err(HostError::invalid_argument("limit должен быть больше 0"));
+    }
+    if limit > DOC_LIST_MAX_LIMIT {
+        return Err(HostError::out_of_range(format!(
+            "limit={limit} больше максимума {DOC_LIST_MAX_LIMIT}"
+        )));
+    }
+    Ok(limit)
+}
+
+fn validate_suggestion_status(status: Option<&str>) -> Result<Option<&str>, HostError> {
+    match status.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some("pending" | "accepted" | "rejected") => Ok(status.map(str::trim)),
+        Some(other) => {
+            Err(HostError::invalid_argument(format!("неизвестный статус предложения `{other}`"))
+                .with_hint("допустимо: pending|accepted|rejected"))
+        }
+    }
+}
+
+fn doc_suggest_edit(host: &dyn RdeHost, args: Value) -> Result<Value, HostError> {
+    let args: DocSuggestEditArgs = parse_args(args)?;
+    if args.doc_id.trim().is_empty() {
+        return Err(HostError::invalid_argument("doc_id не может быть пустым"));
+    }
+    if args.block_id.trim().is_empty() {
+        return Err(HostError::invalid_argument("block_id не может быть пустым"));
+    }
+    validate_block_text("expected_text", &args.expected_text)?;
+    validate_block_text("new_text", &args.new_text)?;
+    to_json(host.doc_suggest_edit(
+        &args.doc_id,
+        &args.block_id,
+        &args.expected_text,
+        &args.new_text,
+        args.note.as_deref(),
+    )?)
+}
+
+fn suggestion_list(host: &dyn RdeHost, args: Value) -> Result<Value, HostError> {
+    let args: SuggestionListArgs = parse_args(args)?;
+    let doc_id = args.doc_id.as_deref().map(str::trim).filter(|id| !id.is_empty());
+    let status = validate_suggestion_status(args.status.as_deref())?;
+    let limit = validate_doc_list_limit(args.limit)?;
+    to_json(host.suggestion_list(doc_id, status, limit)?)
+}
+
+fn suggestion_accept(host: &dyn RdeHost, args: Value) -> Result<Value, HostError> {
+    let args: SuggestionIdArgs = parse_args(args)?;
+    if args.suggestion_id.trim().is_empty() {
+        return Err(HostError::invalid_argument("suggestion_id не может быть пустым"));
+    }
+    to_json(host.suggestion_accept(&args.suggestion_id)?)
+}
+
+fn suggestion_reject(host: &dyn RdeHost, args: Value) -> Result<Value, HostError> {
+    let args: SuggestionRejectArgs = parse_args(args)?;
+    if args.suggestion_id.trim().is_empty() {
+        return Err(HostError::invalid_argument("suggestion_id не может быть пустым"));
+    }
+    to_json(host.suggestion_reject(&args.suggestion_id, args.reason.as_deref())?)
+}
+
+fn doc_replace_range(host: &dyn RdeHost, args: Value) -> Result<Value, HostError> {
+    let args: DocReplaceRangeArgs = parse_args(args)?;
+    if args.doc_id.trim().is_empty() {
+        return Err(HostError::invalid_argument("doc_id не может быть пустым"));
+    }
+    if args.block_id.trim().is_empty() {
+        return Err(HostError::invalid_argument("block_id не может быть пустым"));
+    }
+    validate_block_text("expected_text", &args.expected_text)?;
+    validate_block_text("new_text", &args.new_text)?;
+    validate_expected_sha256(args.expected_body_hash.as_deref())?;
+    to_json(host.doc_replace_range(
+        &args.doc_id,
+        &args.block_id,
+        &args.expected_text,
+        &args.new_text,
+        args.expected_body_hash.as_deref(),
+        args.dry_run,
+    )?)
+}
+
+fn revision_list(host: &dyn RdeHost, args: Value) -> Result<Value, HostError> {
+    let args: RevisionListArgs = parse_args(args)?;
+    if args.doc_id.trim().is_empty() {
+        return Err(HostError::invalid_argument("doc_id не может быть пустым"));
+    }
+    let limit = validate_doc_list_limit(args.limit)?;
+    to_json(host.revision_list(&args.doc_id, limit)?)
+}
+
 // ---------------------------------------------------------------------------
 // Реестр (порядок фиксирован — prompt-cache, R-AGT-08)
 // ---------------------------------------------------------------------------
@@ -649,7 +851,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "Workspace",
             description: "Snapshot of the RDE workspace: project id/name, schema version, object counts by kind, trusted flag, stale count. No arguments. Read-only.",
             input_schema: empty_schema,
-            output_schema: || schema_value::<crate::model::WorkspaceInfo>(),
+            output_schema: || schema_value_compact::<crate::model::WorkspaceInfo>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: workspace_current,
@@ -659,7 +861,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "Project tree",
             description: "Flat project tree: group, kind (document|artifact|source|note|repository|formula), stable id, title, detail, freshness, service flag. Max 500 nodes (RDE_OUT_OF_RANGE beyond). No arguments. Read-only.",
             input_schema: empty_schema,
-            output_schema: || schema_value::<Vec<crate::model::ObjectNode>>(),
+            output_schema: || schema_value_compact::<Vec<crate::model::ObjectNode>>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: project_tree,
@@ -669,7 +871,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "Search project",
             description: "Case-insensitive substring search over object ids, titles and manifest fields. Arguments: {\"query\": string, \"limit\"?: integer (default 20, max 100)}. Read-only.",
             input_schema: || schema_value::<ProjectSearchArgs>(),
-            output_schema: || schema_value::<Vec<crate::model::SearchHit>>(),
+            output_schema: || schema_value_compact::<Vec<crate::model::SearchHit>>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: project_search,
@@ -679,7 +881,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "Read project file",
             description: "Read a UTF-8 text file inside the project root. Arguments: {\"path\": string (POSIX relative), \"range\"?: {\"bytes\":{\"offset\",\"limit\"}} or {\"lines\":{\"start\" (1-based),\"count\"}}}. Defaults to first 32 KiB; files larger than 8 MiB require a range; max 256 KiB / 2000 lines per call. Binary files and `.rde/**` are rejected; paths escaping the root give RDE_PATH_ESCAPE. Read-only.",
             input_schema: || schema_value::<FileReadArgs>(),
-            output_schema: || schema_value::<crate::model::FileChunk>(),
+            output_schema: || schema_value_compact::<crate::model::FileChunk>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: file_read,
@@ -689,7 +891,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "List documents",
             description: "List project documents with `.doc.rde` migration status, rde:doc schema version, block and insert counts. No arguments. Read-only; does not modify or migrate anything.",
             input_schema: empty_schema,
-            output_schema: || schema_value::<Vec<crate::model::DocInfo>>(),
+            output_schema: || schema_value_compact::<Vec<crate::model::DocInfo>>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: doc_list,
@@ -699,7 +901,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "Document outline",
             description: "Document outline by stable doc id: blocks (id, kind, title, chars, index), template, rde:doc schema version, insert count. Only `.doc.rde` packages are readable; otherwise RDE_DOC_NOT_MIGRATED (no auto-migration). Arguments: {\"doc_id\": string}. Read-only.",
             input_schema: || schema_value::<DocOutlineArgs>(),
-            output_schema: || schema_value::<crate::model::DocOutline>(),
+            output_schema: || schema_value_compact::<crate::model::DocOutline>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: doc_outline,
@@ -709,7 +911,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "Read document body",
             description: "Read document body text by block ids or block-index range. Arguments: {\"doc_id\": string, \"block_ids\"?: string[], \"start\"?: integer (0-based), \"limit\"?: integer (default 32, max 256)}. Returns blocks and joined text; `truncated` is set when a limit was hit. Read-only.",
             input_schema: || schema_value::<DocReadArgs>(),
-            output_schema: || schema_value::<crate::model::DocText>(),
+            output_schema: || schema_value_compact::<crate::model::DocText>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: doc_read,
@@ -719,7 +921,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "List artifacts",
             description: "List artifacts with ledger status (fresh|stale|never_run|not_computable), stale reason, out_hash/act_key, updated time and output count. Does not run artifacts. No arguments. Read-only.",
             input_schema: empty_schema,
-            output_schema: || schema_value::<Vec<crate::model::ArtifactInfo>>(),
+            output_schema: || schema_value_compact::<Vec<crate::model::ArtifactInfo>>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: artifact_list,
@@ -729,7 +931,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "Artifact detail",
             description: "Artifact detail: manifest fields (type, rebuild, runtime, params, declared outputs, script files, timeout, network policy, groups) plus outputs from the ledger (relative path, size, blob sha256) and live status. Does not run anything. Arguments: {\"artifact_id\": string}. Read-only.",
             input_schema: || schema_value::<ArtifactReadArgs>(),
-            output_schema: || schema_value::<crate::model::ArtifactDetail>(),
+            output_schema: || schema_value_compact::<crate::model::ArtifactDetail>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: artifact_read,
@@ -739,7 +941,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "List sources",
             description: "List sources (file|url|repo) with relative file path, URL, retrieval date and GOST bibliography entry when available. No arguments. Read-only.",
             input_schema: empty_schema,
-            output_schema: || schema_value::<Vec<crate::model::SourceInfo>>(),
+            output_schema: || schema_value_compact::<Vec<crate::model::SourceInfo>>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: source_list,
@@ -749,7 +951,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "List notes",
             description: "List project notes: id, title, relative file path, file size. No arguments. Read-only.",
             input_schema: empty_schema,
-            output_schema: || schema_value::<Vec<crate::model::NoteInfo>>(),
+            output_schema: || schema_value_compact::<Vec<crate::model::NoteInfo>>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: note_list,
@@ -759,7 +961,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "List templates",
             description: "List built-in document templates (GOST 7.32-2017 etc): id, title, description. No arguments. Read-only.",
             input_schema: empty_schema,
-            output_schema: || schema_value::<Vec<crate::model::TemplateInfo>>(),
+            output_schema: || schema_value_compact::<Vec<crate::model::TemplateInfo>>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: template_list,
@@ -769,7 +971,7 @@ fn build_registry() -> Vec<ToolSpec> {
             title: "Git status",
             description: "Read-only git status of the project: git availability, is-repo flag, branch, changed/untracked project files, last commit, ahead count. No arguments. Read-only (no commit/stage).",
             input_schema: empty_schema,
-            output_schema: || schema_value::<crate::model::GitStatusInfo>(),
+            output_schema: || schema_value_compact::<crate::model::GitStatusInfo>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
             handler: git_status,
@@ -855,6 +1057,67 @@ fn build_registry() -> Vec<ToolSpec> {
             grant: Some(ToolGrant::GitCommit),
             handler: git_commit,
         },
+        // --- M2.5: suggested edits документа, правка блоков, ревизии (R-DOC-32) ---
+        ToolSpec {
+            name: "doc_suggest_edit",
+            title: "Suggest document edit",
+            description: "Create a *suggested edit* (changeset) for one document block: the document is NOT modified. Arguments: {\"doc_id\": string, \"block_id\": string (b1,… from doc_outline), \"expected_text\": string (current block text from doc_read), \"new_text\": string (non-empty, single paragraph), \"note\"?: string}. The user accepts/rejects via `suggestion_accept`/`suggestion_reject` (R-AGT-05: no silent overwrite). Requires project-write grant + approval; the document is guarded by expected_text and body_hash. One paragraph only; inserts/fields/figures are RDE_UNSUPPORTED. Insert/delete blocks — M2.6.",
+            input_schema: || schema_value_compact::<DocSuggestEditArgs>(),
+            output_schema: || schema_value_compact::<crate::model::SuggestedEditInfo>(),
+            annotations: ToolAnnotationsSpec::mutating(false),
+            grant: Some(ToolGrant::ProjectWrite),
+            handler: doc_suggest_edit,
+        },
+        ToolSpec {
+            name: "suggestion_list",
+            title: "List document suggestions",
+            description: "List pending/accepted/rejected suggested edits (newest first). Arguments: {\"doc_id\"?: string, \"status\"?: \"pending|accepted|rejected\", \"limit\"?: integer (default 20, max 100)}. Read-only.",
+            input_schema: || schema_value_compact::<SuggestionListArgs>(),
+            output_schema: || schema_value_compact::<Vec<crate::model::SuggestedEditInfo>>(),
+            annotations: ToolAnnotationsSpec::read_only(),
+            grant: None,
+            handler: suggestion_list,
+        },
+        ToolSpec {
+            name: "suggestion_accept",
+            title: "Accept document suggestion",
+            description: "Apply a suggested edit to the document: checkpoint `.doc.rde` → replace the block text → commit a document revision to the store. Arguments: {\"suggestion_id\": string}. Fails with RDE_CONFLICT if the suggestion was already resolved or the document changed since it was created (body_hash/expected_text). Requires project-write grant + approval.",
+            input_schema: || schema_value_compact::<SuggestionIdArgs>(),
+            output_schema: || schema_value_compact::<crate::model::DocMutationOutcome>(),
+            annotations: ToolAnnotationsSpec::mutating(true),
+            grant: Some(ToolGrant::ProjectWrite),
+            handler: suggestion_accept,
+        },
+        ToolSpec {
+            name: "suggestion_reject",
+            title: "Reject document suggestion",
+            description: "Reject a suggested edit (the document is not modified). Arguments: {\"suggestion_id\": string, \"reason\"?: string}. Requires project-write grant + approval; resolved suggestions cannot be re-resolved (RDE_CONFLICT).",
+            input_schema: || schema_value_compact::<SuggestionRejectArgs>(),
+            output_schema: || schema_value_compact::<crate::model::SuggestedEditInfo>(),
+            annotations: ToolAnnotationsSpec::mutating(false),
+            grant: Some(ToolGrant::ProjectWrite),
+            handler: suggestion_reject,
+        },
+        ToolSpec {
+            name: "doc_replace_range",
+            title: "Replace document block text",
+            description: "Directly replace one document block's paragraph text (destructive; use `doc_suggest_edit` when the user must review). Arguments: {\"doc_id\": string, \"block_id\": string, \"expected_text\": string (current text), \"new_text\": string (non-empty, single paragraph), \"expected_body_hash\"?: string (from doc_list), \"dry_run\"?: bool}. Checkpoint `.doc.rde` + approval; RDE_CONFLICT on stale text/body hash or external edit (R-DOC-13). Requires project-write grant; commits a document revision.",
+            input_schema: || schema_value_compact::<DocReplaceRangeArgs>(),
+            output_schema: || schema_value_compact::<crate::model::DocMutationOutcome>(),
+            annotations: ToolAnnotationsSpec::mutating(true),
+            grant: Some(ToolGrant::ProjectWrite),
+            handler: doc_replace_range,
+        },
+        ToolSpec {
+            name: "revision_list",
+            title: "Document revisions",
+            description: "History of document versions (each accept/replace commits a revision to the project store, R-DOC-41). Arguments: {\"doc_id\": string, \"limit\"?: integer (default 20, max 100)}. Returns revision_id, created_unix, note, root_hash, current flag; restore is an RDE-side operation (MCP tool not published in M2.5). Read-only.",
+            input_schema: || schema_value_compact::<RevisionListArgs>(),
+            output_schema: || schema_value_compact::<Vec<crate::model::DocRevisionInfo>>(),
+            annotations: ToolAnnotationsSpec::read_only(),
+            grant: None,
+            handler: revision_list,
+        },
     ]
 }
 
@@ -910,11 +1173,26 @@ mod tests {
         "git_commit",
     ];
 
+    /// M2.5 инструменты документа (suggested edits/правки/ревизии) — в конец после M2.
+    const M25_TOOLS: [&str; 6] = [
+        "doc_suggest_edit",
+        "suggestion_list",
+        "suggestion_accept",
+        "suggestion_reject",
+        "doc_replace_range",
+        "revision_list",
+    ];
+
     #[test]
     fn registry_order_is_deterministic_and_within_budget() {
         let names: Vec<&str> = tool_registry().iter().map(|tool| tool.name).collect();
-        let expected: Vec<&str> = M1_TOOLS.iter().chain(M2_TOOLS.iter()).copied().collect();
-        assert_eq!(names, expected, "порядок: M1-набор не переставлен, M2 — в конце");
+        let expected: Vec<&str> = M1_TOOLS
+            .iter()
+            .chain(M2_TOOLS.iter())
+            .chain(M25_TOOLS.iter())
+            .copied()
+            .collect();
+        assert_eq!(names, expected, "порядок: M1/M2-наборы не переставлены, M2.5 — в конце");
         // Два независимых построения дают одинаковый порядок (детерминизм, не HashMap).
         let again: Vec<&str> = build_registry().iter().map(|tool| tool.name).collect();
         assert_eq!(names, again);
@@ -932,7 +1210,6 @@ mod tests {
                 assert!(!tool.annotations.destructive, "read-only `{}` не destructive", tool.name);
             } else {
                 assert!(tool.grant.is_some(), "мутирующий `{}` обязан объявить грант", tool.name);
-                assert!(tool.annotations.destructive, "мутирующий `{}` должен быть destructive", tool.name);
             }
         }
     }
@@ -944,7 +1221,7 @@ mod tests {
             assert!(tool.annotations.read_only, "{name} должен остаться read-only");
             assert!(!tool.annotations.destructive, "{name} не может быть destructive");
         }
-        // M2: ровно 6 мутирующих и 2 read-only служебных (run_status/run_log).
+        // Мутирующие: M2 (6 деструктивных) + M2.5 (2 деструктивных, 2 недеструктивных).
         let mutating: Vec<&str> = tool_registry()
             .iter()
             .filter(|tool| !tool.annotations.read_only)
@@ -959,6 +1236,28 @@ mod tests {
                 "run_cancel",
                 "note_write",
                 "git_commit",
+                "doc_suggest_edit",
+                "suggestion_accept",
+                "suggestion_reject",
+                "doc_replace_range",
+            ]
+        );
+        let destructive: Vec<&str> = tool_registry()
+            .iter()
+            .filter(|tool| tool.annotations.destructive)
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(
+            destructive,
+            vec![
+                "artifact_write_manifest",
+                "artifact_write_script",
+                "artifact_run",
+                "run_cancel",
+                "note_write",
+                "git_commit",
+                "suggestion_accept",
+                "doc_replace_range",
             ]
         );
     }
@@ -971,6 +1270,10 @@ mod tests {
         assert_eq!(find_tool("artifact_run").unwrap().grant, Some(ToolGrant::RunScript));
         assert_eq!(find_tool("run_cancel").unwrap().grant, Some(ToolGrant::RunScript));
         assert_eq!(find_tool("git_commit").unwrap().grant, Some(ToolGrant::GitCommit));
+        // M2.5: документные правки — под грантом записи в проект.
+        for name in ["doc_suggest_edit", "suggestion_accept", "suggestion_reject", "doc_replace_range"] {
+            assert_eq!(find_tool(name).unwrap().grant, Some(ToolGrant::ProjectWrite), "{name}");
+        }
     }
 
     #[test]
@@ -1017,6 +1320,19 @@ mod tests {
         assert!(schema_accepts::<ArtifactWriteScriptArgs>(serde_json::json!({
             "artifact_id": "01ART", "file": "compute.py", "content": "print(1)"
         })));
+        // M2.5: документные инструменты.
+        assert!(schema_accepts::<DocSuggestEditArgs>(serde_json::json!({
+            "doc_id": "01DOC", "block_id": "b2",
+            "expected_text": "старый", "new_text": "новый", "note": "из MCP"
+        })));
+        assert!(schema_accepts::<DocReplaceRangeArgs>(serde_json::json!({
+            "doc_id": "01DOC", "block_id": "b2", "expected_text": "a", "new_text": "b",
+            "expected_body_hash": "0".repeat(64), "dry_run": true
+        })));
+        assert!(schema_accepts::<SuggestionListArgs>(serde_json::json!({"status": "pending", "limit": 10})));
+        assert!(schema_accepts::<SuggestionIdArgs>(serde_json::json!({"suggestion_id": "01SUG"})));
+        assert!(schema_accepts::<RevisionListArgs>(serde_json::json!({"doc_id": "01DOC"})));
+        assert!(!schema_accepts::<DocSuggestEditArgs>(serde_json::json!({"doc_id": "01DOC"})));
     }
 
     #[test]
@@ -1094,6 +1410,101 @@ mod tests {
 
         let commit = git_commit(host.as_ref(), serde_json::json!({"message": "M2"})).expect("mock git commit");
         assert_eq!(commit["files"], 1);
+    }
+
+    #[test]
+    fn document_handlers_suggest_accept_reject_and_revisions() {
+        let host = host();
+        // Создание предложения — без изменения документа (dry-семантика на mock).
+        let suggestion = doc_suggest_edit(
+            host.as_ref(),
+            serde_json::json!({
+                "doc_id": "doc-1",
+                "block_id": "b2",
+                "expected_text": "Старый текст блока",
+                "new_text": "Новый текст блока",
+                "note": "M2.5"
+            }),
+        )
+        .expect("предложение создаётся");
+        assert_eq!(suggestion["status"], "pending");
+        assert_eq!(suggestion["author_kind"], "agent");
+        assert!(host.mutation_log().iter().any(|entry| entry.starts_with("doc_suggest_edit:doc-1:b2")));
+
+        let list = suggestion_list(host.as_ref(), serde_json::json!({"doc_id": "doc-1", "status": "pending"}))
+            .expect("список предложений");
+        assert_eq!(list.as_array().map(Vec::len), Some(1));
+
+        let accepted = suggestion_accept(host.as_ref(), serde_json::json!({"suggestion_id": "01SUG"}))
+            .expect("применение предложения");
+        assert_eq!(accepted["doc_id"], "doc-1");
+        assert_eq!(accepted["checkpoint_id"], crate::test_support::MOCK_CHECKPOINT_ID);
+        assert_eq!(accepted["revision_id"], crate::test_support::MOCK_REVISION_ID);
+
+        let rejected = suggestion_reject(
+            host.as_ref(),
+            serde_json::json!({"suggestion_id": "01SUG", "reason": "не нужно"}),
+        )
+        .expect("отклонение предложения");
+        assert_eq!(rejected["status"], "rejected");
+
+        // Прямая правка блока: dry_run не пишет, реальная — чекпоинт+ревизия.
+        let dry = doc_replace_range(
+            host.as_ref(),
+            serde_json::json!({
+                "doc_id": "doc-1", "block_id": "b2",
+                "expected_text": "Старый текст блока", "new_text": "Новый текст блока",
+                "dry_run": true
+            }),
+        )
+        .expect("dry-run правки");
+        assert_eq!(dry["dry_run"], true);
+        assert!(dry.get("checkpoint_id").is_none());
+        let real = doc_replace_range(
+            host.as_ref(),
+            serde_json::json!({
+                "doc_id": "doc-1", "block_id": "b2",
+                "expected_text": "Старый текст блока", "new_text": "Новый текст блока",
+                "expected_body_hash": "e".repeat(64)
+            }),
+        )
+        .expect("правка блока");
+        assert_eq!(real["block_id"], "b2");
+        assert!(real["checkpoint_id"].is_string());
+
+        let revisions = revision_list(host.as_ref(), serde_json::json!({"doc_id": "doc-1"}))
+            .expect("история версий");
+        assert_eq!(revisions.as_array().map(Vec::len), Some(1));
+        assert_eq!(revisions[0]["current"], true);
+    }
+
+    #[test]
+    fn document_handlers_validate_arguments() {
+        let host = host();
+        for args in [
+            serde_json::json!({"doc_id": "doc-1", "block_id": "b1", "expected_text": "x", "new_text": "y\nz"}),
+            serde_json::json!({"doc_id": "doc-1", "block_id": "b1", "expected_text": "", "new_text": "y"}),
+            serde_json::json!({"doc_id": "doc-1", "block_id": "b1", "expected_text": "x", "new_text": "y", "bogus": 1}),
+        ] {
+            let error = doc_suggest_edit(host.as_ref(), args.clone()).expect_err("невалидные аргументы");
+            assert_eq!(error.code, crate::error::RdeErrorCode::InvalidArgument, "{args}: {error}");
+        }
+        let error = doc_replace_range(
+            host.as_ref(),
+            serde_json::json!({
+                "doc_id": "doc-1", "block_id": "b1",
+                "expected_text": "x", "new_text": "y",
+                "expected_body_hash": "zzz"
+            }),
+        )
+        .expect_err("некорректный body hash");
+        assert_eq!(error.code, crate::error::RdeErrorCode::InvalidArgument);
+        let error = suggestion_list(host.as_ref(), serde_json::json!({"status": "unknown"}))
+            .expect_err("неизвестный статус");
+        assert_eq!(error.code, crate::error::RdeErrorCode::InvalidArgument);
+        let error = suggestion_list(host.as_ref(), serde_json::json!({"limit": 1000}))
+            .expect_err("лимит списка");
+        assert_eq!(error.code, crate::error::RdeErrorCode::OutOfRange);
     }
 
     #[test]

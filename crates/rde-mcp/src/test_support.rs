@@ -7,15 +7,20 @@ use std::sync::{Arc, Mutex};
 use crate::error::HostError;
 use crate::host::RdeHost;
 use crate::model::{
-    ArtifactDetail, ArtifactInfo, ArtifactManifestDto, ArtifactRuntimeInfo, DocInfo, DocOutline, DocReadRequest,
-    DocText, DocTextBlock, FileChunk, GitCommitInfo, GitCommitOutcome, GitStatusInfo, JobInfo, JobLog,
-    MutationOutcome, NoteInfo, ObjectNode, OutlineBlock, SearchHit, SourceInfo, TemplateInfo, WorkspaceInfo,
+    ArtifactDetail, ArtifactInfo, ArtifactManifestDto, ArtifactRuntimeInfo, DocInfo, DocMutationOutcome,
+    DocOutline, DocReadRequest, DocRevisionInfo, DocText, DocTextBlock, FileChunk, GitCommitInfo,
+    GitCommitOutcome, GitStatusInfo, JobInfo, JobLog, MutationOutcome, NoteInfo, ObjectNode, OutlineBlock,
+    SearchHit, SourceInfo, SuggestedEditInfo, TemplateInfo, WorkspaceInfo,
 };
 
 /// Id «job'а» mock-хоста (детерминированный; тесты tools/сервера).
 pub(crate) const MOCK_JOB_ID: &str = "01MOCKJOB000000000000000000";
 /// Id «чекпоинта» mock-хоста.
 pub(crate) const MOCK_CHECKPOINT_ID: &str = "01MOCKCHECKPOINT00000000000";
+/// Id «предложения правки» mock-хоста.
+pub(crate) const MOCK_SUGGESTION_ID: &str = "01MOCKSUGGESTION0000000000";
+/// Id «ревизии документа» mock-хоста.
+pub(crate) const MOCK_REVISION_ID: &str = "01MOCKREVISION000000000000";
 
 /// Синтетический хост: стабильные данные о «проекте» из трёх объектов.
 #[derive(Clone, Debug)]
@@ -106,6 +111,40 @@ impl MockHost {
             message: format!("mock job: {state}"),
         }
     }
+
+    fn suggestion_info(&self, doc_id: &str, block_id: &str, status: &str) -> SuggestedEditInfo {
+        SuggestedEditInfo {
+            id: MOCK_SUGGESTION_ID.to_owned(),
+            doc_id: doc_id.to_owned(),
+            block_id: block_id.to_owned(),
+            status: status.to_owned(),
+            before: "Старый текст блока".to_owned(),
+            after: "Новый текст блока".to_owned(),
+            author: "MCP agent".to_owned(),
+            author_kind: "agent".to_owned(),
+            created_unix: 1_700_000_000,
+            base_body_hash: "c".repeat(64),
+            para_id: Some("12345678".to_owned()),
+            note: Some("mock note".to_owned()),
+            resolved_unix: if status == "pending" { None } else { Some(1_700_000_020) },
+            resolution: if status == "pending" { None } else { Some(status.to_owned()) },
+        }
+    }
+
+    fn doc_outcome(&self, doc_id: &str, block_id: Option<&str>, dry_run: bool) -> DocMutationOutcome {
+        DocMutationOutcome {
+            dry_run,
+            checkpoint_id: if dry_run { None } else { Some(MOCK_CHECKPOINT_ID.to_owned()) },
+            changed_files: if dry_run { Vec::new() } else { vec!["objects/documents/01DOC/report.doc.rde".to_owned()] },
+            doc_id: doc_id.to_owned(),
+            block_id: block_id.map(str::to_owned),
+            before: block_id.map(|_| "Старый текст блока".to_owned()),
+            after: block_id.map(|_| "Новый текст блока".to_owned()),
+            body_hash: Some("d".repeat(64)),
+            revision_id: if dry_run { None } else { Some(MOCK_REVISION_ID.to_owned()) },
+            detail: None,
+        }
+    }
 }
 
 fn node(index: usize) -> ObjectNode {
@@ -188,6 +227,7 @@ impl RdeHost for MockHost {
             schema_version: Some("2".to_owned()),
             blocks: Some(2),
             inserts: Some(1),
+            body_hash: Some("b".repeat(64)),
         }])
     }
 
@@ -435,6 +475,95 @@ impl RdeHost for MockHost {
             changed_files: vec!["objects/artifacts/art-1/artifact.toml".to_owned()],
             detail: Some("чекпоинт откачен".to_owned()),
         })
+    }
+
+    // --- M2.5: suggested edits документа / правки блоков / ревизии -------------
+
+    fn doc_suggest_edit(
+        &self,
+        doc_id: &str,
+        block_id: &str,
+        _expected_text: &str,
+        _new_text: &str,
+        _note: Option<&str>,
+    ) -> Result<SuggestedEditInfo, HostError> {
+        if doc_id != "doc-1" {
+            return Err(HostError::not_found("документ не найден"));
+        }
+        if block_id == "b999" {
+            return Err(HostError::not_found("блок не найден"));
+        }
+        self.record(format!("doc_suggest_edit:{doc_id}:{block_id}"));
+        Ok(self.suggestion_info(doc_id, block_id, "pending"))
+    }
+
+    fn suggestion_list(
+        &self,
+        doc_id: Option<&str>,
+        status: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<SuggestedEditInfo>, HostError> {
+        if doc_id.is_some_and(|doc_id| doc_id != "doc-1") {
+            return Ok(Vec::new());
+        }
+        Ok(vec![self.suggestion_info("doc-1", "b2", status.unwrap_or("pending"))])
+    }
+
+    fn suggestion_accept(&self, suggestion_id: &str) -> Result<DocMutationOutcome, HostError> {
+        if suggestion_id == "01NOSUCH" {
+            return Err(HostError::not_found("предложение не найдено"));
+        }
+        self.record(format!("suggestion_accept:{suggestion_id}"));
+        Ok(self.doc_outcome("doc-1", Some("b2"), false))
+    }
+
+    fn suggestion_reject(
+        &self,
+        suggestion_id: &str,
+        _reason: Option<&str>,
+    ) -> Result<SuggestedEditInfo, HostError> {
+        if suggestion_id == "01NOSUCH" {
+            return Err(HostError::not_found("предложение не найдено"));
+        }
+        self.record(format!("suggestion_reject:{suggestion_id}"));
+        Ok(self.suggestion_info("doc-1", "b2", "rejected"))
+    }
+
+    fn doc_replace_range(
+        &self,
+        doc_id: &str,
+        block_id: &str,
+        _expected_text: &str,
+        _new_text: &str,
+        _expected_body_hash: Option<&str>,
+        dry_run: bool,
+    ) -> Result<DocMutationOutcome, HostError> {
+        if doc_id != "doc-1" {
+            return Err(HostError::not_found("документ не найден"));
+        }
+        if !dry_run {
+            self.record(format!("doc_replace_range:{doc_id}:{block_id}"));
+        }
+        Ok(self.doc_outcome(doc_id, Some(block_id), dry_run))
+    }
+
+    fn revision_list(&self, doc_id: &str, _limit: usize) -> Result<Vec<DocRevisionInfo>, HostError> {
+        if doc_id != "doc-1" {
+            return Err(HostError::not_found("документ не найден"));
+        }
+        Ok(vec![DocRevisionInfo {
+            revision_id: MOCK_REVISION_ID.to_owned(),
+            doc_id: doc_id.to_owned(),
+            created_unix: 1_700_000_000,
+            note: "mock revision".to_owned(),
+            root_hash: Some("e".repeat(64)),
+            current: true,
+        }])
+    }
+
+    fn revision_restore(&self, doc_id: &str, revision_id: &str) -> Result<DocMutationOutcome, HostError> {
+        self.record(format!("revision_restore:{doc_id}:{revision_id}"));
+        Ok(self.doc_outcome(doc_id, None, false))
     }
 
     fn instructions(&self) -> Result<String, HostError> {

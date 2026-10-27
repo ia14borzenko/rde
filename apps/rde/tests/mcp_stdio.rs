@@ -29,8 +29,8 @@ struct RdeTestClient;
 
 impl ClientHandler for RdeTestClient {}
 
-/// Ожидаемый каталог M2: M1-набор не переставлен, мутации — в конце (prompt-cache).
-const EXPECTED_TOOLS: [&str; 21] = [
+/// Ожидаемый каталог M2.5: M1/M2-наборы не переставлены, новые инструменты — в конце.
+const EXPECTED_TOOLS: [&str; 27] = [
     // M1 (read-only)
     "workspace_current",
     "project_tree",
@@ -54,16 +54,39 @@ const EXPECTED_TOOLS: [&str; 21] = [
     "run_log",
     "note_write",
     "git_commit",
+    // M2.5 (документные suggested edits/правки/ревизии)
+    "doc_suggest_edit",
+    "suggestion_list",
+    "suggestion_accept",
+    "suggestion_reject",
+    "doc_replace_range",
+    "revision_list",
 ];
 
-/// Мутирующие инструменты M2 (readOnlyHint=false).
-const MUTATING_TOOLS: [&str; 6] = [
+/// Мутирующие инструменты (readOnlyHint=false).
+const MUTATING_TOOLS: [&str; 10] = [
     "artifact_write_manifest",
     "artifact_write_script",
     "artifact_run",
     "run_cancel",
     "note_write",
     "git_commit",
+    "doc_suggest_edit",
+    "suggestion_accept",
+    "suggestion_reject",
+    "doc_replace_range",
+];
+
+/// Деструктивные мутации (destructiveHint=true).
+const DESTRUCTIVE_TOOLS: [&str; 8] = [
+    "artifact_write_manifest",
+    "artifact_write_script",
+    "artifact_run",
+    "run_cancel",
+    "note_write",
+    "git_commit",
+    "suggestion_accept",
+    "doc_replace_range",
 ];
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -202,7 +225,11 @@ async fn external_client_reads_project_document_artifacts_and_audits_calls() {
         assert!(tool.output_schema.is_some(), "{name} без outputSchema");
         if MUTATING_TOOLS.contains(&name) {
             assert_eq!(annotations.read_only_hint, Some(false), "{name}: readOnlyHint");
-            assert_eq!(annotations.destructive_hint, Some(true), "{name}: destructiveHint");
+            assert_eq!(
+                annotations.destructive_hint,
+                Some(DESTRUCTIVE_TOOLS.contains(&name)),
+                "{name}: destructiveHint"
+            );
         } else {
             assert_eq!(annotations.read_only_hint, Some(true), "{name}: readOnlyHint");
             assert_eq!(annotations.destructive_hint, Some(false), "{name}: destructiveHint");
@@ -593,4 +620,236 @@ fn non_mcp_arguments_do_not_touch_mcp_path() {
         .expect("запуск rde mcp api");
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("mcp serve"));
+}
+
+// --- M2.5: suggested edits документа / правки блоков / ревизии (e2e) ---------
+
+/// Мигрированный документ демо-проекта: `(doc_id, body_hash, относительный путь файла)`.
+async fn migrated_document(
+    client: &RunningService<RoleClient, RdeTestClient>,
+) -> (String, String, String) {
+    let documents = call(client, "doc_list", json!({})).await;
+    let document = structured(&documents)
+        .as_array()
+        .and_then(|documents| documents.iter().find(|document| document["migrated"] == true))
+        .expect("мигрированный документ демо-проекта")
+        .clone();
+    let doc_id = document["id"].as_str().expect("doc id").to_owned();
+    let body_hash = document["body_hash"].as_str().expect("body_hash (M2.5)").to_owned();
+    let file = document["file"].as_str().expect("file").to_owned();
+    (doc_id, body_hash, file)
+}
+
+/// Блоки документа с полным текстом.
+async fn document_blocks(
+    client: &RunningService<RoleClient, RdeTestClient>,
+    doc_id: &str,
+) -> Vec<Value> {
+    let body = call(
+        client,
+        "doc_read",
+        json!({"doc_id": doc_id, "start": 0, "limit": 256}),
+    )
+    .await;
+    structured(&body)["blocks"].as_array().cloned().unwrap_or_default()
+}
+
+/// Найти простой редактируемый абзац: `doc_replace_range` с `dry_run` — единственная безопасная
+/// проверка редактируемости (вставки/поля/рисунки вернут RDE_UNSUPPORTED).
+async fn editable_block(
+    client: &RunningService<RoleClient, RdeTestClient>,
+    doc_id: &str,
+    skip: &[String],
+) -> (String, String) {
+    for block in document_blocks(client, doc_id).await {
+        let id = block["id"].as_str().unwrap_or_default().to_owned();
+        let text = block["text"].as_str().unwrap_or_default().to_owned();
+        if skip.contains(&id) || text.chars().count() < 10 || text.chars().count() > 200 {
+            continue;
+        }
+        let dry = call(
+            client,
+            "doc_replace_range",
+            json!({"doc_id": doc_id, "block_id": id, "expected_text": text, "new_text": text, "dry_run": true}),
+        )
+        .await;
+        if dry.is_error != Some(true) {
+            return (id, text);
+        }
+    }
+    panic!("в демо-документе нет простого редактируемого абзаца");
+}
+
+#[tokio::test]
+async fn document_suggestions_edits_and_revisions_e2e() {
+    let root = demo_copy("doc-m25");
+    let client = connect_with(&root, &["--approval=auto"]).await;
+    let (doc_id, body_hash, file) = migrated_document(&client).await;
+    assert_eq!(body_hash.len(), 64, "body_hash — sha256 hex");
+    let package = root.join(&file);
+    let before_bytes = std::fs::read(&package).unwrap();
+    let (block_id, block_text) = editable_block(&client, &doc_id, &[]).await;
+
+    // 1) Предложение: документ НЕ меняется.
+    let suggestion = call(
+        &client,
+        "doc_suggest_edit",
+        json!({
+            "doc_id": doc_id,
+            "block_id": block_id,
+            "expected_text": block_text,
+            "new_text": "Текст, предложенный MCP-агентом",
+            "note": "e2e M2.5"
+        }),
+    )
+    .await;
+    assert_eq!(suggestion.is_error, Some(false), "doc_suggest_edit: {suggestion:?}");
+    let suggestion_info = structured(&suggestion).clone();
+    let suggestion_id = suggestion_info["id"].as_str().expect("suggestion id").to_owned();
+    assert_eq!(suggestion_info["status"], "pending");
+    assert_eq!(std::fs::read(&package).unwrap(), before_bytes, "предложение не меняет документ");
+
+    // 2) Список: pending-предложение видно.
+    let list = call(&client, "suggestion_list", json!({"doc_id": doc_id, "status": "pending"})).await;
+    assert_eq!(structured(&list).as_array().map(Vec::len), Some(1));
+    assert_eq!(structured(&list)[0]["id"], suggestion_id);
+
+    // 3) Принятие: чекпоинт + ревизия + правка документа.
+    let accepted = call(&client, "suggestion_accept", json!({"suggestion_id": suggestion_id})).await;
+    assert_eq!(accepted.is_error, Some(false), "suggestion_accept: {accepted:?}");
+    let outcome = structured(&accepted).clone();
+    let checkpoint_id = outcome["checkpoint_id"].as_str().expect("checkpoint_id").to_owned();
+    let revision_id = outcome["revision_id"].as_str().expect("revision_id").to_owned();
+    assert_eq!(outcome["after"], "Текст, предложенный MCP-агентом");
+    assert!(root.join(".rde/agent/checkpoints").join(&checkpoint_id).join("manifest.json").is_file());
+    let blocks = document_blocks(&client, &doc_id).await;
+    let block = blocks.iter().find(|block| block["id"] == block_id.as_str()).expect("блок");
+    assert_eq!(block["text"], "Текст, предложенный MCP-агентом");
+    // Аудит: allow + checkpoint_id (R-AGT-05).
+    let entries = audit_entries(&root);
+    let audit_entry = entries
+        .iter()
+        .find(|entry| entry["tool"] == "suggestion_accept" && entry["decision"] == "allow")
+        .expect("аудит применения предложения");
+    assert_eq!(audit_entry["checkpoint_id"], checkpoint_id);
+    // Ревизия видна и текущая.
+    let revisions = call(&client, "revision_list", json!({"doc_id": doc_id})).await;
+    let revisions = structured(&revisions).as_array().cloned().unwrap_or_default();
+    assert!(revisions.iter().any(|revision| revision["revision_id"] == revision_id.as_str()
+        && revision["current"] == true), "ревизии: {revisions:?}");
+
+    // 4) Прямая правка: успех с актуальным body_hash, конфликты при устаревших ожиданиях.
+    let documents = call(&client, "doc_list", json!({})).await;
+    let current_hash = structured(&documents)
+        .as_array()
+        .and_then(|documents| documents.iter().find(|document| document["id"] == doc_id.as_str()))
+        .and_then(|document| document["body_hash"].as_str())
+        .expect("body_hash после правки")
+        .to_owned();
+    let direct = call(
+        &client,
+        "doc_replace_range",
+        json!({
+            "doc_id": doc_id,
+            "block_id": block_id,
+            "expected_text": "Текст, предложенный MCP-агентом",
+            "new_text": "Прямая правка M2.5",
+            "expected_body_hash": current_hash
+        }),
+    )
+    .await;
+    assert_eq!(direct.is_error, Some(false), "doc_replace_range: {direct:?}");
+    let conflict = call(
+        &client,
+        "doc_replace_range",
+        json!({
+            "doc_id": doc_id,
+            "block_id": block_id,
+            "expected_text": "Текст, предложенный MCP-агентом",
+            "new_text": "не применится"
+        }),
+    )
+    .await;
+    assert_eq!(error_code(&conflict), "RDE_CONFLICT", "устаревший expected_text");
+    let conflict_hash = call(
+        &client,
+        "doc_replace_range",
+        json!({
+            "doc_id": doc_id,
+            "block_id": block_id,
+            "expected_text": "Прямая правка M2.5",
+            "new_text": "не применится",
+            "expected_body_hash": "0".repeat(64)
+        }),
+    )
+    .await;
+    assert_eq!(error_code(&conflict_hash), "RDE_CONFLICT", "устаревший body_hash");
+
+    // 5) Отклонение предложения документ не меняет.
+    let bytes_before_reject = std::fs::read(&package).unwrap();
+    let second = call(
+        &client,
+        "doc_suggest_edit",
+        json!({
+            "doc_id": doc_id,
+            "block_id": block_id,
+            "expected_text": "Прямая правка M2.5",
+            "new_text": "Отклоняемый вариант"
+        }),
+    )
+    .await;
+    assert_eq!(second.is_error, Some(false), "{second:?}");
+    let second_id = structured(&second)["id"].as_str().unwrap().to_owned();
+    let rejected = call(&client, "suggestion_reject", json!({"suggestion_id": second_id, "reason": "e2e"})).await;
+    assert_eq!(rejected.is_error, Some(false), "{rejected:?}");
+    assert_eq!(structured(&rejected)["status"], "rejected");
+    assert_eq!(std::fs::read(&package).unwrap(), bytes_before_reject, "reject не меняет документ");
+    // Повторное решение по обработанному предложению — RDE_CONFLICT.
+    let repeated = call(&client, "suggestion_accept", json!({"suggestion_id": second_id})).await;
+    assert_eq!(error_code(&repeated), "RDE_CONFLICT");
+
+    client.cancel().await.expect("корректное завершение клиента");
+}
+
+#[tokio::test]
+async fn default_deny_blocks_document_mutations_e2e() {
+    let root = demo_copy("doc-deny");
+    let client = connect(&root).await;
+    let (doc_id, _body_hash, file) = migrated_document(&client).await;
+    let package = root.join(&file);
+    let before = std::fs::read(&package).unwrap();
+    let block = document_blocks(&client, &doc_id)
+        .await
+        .into_iter()
+        .find(|block| block["text"].as_str().map(str::len).unwrap_or(0) > 10)
+        .expect("блок документа");
+    let block_id = block["id"].as_str().unwrap().to_owned();
+    let block_text = block["text"].as_str().unwrap().to_owned();
+
+    let suggest = call(
+        &client,
+        "doc_suggest_edit",
+        json!({"doc_id": doc_id, "block_id": block_id, "expected_text": block_text, "new_text": "x"}),
+    )
+    .await;
+    assert_eq!(error_code(&suggest), "RDE_APPROVAL_DENIED");
+    let replace = call(
+        &client,
+        "doc_replace_range",
+        json!({"doc_id": doc_id, "block_id": block_id, "expected_text": block_text, "new_text": "x"}),
+    )
+    .await;
+    assert_eq!(error_code(&replace), "RDE_APPROVAL_DENIED");
+    let accept = call(&client, "suggestion_accept", json!({"suggestion_id": "01NOPE"})).await;
+    assert_eq!(error_code(&accept), "RDE_APPROVAL_DENIED");
+    // Read-only инструменты документа работают и ничего не меняют.
+    let outline = call(&client, "doc_outline", json!({"doc_id": doc_id})).await;
+    assert_eq!(outline.is_error, Some(false));
+    assert_eq!(std::fs::read(&package).unwrap(), before, "default deny не меняет документ");
+    // В аудите — deny по политике.
+    let entries = audit_entries(&root);
+    assert!(entries.iter().any(|entry| entry["tool"] == "doc_suggest_edit"
+        && entry["decision"] == "deny"
+        && entry["reason"] == "policy"));
+    client.cancel().await.expect("корректное завершение клиента");
 }

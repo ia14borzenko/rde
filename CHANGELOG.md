@@ -12,6 +12,33 @@
 
 ### Добавлено
 
+- **M2.5 «v0.3 — документные мутации: suggested edits/ревизии» (ADR-0008, 2026-10-27)** — к MCP-слою
+  добавлены **6 документных инструментов через те же grants/approvals/чекпоинты/аудит M2**: агент
+  не перезаписывает пользовательский текст молча (R-AGT-05) — правка является **changeset-предложением**:
+  `doc_suggest_edit` (создаёт предложение, документ **не меняется**), `suggestion_list`,
+  `suggestion_accept` (approval → чекпоинт `.doc.rde` → `backup_package` → правка → версия в store →
+  `checkpoint_id`+`revision_id` в ответе/аудите), `suggestion_reject` (документ не меняется),
+  `doc_replace_range` (прямая правка с approval и `expected_text`/`expected_body_hash` — R-DOC-13:
+  `RDE_CONFLICT` вместо перезаписи), `revision_list` (история версий документа из store). Домен — в
+  `rde-doc` (owner-крейт, аддитивно): [`text_edit`](crates/rde-doc/src/text_edit.rs) —
+  `replace_block_text` (замена текста абзаца с сохранением `w:pPr`/`w:rPr`/`w14:paraId`;
+  `block_edit_support`), [`suggestions`](crates/rde-doc/src/suggestions.rs) — `SuggestedEdit`
+  (`{id, doc_id, block_id, before, after, author, author_kind, base_body_hash, status}`) в
+  `.rde/agent/suggestions/*.json` (пакет `.doc.rde` остаётся чистым OOXML), история ревизий
+  (`document_revisions`, `restore_document_revision`; восстановление фиксируется новой ревизией;
+  MCP-инструмента `revision_restore` нет — API хоста/UI). Всего **27 инструментов ≤32**, порядок
+  M1/M2 не переставлен (prompt-cache): [`tools.rs`](crates/rde-mcp/src/tools.rs). `DocInfo` получил
+  `body_hash` (optimistic-конкурентность). **Бюджет:** `tools/list` — **37 175 Б** (≈36,3 KiB, ≈9,3K
+  токенов; компактные `outputSchema` для всех инструментов), инструкции — **8 390 Б**. Границы M2.5:
+  один абзац без переводов строк, только простой текст (без `w:sdt`-вставок/полей/рисунков/формул/
+  track changes — `RDE_UNSUPPORTED`); `doc_insert`/`doc_delete` и символьные диапазоны — M2.6; полные
+  track changes Word (R-DOC-32) — отдельная веха. **Тесты: 371 passed, 0 failed** (355 + 16: `rde-doc`
+  +4 домен-тестов, `rde-host` +8 `tests/doc_mutations.rs` — lifecycle предложений, apply+checkpoint+
+  revision, reject, stale, dry_run/конфликты, checkpoint-restore, ревизии list/restore, немаркированный
+  документ; `apps/rde` e2e +2 — документные сценарии `--approval=auto` и default deny без изменений;
+  `rde-mcp` +2). Документы: [ADR-0008](docs/adr/0008-document-suggested-edits-and-revisions.md),
+  ТЗ §0.2/§5.7.3/§5.7.10/§8.7.3/§8.7.4/§10.3/§16, [`docs/state.md`](docs/state.md), README.
+
 - **M2 «v0.3 — мутации через хуки approvals/checkpoints»: grants, чекпоинты, job-модель (ADR-0007,
   2026-10-27)** — в существующий слой `rde-mcp`/`rde-host` добавлены 8 мутирующих MCP-инструментов
   через **те же хуки** (`ApprovalHook`/`AuditSink`/`EventSink`), без правок архитектуры M1:

@@ -54,7 +54,7 @@ impl ToolGrant {
 pub struct McpPolicy {
     /// Разрешать read-only инструменты.
     pub allow_read_only: bool,
-    /// Грант «запись в проект» (манифест/скрипт/заметка); по умолчанию `false`.
+    /// Грант «запись в проект» (манифест/скрипт/заметка/документ); по умолчанию `false`.
     pub allow_project_write: bool,
     /// Грант «запуск скриптов/артефактов» (R-AGT-06); по умолчанию `false`.
     pub allow_run_script: bool,
@@ -115,9 +115,10 @@ impl McpPolicy {
     pub fn instructions_section(&self) -> String {
         let yes_no = |value: bool| if value { "разрешено" } else { "запрещено" };
         format!(
-            "\n## Политика мутаций этой сессии (M2, grants + approvals)\n\
+            "\n## Политика мутаций этой сессии (M2/M2.5, grants + approvals)\n\
              - режим approvals: `{}`; без гранта мутация → `RDE_APPROVAL_DENIED` (файлы не меняются);\n\
-             - запись в проект (`artifact_write_manifest`/`artifact_write_script`/`note_write`): {};\n\
+             - запись в проект (`artifact_write_manifest`/`artifact_write_script`/`note_write`/документные \
+             `doc_suggest_edit`/`suggestion_accept`/`suggestion_reject`/`doc_replace_range`): {};\n\
              - запуск артефактов (`artifact_run`/`run_cancel`, нужен `trusted`-проект): {};\n\
              - git-коммит (`git_commit`): {};\n\
              - перед мутацией создаётся чекпоинт `.rde/agent/checkpoints/<id>/` (файлы + корни store), \
@@ -711,7 +712,10 @@ mod tests {
         let deny = McpPolicy::read_only();
         let text = deny.instructions_section();
         assert!(text.contains("`deny`"));
-        assert!(text.contains("запись в проект (`artifact_write_manifest`/`artifact_write_script`/`note_write`): запрещено"));
+        assert!(text.contains("запись в проект"));
+        assert!(text.contains("doc_suggest_edit"), "документные правки M2.5 в политике: {text}");
+        assert!(text.contains("`note_write`/документные"), "M2.5 grant-раздел: {text}");
+        assert!(text.contains(": запрещено"));
         let (auto, _hook) = build_policy_and_hook(&ApprovalOptions {
             mode: Some(ApprovalMode::Auto),
             allow_run: true,

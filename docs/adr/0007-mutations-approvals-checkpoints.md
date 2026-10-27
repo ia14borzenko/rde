@@ -7,6 +7,10 @@
 | Контекст | v0.3, веха **M2** «мутирующие MCP-инструменты через существующие хуки»: ТЗ [`§5.10`](../tz-03.md) (R-MCP-01…06), [`§8.7.3`](../tz-03.md) (правки/checkpoints/approvals), [`§8.7.4`](../tz-03.md) (каталог инструментов), [`§10.3`](../tz-03.md) п.1/4/5, R-AGT-05…09, [`ADR-0002`](0002-component-boundaries.md) (инвариант 8), [`ADR-0006`](0006-mcp-independent-layer.md) (слои `rde-mcp`/`rde-host`, хуки) |
 | Внешние опоры | `rmcp =3.8.0` (Apache-2.0), MCP spec **2026-07-28** (stateless; `server/discover`; `ttlMs`/`cacheScope`; MRTR-типы доступны, но approvals в M2 — не MRTR); библиотечные API RDE: `rde-core::ops` (манифест/авторы/backup), `rde-dag::update` (+`UpdateOptions.cancel`), `rde-run::read_log_from`, `rde-vcs::{status,commit}`, `rde-store::{RootSet,current_roots,begin_tx_with_roots,commit_tx}` |
 
+> **M2.5 → [ADR-0008](0008-document-suggested-edits-and-revisions.md):** документные suggested edits,
+> правка текста блоков, ревизии документа и чекпоинты `.doc.rde`. M2.5 переиспользует grants/approvals/
+> чекпоинты/аудит M2 без изменения механизма; реестр вырос с 21 до 27 инструментов.
+
 ## Контекст
 
 M1 ([ADR-0006](0006-mcp-independent-layer.md)) дал независимый протокольный слой (`rde-mcp`) и headless-хост
@@ -183,18 +187,23 @@ Jobs **не переживают перезапуск** процесса (M2, д
 
 ## Parity-матрица «UI ↔ MCP» (R-AGT-07)
 
-Расхождения — явные, не молчаливые. UI-действия и их MCP-эквиваленты на HEAD M2:
+Расхождения — явные, не молчаливые. UI-действия и их MCP-эквиваленты на HEAD M2.5
+(документные строки — после [ADR-0008](0008-document-suggested-edits-and-revisions.md)):
 
-| UI-действие (RDE) | MCP-инструмент M2 | Статус |
+| UI-действие (RDE) | MCP-инструмент | Статус |
 |---|---|---|
 | Сохранить манифест артефакта | `artifact_write_manifest` | ✓ tool (grants+approval+checkpoint) |
 | Сохранить скрипт артефакта | `artifact_write_script` | ✓ tool (python/data, whitelist) |
 | Обновить артефакт / связанные / всё | `artifact_run` + `run_status`/`run_cancel`/`run_log` | ✓ tool (job-модель, trusted) |
 | Редактировать заметку (текст/заголовок) | `note_write` | ✓ tool (checkpoint) |
 | git commit | `git_commit` | ✓ tool (отдельный грант) |
-| Откатить работу агента (чекпоинт) | `checkpoint_restore` (API хоста) | ✗ MCP-инструмента нет (O6-a); UI-откат — вне MCP |
-| Обновить документ из вставок | — (`rde_doc`/`rde_dag` библиотечный API) | ✗ M2.5 (doc-мутации deferred) |
-| Вставить/заменить текст документа | — (`doc_insert`/`doc_replace_range`) | ✗ M2.5 (suggested edits, R-DOC-32) |
+| Предложить правку абзаца (diff) | `doc_suggest_edit` | ✓ M2.5 (changeset в `.rde/agent/suggestions`) |
+| Принять/отклонить предложение | `suggestion_accept`/`suggestion_reject` | ✓ M2.5 (accept — checkpoint+версия) |
+| Прямая правка абзаца | `doc_replace_range` | ✓ M2.5 (approval+checkpoint+версия) |
+| История версий документа | `revision_list` | ✓ M2.5 (store) |
+| Откатить независимо версию/чекпоинт работы агента | `revision_restore`/`checkpoint_restore` (API хоста) | ✗ MCP-инструмента нет (O5/O6-a); доступно RDE/UI |
+| Вставить/удалить абзац/блок | — (`doc_insert`/`doc_delete`) | ✗ M2.6 (O4 ADR-0008) |
+| Обновить документ из вставок | — (`rde_doc`/`rde_dag` библиотечный API) | ✗ M2.6/M3 |
 | Создать/переименовать/удалить объект | — | ✗ M3 (R-ART CRUD) |
 | Источники/PDF-регионы/библиография | — | ✗ M3 (source_get/pdf_page_render/…) |
 | Экспорт документа | — | ✗ M3 (doc_export) |
@@ -223,18 +232,20 @@ Jobs **не переживают перезапуск** процесса (M2, д
 
 ## Последствия
 
-- **M2.5**: doc-мутации (`doc_insert`/`doc_replace_range`/`doc_suggest_edit` + suggestions/revisions,
-  R-DOC-32) — появятся как новые мутирующие инструменты с грантом `project_write`/новым `doc_write`,
-  используя те же `authorize_tool_call`/чекпоинты (файлы `.doc.rde` + roots документа) без правок сервера;
-  `checkpoint_*`-инструменты — по решению владельца (O6-b) вместе с `revision_restore`.
+- **M2.5 (реализовано)** — [`ADR-0008`](0008-document-suggested-edits-and-revisions.md): документные
+  инструменты (`doc_suggest_edit`, `suggestion_list/accept/reject`, `doc_replace_range`, `revision_list`)
+  добавлены с грантом `project_write` **без нового гранта**, через те же `authorize_tool_call`/чекпоинты
+  (файлы `.doc.rde` + roots документа) и аудит; `revision_restore`/`checkpoint_*` — API хоста/UI,
+  MCP-инструментами не публикуются. Реестр — 27 инструментов, `tools/list` 36,3 KiB (компактные
+  output-схемы для бюджета). `doc_insert`/`doc_delete` (вставка/удаление абзацев) — M2.6.
 - **M3 (streamable HTTP)**: транспортный слой `rmcp` + loopback + bearer-токен; политика/реестр/хуки
   не меняются; `approval=deny` остаётся дефолтом, токены — отдельное явное решение пользователя.
 - **M4 (ACP/GUI)**: GUI реализует `ApprovalHook` (диалог с diff/чекпоинтом) и подписывается на
   `EventSink` (прогресс job'ов) — сервер/реестр не меняются; панель чата и URI-чипы §8.7.2 лягут на
   существующую `rde://`-схему.
-- Jobs не переживают рестарт; чекпоинты — переживают (файлы в `.rde`, `.rde` в `.gitignore`).
-- Каталог 21 инструмент: остаётся запас до 32 (§18-3); при добавлении M2.5/M3 следить за бюджетом
-  `tools/list` (39,1 KiB из ≈40 KiB ориентира).
+- Jobs не переживают рестарт; чекпоинты и версии документов/предложения — переживают (`.rde` + store).
+- Каталог 27 инструментов (M2.5): запас до 32 (§18-3) — на M2.6/M3 (~5 инструментов, бюджет
+  `tools/list` 36,3 KiB из ≈40 KiB ориентира; сокращать описания/схемы).
 
 ## Проверки (DoD M2)
 

@@ -945,3 +945,102 @@ cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core
 cargo tree -p rde-host | grep -E "egui|eframe|rde-ui"
 ```
 
+## Обновление 2026-10-27 (M2.5: документные мутации — suggested edits/ревизии)
+
+Веха **M2.5** фазы v0.3 (ТЗ §5.7.3/§5.7.10/§8.7.3/§8.7.4/§10.3, [ADR-0008](../docs/adr/0008-document-suggested-edits-and-revisions.md)):
+документные MCP-инструменты добавлены **через те же grants/approvals/чекпоинты/аудит M2**, без изменения
+механизма. Агент не перезаписывает пользовательский текст молча (R-AGT-05): правка — это **changeset**
+(`before/after` блока), который принимается/отклоняется явно; каждая правка — чекпоинт `.doc.rde` +
+версия документа в store.
+
+| Что | Где |
+|---|---|
+| Домен правки текста блока: `replace_block_text` (сохранение `w:pPr`/`w:rPr`/`w14:paraId`; защита `body_hash`/`expected_text`; простые абзацы) + `block_edit_support` | [`crates/rde-doc/src/text_edit.rs`](../crates/rde-doc/src/text_edit.rs) |
+| Домен suggested edits: `SuggestedEdit`/`NewSuggestion`/`Suggestions` (create/list/load/apply/reject/reject_all; `.rde/agent/suggestions/*.json`; `pending→accepted/rejected`) | [`crates/rde-doc/src/suggestions.rs`](../crates/rde-doc/src/suggestions.rs) |
+| История версий документа: `document_revisions` (tx с корнем `document/<doc_id>`), `restore_document_revision` (snapshot→tree→blob, бэкап, атомарная замена) | [`crates/rde-doc/src/lib.rs`](../crates/rde-doc/src/lib.rs) |
+| DTO M2.5: `SuggestedEditInfo`, `DocMutationOutcome`, `DocRevisionInfo`; `DocInfo.body_hash` (optimistic-конкурентность) | [`crates/rde-mcp/src/model.rs`](../crates/rde-mcp/src/model.rs) |
+| Контракт `RdeHost`: `doc_suggest_edit`/`suggestion_list`/`suggestion_accept`/`suggestion_reject`/`doc_replace_range`/`revision_list` + `revision_restore` (внутренний API) | [`crates/rde-mcp/src/host.rs`](../crates/rde-mcp/src/host.rs) |
+| Реестр **27 инструментов** (13 M1 + 8 M2 + 6 M2.5; порядок M1/M2 не переставлен), компактные `outputSchema` для бюджета | [`crates/rde-mcp/src/tools.rs`](../crates/rde-mcp/src/tools.rs) |
+| Хост: документные мутации через чекпоинт (`with_checkpoint`) + `backup_package` + `commit_document_with`; ревизии/restore; `with_store_mut` | [`crates/rde-host/src/lib.rs`](../crates/rde-host/src/lib.rs) |
+| Инструкции M2.5: раздел «Документы» (suggested edits, R-DOC-13-защиты, границы, revision) | [`crates/rde-host/src/instructions.rs`](../crates/rde-host/src/instructions.rs) |
+| Политика сессии в инструкциях: документные инструменты под `project_write` | [`crates/rde-mcp/src/policy.rs`](../crates/rde-mcp/src/policy.rs) |
+| E2E +2: документные сценарии (`--approval=auto`: suggest→list→accept→revision→direct replace→conflicts→reject; default deny: мутации запрещены, документ байт-в-байт) | [`apps/rde/tests/mcp_stdio.rs`](../apps/rde/tests/mcp_stdio.rs) |
+| Интеграционные тесты хоста: suggested edits lifecycle, apply+checkpoint+revision, reject, stale-предложение, dry_run/конфликты, checkpoint-restore, ревизии list/restore, немаркированный документ | [`crates/rde-host/tests/doc_mutations.rs`](../crates/rde-host/tests/doc_mutations.rs) |
+| Домен-тесты: замена текста/сохранение registry, `Stale`, ограничения (пустой текст/переводы строк), sdt-абзац не редактируется, lifecycle предложений и устаревание | [`crates/rde-doc/tests/text_edit.rs`](../crates/rde-doc/tests/text_edit.rs) |
+
+**Поток правки (fail-closed).** 1) `doc_suggest_edit` — проверки (`block_edit_support`,
+`check_external_edit`, `expected_text`) и создание `pending`-предложения; **документ не меняется**.
+2) `suggestion_accept` — approval (грант `project_write`) → чекпоинт `.doc.rde` → `backup_package` →
+`replace_block_text` → версия в store (`kind="document-mutation"`) → статус `accepted`; ответ
+`DocMutationOutcome` с `checkpoint_id`/`revision_id`. 3) `suggestion_reject` — только статус `rejected`
+(документ не меняется). 4) `doc_replace_range` — прямая правка с approval и `expected_text`
+(+`expected_body_hash` из `doc_list`) для случаев без ревью. 5) `revision_list` — история версий;
+`revision_restore`/`checkpoint_restore` — API хоста/UI (MCP-инструментами не публикуются).
+
+**Гарантии R-DOC-13:** документ, изменённый вне RDE (`body_hash` ≠ `rde:doc`), не правится
+(`RDE_CONFLICT` до перечитывания/восстановления); устаревший `expected_text` — `RDE_CONFLICT`;
+устаревшее предложение (`base_body_hash`) не применяется; повторный accept/reject — `RDE_CONFLICT`.
+Границы M2.5: один абзац без переводов строк (пустой текст удалил бы абзац и сдвинул позиционные
+`block_id`); блоки с `w:sdt`-вставками/полями/рисунками/формулами/track changes — `RDE_UNSUPPORTED`;
+`doc_insert`/`doc_delete` (вставка/удаление абзацев, символьные диапазоны) — M2.6; полные track changes
+Word (`w:ins/w:del`, экспорт) — отдельная веха.
+
+**Замер контекста:** 27 инструментов ≤32; `tools/list` **37 175 байт** (≈36,3 KiB; ≈9,3K токенов при
+байты/4; ориентир ≈40 KiB выполнен) — компактные `outputSchema` для **всех** инструментов (поля
+сохранены, убраны per-field `description`/`title`); инструкции — **8 390 Б** (≤32 KiB).
+
+**Тесты:** `cargo test --workspace` — **371 passed, 0 failed** (M2 355 + 16): `rde-doc` +4
+(`tests/text_edit.rs`), `rde-host` +8 (`tests/doc_mutations.rs`), `apps/rde` e2e +2, `rde-mcp` +2;
+старые asserts не ослаблялись (контракт: 21→27 инструментов; аннотации M2.5: 2 недеструктивные мутации).
+
+**Независимость слоёв:** `cargo tree -p rde-mcp` — без `rde-*`/GUI/`wordcraft`; `-p rde-host` — без
+`egui`/`rde-ui`. Дифф: `rde-doc` — только аддитивные модули (`text_edit`, `suggestions`) и функции
+истории версий; `rde-core`/`rde-dag`/`rde-docx`/`rde-store`/`rde-vcs`/`rde-sources`/`rde-templates`/
+`rde-ui`/`xtask`/`vendor` — 0 файлов.
+
+**Ограничения (честно):** нет вставки/удаления абзацев и символьных диапазонов (M2.6); нет трекинга
+изменений Word (`w:ins/w:del`, `*PrChange`) и diff-UI (M4); `revision_restore`/`checkpoint_*` не
+публикуются MCP-инструментами; правка возможна только для «простого абзаца»; `tools/list` — запас до
+ориентира ~3,7 KiB (M2.6 потребует сокращения описаний/схем); HTTP — M3, ACP/GUI-approvals — M4.
+
+**Следующий шаг:** **M2.6 — `doc_insert`/`doc_delete`** (вставка/удаление абзацев со стабильными
+id на paraId, символьные диапазоны, diff-модель для UI), затем **M3** — streamable HTTP
+(loopback+bearer-токен), **M4** — GUI-хуки/ACP/diff-UI/URI-чипы; отдельная веха — полные track changes
+Word (R-DOC-32).
+
+**Проверить руками (M2.5):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export CARGO_HOME=/home/admin-pc/proj/rde-dev/.cache-tmp/cargo-home
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh build -p rde                                  # бинарь target/debug/rde
+./scripts/build.sh test -p rde-doc -p rde-mcp -p rde-host        # домен + слой M2.5
+./scripts/build.sh test -p rde                                   # e2e stdio (документные сценарии)
+./scripts/build.sh test --workspace                              # 371 passed
+
+# 1) default deny: документные мутации запрещены, документ НЕ меняется
+META='{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}'
+{ printf '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":%s}}\n' "$META"
+  printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":%s}}\n' "$META"; } \
+  | ./target/debug/rde mcp serve --project demo-project 2>/tmp/rde-mcp.log | head -2
+# tools/list — 27 инструментов (13 read-only + 10 мутаций + 2 служебных), M1/M2-порядок не переставлен
+
+# 2) auto: предложение → список → принятие (с чекпоинтом и ревизией)
+#    doc_suggest_edit {"doc_id":"<из doc_list>","block_id":"b1","expected_text":"<текст из doc_read>",
+#                      "new_text":"Новый текст абзаца"}  → suggestion_id (документ не изменён!)
+#    suggestion_list {"doc_id":"<doc>"} → pending; suggestion_accept {"suggestion_id":"<id>"}
+# проверьте: demo-project/.rde/agent/suggestions/<id>.json, .rde/agent/checkpoints/<ULID>/manifest.json,
+#            .rde/agent/audit.log (decision/reason/checkpoint_id), revision_list по документу
+
+# 3) прямая правка с защитой от устаревания: doc_replace_range с expected_body_hash из doc_list;
+#    повтор со старым expected_text → RDE_CONFLICT (ручная правка не перезаписывается)
+
+# 4) независимость слоёв (пусто = доказано)
+cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core|rde-dag|rde-doc|rde-store"
+cargo tree -p rde-host | grep -E "egui|eframe|rde-ui"
+```
+
+

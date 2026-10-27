@@ -155,6 +155,10 @@ pub struct DocInfo {
     /// Живых вставок (если мигрирован).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inserts: Option<usize>,
+    /// `body_hash` документа (sha256 `word/document.xml`; M2.5) — для optimistic-конкурентности
+    /// (`doc_replace_range.expected_body_hash`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<String>,
 }
 
 /// Блок в оглавлении документа.
@@ -627,6 +631,108 @@ pub struct GitCommitOutcome {
     pub files: usize,
     /// Короткое сообщение (при `dry_run` — план, что будет закоммичено).
     pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// M2.5: suggested edits документа, правки блоков и ревизии (R-DOC-32/R-AGT-05)
+// ---------------------------------------------------------------------------
+
+/// Лимит текста блока в `doc_suggest_edit`/`doc_replace_range` (символы).
+pub const DOC_EDIT_MAX_TEXT_CHARS: usize = 4_000;
+
+/// Лимит `suggestion_list`/`revision_list`: записей по умолчанию.
+pub const DOC_LIST_DEFAULT_LIMIT: usize = 20;
+
+/// Лимит `suggestion_list`/`revision_list`: записей максимум.
+pub const DOC_LIST_MAX_LIMIT: usize = 100;
+
+/// Предложение правки документа (changeset, R-AGT-05 / R-DOC-32).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SuggestedEditInfo {
+    /// Идентификатор предложения.
+    pub id: String,
+    /// Id документа.
+    pub doc_id: String,
+    /// Id блока документа (`b1`, …).
+    pub block_id: String,
+    /// `pending` | `accepted` | `rejected`.
+    pub status: String,
+    /// Исходный текст блока (на момент создания предложения).
+    pub before: String,
+    /// Предложенный текст блока.
+    pub after: String,
+    /// Автор предложения.
+    pub author: String,
+    /// `agent` | `human`.
+    pub author_kind: String,
+    /// Unix-время создания.
+    pub created_unix: u64,
+    /// `body_hash` документа на момент создания (устаревание предложения).
+    pub base_body_hash: String,
+    /// `w14:paraId` блока (диагностика).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub para_id: Option<String>,
+    /// Комментарий автора.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Unix-время решения.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_unix: Option<u64>,
+    /// Решение/причина (`accepted`/`rejected: …`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+}
+
+/// Результат мутирующего инструмента документа (правка блока, применение предложения, откат ревизии).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DocMutationOutcome {
+    /// Только проверка (`true`) — документ не изменён.
+    pub dry_run: bool,
+    /// Чекпоинт перед правкой (`null` у `dry_run`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    /// Изменённые относительные пути внутри проекта.
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    /// Id документа.
+    pub doc_id: String,
+    /// Id блока (у откатов ревизии может отсутствовать).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<String>,
+    /// Текст блока до правки.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Текст блока после правки (фактический).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// `body_hash` документа после правки без форматирования.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<String>,
+    /// Транзакция-версия документа в store (для `revision_list`/`revision_restore`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<String>,
+    /// Человекочитаемая деталь.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Версия документа в истории store (R-DOC-41): каждая мутация документа фиксирует корень
+/// `document/<doc_id>` транзакцией.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DocRevisionInfo {
+    /// Идентификатор ревизии (id транзакции store).
+    pub revision_id: String,
+    /// Id документа.
+    pub doc_id: String,
+    /// Unix-время фиксации.
+    pub created_unix: u64,
+    /// Пометка транзакции (кто/что меняло).
+    pub note: String,
+    /// Корневой tree-hash версии документа (sha256, hex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_hash: Option<String>,
+    /// Совпадает с текущими корнями store (последняя версия).
+    pub current: bool,
 }
 
 #[cfg(test)]

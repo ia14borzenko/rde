@@ -51,14 +51,26 @@ pub fn build(project: &Project) -> String {
     out.push_str("- пути — только внутри корня проекта; `.rde/**` закрыт; ошибки — машиночитаемые коды `RDE_*`;\n");
     out.push_str(&format!("- инструкции ≤{} KiB (эти).\n\n", rde_mcp::MAX_INSTRUCTIONS_BYTES / 1024));
 
-    out.push_str("## Мутации (M2: grants + approvals + checkpoints)\n");
+    out.push_str("## Мутации (M2/M2.5: grants + approvals + checkpoints)\n");
     out.push_str("- без гранта CLI (`--approval=deny` по умолчанию) мутация возвращает `RDE_APPROVAL_DENIED` и НЕ меняет файлы;\n");
     out.push_str("- перед каждой мутацией создаётся чекпоинт `.rde/agent/checkpoints/<id>/` (копии файлов + корни store); при ошибке — авто-откат;\n");
-    out.push_str("- `checkpoint_id` возвращается в ответе и пишется в аудит; ручной откат — `RDE`/UI (MCP `checkpoint_*` в M2 не публикуются);\n");
-    out.push_str("- `expected_sha256` (где есть) защищает от перезаписи ручной правки: расхождение → `RDE_CONFLICT`;\n");
+    out.push_str("- `checkpoint_id` возвращается в ответе и пишется в аудит; ручной откат — `RDE`/UI (MCP `checkpoint_*` в M2/M2.5 не публикуются);\n");
+    out.push_str("- `expected_sha256`/`expected_text`/`expected_body_hash` защищают от перезаписи ручной правки: расхождение → `RDE_CONFLICT`;\n");
     out.push_str("- `dry_run: true` — только проверка, файлы не пишутся; `artifact_run` требует `trusted`-проект (R-RUN-06), один job за раз (`RDE_BUSY`);\n");
     out.push_str("- jobs (`artifact_run` → `run_status`/`run_log`/`run_cancel`) живут в процессе сервера и не переживают рестарт;\n");
-    out.push_str("- doc-мутации (insert/suggested edits) в M2 не публикуются — R-DOC-32/M2.5; общего `file_write` нет.\n\n");
+    out.push_str("- общего `file_write` и произвольного shell нет.\n\n");
+
+    out.push_str("## Документы (M2.5: suggested edits + ревизии, R-DOC-32/R-DOC-41)\n");
+    out.push_str("- правка текста документа — только по блокам (`block_id` из `doc_outline`) и только инструментами:\n");
+    out.push_str("  `doc_suggest_edit` создаёт предложение (документ НЕ меняется) → `suggestion_list` → пользователь или\n");
+    out.push_str("  `suggestion_accept`/`suggestion_reject`; `doc_replace_range` — прямая правка с approval (destructive), без ревью;\n");
+    out.push_str("- `expected_text` обязателен и должен совпадать с текущим текстом блока (`doc_read`), иначе `RDE_CONFLICT`;\n");
+    out.push_str("  `expected_body_hash` (из `doc_list`) — дополнительная защита от внешних правок (R-DOC-13: не перезаписываем молча);\n");
+    out.push_str("- каждая правка: чекпоинт `.doc.rde` + версия документа в store (ревизия); `revision_list` — история версий,\n");
+    out.push_str("  откат ревизии — операция RDE (API хоста/UI), MCP-инструмент `revision_restore` в M2.5 не публикуется;\n");
+    out.push_str("- правятся только простые абзацы: без вставок RDE (`w:sdt`), полей, рисунков, формул, track changes;\n");
+    out.push_str("  один абзац без переводов строк; вставка/удаление абзацев и `doc_insert` — M2.6;\n");
+    out.push_str("- документ, изменённый вне RDE (`body_hash` не совпадает с `rde:doc`), не правится до перечитывания/восстановления.\n\n");
 
     out.push_str("## Объекты проекта\n");
     let listed: Vec<&Object> = project.objects.iter().take(MAX_LISTED_OBJECTS).collect();
@@ -73,7 +85,7 @@ pub fn build(project: &Project) -> String {
     }
     out.push('\n');
 
-    out.push_str("## Инструменты (13 read-only + 8 мутаций)\n");
+    out.push_str("## Инструменты (27: 17 read-only + 10 мутаций)\n");
     let names: Vec<&str> = rde_mcp::tool_registry().iter().map(|tool| tool.name).collect();
     out.push_str(&format!("{}\n\n", names.join(", ")));
 

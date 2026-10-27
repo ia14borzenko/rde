@@ -18,6 +18,12 @@
 //! Инженерное решение M3: части rde:doc **не** referenced из `word/document.xml.rels` (Word не
 //! ругается на лишние parts; при пересохранении Word их удаляет — детект). RDE-экспорт `.docx`
 //! всегда вырезает свои customXml, поэтому получается чистый OOXML.
+//!
+//! M2.5 (ADR-0008): аддитивные подсистемы `text_edit` (замена текста абзаца по `block_id` с
+//! сохранением форматирования и защитой `body_hash`/`expected_text`) и `suggestions` (домен
+//! suggested edits: changeset-предложения правок в `.rde/agent/suggestions`, accept/reject через
+//! `replace_block_text`), плюс история версий документа в store (`document_revisions`,
+//! `restore_document_revision`). Существующие функции пакета не менялись.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -40,6 +46,12 @@ pub use formula::*;
 
 mod formula_insert;
 pub use formula_insert::*;
+
+pub mod suggestions;
+pub use suggestions::*;
+
+mod text_edit;
+pub use text_edit::*;
 
 pub const RDE_NS: &str = "https://rde.dev/ns/doc";
 /// Версия схемы `rde:doc`: 2 — формульные вставки (`kind="formula"`, `render_mode`, `body_hash`).
@@ -2631,6 +2643,111 @@ pub fn restore_document_from_store(
     fs::write(&tmp, bytes).map_err(|e| format!("записать {}: {e}", tmp.display()))?;
     fs::rename(&tmp, package).map_err(|e| format!("заменить {}: {e}", package.display()))?;
     Ok(Some(package.to_path_buf()))
+}
+
+// ── история версий документа (R-DOC-41, M2.5): ревизии в store ───────────────
+
+/// Версия документа в истории store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocRevision {
+    /// Идентификатор ревизии (id транзакции store).
+    pub revision_id: String,
+    /// Id документа.
+    pub doc_id: String,
+    /// Unix-время фиксации (updated или started транзакции).
+    pub created_unix: u64,
+    /// Пометка транзакции («кто/что меняло»).
+    pub note: String,
+    /// Tree-hash версии пакета (hex).
+    pub root_hash: Option<String>,
+    /// Совпадает с текущими корнями store (последняя версия).
+    pub current: bool,
+}
+
+/// История версий документа: закоммиченные транзакции с корнем `document/<doc_id>` (новые первыми).
+///
+/// `limit = 0` — без ограничения (вызывающий слой валидирует лимит).
+pub fn document_revisions(
+    store: &rde_store::Store,
+    doc_id: &str,
+    limit: usize,
+) -> Result<Vec<DocRevision>, String> {
+    let root_name = document_root_name(doc_id);
+    let current = store.current_roots().map_err(|e| e.to_string())?;
+    let current_hash = current.roots.get(&root_name).cloned();
+    let mut txs = store.list_txs().map_err(|e| e.to_string())?;
+    txs.retain(|tx| {
+        tx.status == rde_store::TxStatus::Committed
+            && tx.roots.as_ref().is_some_and(|roots| roots.roots.contains_key(&root_name))
+    });
+    txs.sort_by(|left, right| {
+        right.started_unix.cmp(&left.started_unix).then_with(|| right.id.cmp(&left.id))
+    });
+    let mut revisions: Vec<DocRevision> = txs
+        .into_iter()
+        .map(|tx| {
+            let root_hash = tx.roots.as_ref().and_then(|roots| roots.roots.get(&root_name).cloned());
+            let is_current = root_hash.is_some() && root_hash == current_hash;
+            DocRevision {
+                revision_id: tx.id,
+                doc_id: doc_id.to_owned(),
+                created_unix: tx.updated_unix.unwrap_or(tx.started_unix),
+                note: tx.note,
+                root_hash,
+                current: is_current,
+            }
+        })
+        .collect();
+    if limit > 0 {
+        revisions.truncate(limit);
+    }
+    Ok(revisions)
+}
+
+/// Восстановить конкретную версию документа из store по `revision_id`.
+///
+/// Читает `snapshot(revision_id).new_roots` → дерево `document/<doc_id>` → блоб пакета, делает
+/// бэкап текущего пакета (`.bak` + `.rde/doc-backups`) и атомарно заменяет файл. Корни store
+/// **не переключаются**: вызывающий слой фиксирует восстановление новым коммитом
+/// (`commit_document_with` с `kind = document-restore`), чтобы восстановление тоже было откатываемо.
+pub fn restore_document_revision(
+    project_root: &Path,
+    package: &Path,
+    doc_id: &str,
+    store: &rde_store::Store,
+    revision_id: &str,
+) -> Result<Option<PackageInfo>, String> {
+    if revision_id.trim().is_empty() {
+        return Err("пустой revision_id".to_owned());
+    }
+    let root_name = document_root_name(doc_id);
+    let snapshot = store
+        .read_snapshot(revision_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("снапшот ревизии {revision_id} не найден (откат/удаление старых tx?)"))?;
+    let root_hex = snapshot
+        .new_roots
+        .roots
+        .get(&root_name)
+        .ok_or_else(|| format!("ревизия {revision_id} не содержит версию документа {doc_id}"))?;
+    let root = rde_hash::Hash::from_hex(root_hex)?;
+    let entries = store
+        .get_tree(root)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("дерево версии {root_hex} отсутствует в store"))?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.path == "document.doc.rde")
+        .ok_or_else(|| "в дереве документа нет document.doc.rde".to_owned())?;
+    let bytes = store
+        .get_blob(entry.blob)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("блоб версии {} отсутствует в CAS", entry.blob.hex()))?;
+    let _ = backup_package(project_root, package);
+    let tmp = package.with_extension("doc.rde.tmp");
+    fs::write(&tmp, bytes).map_err(|e| format!("записать {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, package).map_err(|e| format!("заменить {}: {e}", package.display()))?;
+    package_info(package).map(Some)
 }
 
 /// Полный отчёт обновления документа (R-DOC-12): изменения, diff, версия в store.

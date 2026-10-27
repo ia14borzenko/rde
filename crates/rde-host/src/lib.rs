@@ -1,5 +1,5 @@
 //! RDE host — headless-реализация контракта MCP-слоя (`rde-mcp::RdeHost`) поверх библиотечных
-//! крейтов RDE (v0.3, вехи M1–M2).
+//! крейтов RDE (v0.3, вехи M1–M2.5).
 //!
 //! Слой `rde-host` — единственное место, которое знает и RDE-библиотеки
 //! (`rde-core`/`rde-dag`/`rde-doc`/`rde-store`/`rde-run`/`rde-vcs`/`rde-templates`), и протокольный
@@ -13,12 +13,17 @@
 //! внешней правке) и асинхронная job-модель запуска артефактов ([`jobs`]: `artifact_run` →
 //! `run_status`/`run_cancel`/`run_log`). Сами мутации сюда приходят только после
 //! `authorize_tool_call` (грант политики + approval) — в `rde-mcp`.
+//! M2.5 (ADR-0008) — **документные мутации как suggested edits/ревизии**: `doc_suggest_edit`
+//! (changeset, документ не меняется) → `suggestion_accept/reject`; прямая правка
+//! `doc_replace_range`; каждая правка — чекпоинт `.doc.rde` + версия в store (`revision_list`);
+//! защита R-DOC-13 (`body_hash`/`expected_text` → `RDE_CONFLICT`), откат — `checkpoint_restore`/
+//! `revision_restore` (API хоста/UI).
 //!
 //! Безопасность (A5/A7):
 //! - все пути — через [`PathSandbox`]: канонизация, `starts_with(корень)`, отказ `..`/абсолютным/
 //!   симлинкам наружу, `.rde/**` закрыт (`RDE_PATH_ESCAPE`/`RDE_APPROVAL_DENIED`);
 //! - запись — только [`PathSandbox::resolve_for_write`] и только разрешённые цели инструмента
-//!   (манифест/файлы скрипта/note.md/note.toml; общего `file_write` нет);
+//!   (манифест/файлы скрипта/note.md/note.toml/`.doc.rde`; общего `file_write` нет);
 //! - тексты ошибок санитизируются (никаких путей вне проекта/секретов);
 //! - лимиты размеров ответов и `RDE_DOC_NOT_MIGRATED` для непреобразованных документов.
 
@@ -38,9 +43,10 @@ use rde_dag::ArtifactState;
 use rde_doc::{RdeBlock, RdeDoc};
 use rde_mcp::model::{
     ArtifactDetail, ArtifactInfo, ArtifactManifestDto, ArtifactOutputInfo, ArtifactRuntimeInfo,
-    DocInfo, DocOutline, DocReadRequest, DocText, DocTextBlock, FileChunk, FileRange, GitCommitInfo,
-    GitCommitOutcome, GitStatusInfo, JobInfo, JobLog, MutationOutcome, NoteInfo, ObjectNode, OutlineBlock,
-    SearchHit, SourceInfo, TemplateInfo, WorkspaceInfo, DOC_READ_DEFAULT_BLOCKS, DOC_READ_MAX_BLOCKS,
+    DocInfo, DocMutationOutcome, DocOutline, DocReadRequest, DocRevisionInfo, DocText, DocTextBlock,
+    FileChunk, FileRange, GitCommitInfo, GitCommitOutcome, GitStatusInfo, JobInfo, JobLog,
+    MutationOutcome, NoteInfo, ObjectNode, OutlineBlock, SearchHit, SourceInfo, SuggestedEditInfo,
+    TemplateInfo, WorkspaceInfo, DOC_READ_DEFAULT_BLOCKS, DOC_READ_MAX_BLOCKS,
     DOC_READ_MAX_BYTES, FILE_READ_MAX_BYTES, FILE_READ_MAX_LINES, MAX_OUTLINE_BLOCKS, MAX_TREE_NODES,
     SEARCH_MAX_LIMIT,
 };
@@ -265,6 +271,202 @@ impl HeadlessHost {
         rel_from_root(&self.root, absolute)
     }
 
+    // --- M2.5: документы (suggested edits / правки блоков / ревизии) -----------
+
+    /// Выполнить запись в store (ленивое открытие; ошибка — `RDE_NOT_READY`).
+    fn with_store_mut<T>(
+        &self,
+        task: impl FnOnce(&mut Store) -> Result<T, HostError>,
+    ) -> Result<T, HostError> {
+        let mut guard = self
+            .store
+            .lock()
+            .map_err(|_| HostError::internal("блокировка хранилища отравлена (panic в другом вызове)"))?;
+        if guard.is_none() {
+            let store = Store::open(&self.root)
+                .map_err(|error| HostError::not_ready(self.sanitize(format!("хранилище .rde недоступно: {error}"))))?;
+            *guard = Some(store);
+        }
+        let store = guard
+            .as_mut()
+            .ok_or_else(|| HostError::internal("хранилище .rde недоступно после открытия (внутренняя ошибка)"))?;
+        task(store)
+    }
+
+    /// Пакет документа по стабильному id: `(абсолютный путь, относительный POSIX)`.
+    fn document_package(&self, project: &Project, doc_id: &str) -> Result<(PathBuf, String), HostError> {
+        let object = Self::doc_object(project, doc_id)?;
+        let path = self.document_path(object)?;
+        let relative = self.object_rel_path(&path)?;
+        // Запись — через песочницу записи (симлинки наружу/`.rde/**` отсекаются).
+        let path = self.sandbox.resolve_for_write(&relative)?;
+        Ok((path, relative))
+    }
+
+    /// Документ должен быть валидным `.doc.rde` с `rde:doc` (иначе `RDE_DOC_NOT_MIGRATED`).
+    fn ensure_doc_migrated(&self, package: &Path) -> Result<(), HostError> {
+        if rde_doc::is_rde_package(package) && rde_doc::has_rde_doc(package).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(HostError::doc_not_migrated(
+                "документ не является .doc.rde с rde:doc — правки через MCP недоступны",
+            )
+            .with_hint("миграция документа — явная операция RDE (авто-миграции нет)"))
+        }
+    }
+
+    /// Документ должен быть не изменён вне RDE (`body_hash` совпадает), иначе `RDE_CONFLICT`.
+    fn ensure_doc_not_externally_edited(&self, package: &Path) -> Result<String, HostError> {
+        let check = rde_doc::check_external_edit(package)
+            .map_err(|error| HostError::internal(self.sanitize(format!("проверка документа: {error}"))))?;
+        match check.verdict {
+            rde_doc::EditVerdict::NotModified => Ok(check.current_body_hash),
+            rde_doc::EditVerdict::ExternalEdit => Err(HostError::conflict(
+                "документ изменён вне RDE (body_hash не совпадает с rde:doc)",
+            )
+            .with_hint("перечитайте doc_list/doc_read; R-DOC-13: внешние правки не перезаписываем")),
+            rde_doc::EditVerdict::MissingRdeDoc => Err(HostError::doc_not_migrated(
+                "в пакете нет rde:doc (документ потерял RDE-данные при внешнем сохранении)",
+            )
+            .with_hint("восстановите из бэкапа/снапшота RDE — см. revision_list/откат")),
+        }
+    }
+
+    fn map_block_text_edit_error(&self, error: rde_doc::BlockTextEditError) -> HostError {
+        let message = self.sanitize(error.to_string());
+        match error {
+            rde_doc::BlockTextEditError::NotFound(_) => HostError::not_found(message),
+            rde_doc::BlockTextEditError::Unsupported(_) => {
+                HostError::unsupported(message).with_hint(
+                    "M2.5 правит только простой текст абзаца без вставок/полей/рисунков/формул; \
+                     вставка новых абзацев — M2.6",
+                )
+            }
+            rde_doc::BlockTextEditError::Stale { .. } => HostError::conflict(message)
+                .with_hint("блок уже изменён — перечитайте doc_read и повторите (R-DOC-13)"),
+            rde_doc::BlockTextEditError::Conflict(_) => HostError::conflict(message),
+            rde_doc::BlockTextEditError::Internal(_) => HostError::internal(message),
+        }
+    }
+
+    fn map_suggestion_error(&self, error: rde_doc::SuggestionError) -> HostError {
+        let message = self.sanitize(error.to_string());
+        match error {
+            rde_doc::SuggestionError::NotFound(_) => HostError::not_found(message),
+            rde_doc::SuggestionError::Conflict(_) => HostError::conflict(message),
+            rde_doc::SuggestionError::Invalid(_) => HostError::invalid_argument(message),
+            rde_doc::SuggestionError::Io(_) => HostError::internal(message),
+        }
+    }
+
+    /// Проверки предложения/текста блока до чекпоинта (без записи): документ актуален, блок
+    /// существует и редактируем, его текст совпадает с ожидаемым.
+    fn precheck_block_edit(
+        &self,
+        package: &Path,
+        block_id: &str,
+        expected_text: &str,
+    ) -> Result<String, HostError> {
+        rde_doc::block_edit_support(package, block_id)
+            .map_err(|error| self.map_block_text_edit_error(error))?;
+        let body_hash = self.ensure_doc_not_externally_edited(package)?;
+        let blocks = rde_doc::document_blocks(package)
+            .map_err(|error| HostError::internal(self.sanitize(format!("блоки документа: {error}"))))?;
+        let block = blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .ok_or_else(|| HostError::not_found(format!("блок `{block_id}` не найден в документе")))?;
+        if block.text != expected_text {
+            return Err(HostError::conflict(format!(
+                "текст блока `{block_id}` изменился: ожидался {:?}, сейчас {:?}",
+                expected_text, block.text
+            ))
+            .with_hint("перечитайте doc_read и повторите (R-DOC-13)"));
+        }
+        Ok(body_hash)
+    }
+
+    /// Применить правку блока: чекпоинт `.doc.rde` → бэкап → [`rde_doc::replace_block_text`] →
+    /// версия документа в store. Возвращает `(отчёт правки, revision_id, checkpoint_id)`.
+    fn apply_block_edit(
+        &self,
+        doc_id: &str,
+        block_id: &str,
+        expected_text: &str,
+        new_text: &str,
+        tool: &str,
+        args_sha256: &str,
+    ) -> Result<(rde_doc::BlockTextEditReport, String, String), HostError> {
+        let project = self.project()?;
+        let (package, relative) = self.document_package(&project, doc_id)?;
+        self.ensure_doc_migrated(&package)?;
+        // Проверки до чекпоинта: ошибки не должны создавать чекпоинт-мусор.
+        self.precheck_block_edit(&package, block_id, expected_text)?;
+        let note = format!("{tool}: {doc_id}/{block_id}");
+        let checkpoint_note = format!("{tool}: {doc_id}/{block_id}");
+        let ((report, revision_id), checkpoint_id) = self.with_checkpoint(
+            tool,
+            args_sha256,
+            vec![(relative, package.clone())],
+            Some(checkpoint_note),
+            |host| {
+                // R-DOC-05/41: бэкап пакета перед изменением (ошибка бэкапа не фатальна).
+                let _ = rde_doc::backup_package(&host.root, &package);
+                let report = rde_doc::replace_block_text(
+                    &package,
+                    &rde_doc::BlockTextEdit {
+                        block_id: block_id.to_owned(),
+                        expected_text: expected_text.to_owned(),
+                        new_text: new_text.to_owned(),
+                    },
+                )
+                .map_err(|error| host.map_block_text_edit_error(error))?;
+                let payload = serde_json::json!({
+                    "kind": "document-mutation",
+                    "tool": tool,
+                    "doc_id": doc_id,
+                    "block_id": block_id,
+                });
+                let revision = host.with_store_mut(|store| {
+                    rde_doc::commit_document_with(
+                        &host.root,
+                        &package,
+                        doc_id,
+                        store,
+                        &note,
+                        &std::collections::BTreeMap::new(),
+                        Some(payload),
+                    )
+                    .map_err(|error| {
+                        HostError::internal(host.sanitize(format!("версия документа: {error}")))
+                    })
+                })?;
+                Ok((report, revision))
+            },
+        )?;
+        Ok((report, revision_id, checkpoint_id))
+    }
+
+    /// DTO предложения для протокольного слоя.
+    fn suggestion_info(edit: &rde_doc::SuggestedEdit) -> SuggestedEditInfo {
+        SuggestedEditInfo {
+            id: edit.id.clone(),
+            doc_id: edit.doc_id.clone(),
+            block_id: edit.block_id.clone(),
+            status: edit.status.clone(),
+            before: edit.before.clone(),
+            after: edit.after.clone(),
+            author: edit.author.clone(),
+            author_kind: edit.author_kind.clone(),
+            created_unix: edit.created_unix,
+            base_body_hash: edit.base_body_hash.clone(),
+            para_id: edit.para_id.clone(),
+            note: edit.note.clone(),
+            resolved_unix: edit.resolved_unix,
+            resolution: edit.resolution.clone(),
+        }
+    }
+
     /// Абсолютный путь документа с проверкой песочницы.
     fn document_path(&self, object: &Object) -> Result<PathBuf, HostError> {
         let ObjectData::Document(document) = &object.data else {
@@ -430,10 +632,13 @@ impl RdeHost for HeadlessHost {
                     schema_version: None,
                     blocks: None,
                     inserts: None,
+                    body_hash: None,
                 });
                 continue;
             }
             let registry = self.load_registry(&path)?;
+            // body_hash для optimistic-конкурентности правок (M2.5): фактический хеш документа.
+            let body_hash = rde_doc::check_external_edit(&path).ok().map(|check| check.current_body_hash);
             documents.push(DocInfo {
                 id: document.id.clone(),
                 title: object.title.clone(),
@@ -442,6 +647,7 @@ impl RdeHost for HeadlessHost {
                 schema_version: Some(registry.schema_version.clone()),
                 blocks: Some(registry.blocks.len()),
                 inserts: Some(registry.inserts.len()),
+                body_hash,
             });
         }
         Ok(documents)
@@ -1057,6 +1263,288 @@ impl RdeHost for HeadlessHost {
             } else {
                 "файлы откачены (в чекпоинте нет корней store)".to_owned()
             }),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // M2.5: suggested edits документа, правки блоков и ревизии (R-DOC-32/R-AGT-05).
+    // Документ меняется только через эти методы: чекпоинт `.doc.rde` + версия в store.
+    // -----------------------------------------------------------------------
+
+    fn doc_suggest_edit(
+        &self,
+        doc_id: &str,
+        block_id: &str,
+        expected_text: &str,
+        new_text: &str,
+        note: Option<&str>,
+    ) -> Result<SuggestedEditInfo, HostError> {
+        let project = self.project()?;
+        let (package, _relative) = self.document_package(&project, doc_id)?;
+        self.ensure_doc_migrated(&package)?;
+        // Проверки до создания предложения: блок существует/редактируем, текст актуален,
+        // документ не правили вне RDE. Само предложение документ не меняет.
+        let base_body_hash = self.precheck_block_edit(&package, block_id, expected_text)?;
+        let registry = self.load_registry(&package)?;
+        let para_id = registry
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.para_id.clone());
+        let suggestions = rde_doc::Suggestions::new(&self.root);
+        let edit = suggestions
+            .create(rde_doc::NewSuggestion {
+                doc_id: doc_id.to_owned(),
+                block_id: block_id.to_owned(),
+                para_id,
+                before: expected_text.to_owned(),
+                after: new_text.to_owned(),
+                author: "MCP agent".to_owned(),
+                author_kind: "agent".to_owned(),
+                base_body_hash,
+                note: note.map(str::to_owned),
+            })
+            .map_err(|error| self.map_suggestion_error(error))?;
+        Ok(Self::suggestion_info(&edit))
+    }
+
+    fn suggestion_list(
+        &self,
+        doc_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SuggestedEditInfo>, HostError> {
+        let suggestions = rde_doc::Suggestions::new(&self.root);
+        let mut edits = suggestions
+            .list(doc_id, status)
+            .map_err(|error| self.map_suggestion_error(error))?;
+        edits.truncate(limit);
+        Ok(edits.iter().map(Self::suggestion_info).collect())
+    }
+
+    fn suggestion_accept(&self, suggestion_id: &str) -> Result<DocMutationOutcome, HostError> {
+        let suggestions = rde_doc::Suggestions::new(&self.root);
+        let suggestion = suggestions
+            .load(suggestion_id)
+            .map_err(|error| self.map_suggestion_error(error))?;
+        let project = self.project()?;
+        let (package, relative) = self.document_package(&project, &suggestion.doc_id)?;
+        self.ensure_doc_migrated(&package)?;
+        if suggestion.status != rde_doc::STATUS_PENDING {
+            return Err(HostError::conflict(format!(
+                "предложение `{suggestion_id}` уже обработано (status={})",
+                suggestion.status
+            ))
+            .with_hint("создайте новое предложение после актуального чтения документа"));
+        }
+        self.precheck_block_edit(&package, &suggestion.block_id, &suggestion.before)?;
+        let args_hash = Self::payload_sha256(&(
+            suggestion_id,
+            &suggestion.doc_id,
+            &suggestion.block_id,
+            &suggestion.before,
+            &suggestion.after,
+            &suggestion.base_body_hash,
+        ));
+        let ((edited, revision_id), checkpoint_id) = self.with_checkpoint(
+            "suggestion_accept",
+            &args_hash,
+            vec![(relative.clone(), package.clone())],
+            Some(format!("suggestion {suggestion_id}: {}/{}", suggestion.doc_id, suggestion.block_id)),
+            |host| {
+                let _ = rde_doc::backup_package(&host.root, &package);
+                let edited = suggestions
+                    .apply(suggestion_id, &package)
+                    .map_err(|error| host.map_suggestion_error(error))?;
+                let payload = serde_json::json!({
+                    "kind": "document-mutation",
+                    "tool": "suggestion_accept",
+                    "suggestion_id": suggestion_id,
+                    "doc_id": edited.doc_id,
+                });
+                let revision = host.with_store_mut(|store| {
+                    rde_doc::commit_document_with(
+                        &host.root,
+                        &package,
+                        &edited.doc_id,
+                        store,
+                        &format!("suggestion accept {suggestion_id}"),
+                        &std::collections::BTreeMap::new(),
+                        Some(payload),
+                    )
+                    .map_err(|error| {
+                        HostError::internal(host.sanitize(format!("версия документа: {error}")))
+                    })
+                })?;
+                Ok((edited, revision))
+            },
+        )?;
+        let body_hash = rde_doc::package_info(&package).ok().map(|info| info.body_hash);
+        Ok(DocMutationOutcome {
+            dry_run: false,
+            checkpoint_id: Some(checkpoint_id),
+            changed_files: vec![relative],
+            doc_id: edited.doc_id,
+            block_id: Some(edited.block_id),
+            before: Some(edited.before),
+            after: Some(edited.after),
+            body_hash,
+            revision_id: Some(revision_id),
+            detail: Some("предложение принято и зафиксировано версией в store".to_owned()),
+        })
+    }
+
+    fn suggestion_reject(
+        &self,
+        suggestion_id: &str,
+        reason: Option<&str>,
+    ) -> Result<SuggestedEditInfo, HostError> {
+        let suggestions = rde_doc::Suggestions::new(&self.root);
+        let edit = suggestions
+            .reject(suggestion_id, reason)
+            .map_err(|error| self.map_suggestion_error(error))?;
+        Ok(Self::suggestion_info(&edit))
+    }
+
+    fn doc_replace_range(
+        &self,
+        doc_id: &str,
+        block_id: &str,
+        expected_text: &str,
+        new_text: &str,
+        expected_body_hash: Option<&str>,
+        dry_run: bool,
+    ) -> Result<DocMutationOutcome, HostError> {
+        let project = self.project()?;
+        let (package, relative) = self.document_package(&project, doc_id)?;
+        self.ensure_doc_migrated(&package)?;
+        let body_hash = self.precheck_block_edit(&package, block_id, expected_text)?;
+        if let Some(expected) = expected_body_hash {
+            if !expected.eq_ignore_ascii_case(&body_hash) {
+                return Err(HostError::conflict(
+                    "expected_body_hash не совпадает с текущим body_hash документа",
+                )
+                .with_hint("документ изменился после вашего чтения — перечитайте doc_list/doc_read"));
+            }
+        }
+        if dry_run {
+            return Ok(DocMutationOutcome {
+                dry_run: true,
+                checkpoint_id: None,
+                changed_files: Vec::new(),
+                doc_id: doc_id.to_owned(),
+                block_id: Some(block_id.to_owned()),
+                before: Some(expected_text.to_owned()),
+                after: Some(new_text.to_owned()),
+                body_hash: Some(body_hash),
+                revision_id: None,
+                detail: Some("проверка пройдена: документ не менялся".to_owned()),
+            });
+        }
+        let args_hash = Self::payload_sha256(&(doc_id, block_id, expected_text, new_text, expected_body_hash));
+        let (report, revision_id, checkpoint_id) =
+            self.apply_block_edit(doc_id, block_id, expected_text, new_text, "doc_replace_range", &args_hash)?;
+        let body_hash = rde_doc::package_info(&package).ok().map(|info| info.body_hash);
+        Ok(DocMutationOutcome {
+            dry_run: false,
+            checkpoint_id: Some(checkpoint_id),
+            changed_files: vec![relative],
+            doc_id: doc_id.to_owned(),
+            block_id: Some(report.block_id),
+            before: Some(report.before),
+            after: Some(report.after),
+            body_hash,
+            revision_id: Some(revision_id),
+            detail: None,
+        })
+    }
+
+    fn revision_list(&self, doc_id: &str, limit: usize) -> Result<Vec<DocRevisionInfo>, HostError> {
+        let project = self.project()?;
+        Self::doc_object(&project, doc_id)?;
+        let revisions = self.with_store(|store| {
+            rde_doc::document_revisions(store, doc_id, limit)
+                .map_err(|error| HostError::internal(self.sanitize(format!("история документа: {error}"))))
+        })?;
+        Ok(revisions
+            .into_iter()
+            .map(|revision| DocRevisionInfo {
+                revision_id: revision.revision_id,
+                doc_id: revision.doc_id,
+                created_unix: revision.created_unix,
+                note: revision.note,
+                root_hash: revision.root_hash,
+                current: revision.current,
+            })
+            .collect())
+    }
+
+    fn revision_restore(&self, doc_id: &str, revision_id: &str) -> Result<DocMutationOutcome, HostError> {
+        let project = self.project()?;
+        let (package, relative) = self.document_package(&project, doc_id)?;
+        self.ensure_doc_migrated(&package)?;
+        // Проверка, что ревизия относится к документу (до чекпоинта).
+        let revisions = self.with_store(|store| {
+            rde_doc::document_revisions(store, doc_id, 0)
+                .map_err(|error| HostError::internal(self.sanitize(format!("история документа: {error}"))))
+        })?;
+        if !revisions.iter().any(|revision| revision.revision_id == revision_id) {
+            return Err(HostError::not_found(format!(
+                "ревизия `{revision_id}` не найдена в истории документа {doc_id}"
+            ))
+            .with_hint("список ревизий — revision_list"));
+        }
+        let args_hash = Self::payload_sha256(&("revision_restore", doc_id, revision_id));
+        let ((info, new_revision), checkpoint_id) = self.with_checkpoint(
+            "revision_restore",
+            &args_hash,
+            vec![(relative.clone(), package.clone())],
+            Some(format!("revision restore {doc_id}: {revision_id}")),
+            |host| {
+                let info = host
+                    .with_store(|store| {
+                        rde_doc::restore_document_revision(&host.root, &package, doc_id, store, revision_id)
+                            .map_err(|error| {
+                                HostError::conflict(host.sanitize(format!(
+                                    "восстановление ревизии: {error}"
+                                )))
+                            })
+                    })?
+                    .ok_or_else(|| HostError::internal("не удалось восстановить пакет из ревизии"))?;
+                let payload = serde_json::json!({
+                    "kind": "document-restore",
+                    "tool": "revision_restore",
+                    "doc_id": doc_id,
+                    "restored_revision": revision_id,
+                });
+                let new_revision = host.with_store_mut(|store| {
+                    rde_doc::commit_document_with(
+                        &host.root,
+                        &package,
+                        doc_id,
+                        store,
+                        &format!("revision restore {revision_id}"),
+                        &std::collections::BTreeMap::new(),
+                        Some(payload),
+                    )
+                    .map_err(|error| {
+                        HostError::internal(host.sanitize(format!("версия документа: {error}")))
+                    })
+                })?;
+                Ok((info, new_revision))
+            },
+        )?;
+        Ok(DocMutationOutcome {
+            dry_run: false,
+            checkpoint_id: Some(checkpoint_id),
+            changed_files: vec![relative],
+            doc_id: doc_id.to_owned(),
+            block_id: None,
+            before: None,
+            after: None,
+            body_hash: Some(info.body_hash),
+            revision_id: Some(new_revision),
+            detail: Some(format!("восстановлена ревизия {revision_id}")),
         })
     }
 
