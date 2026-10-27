@@ -30,7 +30,7 @@ struct RdeTestClient;
 impl ClientHandler for RdeTestClient {}
 
 /// Ожидаемый каталог M2.5: M1/M2-наборы не переставлены, новые инструменты — в конце.
-const EXPECTED_TOOLS: [&str; 27] = [
+const EXPECTED_TOOLS: [&str; 29] = [
     // M1 (read-only)
     "workspace_current",
     "project_tree",
@@ -61,10 +61,13 @@ const EXPECTED_TOOLS: [&str; 27] = [
     "suggestion_reject",
     "doc_replace_range",
     "revision_list",
+    // M2.6 (вставка/удаление абзацев)
+    "doc_insert",
+    "doc_delete",
 ];
 
 /// Мутирующие инструменты (readOnlyHint=false).
-const MUTATING_TOOLS: [&str; 10] = [
+const MUTATING_TOOLS: [&str; 12] = [
     "artifact_write_manifest",
     "artifact_write_script",
     "artifact_run",
@@ -75,10 +78,12 @@ const MUTATING_TOOLS: [&str; 10] = [
     "suggestion_accept",
     "suggestion_reject",
     "doc_replace_range",
+    "doc_insert",
+    "doc_delete",
 ];
 
 /// Деструктивные мутации (destructiveHint=true).
-const DESTRUCTIVE_TOOLS: [&str; 8] = [
+const DESTRUCTIVE_TOOLS: [&str; 9] = [
     "artifact_write_manifest",
     "artifact_write_script",
     "artifact_run",
@@ -87,6 +92,7 @@ const DESTRUCTIVE_TOOLS: [&str; 8] = [
     "git_commit",
     "suggestion_accept",
     "doc_replace_range",
+    "doc_delete",
 ];
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -290,7 +296,7 @@ async fn external_client_reads_project_document_artifacts_and_audits_calls() {
     assert_eq!(error_code(&too_many), "RDE_OUT_OF_RANGE");
 
     // 9. Неизвестный инструмент — ошибка JSON-RPC.
-    let unknown = client.peer().call_tool(CallToolRequestParams::new("doc_insert")).await;
+    let unknown = client.peer().call_tool(CallToolRequestParams::new("doc_export")).await;
     assert!(unknown.is_err(), "неизвестный инструмент должен вернуть ошибку протокола");
 
     // 10. Ресурсы: list/templates/read.
@@ -842,6 +848,16 @@ async fn default_deny_blocks_document_mutations_e2e() {
     assert_eq!(error_code(&replace), "RDE_APPROVAL_DENIED");
     let accept = call(&client, "suggestion_accept", json!({"suggestion_id": "01NOPE"})).await;
     assert_eq!(error_code(&accept), "RDE_APPROVAL_DENIED");
+    // M2.6: вставка/удаление абзацев — тоже только с грантом+approval.
+    let insert = call(&client, "doc_insert", json!({"doc_id": doc_id, "text": "Абзац из агента"})).await;
+    assert_eq!(error_code(&insert), "RDE_APPROVAL_DENIED");
+    let delete = call(
+        &client,
+        "doc_delete",
+        json!({"doc_id": doc_id, "block_id": block_id, "expected_text": block_text}),
+    )
+    .await;
+    assert_eq!(error_code(&delete), "RDE_APPROVAL_DENIED");
     // Read-only инструменты документа работают и ничего не меняют.
     let outline = call(&client, "doc_outline", json!({"doc_id": doc_id})).await;
     assert_eq!(outline.is_error, Some(false));
@@ -851,5 +867,77 @@ async fn default_deny_blocks_document_mutations_e2e() {
     assert!(entries.iter().any(|entry| entry["tool"] == "doc_suggest_edit"
         && entry["decision"] == "deny"
         && entry["reason"] == "policy"));
+    assert!(entries.iter().any(|entry| entry["tool"] == "doc_insert"
+        && entry["decision"] == "deny"
+        && entry["error_code"] == "RDE_APPROVAL_DENIED"));
+    client.cancel().await.expect("корректное завершение клиента");
+}
+
+#[tokio::test]
+async fn document_insert_delete_e2e_with_approval() {
+    let root = demo_copy("doc-m26");
+    let client = connect_with(&root, &["--approval=auto"]).await;
+    let (doc_id, _body_hash, _file) = migrated_document(&client).await;
+    let (anchor_id, anchor_text) = editable_block(&client, &doc_id, &[]).await;
+    let before_blocks = document_blocks(&client, &doc_id).await;
+    let anchor_index = before_blocks
+        .iter()
+        .position(|block| block["id"].as_str() == Some(anchor_id.as_str()))
+        .expect("якорь в оглавлении");
+    // 1) Вставка абзаца после якоря: +1 блок, чекпоинт+ревизия, текст на месте.
+    let inserted = call(
+        &client,
+        "doc_insert",
+        json!({
+            "doc_id": doc_id, "anchor_block_id": anchor_id, "position": "after",
+            "text": "Новый абзац M2.6", "style": "Normal"
+        }),
+    )
+    .await;
+    assert_eq!(inserted.is_error, Some(false), "doc_insert: {inserted:?}");
+    let insert_outcome = structured(&inserted).clone();
+    let insert_checkpoint = insert_outcome["checkpoint_id"].as_str().expect("checkpoint_id").to_owned();
+    let new_block_id = insert_outcome["block_id"].as_str().expect("block_id нового абзаца").to_owned();
+    assert_eq!(insert_outcome["after"], "Новый абзац M2.6");
+    let after_insert = document_blocks(&client, &doc_id).await;
+    assert_eq!(after_insert.len(), before_blocks.len() + 1);
+    assert_eq!(after_insert[anchor_index]["text"], anchor_text, "якорь на месте");
+    assert_eq!(after_insert[anchor_index + 1]["text"], "Новый абзац M2.6");
+    assert!(root.join(".rde/agent/checkpoints").join(&insert_checkpoint).join("manifest.json").is_file());
+    let revisions = call(&client, "revision_list", json!({"doc_id": doc_id})).await;
+    let revisions = structured(&revisions).as_array().cloned().unwrap_or_default();
+    assert!(revisions.iter().any(|revision| revision["revision_id"] == insert_outcome["revision_id"]));
+    // 2) Удаление вставленного абзаца: блоков снова столько же; чекпоинт есть.
+    let deleted = call(
+        &client,
+        "doc_delete",
+        json!({"doc_id": doc_id, "block_id": new_block_id, "expected_text": "Новый абзац M2.6"}),
+    )
+    .await;
+    assert_eq!(deleted.is_error, Some(false), "doc_delete: {deleted:?}");
+    let delete_outcome = structured(&deleted).clone();
+    assert!(delete_outcome["checkpoint_id"].as_str().is_some());
+    assert_eq!(delete_outcome["before"], "Новый абзац M2.6");
+    assert!(delete_outcome.get("after").is_none() || delete_outcome["after"].is_null());
+    let after_delete = document_blocks(&client, &doc_id).await;
+    assert_eq!(after_delete.len(), before_blocks.len());
+    assert!(!after_delete.iter().any(|block| block["text"] == "Новый абзац M2.6"));
+    // 3) Конфликт: устаревший expected_text (R-DOC-13) — документ не меняется.
+    let stale = call(
+        &client,
+        "doc_delete",
+        json!({"doc_id": doc_id, "block_id": anchor_id, "expected_text": "устаревший текст"}),
+    )
+    .await;
+    assert_eq!(error_code(&stale), "RDE_CONFLICT");
+    // 4) Аудит: checkpoint_id для вставки/удаления.
+    let entries = audit_entries(&root);
+    for tool in ["doc_insert", "doc_delete"] {
+        let entry = entries
+            .iter()
+            .find(|entry| entry["tool"] == tool && entry["decision"] == "allow")
+            .unwrap_or_else(|| panic!("аудит {tool}: {entries:?}"));
+        assert!(entry["checkpoint_id"].as_str().is_some(), "{tool}: checkpoint_id в аудите");
+    }
     client.cancel().await.expect("корректное завершение клиента");
 }

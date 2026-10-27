@@ -118,7 +118,8 @@ impl McpPolicy {
             "\n## Политика мутаций этой сессии (M2/M2.5, grants + approvals)\n\
              - режим approvals: `{}`; без гранта мутация → `RDE_APPROVAL_DENIED` (файлы не меняются);\n\
              - запись в проект (`artifact_write_manifest`/`artifact_write_script`/`note_write`/документные \
-             `doc_suggest_edit`/`suggestion_accept`/`suggestion_reject`/`doc_replace_range`): {};\n\
+             `doc_suggest_edit`/`suggestion_accept`/`suggestion_reject`/`doc_replace_range`/\
+             `doc_insert`/`doc_delete`): {};\n\
              - запуск артефактов (`artifact_run`/`run_cancel`, нужен `trusted`-проект): {};\n\
              - git-коммит (`git_commit`): {};\n\
              - перед мутацией создаётся чекпоинт `.rde/agent/checkpoints/<id>/` (файлы + корни store), \

@@ -272,7 +272,7 @@ async fn http_streamable_transport_e2e_with_rmcp_client() {
     assert_eq!(peer.server_info.as_ref().map(|info| info.name.as_str()), Some("rde"));
     assert_eq!(peer.protocol_version, ProtocolVersion::V_2026_07_28);
     let tools = client.peer().list_tools(None).await.expect("tools/list по HTTP");
-    assert_eq!(tools.tools.len(), 27);
+    assert_eq!(tools.tools.len(), 29);
     // Чтение проекта работает; мутации по умолчанию запрещены (approvals=deny).
     let tree = call(&client, "project_tree", json!({})).await;
     assert_eq!(tree.is_error, Some(false));
@@ -298,7 +298,7 @@ async fn http_generated_token_is_printed_once_and_works() {
     assert!(server.stderr_text().contains("bearer-токен этой сессии"));
     let client = connect_http(&server.url(), &server.token).await;
     let tools = client.peer().list_tools(None).await.expect("tools/list с автогенерированным токеном");
-    assert_eq!(tools.tools.len(), 27);
+    assert_eq!(tools.tools.len(), 29);
     client.cancel().await.expect("закрыть клиент");
 }
 

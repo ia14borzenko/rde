@@ -447,6 +447,122 @@ impl HeadlessHost {
         Ok((report, revision_id, checkpoint_id))
     }
 
+    /// Вставить абзац: чекпоинт `.doc.rde` → бэкап → [`rde_doc::insert_paragraph`] → версия в store.
+    /// Возвращает `(отчёт, revision_id, checkpoint_id)`.
+    fn apply_paragraph_insert(
+        &self,
+        doc_id: &str,
+        anchor_block: Option<&str>,
+        position: rde_doc::InsertPosition,
+        text: &str,
+        style: Option<&str>,
+    ) -> Result<(rde_doc::ParagraphInsertReport, String, String), HostError> {
+        let project = self.project()?;
+        let (package, relative) = self.document_package(&project, doc_id)?;
+        self.ensure_doc_migrated(&package)?;
+        // Предпроверки до чекпоинта: внешняя правка/якорь должны быть валидны до создания чекпоинта.
+        self.ensure_doc_not_externally_edited(&package)?;
+        if let Some(anchor) = anchor_block {
+            rde_doc::block_edit_support(&package, anchor)
+                .map_err(|error| self.map_block_text_edit_error(error))?;
+        }
+        let request = rde_doc::ParagraphInsert {
+            anchor_block: anchor_block.map(str::to_owned),
+            position,
+            text: text.to_owned(),
+            style: style.unwrap_or_default().to_owned(),
+        };
+        let note = format!("doc_insert: {doc_id} ({})", anchor_block.unwrap_or("<end>"));
+        let args_hash = Self::payload_sha256(&(&request, doc_id));
+        let ((report, revision_id), checkpoint_id) = self.with_checkpoint(
+            "doc_insert",
+            &args_hash,
+            vec![(relative, package.clone())],
+            Some(note.clone()),
+            |host| {
+                let _ = rde_doc::backup_package(&host.root, &package);
+                let report = rde_doc::insert_paragraph(&package, &request)
+                    .map_err(|error| host.map_block_text_edit_error(error))?;
+                let payload = serde_json::json!({
+                    "kind": "document-mutation",
+                    "tool": "doc_insert",
+                    "doc_id": doc_id,
+                    "block_id": report.block_id,
+                });
+                let revision = host.with_store_mut(|store| {
+                    rde_doc::commit_document_with(
+                        &host.root,
+                        &package,
+                        doc_id,
+                        store,
+                        &note,
+                        &std::collections::BTreeMap::new(),
+                        Some(payload),
+                    )
+                    .map_err(|error| {
+                        HostError::internal(host.sanitize(format!("версия документа: {error}")))
+                    })
+                })?;
+                Ok((report, revision))
+            },
+        )?;
+        Ok((report, revision_id, checkpoint_id))
+    }
+
+    /// Удалить абзац: чекпоинт → бэкап → [`rde_doc::delete_block`] → версия в store.
+    fn apply_block_delete(
+        &self,
+        doc_id: &str,
+        block_id: &str,
+        expected_text: &str,
+    ) -> Result<(rde_doc::BlockDeleteReport, String, String), HostError> {
+        let project = self.project()?;
+        let (package, relative) = self.document_package(&project, doc_id)?;
+        self.ensure_doc_migrated(&package)?;
+        self.precheck_block_edit(&package, block_id, expected_text)?;
+        let note = format!("doc_delete: {doc_id}/{block_id}");
+        let args_hash = Self::payload_sha256(&("doc_delete", doc_id, block_id, expected_text));
+        let ((report, revision_id), checkpoint_id) = self.with_checkpoint(
+            "doc_delete",
+            &args_hash,
+            vec![(relative, package.clone())],
+            Some(note.clone()),
+            |host| {
+                let _ = rde_doc::backup_package(&host.root, &package);
+                let report = rde_doc::delete_block(
+                    &package,
+                    &rde_doc::BlockDelete {
+                        block_id: block_id.to_owned(),
+                        expected_text: expected_text.to_owned(),
+                    },
+                )
+                .map_err(|error| host.map_block_text_edit_error(error))?;
+                let payload = serde_json::json!({
+                    "kind": "document-mutation",
+                    "tool": "doc_delete",
+                    "doc_id": doc_id,
+                    "block_id": block_id,
+                });
+                let revision = host.with_store_mut(|store| {
+                    rde_doc::commit_document_with(
+                        &host.root,
+                        &package,
+                        doc_id,
+                        store,
+                        &note,
+                        &std::collections::BTreeMap::new(),
+                        Some(payload),
+                    )
+                    .map_err(|error| {
+                        HostError::internal(host.sanitize(format!("версия документа: {error}")))
+                    })
+                })?;
+                Ok((report, revision))
+            },
+        )?;
+        Ok((report, revision_id, checkpoint_id))
+    }
+
     /// DTO предложения для протокольного слоя.
     fn suggestion_info(edit: &rde_doc::SuggestedEdit) -> SuggestedEditInfo {
         SuggestedEditInfo {
@@ -1545,6 +1661,105 @@ impl RdeHost for HeadlessHost {
             body_hash: Some(info.body_hash),
             revision_id: Some(new_revision),
             detail: Some(format!("восстановлена ревизия {revision_id}")),
+        })
+    }
+
+    // --- M2.6: вставка/удаление абзацев ------------------------------------
+
+    fn doc_insert_paragraph(
+        &self,
+        doc_id: &str,
+        anchor_block: Option<&str>,
+        position: &str,
+        text: &str,
+        style: Option<&str>,
+        dry_run: bool,
+    ) -> Result<DocMutationOutcome, HostError> {
+        let project = self.project()?;
+        let (package, relative) = self.document_package(&project, doc_id)?;
+        self.ensure_doc_migrated(&package)?;
+        let position = rde_doc::InsertPosition::parse(position).ok_or_else(|| {
+            HostError::invalid_argument(format!("неизвестная позиция вставки `{position}` (after|before)"))
+        })?;
+        let body_hash = self.ensure_doc_not_externally_edited(&package)?;
+        if let Some(anchor) = anchor_block {
+            rde_doc::block_edit_support(&package, anchor)
+                .map_err(|error| self.map_block_text_edit_error(error))?;
+        }
+        if dry_run {
+            return Ok(DocMutationOutcome {
+                dry_run: true,
+                checkpoint_id: None,
+                changed_files: Vec::new(),
+                doc_id: doc_id.to_owned(),
+                block_id: None,
+                before: None,
+                after: Some(text.trim().to_owned()),
+                body_hash: Some(body_hash),
+                revision_id: None,
+                detail: Some("проверка пройдена: документ не менялся".to_owned()),
+            });
+        }
+        let (report, revision_id, checkpoint_id) =
+            self.apply_paragraph_insert(doc_id, anchor_block, position, text, style)?;
+        let body_hash = rde_doc::package_info(&package).ok().map(|info| info.body_hash);
+        Ok(DocMutationOutcome {
+            dry_run: false,
+            checkpoint_id: Some(checkpoint_id),
+            changed_files: vec![relative],
+            doc_id: doc_id.to_owned(),
+            block_id: Some(report.block_id),
+            before: None,
+            after: Some(report.text),
+            body_hash,
+            revision_id: Some(revision_id),
+            detail: Some(format!(
+                "вставлен абзац {} {}",
+                position.as_str(),
+                anchor_block.unwrap_or("<конец документа>")
+            )),
+        })
+    }
+
+    fn doc_delete_block(
+        &self,
+        doc_id: &str,
+        block_id: &str,
+        expected_text: &str,
+        dry_run: bool,
+    ) -> Result<DocMutationOutcome, HostError> {
+        let project = self.project()?;
+        let (package, relative) = self.document_package(&project, doc_id)?;
+        self.ensure_doc_migrated(&package)?;
+        let body_hash = self.precheck_block_edit(&package, block_id, expected_text)?;
+        if dry_run {
+            return Ok(DocMutationOutcome {
+                dry_run: true,
+                checkpoint_id: None,
+                changed_files: Vec::new(),
+                doc_id: doc_id.to_owned(),
+                block_id: Some(block_id.to_owned()),
+                before: Some(expected_text.to_owned()),
+                after: None,
+                body_hash: Some(body_hash),
+                revision_id: None,
+                detail: Some("проверка пройдена: документ не менялся".to_owned()),
+            });
+        }
+        let (report, revision_id, checkpoint_id) =
+            self.apply_block_delete(doc_id, block_id, expected_text)?;
+        let body_hash = rde_doc::package_info(&package).ok().map(|info| info.body_hash);
+        Ok(DocMutationOutcome {
+            dry_run: false,
+            checkpoint_id: Some(checkpoint_id),
+            changed_files: vec![relative],
+            doc_id: doc_id.to_owned(),
+            block_id: Some(report.block_id),
+            before: Some(report.before),
+            after: None,
+            body_hash,
+            revision_id: Some(revision_id),
+            detail: Some("абзац удалён".to_owned()),
         })
     }
 

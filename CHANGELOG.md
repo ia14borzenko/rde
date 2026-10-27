@@ -12,6 +12,28 @@
 
 ### Добавлено
 
+- **M2.6 «v0.3 — вставка/удаление абзацев документа» (ADR-0010, 2026-10-27)** — завершён документный
+  каталог мутаций: агент может **вставить новый абзац** (`doc_insert`: якорь/конец, `after|before`,
+  текст, опциональный стиль) и **удалить абзац** (`doc_delete`: по `block_id`+`expected_text`). Оба — под
+  теми же grants/approvals/чекпоинтами M2: предпроверки → чекпоинт `.doc.rde`+`backup_package` → операция
+  → версия документа в store → `checkpoint_id`/`revision_id` в ответе и аудите; `dry_run` без записи; на
+  ошибке — авто-откат. Домен — аддитивные `insert_paragraph`/`delete_block` в [`rde-doc`](crates/rde-doc/src/text_edit.rs)
+  (копия `pPr/rPr` якоря, `w:pStyle`, свежий `w14:paraId`, валидация; запрет удаления последнего блока и
+  абзацев со вставками/полями/рисунками/формулами/track changes; `expected_text`-защита → `RDE_CONFLICT`).
+  Позиционные `block_id` `bN` после вставки/удаления сдвигаются (документировано; устаревшие ожидания →
+  `RDE_CONFLICT`, ничего не теряется). Suggested edits остаются для замены текста; вставка/удаление —
+  прямые инструменты под approval. Всего **29 инструментов ≤32** (порядок M1/M2/M2.5 не переставлен);
+  **бюджет:** `tools/list` — **38 103 Б** (≈37,2 KiB; все `inputSchema` переведены на компактную
+  генерацию, запас ≈2,8 KiB до ориентира ≈40 KiB), инструкции — 8 886 Б. Новых зависимостей нет.
+  **Тесты: 392 passed, 0 failed** (383 + 9: `rde-doc` +4 домен — вставка после якоря/в конец/перед,
+  удаление+guards, валидация/sdt; `rde-host` +3 — checkpoint+revision+dry_run, удаление+checkpoint_restore
+  байт-в-байт, конфликты; `rde-mcp` +1 — обработчики/валидация аргументов `doc_insert`/`doc_delete`;
+  `apps/rde` e2e +1 — вставка+удаление через stdio, аудит `checkpoint_id`, default deny). Документы:
+  [ADR-0010](docs/adr/0010-m26-insert-delete-paragraphs.md), ТЗ §0.2/§5.7.3/§8.7.3/§8.7.4/§10.3/§16,
+  [`docs/state.md`](docs/state.md), README. Ограничения M2.6: только один простой абзац (таблицы/рисунки/
+  формулы — M3+); символьные диапазоны (run-aware) — M2.7/M3; track changes Word — отдельная веха;
+  UI-diff — M4.
+
 - **M3 «v0.3 — транспорт streamable HTTP»: opt-in, loopback + bearer-токен (ADR-0009, 2026-10-27)** —
   у MCP-сервера появился второй транспорт для **внешних** агентов: **streamable HTTP** (spec MCP
   **2026-07-28**, stateless core) на штатном `rmcp::StreamableHttpService` (tower) поверх `axum 0.8`;

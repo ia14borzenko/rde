@@ -566,6 +566,53 @@ impl RdeHost for MockHost {
         Ok(self.doc_outcome(doc_id, None, false))
     }
 
+    fn doc_insert_paragraph(
+        &self,
+        doc_id: &str,
+        anchor_block: Option<&str>,
+        _position: &str,
+        text: &str,
+        _style: Option<&str>,
+        dry_run: bool,
+    ) -> Result<DocMutationOutcome, HostError> {
+        if doc_id != "doc-1" {
+            return Err(HostError::not_found("документ не найден"));
+        }
+        if anchor_block == Some("b999") {
+            return Err(HostError::not_found("якорный блок не найден"));
+        }
+        if !dry_run {
+            self.record(format!("doc_insert:{doc_id}:{}", anchor_block.unwrap_or("<end>")));
+        }
+        let mut outcome = self.doc_outcome(doc_id, Some("b3"), dry_run);
+        outcome.after = Some(text.to_owned());
+        outcome.detail = Some("абзац вставлен".to_owned());
+        Ok(outcome)
+    }
+
+    fn doc_delete_block(
+        &self,
+        doc_id: &str,
+        block_id: &str,
+        expected_text: &str,
+        dry_run: bool,
+    ) -> Result<DocMutationOutcome, HostError> {
+        if doc_id != "doc-1" {
+            return Err(HostError::not_found("документ не найден"));
+        }
+        if expected_text.contains("stale") {
+            return Err(HostError::conflict("текст блока изменился").with_hint("перечитайте doc_read"));
+        }
+        if !dry_run {
+            self.record(format!("doc_delete:{doc_id}:{block_id}"));
+        }
+        let mut outcome = self.doc_outcome(doc_id, Some(block_id), dry_run);
+        outcome.before = Some(expected_text.to_owned());
+        outcome.after = None;
+        outcome.detail = Some("абзац удалён".to_owned());
+        Ok(outcome)
+    }
+
     fn instructions(&self) -> Result<String, HostError> {
         Ok(self.instructions.clone())
     }

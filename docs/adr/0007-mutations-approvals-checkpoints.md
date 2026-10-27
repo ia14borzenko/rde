@@ -202,7 +202,7 @@ Jobs **не переживают перезапуск** процесса (M2, д
 | Прямая правка абзаца | `doc_replace_range` | ✓ M2.5 (approval+checkpoint+версия) |
 | История версий документа | `revision_list` | ✓ M2.5 (store) |
 | Откатить независимо версию/чекпоинт работы агента | `revision_restore`/`checkpoint_restore` (API хоста) | ✗ MCP-инструмента нет (O5/O6-a); доступно RDE/UI |
-| Вставить/удалить абзац/блок | — (`doc_insert`/`doc_delete`) | ✗ M2.6 (O4 ADR-0008) |
+| Вставить/удалить абзац | `doc_insert`/`doc_delete` | ✓ M2.6 (approval+checkpoint+ревизия; ADR-0010) |
 | Обновить документ из вставок | — (`rde_doc`/`rde_dag` библиотечный API) | ✗ M2.6/M3 |
 | Создать/переименовать/удалить объект | — | ✗ M3 (R-ART CRUD) |
 | Источники/PDF-регионы/библиография | — | ✗ M3 (source_get/pdf_page_render/…) |

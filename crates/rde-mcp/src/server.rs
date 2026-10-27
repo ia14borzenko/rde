@@ -851,11 +851,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_is_protocol_error_and_audited() {
         let (server, sink) = recording_server();
-        let error = server.call_tool_impl("doc_insert", serde_json::json!({})).await.expect_err("неизвестный инструмент");
+        let error = server.call_tool_impl("doc_export", serde_json::json!({})).await.expect_err("неизвестный инструмент");
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
         let entries = sink.entries();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].tool, "doc_insert");
+        assert_eq!(entries[0].tool, "doc_export");
         assert_eq!(entries[0].decision, "deny");
         assert_eq!(entries[0].error_code.as_deref(), Some("RDE_UNSUPPORTED"));
     }

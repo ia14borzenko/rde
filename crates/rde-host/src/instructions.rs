@@ -60,7 +60,7 @@ pub fn build(project: &Project) -> String {
     out.push_str("- jobs (`artifact_run` → `run_status`/`run_log`/`run_cancel`) живут в процессе сервера и не переживают рестарт;\n");
     out.push_str("- общего `file_write` и произвольного shell нет.\n\n");
 
-    out.push_str("## Документы (M2.5: suggested edits + ревизии, R-DOC-32/R-DOC-41)\n");
+    out.push_str("## Документы (M2.5/M2.6: suggested edits, правки блоков, ревизии, R-DOC-32/R-DOC-41)\n");
     out.push_str("- правка текста документа — только по блокам (`block_id` из `doc_outline`) и только инструментами:\n");
     out.push_str("  `doc_suggest_edit` создаёт предложение (документ НЕ меняется) → `suggestion_list` → пользователь или\n");
     out.push_str("  `suggestion_accept`/`suggestion_reject`; `doc_replace_range` — прямая правка с approval (destructive), без ревью;\n");
@@ -69,7 +69,10 @@ pub fn build(project: &Project) -> String {
     out.push_str("- каждая правка: чекпоинт `.doc.rde` + версия документа в store (ревизия); `revision_list` — история версий,\n");
     out.push_str("  откат ревизии — операция RDE (API хоста/UI), MCP-инструмент `revision_restore` в M2.5 не публикуется;\n");
     out.push_str("- правятся только простые абзацы: без вставок RDE (`w:sdt`), полей, рисунков, формул, track changes;\n");
-    out.push_str("  один абзац без переводов строк; вставка/удаление абзацев и `doc_insert` — M2.6;\n");
+    out.push_str("  один абзац без переводов строк;\n");
+    out.push_str("- `doc_insert` (M2.6) — вставить новый абзац (якорь/конец, style); `doc_delete` (M2.6) — удалить\n");
+    out.push_str("  абзац по `block_id`+`expected_text`; оба — approval+чекпоинт+ревизия; id блоков `bN` после места\n");
+    out.push_str("  изменения сдвигаются; последний блок удалить нельзя; вставки/поля/рисунки/формулы не правятся;\n");
     out.push_str("- документ, изменённый вне RDE (`body_hash` не совпадает с `rde:doc`), не правится до перечитывания/восстановления.\n\n");
 
     out.push_str("## Объекты проекта\n");
@@ -85,7 +88,7 @@ pub fn build(project: &Project) -> String {
     }
     out.push('\n');
 
-    out.push_str("## Инструменты (27: 17 read-only + 10 мутаций)\n");
+    out.push_str("## Инструменты (29: 17 read-only + 12 мутаций)\n");
     let names: Vec<&str> = rde_mcp::tool_registry().iter().map(|tool| tool.name).collect();
     out.push_str(&format!("{}\n\n", names.join(", ")));
 

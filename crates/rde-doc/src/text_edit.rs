@@ -162,16 +162,299 @@ pub fn replace_block_text(
     })
 }
 
+// ── M2.6: вставка и удаление абзацев (block_id сдвигаются у последующих блоков) ──
+
+/// Куда вставить новый абзац относительно блока-якоря.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InsertPosition {
+    /// После якорного блока.
+    After,
+    /// Перед якорным блоком.
+    Before,
+}
+
+impl InsertPosition {
+    /// Разобрать `after|before` (без учёта регистра).
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "after" => Some(InsertPosition::After),
+            "before" => Some(InsertPosition::Before),
+            _ => None,
+        }
+    }
+
+    /// Строковое значение (`after`/`before`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InsertPosition::After => "after",
+            InsertPosition::Before => "before",
+        }
+    }
+}
+
+/// Запрос вставки нового абзаца (M2.6, R-DOC-32): один абзац, без переводов строк.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParagraphInsert {
+    /// Блок-якорь (`None` — в конец документа перед `w:sectPr`).
+    pub anchor_block: Option<String>,
+    /// Позиция относительно якоря.
+    pub position: InsertPosition,
+    /// Текст нового абзаца (непустой, без переводов строк).
+    pub text: String,
+    /// Стиль абзаца (`w:pStyle`); пусто — форматирование якоря.
+    pub style: String,
+}
+
+/// Результат вставки абзаца.
+#[derive(Clone, Debug)]
+pub struct ParagraphInsertReport {
+    /// Id нового блока (позиционный `bN`; последующие блоки сдвинулись).
+    pub block_id: String,
+    /// Стабильный `w14:paraId` нового абзаца.
+    pub para_id: String,
+    /// Текст нового блока (как извлечён WordCraft).
+    pub text: String,
+    /// Якорь (если был).
+    pub anchor_block: Option<String>,
+    /// Новое состояние пакета.
+    pub package: PackageInfo,
+    /// Обновлённый реестр `rde:doc`.
+    pub rde_doc: RdeDoc,
+}
+
+/// Запрос удаления абзаца (M2.6).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockDelete {
+    /// Id удаляемого блока.
+    pub block_id: String,
+    /// Ожидаемый текст блока (защита от устаревшего чтения, R-DOC-13).
+    pub expected_text: String,
+}
+
+/// Результат удаления абзаца.
+#[derive(Clone, Debug)]
+pub struct BlockDeleteReport {
+    /// Id удалённого блока (в документе он уже не существует).
+    pub block_id: String,
+    /// `w14:paraId` удалённого абзаца.
+    pub para_id: String,
+    /// Текст удалённого блока.
+    pub before: String,
+    /// Новое состояние пакета.
+    pub package: PackageInfo,
+    /// Обновлённый реестр `rde:doc`.
+    pub rde_doc: RdeDoc,
+}
+
+/// Вставить новый абзац в `.doc.rde` (M2.6).
+///
+/// Абзац получает стабильный `w14:paraId`; форматирование копируется у якоря (или последнего
+/// редактируемого абзаца при `anchor_block = None`), стиль можно переопределить. Id блоков
+/// позиционные (`bN`): блоки после места вставки сдвигаются; подписи/формулы/вставки RDE не
+/// перезаписываются (новый абзац пустой по смыслу, без sdt).
+///
+/// # Errors
+///
+/// [`BlockTextEditError`]: `NotFound` (нет якоря), `Unsupported` (непустой/переводы строк,
+/// якорь не простой абзац), `Conflict` (внешняя правка), `Internal`.
+pub fn insert_paragraph(
+    package: &Path,
+    request: &ParagraphInsert,
+) -> Result<ParagraphInsertReport, BlockTextEditError> {
+    validate_new_text(&request.text)?;
+    let (mut entries, document_xml, rde_doc) = load_fresh_document(package)?;
+    let before_blocks = document_blocks(package)
+        .map_err(|error| BlockTextEditError::Internal(format!("блоки документа: {error}")))?;
+    // Индекс нового блока в видимом списке (id позиционные: `b{index+1}`; после engine-сохранения
+    // paraId переинжектируются позиционно, поэтому id нового абзаца вычисляем по позиции).
+    let mut expected_index = before_blocks.len();
+    let mut anchor_block_id: Option<String> = None;
+    // Форматирование и место вставки: у якоря, иначе — последний редактируемый абзац и конец тела.
+    let (paragraph_props, run_props, insert_at) = match &request.anchor_block {
+        Some(anchor) => {
+            let anchor_index = before_blocks
+                .iter()
+                .position(|block| &block.id == anchor)
+                .ok_or_else(|| {
+                    BlockTextEditError::NotFound(format!("блок `{anchor}` не найден в документе"))
+                })?;
+            let resolved = resolve_editable_block(package, anchor)?;
+            let insert_at = match request.position {
+                InsertPosition::After => resolved.end,
+                InsertPosition::Before => resolved.start,
+            };
+            expected_index = match request.position {
+                InsertPosition::After => anchor_index + 1,
+                InsertPosition::Before => anchor_index,
+            };
+            anchor_block_id = Some(anchor.clone());
+            (resolved.paragraph_props, resolved.run_props, insert_at)
+        }
+        None => {
+            let mut formatting = (String::new(), String::new());
+            for block in before_blocks.iter().rev() {
+                if let Ok(resolved) = resolve_editable_block(package, &block.id) {
+                    formatting = (resolved.paragraph_props, resolved.run_props);
+                    break;
+                }
+            }
+            let insert_at = append_position(&document_xml);
+            (formatting.0, formatting.1, insert_at)
+        }
+    };
+    let paragraph_props = apply_paragraph_style(&paragraph_props, &request.style);
+    let para_id = fresh_para_id(&document_xml, &rde_doc, &request.text);
+    let text = escape_xml(request.text.trim());
+    let paragraph = format!(
+        "<w:p w14:paraId=\"{para_id}\">{paragraph_props}<w:r>{run_props}<w:t xml:space=\"preserve\">{text}</w:t></w:r></w:p>"
+    );
+    let mut document_xml = document_xml;
+    document_xml.insert_str(insert_at, &paragraph);
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    write_entries_atomic(&entries, package).map_err(BlockTextEditError::Internal)?;
+    let update = update_document_package(package).map_err(BlockTextEditError::Internal)?;
+    let rde_doc = update.rde_doc.ok_or_else(|| {
+        BlockTextEditError::Internal("после вставки не удалось перечитать rde:doc".to_owned())
+    })?;
+    let new_block = rde_doc.blocks.get(expected_index).ok_or_else(|| {
+        BlockTextEditError::Internal("вставленный абзац не появился в реестре rde:doc".to_owned())
+    })?;
+    let expected_text = request.text.trim();
+    if new_block.text != expected_text {
+        return Err(BlockTextEditError::Internal(format!(
+            "после вставки текст блока `{}` отличается: ожидался {:?}, получен {:?}",
+            new_block.id, expected_text, new_block.text
+        )));
+    }
+    Ok(ParagraphInsertReport {
+        block_id: new_block.id.clone(),
+        para_id: new_block.para_id.clone().unwrap_or(para_id),
+        text: new_block.text.clone(),
+        anchor_block: anchor_block_id,
+        package: update.package.unwrap_or_default(),
+        rde_doc,
+    })
+}
+
+/// Удалить абзац из `.doc.rde` (M2.6).
+///
+/// Нельзя удалить последний непустой блок; блоки с вставками RDE/полями/рисунками/формулами/
+/// track changes не удаляются (`Unsupported`). Id блоков позиционные — последующие сдвигаются.
+///
+/// # Errors
+///
+/// [`BlockTextEditError`]: `NotFound`, `Unsupported`, `Stale` (текст не совпал), `Conflict`,
+/// `Internal`.
+pub fn delete_block(
+    package: &Path,
+    request: &BlockDelete,
+) -> Result<BlockDeleteReport, BlockTextEditError> {
+    let resolved = resolve_editable_block(package, &request.block_id)?;
+    if resolved.full_text != request.expected_text {
+        return Err(BlockTextEditError::Stale {
+            expected: request.expected_text.clone(),
+            actual: resolved.full_text.clone(),
+        });
+    }
+    if resolved.visible_blocks <= 1 {
+        return Err(BlockTextEditError::Unsupported(
+            "нельзя удалить единственный блок документа".to_owned(),
+        ));
+    }
+    let mut document_xml = resolved.document_xml;
+    document_xml.replace_range(resolved.start..resolved.end, "");
+    let mut entries = resolved.entries;
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    write_entries_atomic(&entries, package).map_err(BlockTextEditError::Internal)?;
+    let update = update_document_package(package).map_err(BlockTextEditError::Internal)?;
+    let rde_doc = update.rde_doc.ok_or_else(|| {
+        BlockTextEditError::Internal("после удаления не удалось перечитать rde:doc".to_owned())
+    })?;
+    Ok(BlockDeleteReport {
+        block_id: request.block_id.clone(),
+        para_id: resolved.para_id,
+        before: resolved.full_text,
+        package: update.package.unwrap_or_default(),
+        rde_doc,
+    })
+}
+
+/// Позиция для вставки в конец тела: перед `w:sectPr` (он обязан быть последним в `w:body`).
+fn append_position(document_xml: &str) -> usize {
+    let Some(body_end) = document_xml.rfind("</w:body>") else {
+        return document_xml.len();
+    };
+    let body = &document_xml[..body_end];
+    body.rfind("<w:sectPr").unwrap_or(body_end)
+}
+
+/// Подставить стиль абзаца в копию `w:pPr` (пустой стиль — не менять).
+fn apply_paragraph_style(paragraph_props: &str, style: &str) -> String {
+    let style = style.trim();
+    if style.is_empty() {
+        return paragraph_props.to_owned();
+    }
+    let style_attr = escape_xml(style);
+    if paragraph_props.contains("<w:pStyle ") {
+        // Заменяем значение существующего стиля (атрибут `w:val`).
+        let Some(start) = paragraph_props.find("<w:pStyle ") else { return paragraph_props.to_owned() };
+        let Some(val_start) = paragraph_props[start..].find("w:val=\"") else {
+            return paragraph_props.to_owned();
+        };
+        let val_start = start + val_start + "w:val=\"".len();
+        let Some(val_end) = paragraph_props[val_start..].find('"') else {
+            return paragraph_props.to_owned();
+        };
+        let mut out = String::with_capacity(paragraph_props.len() + style_attr.len());
+        out.push_str(&paragraph_props[..val_start]);
+        out.push_str(&style_attr);
+        out.push_str(&paragraph_props[val_start + val_end..]);
+        return out;
+    }
+    if let Some(open) = paragraph_props.find("<w:pPr>") {
+        let insert_at = open + "<w:pPr>".len();
+        let mut out = String::with_capacity(paragraph_props.len() + style_attr.len() + 32);
+        out.push_str(&paragraph_props[..insert_at]);
+        out.push_str(&format!("<w:pStyle w:val=\"{style_attr}\"/>"));
+        out.push_str(&paragraph_props[insert_at..]);
+        out
+    } else {
+        format!("<w:pPr><w:pStyle w:val=\"{style_attr}\"/></w:pPr>")
+    }
+}
+
+/// Свежий `w14:paraId` (8 hex, верхний регистр), не встречающийся в документе и реестре.
+fn fresh_para_id(document_xml: &str, rde_doc: &RdeDoc, text: &str) -> String {
+    for index in 0..1000usize {
+        let hash = rde_hash::sha256(
+            format!("{}:para-insert:{index}:{}", rde_doc.doc_id, text).as_bytes(),
+        )
+        .hex();
+        let candidate: String = hash.chars().take(8).collect::<String>().to_uppercase();
+        let taken = document_xml.contains(&format!("w14:paraId=\"{candidate}\""))
+            || rde_doc
+                .blocks
+                .iter()
+                .any(|block| block.para_id.as_deref() == Some(candidate.as_str()));
+        if !taken {
+            return candidate;
+        }
+    }
+    // Практически недостижимо; детерминированный fallback (всё равно может совпасть).
+    "7DE0A1A6".to_owned()
+}
+
 fn validate_new_text(new_text: &str) -> Result<(), BlockTextEditError> {
     if new_text.trim().is_empty() {
         return Err(BlockTextEditError::Unsupported(
-            "пустой текст удалил бы абзац (сдвиг block_id) — удаление/вставка абзацев M2.5 не поддерживает"
+            "пустой текст недопустим при замене: для удаления абзаца используйте `doc_delete` (M2.6)"
                 .to_owned(),
         ));
     }
     if new_text.contains('\n') || new_text.contains('\r') {
         return Err(BlockTextEditError::Unsupported(
-            "переводы строк в тексте абзаца M2.5 не поддерживает (вставка новых абзацев — M2.6)"
+            "переводы строк внутри абзаца не поддерживаются: вставка нового абзаца — `doc_insert` (M2.6)"
                 .to_owned(),
         ));
     }
@@ -189,14 +472,15 @@ struct ResolvedBlock {
     start: usize,
     /// Позиция сразу после `</w:p>`.
     end: usize,
+    /// Видимых блоков в документе (для запрета удалить последний блок, M2.6).
+    visible_blocks: usize,
     document_xml: String,
     entries: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
-fn resolve_editable_block(
+fn load_fresh_document(
     package: &Path,
-    block_id: &str,
-) -> Result<ResolvedBlock, BlockTextEditError> {
+) -> Result<(std::collections::BTreeMap<String, Vec<u8>>, String, RdeDoc), BlockTextEditError> {
     if !package.is_file() {
         return Err(BlockTextEditError::NotFound(format!(
             "пакет документа не найден: {}",
@@ -220,6 +504,14 @@ fn resolve_editable_block(
                 .to_owned(),
         ));
     }
+    Ok((entries, document_xml, rde_doc))
+}
+
+fn resolve_editable_block(
+    package: &Path,
+    block_id: &str,
+) -> Result<ResolvedBlock, BlockTextEditError> {
+    let (entries, document_xml, rde_doc) = load_fresh_document(package)?;
     let blocks = document_blocks(package)
         .map_err(|error| BlockTextEditError::Internal(format!("блоки документа: {error}")))?;
     let full_text = blocks
@@ -260,6 +552,7 @@ fn resolve_editable_block(
         run_props,
         start,
         end,
+        visible_blocks: rde_doc.blocks.len(),
         document_xml,
         entries,
     })

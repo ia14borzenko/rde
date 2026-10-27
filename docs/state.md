@@ -1127,4 +1127,67 @@ cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core
 cargo tree -p rde-host | grep -E "egui|eframe|rde-ui"
 ```
 
+## Обновление 2026-10-27 (M2.6: вставка/удаление абзацев документа)
 
+Веха **M2.6** фазы v0.3 (ТЗ §5.7.3 R-DOC-11…13, §8.7.3 R-DOC-32, §8.7.4 (каталог), §10.3,
+[ADR-0010](../docs/adr/0010-m26-insert-delete-paragraphs.md)): завершён документный каталог мутаций —
+агент может **вставить новый абзац** и **удалить абзац**; всё через те же grants/approvals/чекпоинты/
+аудит/ревизии, что в M2/M2.5.
+
+| Что | Где |
+|---|---|
+| Домен: `insert_paragraph(package, ParagraphInsert)` (якорь/конец, `after|before`, копия `pPr/rPr`, `w:pStyle`, свежий `w14:paraId`), `delete_block(package, BlockDelete)` (проверка `expected_text`, запрет последнего блока/не-простых абзацев) | [`crates/rde-doc/src/text_edit.rs`](../crates/rde-doc/src/text_edit.rs) |
+| Контракт `RdeHost`: `doc_insert_paragraph`/`doc_delete_block` (аддитивно, default `RDE_UNSUPPORTED`) | [`crates/rde-mcp/src/host.rs`](../crates/rde-mcp/src/host.rs) |
+| Реестр **29 инструментов**: +`doc_insert` (mutation, не destructive), +`doc_delete` (destructive), в конец; компактные `inputSchema` **всех** инструментов (бюджет) | [`crates/rde-mcp/src/tools.rs`](../crates/rde-mcp/src/tools.rs) |
+| Хост: предпроверки → чекпоинт `.doc.rde`+`backup_package` → операция → версия в store → `checkpoint_id`/`revision_id`; `dry_run` без записи; авто-откат | [`crates/rde-host/src/lib.rs`](../crates/rde-host/src/lib.rs) |
+| Инструкции: раздел «Документы» дополнен `doc_insert`/`doc_delete`, сдвиг `bN`, ограничения | [`crates/rde-host/src/instructions.rs`](../crates/rde-host/src/instructions.rs) |
+| E2E: вставка+удаление через stdio с `--approval=auto` (блок±1, чекпоинт, ревизия, аудит `checkpoint_id`, конфликт stale-текста); default deny — `RDE_APPROVAL_DENIED` для обоих | [`apps/rde/tests/mcp_stdio.rs`](../apps/rde/tests/mcp_stdio.rs) |
+| Интеграционные тесты хоста: вставка +checkpoint+revision, вставка в конец, удаление+checkpoint_restore (байт-в-байт), dry_run/конфликты/валидация | [`crates/rde-host/tests/doc_mutations.rs`](../crates/rde-host/tests/doc_mutations.rs) |
+| Домен-тесты: вставка после якоря/в конец/перед, сдвиг id, удаление+guards, валидация, sdt-блок | [`crates/rde-doc/tests/text_edit.rs`](../crates/rde-doc/tests/text_edit.rs) |
+
+**Семантика:** `block_id` (`b1..bN`) — позиционные: после вставки/удаления последующие блоки сдвигаются
+(описания инструментов предупреждают; агент перечитывает `doc_outline`/`doc_read`); устаревшие
+`expected_text`/`body_hash`/`base_body_hash` предложений → `RDE_CONFLICT` (R-DOC-13: ничего не теряется).
+Новый абзац получает `w14:paraId`, но при пересборке `rde:doc` paraId переинжектируются позиционно —
+отчёт возвращает фактический `block_id`/`para_id`. Suggested edits остаются **для замены текста**;
+вставка/удаление — прямые инструменты под approval (ADR-0010 O3). Символьные диапазоны (run-aware) и
+track changes Word — следующие вехи.
+
+**Числа M2.6:** инструментов **29 ≤32**, `tools/list` **38 103 Б** (≈37,2 KiB; все `inputSchema`
+компактные — запас ≈2,8 KiB до ориентира ≈40 KiB), инструкции **8 886 Б**; `cargo test --workspace` —
+**392 passed, 0 failed** (383 + 9: `rde-doc` +4 домен, `rde-host` +3, `rde-mcp` +1, `apps/rde` e2e +1).
+Новых зависимостей нет; `rde-core`/`rde-dag`/`rde-docx`/`rde-store`/`rde-vcs`/`rde-sources`/
+`rde-templates`/`rde-ui`/`xtask`/`vendor` — 0 файлов. Ручной smoke (stdio, `--approval=auto`): 46→47→46
+блоков, 2 чекпоинта, аудит `doc_insert`/`doc_delete` с `checkpoint_id`, ревизии в store.
+
+**Ограничения (честно):** вставляется/удаляется только один простой абзац (таблицы/рисунки/формулы —
+M3+); позиционные `bN` сдвигаются; символьные диапазоны и run-aware частичная замена — M2.7/M3; полные
+track changes Word (`w:ins/w:del`, экспорт) — отдельная веха; UI-diff вставок/удалений — M4;
+`tools/list` — запас ≈2,8 KiB (следующие инструменты потребуют сокращения или пересмотра бюджета).
+
+**Следующий шаг:** **M4** (GUI/ACP-хуки: панель агента/чат, интерактивный approval с diff, настройка
+«Разрешить внешним агентам» с показом адреса/токена, diff-UI suggested edits/вставок, URI-чипы §8.7.2)
+и **M2.7** (символьные диапазоны run-aware) / отдельная веха track changes R-DOC-32.
+
+**Проверить руками (M2.6):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export CARGO_HOME=/home/admin-pc/proj/rde-dev/.cache-tmp/cargo-home
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh build -p rde
+./scripts/build.sh test -p rde-doc -p rde-mcp -p rde-host   # домен + слой M2.6
+./scripts/build.sh test -p rde                               # e2e stdio+HTTP
+./scripts/build.sh test --workspace                          # 392 passed
+
+# 1) default deny: doc_insert/doc_delete → RDE_APPROVAL_DENIED, документ не меняется
+# 2) --approval=auto: doc_insert {"doc_id":"<doc>","anchor_block_id":"b1","text":"Новый абзац"}
+#    → block_id/checkpoint_id/revision_id; doc_read показывает блок+1; затем doc_delete по новому блоку
+#    с expected_text → блок-1; чекпоинты в .rde/agent/checkpoints, аудит с checkpoint_id, revision_list.
+# 3) конкурентность: doc_delete с устаревшим expected_text → RDE_CONFLICT (документ не меняется).
+# 4) независимость слоёв (пусто = доказано):
+cargo tree -p rde-mcp  | grep -E "egui|eframe|rde-ui|wordcraft|rde-host|rde-core|rde-dag|rde-doc|rde-store"
+cargo tree -p rde-host | grep -E "egui|eframe|rde-ui"
+```

@@ -418,6 +418,43 @@ pub struct RevisionListArgs {
     pub limit: Option<usize>,
 }
 
+/// `doc_insert` (M2.6): вставка нового абзаца.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocInsertArgs {
+    /// Стабильный id документа.
+    pub doc_id: String,
+    /// Блок-якорь (`null` — в конец документа).
+    #[serde(default)]
+    pub anchor_block_id: Option<String>,
+    /// Позиция относительно якоря: `after` (по умолчанию) | `before`.
+    #[serde(default)]
+    pub position: Option<String>,
+    /// Текст нового абзаца (непустой, без переводов строк).
+    pub text: String,
+    /// Стиль абзаца (`w:pStyle`); `null` — форматирование якоря/последнего абзаца.
+    #[serde(default)]
+    pub style: Option<String>,
+    /// Только проверить (документ не меняется).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `doc_delete` (M2.6): удаление абзаца.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocDeleteArgs {
+    /// Стабильный id документа.
+    pub doc_id: String,
+    /// Стабильный id блока (`b1`, …).
+    pub block_id: String,
+    /// Ожидаемый текст блока (защита от устаревшего чтения, R-DOC-13).
+    pub expected_text: String,
+    /// Только проверить (документ не меняется).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Обработчики
 // ---------------------------------------------------------------------------
@@ -839,6 +876,66 @@ fn revision_list(host: &dyn RdeHost, args: Value) -> Result<Value, HostError> {
     to_json(host.revision_list(&args.doc_id, limit)?)
 }
 
+/// Проверить стиль абзаца (`w:pStyle`): ≤100 символов, безопасные для XML-атрибута.
+fn validate_paragraph_style(style: Option<&str>) -> Result<Option<&str>, HostError> {
+    let Some(style) = style.map(str::trim).filter(|style| !style.is_empty()) else {
+        return Ok(None);
+    };
+    if style.chars().count() > 100 {
+        return Err(HostError::invalid_argument("style длиннее 100 символов"));
+    }
+    if !style.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.')) {
+        return Err(HostError::invalid_argument(
+            "style должен содержать только ASCII-буквы/цифры, пробел, `-`, `_`, `.`",
+        )
+        .with_hint("пример: Heading1 / Normal / GOST Heading"));
+    }
+    Ok(Some(style))
+}
+
+fn doc_insert(host: &dyn RdeHost, args: Value) -> Result<Value, HostError> {
+    let args: DocInsertArgs = parse_args(args)?;
+    if args.doc_id.trim().is_empty() {
+        return Err(HostError::invalid_argument("doc_id не может быть пустым"));
+    }
+    validate_block_text("text", &args.text)?;
+    let anchor = args
+        .anchor_block_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|anchor| !anchor.is_empty());
+    let position = match args.position.as_deref().map(str::trim) {
+        None | Some("") | Some("after") => "after",
+        Some("before") => "before",
+        Some(other) => {
+            return Err(HostError::invalid_argument(format!(
+                "неизвестная позиция вставки `{other}` (after|before)"
+            )));
+        }
+    };
+    let style = validate_paragraph_style(args.style.as_deref())?;
+    to_json(host.doc_insert_paragraph(
+        &args.doc_id,
+        anchor,
+        position,
+        &args.text,
+        style,
+        args.dry_run,
+    )?)
+}
+
+fn doc_delete(host: &dyn RdeHost, args: Value) -> Result<Value, HostError> {
+    let args: DocDeleteArgs = parse_args(args)?;
+    if args.doc_id.trim().is_empty() {
+        return Err(HostError::invalid_argument("doc_id не может быть пустым"));
+    }
+    if args.block_id.trim().is_empty() {
+        return Err(HostError::invalid_argument("block_id не может быть пустым"));
+    }
+    validate_block_text("expected_text", &args.expected_text)?;
+    to_json(host.doc_delete_block(&args.doc_id, &args.block_id, &args.expected_text, args.dry_run)?)
+}
+
 // ---------------------------------------------------------------------------
 // Реестр (порядок фиксирован — prompt-cache, R-AGT-08)
 // ---------------------------------------------------------------------------
@@ -870,7 +967,7 @@ fn build_registry() -> Vec<ToolSpec> {
             name: "project_search",
             title: "Search project",
             description: "Case-insensitive substring search over object ids, titles and manifest fields. Arguments: {\"query\": string, \"limit\"?: integer (default 20, max 100)}. Read-only.",
-            input_schema: || schema_value::<ProjectSearchArgs>(),
+            input_schema: || schema_value_compact::<ProjectSearchArgs>(),
             output_schema: || schema_value_compact::<Vec<crate::model::SearchHit>>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
@@ -880,7 +977,7 @@ fn build_registry() -> Vec<ToolSpec> {
             name: "file_read",
             title: "Read project file",
             description: "Read a UTF-8 text file inside the project root. Arguments: {\"path\": string (POSIX relative), \"range\"?: {\"bytes\":{\"offset\",\"limit\"}} or {\"lines\":{\"start\" (1-based),\"count\"}}}. Defaults to first 32 KiB; files larger than 8 MiB require a range; max 256 KiB / 2000 lines per call. Binary files and `.rde/**` are rejected; paths escaping the root give RDE_PATH_ESCAPE. Read-only.",
-            input_schema: || schema_value::<FileReadArgs>(),
+            input_schema: || schema_value_compact::<FileReadArgs>(),
             output_schema: || schema_value_compact::<crate::model::FileChunk>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
@@ -900,7 +997,7 @@ fn build_registry() -> Vec<ToolSpec> {
             name: "doc_outline",
             title: "Document outline",
             description: "Document outline by stable doc id: blocks (id, kind, title, chars, index), template, rde:doc schema version, insert count. Only `.doc.rde` packages are readable; otherwise RDE_DOC_NOT_MIGRATED (no auto-migration). Arguments: {\"doc_id\": string}. Read-only.",
-            input_schema: || schema_value::<DocOutlineArgs>(),
+            input_schema: || schema_value_compact::<DocOutlineArgs>(),
             output_schema: || schema_value_compact::<crate::model::DocOutline>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
@@ -910,7 +1007,7 @@ fn build_registry() -> Vec<ToolSpec> {
             name: "doc_read",
             title: "Read document body",
             description: "Read document body text by block ids or block-index range. Arguments: {\"doc_id\": string, \"block_ids\"?: string[], \"start\"?: integer (0-based), \"limit\"?: integer (default 32, max 256)}. Returns blocks and joined text; `truncated` is set when a limit was hit. Read-only.",
-            input_schema: || schema_value::<DocReadArgs>(),
+            input_schema: || schema_value_compact::<DocReadArgs>(),
             output_schema: || schema_value_compact::<crate::model::DocText>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
@@ -930,7 +1027,7 @@ fn build_registry() -> Vec<ToolSpec> {
             name: "artifact_read",
             title: "Artifact detail",
             description: "Artifact detail: manifest fields (type, rebuild, runtime, params, declared outputs, script files, timeout, network policy, groups) plus outputs from the ledger (relative path, size, blob sha256) and live status. Does not run anything. Arguments: {\"artifact_id\": string}. Read-only.",
-            input_schema: || schema_value::<ArtifactReadArgs>(),
+            input_schema: || schema_value_compact::<ArtifactReadArgs>(),
             output_schema: || schema_value_compact::<crate::model::ArtifactDetail>(),
             annotations: ToolAnnotationsSpec::read_only(),
             grant: None,
@@ -1118,6 +1215,27 @@ fn build_registry() -> Vec<ToolSpec> {
             grant: None,
             handler: revision_list,
         },
+        // --- M2.6: вставка/удаление абзацев документа (R-DOC-32) ---
+        ToolSpec {
+            name: "doc_insert",
+            title: "Insert document paragraph",
+            description: "Insert one new paragraph into the document. Arguments: {\"doc_id\": string, \"anchor_block_id\"?: string (bN; null = append at end), \"position\"?: \"after|before\" (default after), \"text\": string (non-empty, single paragraph), \"style\"?: string (w:pStyle; default = formatting of anchor/last paragraph), \"dry_run\"?: bool}. Checkpointed; commits a document revision; block ids after the insertion shift (bN). Requires project-write grant + approval. Not for tables/figures/formulas.",
+            input_schema: || schema_value_compact::<DocInsertArgs>(),
+            output_schema: || schema_value_compact::<crate::model::DocMutationOutcome>(),
+            annotations: ToolAnnotationsSpec::mutating(false),
+            grant: Some(ToolGrant::ProjectWrite),
+            handler: doc_insert,
+        },
+        ToolSpec {
+            name: "doc_delete",
+            title: "Delete document paragraph",
+            description: "Delete one document paragraph (destructive). Arguments: {\"doc_id\": string, \"block_id\": string, \"expected_text\": string (current text from doc_read), \"dry_run\"?: bool}. Guards: expected_text must match (RDE_CONFLICT otherwise), the last remaining block cannot be deleted, paragraphs with RDE inserts/fields/figures/formulas/track changes are RDE_UNSUPPORTED. Checkpointed; commits a document revision; block ids after the deleted one shift. Requires project-write grant + approval.",
+            input_schema: || schema_value_compact::<DocDeleteArgs>(),
+            output_schema: || schema_value_compact::<crate::model::DocMutationOutcome>(),
+            annotations: ToolAnnotationsSpec::mutating(true),
+            grant: Some(ToolGrant::ProjectWrite),
+            handler: doc_delete,
+        },
     ]
 }
 
@@ -1183,6 +1301,9 @@ mod tests {
         "revision_list",
     ];
 
+    /// M2.6 инструменты вставки/удаления абзацев — строго в конец.
+    const M26_TOOLS: [&str; 2] = ["doc_insert", "doc_delete"];
+
     #[test]
     fn registry_order_is_deterministic_and_within_budget() {
         let names: Vec<&str> = tool_registry().iter().map(|tool| tool.name).collect();
@@ -1190,9 +1311,10 @@ mod tests {
             .iter()
             .chain(M2_TOOLS.iter())
             .chain(M25_TOOLS.iter())
+            .chain(M26_TOOLS.iter())
             .copied()
             .collect();
-        assert_eq!(names, expected, "порядок: M1/M2-наборы не переставлены, M2.5 — в конце");
+        assert_eq!(names, expected, "порядок: M1/M2/M2.5-наборы не переставлены, M2.6 — в конце");
         // Два независимых построения дают одинаковый порядок (детерминизм, не HashMap).
         let again: Vec<&str> = build_registry().iter().map(|tool| tool.name).collect();
         assert_eq!(names, again);
@@ -1240,6 +1362,8 @@ mod tests {
                 "suggestion_accept",
                 "suggestion_reject",
                 "doc_replace_range",
+                "doc_insert",
+                "doc_delete",
             ]
         );
         let destructive: Vec<&str> = tool_registry()
@@ -1258,6 +1382,7 @@ mod tests {
                 "git_commit",
                 "suggestion_accept",
                 "doc_replace_range",
+                "doc_delete",
             ]
         );
     }
@@ -1271,7 +1396,14 @@ mod tests {
         assert_eq!(find_tool("run_cancel").unwrap().grant, Some(ToolGrant::RunScript));
         assert_eq!(find_tool("git_commit").unwrap().grant, Some(ToolGrant::GitCommit));
         // M2.5: документные правки — под грантом записи в проект.
-        for name in ["doc_suggest_edit", "suggestion_accept", "suggestion_reject", "doc_replace_range"] {
+        for name in [
+            "doc_suggest_edit",
+            "suggestion_accept",
+            "suggestion_reject",
+            "doc_replace_range",
+            "doc_insert",
+            "doc_delete",
+        ] {
             assert_eq!(find_tool(name).unwrap().grant, Some(ToolGrant::ProjectWrite), "{name}");
         }
     }
@@ -1333,6 +1465,17 @@ mod tests {
         assert!(schema_accepts::<SuggestionIdArgs>(serde_json::json!({"suggestion_id": "01SUG"})));
         assert!(schema_accepts::<RevisionListArgs>(serde_json::json!({"doc_id": "01DOC"})));
         assert!(!schema_accepts::<DocSuggestEditArgs>(serde_json::json!({"doc_id": "01DOC"})));
+        // M2.6: вставка/удаление абзацев.
+        assert!(schema_accepts::<DocInsertArgs>(serde_json::json!({
+            "doc_id": "01DOC", "anchor_block_id": "b2", "position": "before",
+            "text": "Новый абзац", "style": "Normal", "dry_run": true
+        })));
+        assert!(schema_accepts::<DocInsertArgs>(serde_json::json!({"doc_id": "01DOC", "text": "В конец"})));
+        assert!(!schema_accepts::<DocInsertArgs>(serde_json::json!({"doc_id": "01DOC"})));
+        assert!(schema_accepts::<DocDeleteArgs>(serde_json::json!({
+            "doc_id": "01DOC", "block_id": "b2", "expected_text": "старый текст"
+        })));
+        assert!(!schema_accepts::<DocDeleteArgs>(serde_json::json!({"doc_id": "01DOC", "block_id": "b2"})));
     }
 
     #[test]
@@ -1508,6 +1651,71 @@ mod tests {
     }
 
     #[test]
+    fn document_insert_delete_handlers() {
+        let host = host();
+        // Вставка: по умолчанию position=after, якорь необязателен; dry_run не пишет.
+        let dry = doc_insert(
+            host.as_ref(),
+            serde_json::json!({"doc_id": "doc-1", "text": "Новый абзац", "dry_run": true}),
+        )
+        .expect("dry-run вставки");
+        assert_eq!(dry["dry_run"], true);
+        assert!(dry.get("checkpoint_id").is_none());
+        assert_eq!(host.mutation_count(), 0);
+        let inserted = doc_insert(
+            host.as_ref(),
+            serde_json::json!({
+                "doc_id": "doc-1", "anchor_block_id": "b1", "position": "before",
+                "text": "Новый абзац", "style": "Normal"
+            }),
+        )
+        .expect("вставка абзаца");
+        assert_eq!(inserted["after"], "Новый абзац");
+        assert_eq!(inserted["checkpoint_id"], crate::test_support::MOCK_CHECKPOINT_ID);
+        assert!(host.mutation_log().iter().any(|entry| entry == "doc_insert:doc-1:b1"));
+        let at_end = doc_insert(
+            host.as_ref(),
+            serde_json::json!({"doc_id": "doc-1", "text": "Абзац в конец"}),
+        )
+        .expect("вставка в конец");
+        assert_eq!(at_end["block_id"], "b3");
+
+        // Удаление: чекпоинт+ревизия, stale-текст → RDE_CONFLICT, неизвестный якорь → NotFound.
+        let deleted = doc_delete(
+            host.as_ref(),
+            serde_json::json!({"doc_id": "doc-1", "block_id": "b2", "expected_text": "Старый текст"}),
+        )
+        .expect("удаление абзаца");
+        assert_eq!(deleted["block_id"], "b2");
+        assert_eq!(deleted["before"], "Старый текст");
+        assert!(deleted.get("after").is_none());
+        assert!(host.mutation_log().iter().any(|entry| entry == "doc_delete:doc-1:b2"));
+        let stale = doc_delete(
+            host.as_ref(),
+            serde_json::json!({"doc_id": "doc-1", "block_id": "b2", "expected_text": "stale текст"}),
+        )
+        .expect_err("устаревший текст");
+        assert_eq!(stale.code, crate::error::RdeErrorCode::Conflict);
+        let missing = doc_insert(
+            host.as_ref(),
+            serde_json::json!({"doc_id": "doc-1", "anchor_block_id": "b999", "text": "x"}),
+        )
+        .expect_err("нет якоря");
+        assert_eq!(missing.code, crate::error::RdeErrorCode::NotFound);
+        // Валидация аргументов.
+        for args in [
+            serde_json::json!({"doc_id": "doc-1", "text": ""}),
+            serde_json::json!({"doc_id": "doc-1", "text": "a\nb"}),
+            serde_json::json!({"doc_id": "doc-1", "text": "x", "position": "sideways"}),
+            serde_json::json!({"doc_id": "doc-1", "text": "x", "style": "T<1"}),
+            serde_json::json!({"doc_id": "doc-1", "text": "x", "bogus": 1}),
+        ] {
+            let error = doc_insert(host.as_ref(), args.clone()).expect_err("невалидная вставка");
+            assert_eq!(error.code, crate::error::RdeErrorCode::InvalidArgument, "{args}: {error}");
+        }
+    }
+
+    #[test]
     fn handler_propagates_host_error_codes() {
         let host = host();
         let error = artifact_read(host.as_ref(), serde_json::json!({"artifact_id": "missing"}))
@@ -1542,8 +1750,9 @@ mod tests {
         for tool in tool_registry() {
             assert!(find_tool(tool.name).is_some());
         }
-        assert!(find_tool("doc_insert").is_none(), "doc-мутаций в M2 нет (R-DOC-32/M2.5)");
+        assert!(find_tool("doc_export").is_none(), "экспорт документа — M3+, MCP-инструмента нет");
         assert!(find_tool("file_write").is_none(), "общего file_write нет (A7)");
+        assert!(find_tool("suggestion_restore").is_none(), "откат предложений — не в M2.6");
     }
 
     #[test]

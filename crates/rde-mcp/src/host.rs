@@ -228,6 +228,31 @@ pub trait RdeHost: Send + Sync {
         Err(unsupported("история версий документа"))
     }
 
+    /// Вставить новый абзац документа (M2.6): `position` = `after|before` относительно якоря,
+    /// `anchor_block = None` — в конец документа; `dry_run` — проверки без записи.
+    fn doc_insert_paragraph(
+        &self,
+        _doc_id: &str,
+        _anchor_block: Option<&str>,
+        _position: &str,
+        _text: &str,
+        _style: Option<&str>,
+        _dry_run: bool,
+    ) -> Result<DocMutationOutcome, HostError> {
+        Err(unsupported("вставка абзаца документа"))
+    }
+
+    /// Удалить абзац документа (M2.6); `expected_text` — защита от устаревшего чтения.
+    fn doc_delete_block(
+        &self,
+        _doc_id: &str,
+        _block_id: &str,
+        _expected_text: &str,
+        _dry_run: bool,
+    ) -> Result<DocMutationOutcome, HostError> {
+        Err(unsupported("удаление абзаца документа"))
+    }
+
     /// Восстановить версию документа по ревизии (интерфейс хоста; MCP-инструмента в M2.5 нет).
     fn revision_restore(&self, _doc_id: &str, _revision_id: &str) -> Result<DocMutationOutcome, HostError> {
         Err(unsupported("восстановление версии документа"))

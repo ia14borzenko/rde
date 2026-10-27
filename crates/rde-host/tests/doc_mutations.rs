@@ -284,3 +284,107 @@ fn document_mutations_require_migrated_document() {
         .expect_err("немаркированный документ");
     assert_eq!(error.code, RdeErrorCode::DocNotMigrated);
 }
+
+// --- M2.6: вставка/удаление абзацев ----------------------------------------
+
+#[test]
+fn doc_insert_paragraph_is_checkpointed_and_versioned() {
+    let (host, root) = demo_host("insert");
+    let (doc_id, package) = doc_setup(&host, &root);
+    let before_bytes = std::fs::read(&package).unwrap();
+    let (anchor_id, anchor_text) = editable_block(&host, &doc_id, &[]);
+    let before_blocks = blocks(&host, &doc_id);
+    // dry_run: текст не пишется, чекпоинта нет.
+    let dry = host
+        .doc_insert_paragraph(&doc_id, Some(&anchor_id), "after", "Абзац-черновик", None, true)
+        .expect("dry-run вставки");
+    assert!(dry.dry_run && dry.checkpoint_id.is_none());
+    assert_eq!(std::fs::read(&package).unwrap(), before_bytes);
+    // Вставка после якоря: блоков +1, текст сразу после якоря; чекпоинт + ревизия.
+    let outcome = host
+        .doc_insert_paragraph(&doc_id, Some(&anchor_id), "after", "Вставленный абзац M2.6", Some("Normal"), false)
+        .expect("вставка абзаца");
+    let checkpoint_id = outcome.checkpoint_id.clone().expect("чекпоинт");
+    let revision_id = outcome.revision_id.clone().expect("ревизия");
+    assert_eq!(outcome.after.as_deref(), Some("Вставленный абзац M2.6"));
+    assert!(outcome.block_id.is_some());
+    assert!(root.join(".rde/agent/checkpoints").join(&checkpoint_id).join("manifest.json").is_file());
+    let after_blocks = blocks(&host, &doc_id);
+    assert_eq!(after_blocks.len(), before_blocks.len() + 1);
+    let anchor_index = after_blocks.iter().position(|block| block.id == anchor_id).expect("якорь");
+    assert_eq!(after_blocks[anchor_index].text, anchor_text);
+    assert_eq!(after_blocks[anchor_index + 1].text, "Вставленный абзац M2.6");
+    assert_eq!(Some(after_blocks[anchor_index + 1].id.clone()), outcome.block_id);
+    let revisions = host.revision_list(&doc_id, 20).unwrap();
+    assert!(revisions.iter().any(|revision| revision.revision_id == revision_id && revision.current));
+    // Вставка в конец (без якоря) — последний блок.
+    let at_end = host
+        .doc_insert_paragraph(&doc_id, None, "after", "Абзац в конец", None, false)
+        .expect("вставка в конец");
+    let after_end = blocks(&host, &doc_id);
+    assert_eq!(after_end.last().map(|block| block.text.as_str()), Some("Абзац в конец"));
+    assert!(at_end.block_id.is_some());
+}
+
+#[test]
+fn doc_delete_paragraph_is_checkpointed_and_restorable() {
+    let (host, root) = demo_host("delete");
+    let (doc_id, package) = doc_setup(&host, &root);
+    let before_bytes = std::fs::read(&package).unwrap();
+    let before_blocks = blocks(&host, &doc_id);
+    let (block_id, text) = editable_block(&host, &doc_id, &[]);
+    // dry_run + stale-текст не меняют документ.
+    let dry = host.doc_delete_block(&doc_id, &block_id, &text, true).expect("dry-run удаления");
+    assert!(dry.dry_run && dry.checkpoint_id.is_none());
+    expect_code(
+        host.doc_delete_block(&doc_id, &block_id, "другой текст", false).unwrap_err(),
+        RdeErrorCode::Conflict,
+    );
+    expect_code(
+        host.doc_delete_block(&doc_id, "b9999", &text, false).unwrap_err(),
+        RdeErrorCode::NotFound,
+    );
+    assert_eq!(std::fs::read(&package).unwrap(), before_bytes);
+    // Реальное удаление: блоков -1, текст исчез, чекпоинт/ревизия есть.
+    let outcome = host.doc_delete_block(&doc_id, &block_id, &text, false).expect("удаление абзаца");
+    assert_eq!(outcome.before.as_deref(), Some(text.as_str()));
+    assert!(outcome.after.is_none());
+    let checkpoint_id = outcome.checkpoint_id.clone().expect("чекпоинт");
+    let revision_id = outcome.revision_id.clone().expect("ревизия");
+    let after_blocks = blocks(&host, &doc_id);
+    assert_eq!(after_blocks.len(), before_blocks.len() - 1);
+    assert!(!after_blocks.iter().any(|block| block.text == text));
+    assert!(host.revision_list(&doc_id, 20).unwrap().iter().any(|revision| revision.revision_id == revision_id));
+    // Откат чекпоинта возвращает документ байт-в-байт (и корни store).
+    host.checkpoint_restore(&checkpoint_id).expect("откат чекпоинта");
+    assert_eq!(std::fs::read(&package).unwrap(), before_bytes, "документ восстановлен");
+    assert_eq!(blocks(&host, &doc_id).len(), before_blocks.len());
+}
+
+#[test]
+fn doc_insert_delete_validation() {
+    let (host, root) = demo_host("insert-delete-validation");
+    let (doc_id, package) = doc_setup(&host, &root);
+    let before_bytes = std::fs::read(&package).unwrap();
+    let (_block_id, _text) = editable_block(&host, &doc_id, &[]);
+    // Неизвестная позиция/якорь — ошибки, документ не меняется.
+    expect_code(
+        host.doc_insert_paragraph(&doc_id, None, "sideways", "x", None, false).unwrap_err(),
+        RdeErrorCode::InvalidArgument,
+    );
+    expect_code(
+        host.doc_insert_paragraph(&doc_id, Some("b9999"), "after", "x", None, false).unwrap_err(),
+        RdeErrorCode::NotFound,
+    );
+    // Пустой текст/переводы строк — Unsupported (домен).
+    expect_code(
+        host.doc_insert_paragraph(&doc_id, None, "after", "  ", None, false).unwrap_err(),
+        RdeErrorCode::Unsupported,
+    );
+    expect_code(
+        host.doc_insert_paragraph(&doc_id, None, "after", "a\nb", None, false).unwrap_err(),
+        RdeErrorCode::Unsupported,
+    );
+    assert_eq!(std::fs::read(&package).unwrap(), before_bytes);
+}
+
