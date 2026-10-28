@@ -1,0 +1,625 @@
+From d3a92ab729d04ebc075ae4417cde962448a76fff Mon Sep 17 00:00:00 2001
+From: ilya <ilunix@pc.ubuntu>
+Date: Wed, 28 Oct 2026 21:50:44 +0300
+Subject: [PATCH] RDE: metafile: WMF/EMF text records (MathType formula
+ previews)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+WMF reader dropped all text records, so MathType/Equation preview metafiles
+(which are pure text: Times New Roman / Symbol / MT Extra / Arial) rendered
+as empty images — in RDE imported .docx formulas looked like blank spaces.
+
+- read CreateFontIndirect/FontIndirect, TextOut/ExtTextOut (byte and 16-bit
+  length forms), SetTextCharacterExtra, SetTextColor, SetBkColor,
+  ExtTextOut options (ETO_OPAQUE/ETO_CLIPPED), Rectangle (opaque fill
+  behind text), and WmfCanvas/EmfCanvas font+text state;
+- truncate CREATEFONTINDIRECT face names at the first NUL (MathType pads
+  names with junk after NUL, which broke font resolution);
+- convert text bytes to Unicode per charset (ANSI/CP1252, CP1251, CP1250)
+  and full Adobe Symbol encoding incl. bracket pieces 0xE6..0xFE ->
+  U+239B..U+23AE; MT Extra 0x26 -> U+02D9 (dot above), oracle-checked
+  against LibreOffice rendering of the same WMF previews;
+- raster fallback (Font::charset) for canvases that need it.
+
+Verified: 70 metafile tests (7 new: text records, charsets, Symbol pieces,
+NUL-terminated faces, opaque ExtTextOut, advances), clippy -D warnings,
+cargo fmt. Visual: all 15 formula preview pages of the real .docx match
+LibreOffice when rendered by WordCraft (RDE vendor probe).
+---
+ crates/metafile/src/canvas.rs |  28 ++++++-
+ crates/metafile/src/emf.rs    |   5 +-
+ crates/metafile/src/lib.rs    |   1 +
+ crates/metafile/src/tests.rs  | 148 ++++++++++++++++++++++++++++++++-
+ crates/metafile/src/text.rs   | 151 ++++++++++++++++++++++++++++++++++
+ crates/metafile/src/wmf.rs    |  90 +++++++++++++++++++-
+ 6 files changed, 415 insertions(+), 8 deletions(-)
+ create mode 100644 crates/metafile/src/text.rs
+
+diff --git a/crates/metafile/src/canvas.rs b/crates/metafile/src/canvas.rs
+index 03a8f345..7a7d9343 100644
+--- a/crates/metafile/src/canvas.rs
++++ b/crates/metafile/src/canvas.rs
+@@ -62,6 +62,7 @@ pub(crate) struct Brush {
+ 
+ /// A logical font (EMF LogFont): height in logical units (negative = character height, positive =
+ /// cell height, 0 = default), escapement in tenths of a degree, face name as UTF-16 (NUL-padded).
++/// `charset` names the code page of a WMF text record's bytes (EMF text is UTF-16 and ignores it).
+ #[derive(Clone, Copy, PartialEq, Debug)]
+ pub(crate) struct Font {
+     pub height: i32,
+@@ -69,6 +70,7 @@ pub(crate) struct Font {
+     pub weight: i32,
+     pub italic: bool,
+     pub face: [u16; 32],
++    pub charset: u8,
+ }
+ 
+ #[derive(Clone, Copy, Debug)]
+@@ -215,6 +217,7 @@ struct Saved {
+     font: Option<Font>,
+     text_color: [u8; 4],
+     text_align: u32,
++    bk_color: [u8; 4],
+ }
+ 
+ pub(crate) struct Canvas {
+@@ -244,6 +247,8 @@ pub(crate) struct Canvas {
+     text_color: [u8; 4],
+     /// SETTEXTALIGN flags (TA_*).
+     text_align: u32,
++    /// SETBKCOLOR: the colour an ETO_OPAQUE text rectangle fills with.
++    bk_color: [u8; 4],
+     pos: P,
+     in_path: bool,
+     path: Vec<Op>,
+@@ -270,6 +275,7 @@ impl Canvas {
+             font: None,
+             text_color: [0, 0, 0, 255],
+             text_align: 0,
++            bk_color: [255, 255, 255, 255],
+             pos: (0.0, 0.0),
+             in_path: false,
+             path: Vec::new(),
+@@ -374,6 +380,7 @@ impl Canvas {
+                 font: self.font,
+                 text_color: self.text_color,
+                 text_align: self.text_align,
++                bk_color: self.bk_color,
+             });
+         } else {
+             self.full = true;
+@@ -394,6 +401,7 @@ impl Canvas {
+         self.font = s.font;
+         self.text_color = s.text_color;
+         self.text_align = s.text_align;
++        self.bk_color = s.bk_color;
+     }
+ 
+     /// Stores an object in `slot` (EMF index), or in the lowest free slot (WMF handle table).
+@@ -641,6 +649,24 @@ impl Canvas {
+         self.text_align = a;
+     }
+ 
++    /// SETBKCOLOR: the background colour an ETO_OPAQUE text rectangle fills with.
++    pub fn set_bk_color(&mut self, c: [u8; 4]) {
++        self.bk_color = c;
++    }
++
++    /// Fills a WMF text record's ETO_OPAQUE rectangle (logical units) with the background colour.
++    pub fn fill_text_rect(&mut self, rect: [f64; 4]) {
++        self.fill_rect_with(rect, self.bk_color);
++    }
++
++    /// Draws the bytes of a WMF text record at the logical point `at`, decoded with the selected
++    /// font's charset, and `dx` per-character advances (MS-WMF 2.3.3.5, see [`crate::text`]).
++    pub fn text_bytes(&mut self, at: P, bytes: &[u8], dx: &[f64]) {
++        let (charset, face) = self.font.map_or((0, [0; 32]), |f| (f.charset, f.face));
++        let text = crate::text::decode(bytes, charset, &face);
++        self.text(at, text, dx);
++    }
++
+     /// Draws `text` at the logical point `at` (the current point with TA_UPDATECP) with the selected
+     /// font, text colour and alignment. `dx` holds per-character logical advances (empty for the
+     /// font's own); with TA_UPDATECP the current point moves past them.
+@@ -648,7 +674,7 @@ impl Canvas {
+         if text.is_empty() || self.in_path {
+             return;
+         }
+-        let font = self.font.unwrap_or(Font { height: 0, escapement: 0, weight: 400, italic: false, face: [0; 32] });
++        let font = self.font.unwrap_or(Font { height: 0, escapement: 0, weight: 400, italic: false, face: [0; 32], charset: 0 });
+         let at = if self.text_align & TA_UPDATECP != 0 { self.pos } else { at };
+         if self.text_align & TA_UPDATECP != 0 {
+             self.pos = (at.0 + dx.iter().sum::<f64>(), at.1);
+diff --git a/crates/metafile/src/emf.rs b/crates/metafile/src/emf.rs
+index 4ffe9cd1..e4fc78be 100644
+--- a/crates/metafile/src/emf.rs
++++ b/crates/metafile/src/emf.rs
+@@ -258,14 +258,15 @@ fn create_brush(cv: &mut Canvas, r: Bytes) -> Option<()> {
+ }
+ 
+ /// EMR_EXTCREATEFONTINDIRECTW: handle, then a LogFont (height, width, escapement, orientation, weight,
+-/// italic, ..., face name of 32 UTF-16 units at 40).
++/// italic, ..., charset at 35, face name of 32 UTF-16 units at 40). The charset only matters for WMF
++/// text; a LogFont carries it, so both readers' fonts are the same shape.
+ fn create_font(cv: &mut Canvas, r: Bytes) -> Option<()> {
+     let slot = r.u32(8)? as usize;
+     let mut face = [0u16; 32];
+     for (i, u) in face.iter_mut().enumerate() {
+         *u = r.u16(40 + i * 2).unwrap_or(0);
+     }
+-    let font = Font { height: r.i32(12)?, escapement: r.i32(20)?, weight: r.i32(28)?, italic: *r.0.get(32)? != 0, face };
++    let font = Font { height: r.i32(12)?, escapement: r.i32(20)?, weight: r.i32(28)?, italic: *r.0.get(32)? != 0, face, charset: *r.0.get(35)? };
+     cv.add_object(Some(slot), Obj::Font(font));
+     Some(())
+ }
+diff --git a/crates/metafile/src/lib.rs b/crates/metafile/src/lib.rs
+index c63bbb12..67762131 100644
+--- a/crates/metafile/src/lib.rs
++++ b/crates/metafile/src/lib.rs
+@@ -15,6 +15,7 @@ mod dib;
+ mod emf;
+ mod geom;
+ mod place;
++mod text;
+ mod wmf;
+ 
+ #[cfg(test)]
+diff --git a/crates/metafile/src/tests.rs b/crates/metafile/src/tests.rs
+index eaa5b167..1d084f91 100644
+--- a/crates/metafile/src/tests.rs
++++ b/crates/metafile/src/tests.rs
+@@ -2,7 +2,7 @@
+ 
+ use crate::canvas::Canvas;
+ use crate::dib::Rgba;
+-use crate::{Error, Item, MAX_BYTES, MAX_ITEMS, Seg, is_metafile, parse};
++use crate::{Error, HAlign, Item, MAX_BYTES, MAX_ITEMS, Picture, Seg, VAlign, is_metafile, parse};
+ 
+ fn h16(v: i32) -> Vec<u8> {
+     (v as i16).to_le_bytes().to_vec()
+@@ -523,7 +523,7 @@ fn bitblt_rec(rop: u32, dst: [u32; 4], info: &[u8], bits: &[u8]) -> Vec<u8> {
+ fn wmf_font_takes_an_object_slot_so_handles_line_up() {
+     // The font is handle 0, so the pen created after it is handle 1.
+     let recs = [
+-        wrec(0x02FB, &[0u8; 18]),
++        wfont(-100, 400, false, 0, "Times New Roman"),
+         wrec(0x02FA, &cat(vec![h16(0), h16(4), h16(0), h32(0x0000_FF00)])),
+         wrec(0x012D, &h16(1)),
+         wrec(0x0325, &cat(vec![h16(2), h16(0), h16(0), h16(50), h16(0), h16(50)])),
+@@ -1053,3 +1053,147 @@ fn plain_wmf_target_comes_from_a_window_that_was_read() {
+     let (x0, y0, x1, y1) = rect_extent(&p.items[0]);
+     assert!(close(x0, 0.0) && close(y0, 0.0) && close(x1, 200.0) && close(y1, 100.0), "{x0} {y0} {x1} {y1}");
+ }
++
++// ---- text records ----
++
++/// A CREATEFONTINDIRECT record (MS-WMF 2.3.1.8): height and weight (a negative height is the
++/// character height), italic, charset and a face name; the unused fields are zero.
++fn wfont(height: i16, weight: i16, italic: bool, charset: u8, face: &str) -> Vec<u8> {
++    let mut p = cat(vec![h16(i32::from(height)), h16(0), h16(0), h16(0), h16(i32::from(weight))]);
++    p.extend([u8::from(italic), 0, 0, charset, 0, 0, 0, 0]);
++    let mut name = face.as_bytes().to_vec();
++    name.resize(32, 0);
++    p.extend(name);
++    wrec(0x02FB, &p)
++}
++
++/// An EXTTEXTOUT record (MS-WMF 2.3.3.5) without a rectangle: y, x, the bytes and one advance per
++/// character.
++fn wexttext(y: i16, x: i16, text: &[u8], dx: &[i16]) -> Vec<u8> {
++    let mut p = cat(vec![h16(i32::from(y)), h16(i32::from(x)), h16(text.len() as i32), h16(0)]);
++    let mut s = text.to_vec();
++    if !s.len().is_multiple_of(2) {
++        s.push(0);
++    }
++    p.extend(s);
++    p.extend(dx.iter().flat_map(|d| h16(i32::from(*d))));
++    wrec(0x0A32, &p)
++}
++
++/// A picture from a WMF whose placeable bounds are 1000 x 200 logical units at 1440 per inch: one
++/// logical unit is 0.05 points, so lengths divide by 20.
++fn wmf_picture(recs: &[Vec<u8>]) -> Picture {
++    parse(&wmf(recs, Some([0, 0, 1000, 200]))).expect("parse")
++}
++
++/// The text runs of a picture.
++fn texts(p: &Picture) -> Vec<&crate::Text> {
++    p.items
++        .iter()
++        .filter_map(|i| match i {
++            Item::Text(t) => Some(t),
++            _ => None,
++        })
++        .collect()
++}
++
++#[test]
++fn wmf_ext_text_out_draws_a_text_run() {
++    // TA_UPDATECP draws at the current point (the MOVETO), a negative height is the character height,
++    // and the dx array gives each character's advance: 100 and 48 logical units are 5 and 2.4 points.
++    let recs = [
++        wrec(0x012E, &h16(0x19)),
++        wrec(0x0214, &cat(vec![h16(100), h16(200)])),
++        wfont(-100, 700, true, 204, "Times New Roman"),
++        wrec(0x012D, &h16(0)),
++        wexttext(0, 0, &[0xEF], &[48]),
++    ];
++    let p = wmf_picture(&recs);
++    let t = texts(&p)[0];
++    assert_eq!(t.text, "п");
++    assert_eq!(t.font, "Times New Roman");
++    assert_eq!((t.x, t.y), (10.0, 5.0));
++    assert_eq!(t.size, 5.0);
++    assert_eq!(t.dx, [2.4]);
++    assert!(t.bold && t.italic);
++    assert_eq!((t.halign, t.valign), (HAlign::Left, VAlign::Baseline));
++    assert_eq!(t.color, [0, 0, 0, 255]);
++}
++
++#[test]
++fn wmf_text_decodes_the_fonts_charset() {
++    let decode = |font: Vec<u8>, bytes: &[u8]| -> String {
++        let dx = vec![0i16; bytes.len()];
++        let recs = [font, wrec(0x012D, &h16(0)), wexttext(100, 200, bytes, &dx)];
++        let p = wmf_picture(&recs);
++        texts(&p).first().map(|t| t.text.clone()).unwrap_or_default()
++    };
++    // RUSSIAN charset is Windows-1251, SYMBOL the Adobe Symbol encoding (by charset and by face), and
++    // ANSI Windows-1252; a trailing NUL (some writers count the terminator) is dropped.
++    assert_eq!(decode(wfont(-100, 400, false, 204, "Times New Roman"), &[0xEF, 0xF2]), "пт");
++    assert_eq!(decode(wfont(-100, 400, false, 2, "Symbol"), &[0xA3, 0x74]), "≤τ");
++    assert_eq!(decode(wfont(-100, 400, false, 1, "Symbol"), &[0xA3, 0x74]), "≤τ");
++    assert_eq!(decode(wfont(-100, 400, false, 0, "Arial"), &[0x80]), "€");
++    assert_eq!(decode(wfont(-100, 400, false, 238, "Arial"), &[0x8A]), "Š");
++    assert_eq!(decode(wfont(-100, 400, false, 0, "Arial"), &[b'A', 0]), "A");
++    // MathType's MT Extra dot-above accent, then the untabled character as its Latin code.
++    assert_eq!(decode(wfont(-100, 400, false, 1, "MT Extra"), &[0x26]), "\u{02D9}");
++    assert_eq!(decode(wfont(-100, 400, false, 1, "MT Extra"), &[0x2B]), "+");
++}
++
++#[test]
++fn wmf_text_out_draws_the_string_before_the_point() {
++    // META_TEXTOUT: the count, the bytes (padded to a word), then y and x.
++    let mut p = cat(vec![h16(3)]);
++    p.extend(b"cos");
++    p.push(0);
++    p.extend(cat(vec![h16(100), h16(200)]));
++    let recs = [wfont(-100, 400, false, 0, "Times New Roman"), wrec(0x012D, &h16(0)), wrec(0x0521, &p)];
++    let pic = wmf_picture(&recs);
++    let t = texts(&pic)[0];
++    assert_eq!(t.text, "cos");
++    assert_eq!((t.x, t.y), (10.0, 5.0));
++}
++
++#[test]
++fn wmf_opaque_text_fills_its_rectangle_with_the_background_colour() {
++    // ETO_OPAQUE paints the record's rectangle (left, top, right, bottom) with SETBKCOLOR first: a
++    // red 400 x 100 logical unit box (20 x 5 points), then the text.
++    let mut p = cat(vec![h16(100), h16(200), h16(1), h16(2)]);
++    p.extend(cat(vec![h16(0), h16(0), h16(400), h16(100)]));
++    p.extend(b"A\0");
++    p.extend(h16(48));
++    let recs = [wrec(0x0201, &h32(0x0000_00FF)), wfont(-100, 400, false, 0, "Times New Roman"), wrec(0x012D, &h16(0)), wrec(0x0A32, &p)];
++    let pic = wmf_picture(&recs);
++    let (_, fill, stroke, _) = path_segs(&pic.items[0]);
++    assert_eq!(fill, Some([255, 0, 0, 255]));
++    assert_eq!(stroke, None);
++    assert_eq!(texts(&pic)[0].text, "A");
++}
++
++#[test]
++fn wmf_text_with_ta_updatecp_advances_the_current_point() {
++    // Two runs at the same zero record coordinates: the second draws where the first's dx left the
++    // current point (100 logical units, 5 points, on).
++    let recs = [
++        wrec(0x012E, &h16(0x19)),
++        wrec(0x0214, &cat(vec![h16(100), h16(200)])),
++        wfont(-100, 400, false, 0, "Times New Roman"),
++        wrec(0x012D, &h16(0)),
++        wexttext(0, 0, b"A", &[100]),
++        wexttext(0, 0, b"B", &[100]),
++    ];
++    let p = wmf_picture(&recs);
++    let ts = texts(&p);
++    assert_eq!((ts[0].x, ts[1].x), (10.0, 15.0));
++    assert_eq!((ts[0].y, ts[1].y), (5.0, 5.0));
++}
++
++#[test]
++fn truncated_text_records_draw_nothing_and_do_not_panic() {
++    // A font record too short for its face, text records whose fields run past the record, and state
++    // records with no parameters: all skipped, and the parse still succeeds.
++    let recs = [wrec(0x02FB, &[0u8; 10]), wrec(0x0A32, &h16(1)), wrec(0x0521, &h16(9)), wrec(0x0209, &[]), wrec(0x012E, &[]), wrec(0x0201, &[])];
++    let p = parse(&wmf(&recs, Some([0, 0, 100, 100]))).expect("parse");
++    assert!(p.items.is_empty(), "{:?}", p.items);
++}
+diff --git a/crates/metafile/src/text.rs b/crates/metafile/src/text.rs
+new file mode 100644
+index 00000000..44837afb
+--- /dev/null
++++ b/crates/metafile/src/text.rs
+@@ -0,0 +1,151 @@
++//! WMF text bytes as Unicode. A WMF text record stores 8-bit characters, and the charset of the font
++//! selected into the playback DC names their code page (MS-WMF 2.3.3.5, "META_EXTTEXTOUT Record"):
++//! ANSI is Windows-1252, RUSSIAN Windows-1251, EASTEUROPE Windows-1250, and a symbol font (Symbol,
++//! whose characters are the Adobe Symbol encoding) maps to the standard Unicode characters. EMF text
++//! is UTF-16 and never comes here.
++//!
++//! The symbol correspondence is the published Adobe Symbol encoding table
++//! (<https://www.unicode.org/Public/MAPPINGS/VENDORS/ADOBE/symbol.txt>), the same one
++//! `wordcraft_doc::symbol_fonts` keeps for document text; the metafile reader sits below the document
++//! model (L1, no workspace dependencies), so it carries its own copy. Unlike the document model's copy
++//! this one also maps the table's corporate-use codes 0xE6–0xFE — the bracket, parenthesis, brace and
++//! integral pieces MathType builds tall delimiters from — to the Unicode Symbol Pieces block
++//! (U+239B–U+23AE), the characters that stand for exactly those pieces.
++
++/// SYMBOL charset: the Adobe Symbol encoding.
++const SYMBOL_CHARSET: u8 = 2;
++/// RUSSIAN charset: Windows-1251.
++const RUSSIAN_CHARSET: u8 = 204;
++/// EASTEUROPE charset: Windows-1250.
++const EASTEUROPE_CHARSET: u8 = 238;
++
++/// The Unicode text of a WMF record's bytes, decoded by the selected font's `charset` and `face`.
++/// Trailing NULs (some writers count the terminator) are dropped.
++pub(crate) fn decode(bytes: &[u8], charset: u8, face: &[u16; 32]) -> String {
++    let name = String::from_utf16_lossy(face);
++    let name = name.trim_end_matches('\0').trim();
++    let text: String = if charset == SYMBOL_CHARSET || is_symbol_face(name) {
++        bytes.iter().map(|b| symbol(*b)).collect()
++    } else {
++        bytes.iter().map(|b| mt_extra(*b).unwrap_or_else(|| codepage(*b, charset))).collect()
++    };
++    text.trim_end_matches('\0').to_string()
++}
++
++/// MathType's own fonts have no published encoding table. The only code these previews use is 0x26
++/// in MT Extra, the dot-above accent drawn over the letter beside it: LibreOffice renders the same
++/// metafiles with a dot there, so it maps to the spacing dot U+02D9. Other codes of that font stay
++/// their Windows-1252 character (a documented approximation).
++fn mt_extra(b: u8) -> Option<char> {
++    (b == 0x26).then_some('\u{02D9}')
++}
++
++/// Whether `face` is one of Word's symbol fonts whose bytes are the Adobe Symbol encoding.
++fn is_symbol_face(face: &str) -> bool {
++    face.eq_ignore_ascii_case("symbol") || face.eq_ignore_ascii_case("symbol (pcl6)")
++}
++
++/// One byte of a single-byte Windows code page as a character. ANSI (0), DEFAULT (1) and charsets this
++/// reader does not know (Greek, Turkish, Hebrew, Arabic, Baltic, Vietnamese, OEM…) are read as
++/// Windows-1252: Latin text stays right, other scripts show their Latin letters (a documented
++/// limitation; the charsets listed above have their own table).
++fn codepage(b: u8, charset: u8) -> char {
++    match charset {
++        RUSSIAN_CHARSET => table_char(&CP1251, b),
++        EASTEUROPE_CHARSET => table_char(&CP1250, b),
++        _ => {
++            if (0x80..0xA0).contains(&b) {
++                CP1252.get(usize::from(b) - 0x80).map_or_else(|| char_of(u16::from(b)), |u| char_of(*u))
++            } else {
++                // ASCII and Latin-1 agree with Windows-1252 outside 0x80..=0x9F.
++                char_of(u16::from(b))
++            }
++        }
++    }
++}
++
++/// A high byte of a 128-entry Windows code page table.
++fn table_char(table: &[u16; 128], b: u8) -> char {
++    if b < 0x80 {
++        return char_of(u16::from(b));
++    }
++    table.get(usize::from(b) - 0x80).map_or_else(|| char_of(u16::from(b)), |u| char_of(*u))
++}
++
++/// One byte of the Adobe Symbol encoding as a character; a code with no Unicode equivalent stays its
++/// own low character, so nothing silently vanishes.
++fn symbol(b: u8) -> char {
++    let code = usize::from(b);
++    let Some(u) = code.checked_sub(0x20).and_then(|i| SYMBOL.get(i)).copied().filter(|u| *u != 0) else {
++        return char_of(u16::from(b));
++    };
++    char::from_u32(u).unwrap_or_else(|| char_of(u16::from(b)))
++}
++
++/// A code point as a character; an unpaired one (the tables' U+FFFD placeholders are fine) becomes
++/// the replacement character.
++fn char_of(code: u16) -> char {
++    char::from_u32(u32::from(code)).unwrap_or(char::REPLACEMENT_CHARACTER)
++}
++
++/// Windows-1252 code points for 0x80..=0x9F.
++const CP1252: [u16; 32] = [
++    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018,
++    0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
++];
++
++/// Windows-1251 code points for 0x80..=0xFF (U+FFFD where the byte is unassigned).
++const CP1251: [u16; 128] = [
++    0x0402, 0x0403, 0x201A, 0x0453, 0x201E, 0x2026, 0x2020, 0x2021, 0x20AC, 0x2030, 0x0409, 0x2039, 0x040A, 0x040C, 0x040B, 0x040F, 0x0452, 0x2018,
++    0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0xFFFD, 0x2122, 0x0459, 0x203A, 0x045A, 0x045C, 0x045B, 0x045F, 0x00A0, 0x040E, 0x045E, 0x0408,
++    0x00A4, 0x0490, 0x00A6, 0x00A7, 0x0401, 0x00A9, 0x0404, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x0407, 0x00B0, 0x00B1, 0x0406, 0x0456, 0x0491, 0x00B5,
++    0x00B6, 0x00B7, 0x0451, 0x2116, 0x0454, 0x00BB, 0x0458, 0x0405, 0x0455, 0x0457, 0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417,
++    0x0418, 0x0419, 0x041A, 0x041B, 0x041C, 0x041D, 0x041E, 0x041F, 0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425, 0x0426, 0x0427, 0x0428, 0x0429,
++    0x042A, 0x042B, 0x042C, 0x042D, 0x042E, 0x042F, 0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437, 0x0438, 0x0439, 0x043A, 0x043B,
++    0x043C, 0x043D, 0x043E, 0x043F, 0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447, 0x0448, 0x0449, 0x044A, 0x044B, 0x044C, 0x044D,
++    0x044E, 0x044F,
++];
++
++/// Windows-1250 code points for 0x80..=0xFF (U+FFFD where the byte is unassigned).
++const CP1250: [u16; 128] = [
++    0x20AC, 0xFFFD, 0x201A, 0xFFFD, 0x201E, 0x2026, 0x2020, 0x2021, 0xFFFD, 0x2030, 0x0160, 0x2039, 0x015A, 0x0164, 0x017D, 0x0179, 0xFFFD, 0x2018,
++    0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0xFFFD, 0x2122, 0x0161, 0x203A, 0x015B, 0x0165, 0x017E, 0x017A, 0x00A0, 0x02C7, 0x02D8, 0x0141,
++    0x00A4, 0x0104, 0x00A6, 0x00A7, 0x00A8, 0x00A9, 0x015E, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x017B, 0x00B0, 0x00B1, 0x02DB, 0x0142, 0x00B4, 0x00B5,
++    0x00B6, 0x00B7, 0x00B8, 0x0105, 0x015F, 0x00BB, 0x013D, 0x02DD, 0x013E, 0x017C, 0x0154, 0x00C1, 0x00C2, 0x0102, 0x00C4, 0x0139, 0x0106, 0x00C7,
++    0x010C, 0x00C9, 0x0118, 0x00CB, 0x011A, 0x00CD, 0x00CE, 0x010E, 0x0110, 0x0143, 0x0147, 0x00D3, 0x00D4, 0x0150, 0x00D6, 0x00D7, 0x0158, 0x016E,
++    0x00DA, 0x0170, 0x00DC, 0x00DD, 0x0162, 0x00DF, 0x0155, 0x00E1, 0x00E2, 0x0103, 0x00E4, 0x013A, 0x0107, 0x00E7, 0x010D, 0x00E9, 0x0119, 0x00EB,
++    0x011B, 0x00ED, 0x00EE, 0x010F, 0x0111, 0x0144, 0x0148, 0x00F3, 0x00F4, 0x0151, 0x00F6, 0x00F7, 0x0159, 0x016F, 0x00FA, 0x0171, 0x00FC, 0x00FD,
++    0x0163, 0x02D9,
++];
++
++/// The Adobe Symbol encoding, indexed by code − 0x20; 0 = no Unicode equivalent.
++const SYMBOL: [u32; 224] = [
++    0x0020, 0x0021, 0x2200, 0x0023, 0x2203, 0x0025, 0x0026, 0x220B, // 0x20
++    0x0028, 0x0029, 0x2217, 0x002B, 0x002C, 0x2212, 0x002E, 0x002F, // 0x28
++    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037, // 0x30
++    0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x003F, // 0x38
++    0x2245, 0x0391, 0x0392, 0x03A7, 0x0394, 0x0395, 0x03A6, 0x0393, // 0x40
++    0x0397, 0x0399, 0x03D1, 0x039A, 0x039B, 0x039C, 0x039D, 0x039F, // 0x48
++    0x03A0, 0x0398, 0x03A1, 0x03A3, 0x03A4, 0x03A5, 0x03C2, 0x03A9, // 0x50
++    0x039E, 0x03A8, 0x0396, 0x005B, 0x2234, 0x005D, 0x22A5, 0x005F, // 0x58
++    0x0000, 0x03B1, 0x03B2, 0x03C7, 0x03B4, 0x03B5, 0x03C6, 0x03B3, // 0x60
++    0x03B7, 0x03B9, 0x03D5, 0x03BA, 0x03BB, 0x03BC, 0x03BD, 0x03BF, // 0x68
++    0x03C0, 0x03B8, 0x03C1, 0x03C3, 0x03C4, 0x03C5, 0x03D6, 0x03C9, // 0x70
++    0x03BE, 0x03C8, 0x03B6, 0x007B, 0x007C, 0x007D, 0x223C, 0x0000, // 0x78
++    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, // 0x80
++    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, // 0x88
++    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, // 0x90
++    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, // 0x98
++    0x20AC, 0x03D2, 0x2032, 0x2264, 0x2044, 0x221E, 0x0192, 0x2663, // 0xA0
++    0x2666, 0x2665, 0x2660, 0x2194, 0x2190, 0x2191, 0x2192, 0x2193, // 0xA8
++    0x00B0, 0x00B1, 0x2033, 0x2265, 0x00D7, 0x221D, 0x2202, 0x2022, // 0xB0
++    0x00F7, 0x2260, 0x2261, 0x2248, 0x2026, 0x0000, 0x0000, 0x21B5, // 0xB8
++    0x2135, 0x2111, 0x211C, 0x2118, 0x2297, 0x2295, 0x2205, 0x2229, // 0xC0
++    0x222A, 0x2283, 0x2287, 0x2284, 0x2282, 0x2286, 0x2208, 0x2209, // 0xC8
++    0x2220, 0x2207, 0x0000, 0x0000, 0x0000, 0x220F, 0x221A, 0x22C5, // 0xD0
++    0x00AC, 0x2227, 0x2228, 0x21D4, 0x21D0, 0x21D1, 0x21D2, 0x21D3, // 0xD8
++    0x25CA, 0x2329, 0x0000, 0x0000, 0x0000, 0x2211, 0x239B, 0x239C, // 0xE0
++    0x239D, 0x23A1, 0x23A2, 0x23A3, 0x23A7, 0x23A8, 0x23A9, 0x23AA, // 0xE8
++    0x0000, 0x232A, 0x222B, 0x2320, 0x23AE, 0x2321, 0x239E, 0x239F, // 0xF0
++    0x23A0, 0x23A4, 0x23A5, 0x23A6, 0x23AB, 0x23AC, 0x23AD, 0x0000, // 0xF8
++];
+diff --git a/crates/metafile/src/wmf.rs b/crates/metafile/src/wmf.rs
+index 54c14271..12f68199 100644
+--- a/crates/metafile/src/wmf.rs
++++ b/crates/metafile/src/wmf.rs
+@@ -2,13 +2,17 @@
+ //! records of (size in 16-bit words, function, parameters). Parameters are read at byte 6 of each record.
+ 
+ use crate::bytes::Bytes;
+-use crate::canvas::{Brush, Canvas, Obj, Pen, colorref};
++use crate::canvas::{Brush, Canvas, Font, Obj, Pen, colorref};
+ use crate::dib;
+ use crate::geom::{self, ArcKind, P};
+ use crate::{Error, Frame, MAX_PATH_OPS};
+ 
+ const PLACEABLE_KEY: u32 = 0x9AC6_CDD7;
+ const DEFAULT_INCH: f64 = 1440.0;
++/// META_EXTTEXTOUT options (MS-WMF 2.1.2.2): fill the rectangle with the background colour, and clip
++/// the text to it.
++const ETO_OPAQUE: u16 = 0x0002;
++const ETO_CLIPPED: u16 = 0x0004;
+ 
+ pub(crate) fn is_wmf(b: Bytes) -> bool {
+     if b.u32(0) == Some(PLACEABLE_KEY) {
+@@ -128,14 +132,21 @@ fn record(cv: &mut Canvas, func: u16, r: Bytes) {
+         }),
+         0x02FA => create_pen(cv, r),
+         0x02FC => create_brush(cv, r),
+-        // Fonts, palettes, pattern brushes and regions take a handle slot too, so later SELECTOBJECT
++        0x02FB => create_font(cv, r),
++        // Palettes, pattern brushes and regions take a handle slot too, so later SELECTOBJECT
+         // handles count them; selecting one draws nothing.
+-        0x02FB | 0x00F7 | 0x01F9 | 0x0142 | 0x06FF => {
++        0x00F7 | 0x01F9 | 0x0142 | 0x06FF => {
+             cv.add_object(None, Obj::Other);
+             Some(())
+         }
+         0x012D => r.u16(6).map(|h| cv.select(wmf_handle(h))),
+         0x01F0 => r.u16(6).map(|h| cv.delete_object(u32::from(h))),
++        // Text state and the two text records (see MS-WMF 2.3.3.5 and 2.3.3.20).
++        0x012E => r.u16(6).map(|a| cv.set_text_align(u32::from(a))),
++        0x0209 => r.u32(6).map(|c| cv.set_text_color(colorref(c))),
++        0x0201 => r.u32(6).map(|c| cv.set_bk_color(colorref(c))),
++        0x0521 => text_out(cv, r),
++        0x0A32 => ext_text_out(cv, r),
+         // STRETCHDIB: rop(4) usage(2) srcH srcW ySrc xSrc destH destW yDest xDest, then the DIB.
+         0x0F43 => {
+             let rop = r.u32(6).unwrap_or(0);
+@@ -176,6 +187,79 @@ fn create_brush(cv: &mut Canvas, r: Bytes) -> Option<()> {
+     Some(())
+ }
+ 
++/// CREATEFONTINDIRECT: height, width, escapement, orientation and weight (16-bit each), the style and
++/// charset bytes, then a NUL-terminated (or NUL-padded) 32-byte ANSI face name. A negative height is
++/// the character height, which the canvas keeps; the charset picks the code page of later text
++/// records.
++fn create_font(cv: &mut Canvas, r: Bytes) -> Option<()> {
++    let height = i32::from(r.i16(6)?);
++    let escapement = i32::from(r.i16(10)?);
++    let weight = i32::from(r.i16(14)?);
++    let italic = *r.0.get(16)? != 0;
++    let charset = *r.0.get(19)?;
++    let name = r.slice(24, 32)?;
++    // The name ends at its NUL; writers leave junk in the padding after it (MathType does).
++    let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
++    let name = name.get(..end).unwrap_or_default();
++    let mut face = [0u16; 32];
++    for (slot, b) in face.iter_mut().zip(name) {
++        *slot = u16::from(*b);
++    }
++    cv.add_object(None, Obj::Font(Font { height, escapement, weight, italic, face, charset }));
++    Some(())
++}
++
++/// META_TEXTOUT: the length in bytes, the bytes (padded to a word), then the y and x start.
++fn text_out(cv: &mut Canvas, r: Bytes) -> Option<()> {
++    let n = usize::from(r.u16(6)?);
++    let bytes = r.slice(8, n)?;
++    let at = xy16(r, 8usize.checked_add(n.checked_add(n & 1)?)?)?;
++    cv.text_bytes(at, bytes, &[]);
++    Some(())
++}
++
++/// META_EXTTEXTOUT: y, x, the length in bytes, the options, an optional rectangle when ETO_OPAQUE or
++/// ETO_CLIPPED is set, the bytes (padded to a word) and one 16-bit advance per character.
++fn ext_text_out(cv: &mut Canvas, r: Bytes) -> Option<()> {
++    let at = xy16(r, 6)?;
++    let n = usize::from(r.u16(10)?);
++    let options = r.u16(12)?;
++    let mut off = 14usize;
++    if options & (ETO_OPAQUE | ETO_CLIPPED) != 0 {
++        let [l, t, rr, b] = rect_object(r, off)?;
++        // ETO_OPAQUE paints the rectangle with the background colour behind the text.
++        if options & ETO_OPAQUE != 0 {
++            cv.fill_text_rect([l, t, rr, b]);
++        }
++        off = off.checked_add(8)?;
++    }
++    let bytes = r.slice(off, n)?;
++    off = off.checked_add(n.checked_add(n & 1)?)?;
++    let dx = advances(r, off, n)?;
++    cv.text_bytes(at, bytes, &dx);
++    Some(())
++}
++
++/// The Rect Object of a text record (MS-WMF 2.2.2.18): left, top, right, bottom.
++fn rect_object(r: Bytes, off: usize) -> Option<[f64; 4]> {
++    Some([
++        f64::from(r.i16(off)?),
++        f64::from(r.i16(off.checked_add(2)?)?),
++        f64::from(r.i16(off.checked_add(4)?)?),
++        f64::from(r.i16(off.checked_add(6)?)?),
++    ])
++}
++
++/// The Dx array of a text record: one signed 16-bit advance per character.
++fn advances(r: Bytes, off: usize, n: usize) -> Option<Vec<f64>> {
++    let raw = r.slice(off, n.checked_mul(2)?)?;
++    let mut dx = Vec::with_capacity(n);
++    for c in raw.as_chunks::<2>().0 {
++        dx.push(f64::from(i16::from_le_bytes(*c)));
++    }
++    Some(dx)
++}
++
+ /// (x, y) from a Y-then-X pair stored at `off`.
+ fn xy16(r: Bytes, off: usize) -> Option<P> {
+     Some((f64::from(r.i16(off + 2)?), f64::from(r.i16(off)?)))
+-- 
+2.53.0
+

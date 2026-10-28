@@ -14,3 +14,16 @@ git submodule update --init
 git -C vendor/wordcraft checkout v0.10.0
 git -C vendor/wordcraft apply ../../../patches/wordcraft/0001-rde-docview.patch
 ```
+
+## 0002-wmf-text.patch
+WMF/EMF: чтение текстовых записей (`CreateFontIndirect`, `TextOut`/`ExtTextOut`, `SetText*`,
+`ExtTextOut`-опции, `Rectangle`-фон), Unicode-конверсия по charset + таблица Adobe Symbol и MT Extra,
+обрезка имени шрифта по NUL. Зачем: превью MathType-формул (текстовые WMF) были пустыми; после
+R-DOC-44 preview — fallback при неудачной конверсии в нативную формулу.
+
+Применение на чистом WordCraft v0.10.0 (после 0001):
+```bash
+git -C vendor/wordcraft checkout v0.10.0
+git -C vendor/wordcraft apply ../../../patches/wordcraft/0001-rde-docview.patch
+git -C vendor/wordcraft apply ../../../patches/wordcraft/0002-wmf-text.patch
+```
