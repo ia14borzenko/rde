@@ -48,6 +48,15 @@ pub struct AppSettings {
     /// без него доступ только на чтение (fail-closed, R-MCP-05).
     #[serde(default)]
     pub allow_agent_mutations: bool,
+    /// Разрешить внешним агентам **запускать скрипты проекта** (`artifact_run`/`run_cancel`,
+    /// M4.2b): каждое действие — через GUI-диалог; действует только для `trusted`-проекта
+    /// (R-RUN-06, эффективный грант вычисляется при старте сервера). По умолчанию выключено.
+    #[serde(default)]
+    pub allow_agent_run_script: bool,
+    /// Разрешить внешним агентам **git-коммиты** (`git_commit`, M4.2b): каждое действие — через
+    /// GUI-диалог с сообщением/автором; `.rde/**` не коммитится. По умолчанию выключено.
+    #[serde(default)]
+    pub allow_agent_git_commit: bool,
 }
 
 fn default_language() -> String {
@@ -76,6 +85,8 @@ impl Default for AppSettings {
             show_service_objects: false,
             allow_external_mcp: false,
             allow_agent_mutations: false,
+            allow_agent_run_script: false,
+            allow_agent_git_commit: false,
         }
     }
 }
@@ -173,9 +184,30 @@ mod tests {
         assert_eq!(settings.keep_runs, 200);
         assert!(!settings.allow_external_mcp, "внешние агенты по умолчанию запрещены (fail-closed)");
         assert!(!settings.allow_agent_mutations, "мутации агента по умолчанию запрещены (fail-closed)");
+        // M4.2b: отдельные гранты run/git по умолчанию выключены (fail-closed).
+        assert!(!settings.allow_agent_run_script, "запуск скриптов агентом по умолчанию запрещён");
+        assert!(!settings.allow_agent_git_commit, "git-коммиты агентом по умолчанию запрещены");
         save_to(&settings, &path).unwrap();
         let loaded = load_from(&path);
         assert_eq!(loaded, settings);
+        // M4.2b: старые settings.toml без новых ключей читаются (аддитивная миграция) → false.
+        let old_text = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("allow_agent_run_script") && !line.starts_with("allow_agent_git_commit"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &old_text).unwrap();
+        let old_loaded = load_from(&path);
+        assert!(!old_loaded.allow_agent_run_script, "старый файл: run_script = false");
+        assert!(!old_loaded.allow_agent_git_commit, "старый файл: git_commit = false");
+        // Включённые гранты переживают сохранение/чтение (аддитивные поля сериализуются).
+        let mut granted = AppSettings { allow_agent_run_script: true, allow_agent_git_commit: true, ..AppSettings::default() };
+        granted.normalize();
+        save_to(&granted, &path).unwrap();
+        let granted_loaded = load_from(&path);
+        assert!(granted_loaded.allow_agent_run_script);
+        assert!(granted_loaded.allow_agent_git_commit);
         // Некорректные значения нормализуются.
         let mut bad = settings.clone();
         bad.language = "de".into();

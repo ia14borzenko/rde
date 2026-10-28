@@ -39,6 +39,12 @@ fn main() {
             state.demo_select_tab("document");
         }
         Some("app-settings") => state.demo_open_app_settings(),
+        // M4.2b: настройки с включёнными мастер-галочками (видны подгалочки run/git).
+        Some("app-settings-agents") => state.demo_open_app_settings_agents(),
+        // M4.2b: диалог approval внешнего агента (run/git) и режим грантов в панели «Агент».
+        Some("agent-approval") => state.demo_open_agent_approval("artifact_run"),
+        Some("agent-approval-git") => state.demo_open_agent_approval("git_commit"),
+        Some("agent-grants") => state.demo_set_agent_grants(true, true),
         Some("artifact-inputs") => state.demo_set_artifact_section("inputs"),
         Some("artifact-generation") => state.demo_set_artifact_section("generation"),
         Some("artifact-result") => state.demo_set_artifact_section("result"),

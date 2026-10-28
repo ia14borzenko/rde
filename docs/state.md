@@ -1311,3 +1311,71 @@ cd rde
 # 3) «Отклонить» → RDE_APPROVAL_DENIED, файл не изменён; без ответа 5 мин → отказ (fail-closed).
 # 4) выключить доступ/сменить проект/закрыть RDE → сервер остановлен, ожидающие запросы отклонены.
 ```
+
+## Обновление 2026-10-28 (M4.2b: GUI-гранты запуска скриптов и git-коммитов с подтверждением)
+
+Веха **M4.2b** фазы v0.3 (ТЗ §5.10 R-MCP-02/R-MCP-05/R-MCP-06, §8.7.3 R-AGT-05/06/09,
+R-RUN-06; [ADR-0013](../docs/adr/0013-m42b-gui-run-git-grants.md)): внешним агентам из GUI стали
+доступны **два оставшихся гранта** — `run_script` (`artifact_run`/`run_cancel`) и `git_commit`;
+каждое действие по-прежнему проходит через **интерактивный диалог** (уже с human-readable превью),
+с чекпоинтом и аудитом, fail-closed. **`rde-mcp`/`rde-host` — 0 правок** (гранты/approvals/чекпоинты
+были готовы в M2); менялись только `rde-core` (2 аддитивные настройки) и `rde-ui` (гранты → политика,
+превью, trusted-поток UX).
+
+| Что | Где |
+|---|---|
+| `rde-core`: `AppSettings.allow_agent_run_script`, `allow_agent_git_commit` (default false; старые settings.toml читаются, `normalize()` не тронут) | [`crates/rde-core/src/settings.rs`](../crates/rde-core/src/settings.rs) |
+| `rde-ui::agent_server`: `ExternalAgentGrants { project_write, run_script, git_commit }` (вместо `allow_mutations`), **эффективные** гранты при старте (`run_script` только для `trusted`, R-RUN-06), `ExternalAgentStatus::Running { info, grants }`, `apply()` перезапускает при изменении любого гранта, `PendingApproval::human_summary()` для run/run_cancel/git (цели/флаги/R-RUN-06, `job_id`, сообщение/`.rde/**`/автор/`dry_run`) | [`crates/rde-ui/src/agent_server.rs`](../crates/rde-ui/src/agent_server.rs) |
+| GUI: две подгалочки под «Разрешить агенту изменения»; при нетrusted-проекте и включённой run-галочке — предупреждение и кнопка «Пометить проект доверенным…» (переиспользует **общий** `trust_dialog` R-RUN-06: `TrustRequest::AgentRunScript` → `set_project_trusted(true)` → `reload_project` → перезапуск сервера); диалог approval — блок «Что произойдёт» + контекст (`git_commit`: файлов/автор/ветка из `rde_vcs::status`, `artifact_run`: trusted-статус); панель «Агент» — режим по грантам, статус-бар `MCP: on :порт (rw+run+git)`; demo-хуки для скриншотов/тестов | [`crates/rde-ui/src/lib.rs`](../crates/rde-ui/src/lib.rs), [`examples/screenshot.rs`](../crates/rde-ui/examples/screenshot.rs) |
+| Тесты: `rde-ui` +11 (8 интеграционных через настоящий `start_http_background` + сырой MCP-HTTP: read-only все три гранта `RDE_APPROVAL_DENIED`; `server/discover` → `approval_mode=gui` + все grants «разрешено»; run без trusted → грант не выдан, после `trusted`+`apply` — выдан (перезапуск); Deny/AllowOnce `artifact_run` (нет job/чекпоинта ↔ `JobInfo`); превью run/run_cancel/git; git Deny/AllowOnce/`dry_run`/«нечего коммитить»/пустое сообщение; `apply`/снятие гранта; +3 egui_kittest — подгалочки рендер/клик/сохранение, диалог run/git, trusted-поток) | [`agent_server.rs`](../crates/rde-ui/src/agent_server.rs), [`lib.rs`](../crates/rde-ui/src/lib.rs) |
+
+**Поток (M4.2b):** агент вызывает `artifact_run`/`run_cancel`/`git_commit` → сервер: эффективный грант
+есть → `GuiApprovalHook` → диалог с превью (цели/флаги/предупреждение R-RUN-06, `job_id`, сообщение+
+файлы/автор) → AllowOnce/AllowSession/Deny → M2-схема (чекпоинт → библиотечная операция → аудит) или
+`RDE_APPROVAL_DENIED`. Run-грант существует только при `trusted=true`; без согласия пользователя
+(кнопка в настройках/панели) он не включается. Снятие гранта/выключение доступа — перезапуск
+сервера/остановка и `deny_all`.
+
+**Числа M4.2b:** `cargo test --workspace` — **415 passed, 0 failed** (M4.2: 404 + 11); 4-крейтовый
+прогон `-p rde-core -p rde-mcp -p rde-host -p rde-ui` — **258 passed** (было 247); инструменты/бюджет
+MCP не менялись (29 / `tools/list` 38 103 Б / инструкции 8 886 Б — проверено через
+`server/discover`/`tools/list`); `rde-mcp`/`rde-host`/`Cargo.lock`/`Cargo.toml` — 0 правок;
+`cargo tree -p rde-mcp`/`-p rde-host` без `egui`/`rde-ui`. Headless-скриншоты: настройки с двумя
+подгалочками, панель «Агент» `(rw+run+git)`, диалоги approval для `artifact_run`/`git_commit`,
+регрессия «Документ» — без изменений.
+
+**Ограничения (честно):** превью запуска показывает цели/зависимые/`force` и предупреждение, но **не
+код/окружение артефакта** (показ скрипта — в рабочем месте артефакта); `git_commit`-контекст
+(файлы/автор/ветка) — снимок на момент показа диалога (не live); `run_cancel` подтверждается тем же
+диалогом; approvals работают только при открытом окне RDE (таймаут 300 с → `Deny`); токен/очередь
+approvals не переживают перезапуск; ACP-агент/чат — M4.3; URI-чипы/diff-UI — M4.4.
+
+**Следующий шаг:** **M4.3** — встроенный ACP-агент/панель чата (тот же механизм approvals и
+`EventSink` для прогресса); далее M4.4 (URI-чипы §8.7.2, diff-UI suggested edits), M2.7 (run-aware
+символьные диапазоны), отдельная веха — полные track changes R-DOC-32.
+
+**Проверить руками (M4.2b):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export CARGO_HOME=/home/admin-pc/proj/rde-dev/.cache-tmp/cargo-home
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+./scripts/build.sh test -p rde-mcp -p rde-ui -p rde-host   # гранты run/git + GUI-approvals
+./scripts/build.sh test --workspace                         # 415 passed
+./scripts/build.sh run -p rde                               # GUI: Настройки → «Внешние агенты»
+
+# 1) включить «Разрешить доступ внешним агентам» + «Разрешить агенту изменения в проекте» →
+#    подгалочки «Разрешить запуск скриптов проекта» и «Разрешить git-коммиты» → «Сохранить»;
+#    панель «Агент»: «чтение + правки/запуск скриптов/git-коммиты с подтверждением»,
+#    статус-бар — «MCP: on :порт (rw+run+git)».
+# 2) если проект не trusted: рядом с run-галочкой — предупреждение и кнопка
+#    «Пометить проект доверенным…» (общий диалог R-RUN-06); без согласия run-грант не выдаётся.
+# 3) внешним MCP-клиентом: artifact_run → диалог с целями/флагами и предупреждением R-RUN-06;
+#    Deny → RDE_APPROVAL_DENIED (job не стартовал), AllowOnce → JobInfo (run_status/run_log/run_cancel);
+#    git_commit → диалог с сообщением/автором/числом файлов; Deny → коммита нет, AllowOnce → коммит,
+#    `.rde/**` не в коммите; чекпоинт — .rde/agent/checkpoints, решение — .rde/agent/audit.log.
+# 4) снять любой грант/выключить доступ/сменить проект/закрыть RDE → сервер перезапущен/остановлен,
+#    ожидающие запросы отклонены (fail-closed).
+```

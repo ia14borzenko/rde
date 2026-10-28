@@ -14,13 +14,21 @@ DocView. Ещё: [светлая тема](docs/fidelity/gui-p10-document-light.
 
 ## Состояние
 
-Текущая веха — **M4.2 «v0.3: интерактивные GUI-approvals внешних агентов»** (2026-10-27,
-[ADR-0012](docs/adr/0012-m42-gui-interactive-approvals.md)): внешние агенты из GUI могут **менять
-проект**, но только через диалог подтверждения — вторая галочка **«Разрешить агенту изменения в
-проекте»** (по умолчанию выключена) включает грант `project_write` и GUI-хук approval: RDE показывает
-«Запрос внешнего агента» с превью **«Было/Станет»** и кнопками «Разрешить один раз / в сессии /
-Отклонить», перед мутацией создаётся чекпоинт, решение и `checkpoint_id` пишутся в аудит; таймаут/
-закрытие/выключение → отказ (fail-closed). До M4.2 — **M4.1 «внешние агенты из GUI»**
+Текущая веха — **M4.2b «v0.3: GUI-гранты запуска скриптов и git-коммитов с подтверждением»**
+(2026-10-28, [ADR-0013](docs/adr/0013-m42b-gui-run-git-grants.md)): внешним агентам из GUI доступны
+**два оставшихся гранта** — отдельные подгалочки **«Разрешить запуск скриптов проекта (artifact_run)»**
+и **«Разрешить git-коммиты (git_commit)»** под «Разрешить агенту изменения в проекте». Каждый
+`artifact_run`/`run_cancel`/`git_commit` проходит через тот же диалог confirmation, но с
+**human-readable превью** (цели/флаги запуска + предупреждение о выполнении кода, R-RUN-06;
+сообщение коммита, автор и число файлов), с чекпоинтом и аудитом; fail-closed. Эффективный грант
+`run_script` выдаётся **только trusted-проекту**: если проект не доверенный — предупреждение и кнопка
+«Пометить проект доверенным…», открывающая существующий диалог согласия R-RUN-06. До M4.2b —
+**M4.2 «интерактивные GUI-approvals»** (2026-10-27,
+[ADR-0012](docs/adr/0012-m42-gui-interactive-approvals.md)): вторая галочка **«Разрешить агенту
+изменения в проекте»** (по умолчанию выключена) включает грант `project_write` и GUI-хук approval:
+RDE показывает «Запрос внешнего агента» с превью **«Было/Станет»** и кнопками «Разрешить один раз /
+в сессии / Отклонить», перед мутацией создаётся чекпоинт, решение и `checkpoint_id` пишутся в аудит;
+таймаут/закрытие/выключение → отказ (fail-closed). До M4.2 — **M4.1 «внешние агенты из GUI»**
 ([ADR-0011](docs/adr/0011-m41-gui-external-agents.md)): чекбокс «Разрешить доступ внешним агентам» +
 встроенный фоновый MCP-сервер (loopback + bearer-токен, read-only), адрес/токен в панели «Агент»;
 до M4.1 — **M2.6 «вставка/удаление абзацев документа»** (2026-10-27,
@@ -77,7 +85,7 @@ suggested edits/ревизии), **M2**
 | Источники, PDF/OCR, ревью | импорт BibTeX/RIS/CSL-JSON, PDF-текст/рендер, OCR страницы, комментарии Word и импорт внешнего ревью; веб-архив — при наличии `monolith` |
 | VCS, настройки, гейты | git init/status/commit/revert/log, `.gitignore`/`.gitattributes`, настройки приложения и авторы (вкл. «Разрешить внешним агентам», M4.1), i18n-каркас ru/en, экспорт диагностики, OPC-гейт, корпус docx, `xtask`/CI, перф 10k |
 | Структура и Код документа | **реальные**: блоки/paraId/вставки из `.doc.rde`; манифест объекта + RDE-часть `customXml/item1.xml` |
-| Агент / MCP / ACP | **MCP-сервер — M3/M2.6/M4.1/M4.2** (v0.3): `rde mcp serve` — **stdio (дефолт) + streamable HTTP (opt-in)**, spec 2026-07-28, **29 инструментов** (13 read-only + 8 мутаций M2: манифест/скрипт/запуск/статус/отмена/лог/заметка/git-коммит + 6 документных M2.5: suggested edits `doc_suggest_edit`/`suggestion_list`/`suggestion_accept`/`suggestion_reject`, `doc_replace_range`, `revision_list` + 2 M2.6: `doc_insert`/`doc_delete`) + 4 ресурса `rde://…`, grants+approvals (по умолчанию deny, CLI `--approval=deny\|auto\|allowlist`), чекпоинты `.rde/agent/checkpoints` с авто-откатом, версии документа в store, аудит `.rde/agent/audit.log` (`decision`/`reason`/`checkpoint_id`), коды `RDE_*` ([ADR-0006](docs/adr/0006-mcp-independent-layer.md), [ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md), [ADR-0008](docs/adr/0008-document-suggested-edits-and-revisions.md), [ADR-0009](docs/adr/0009-m3-streamable-http-transport.md), [ADR-0010](docs/adr/0010-m26-insert-delete-paragraphs.md), [ADR-0011](docs/adr/0011-m41-gui-external-agents.md), [ADR-0012](docs/adr/0012-m42-gui-interactive-approvals.md)); HTTP — только loopback + обязательный bearer-токен (`/mcp`, `/health`), 401 → `RDE_UNAUTHORIZED`+аудит; track changes — отдельно; **M4.1:** в настройках приложения — «Разрешить доступ внешним агентам» (встроенный HTTP-сервер, read-only, адрес/токен в панели «Агент», старт/стоп), **M4.2:** «Разрешить агенту изменения в проекте» — мутации с интерактивным подтверждением (превью «Было/Станет», AllowOnce/AllowSession/Deny, чекпоинт+аудит, fail-closed по таймауту/закрытию); run/git из GUI — M4.2b, встроенный ACP-агент/чат — M4.3 |
+| Агент / MCP / ACP | **MCP-сервер — M3/M2.6/M4.1/M4.2/M4.2b** (v0.3): `rde mcp serve` — **stdio (дефолт) + streamable HTTP (opt-in)**, spec 2026-07-28, **29 инструментов** (13 read-only + 8 мутаций M2: манифест/скрипт/запуск/статус/отмена/лог/заметка/git-коммит + 6 документных M2.5: suggested edits `doc_suggest_edit`/`suggestion_list`/`suggestion_accept`/`suggestion_reject`, `doc_replace_range`, `revision_list` + 2 M2.6: `doc_insert`/`doc_delete`) + 4 ресурса `rde://…`, grants+approvals (по умолчанию deny, CLI `--approval=deny\|auto\|allowlist`), чекпоинты `.rde/agent/checkpoints` с авто-откатом, версии документа в store, аудит `.rde/agent/audit.log` (`decision`/`reason`/`checkpoint_id`), коды `RDE_*` ([ADR-0006](docs/adr/0006-mcp-independent-layer.md), [ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md), [ADR-0008](docs/adr/0008-document-suggested-edits-and-revisions.md), [ADR-0009](docs/adr/0009-m3-streamable-http-transport.md), [ADR-0010](docs/adr/0010-m26-insert-delete-paragraphs.md), [ADR-0011](docs/adr/0011-m41-gui-external-agents.md), [ADR-0012](docs/adr/0012-m42-gui-interactive-approvals.md), [ADR-0013](docs/adr/0013-m42b-gui-run-git-grants.md)); HTTP — только loopback + обязательный bearer-токен (`/mcp`, `/health`), 401 → `RDE_UNAUTHORIZED`+аудит; track changes — отдельно; **M4.1:** в настройках приложения — «Разрешить доступ внешним агентам» (встроенный HTTP-сервер, read-only, адрес/токен в панели «Агент», старт/стоп), **M4.2:** «Разрешить агенту изменения в проекте» — мутации с интерактивным подтверждением (превью «Было/Станет», AllowOnce/AllowSession/Deny, чекпоинт+аудит, fail-closed по таймауту/закрытию), **M4.2b:** отдельные подгалочки `run_script`/`git_commit` (превью целей/сообщения/автора, run — только для trusted-проекта, R-RUN-06); встроенный ACP-агент/чат — M4.3 |
 
 ## Сборка и запуск
 
@@ -127,10 +135,10 @@ RDE_PROJECT=/путь/к/проекту ./scripts/build.sh run -p rde
 ### Тесты
 
 ```bash
-./scripts/build.sh test --workspace   # 404 теста (#[test]) в 15 пакетах
+./scripts/build.sh test --workspace   # 415 тестов (#[test]) в 15 пакетах
 ```
 
-Разбивка: core 31, dag 28, ui 60, doc 46, run 14, hash 13, store 12, docx 11, sources 6,
+Разбивка: core 31, dag 28, ui 71, doc 46, run 14, hash 13, store 12, docx 11, sources 6,
 templates 5, env 4, vcs 2, **mcp 88, host 68 (28 unit + 15 headless + 14 mutations + 11 doc_mutations),
 apps/rde (e2e MCP stdio+HTTP) 16**. Тесты, которым нужны
 внешние инструменты (LibreOffice, poppler, tesseract), проверяют наличие и пропускают проверку,
@@ -166,17 +174,23 @@ apps/rde (e2e MCP stdio+HTTP) 16**. Тесты, которым нужны
 (manifest + копии файлов + корни store); на ошибке — авто-откат; внешняя правка файла/документа при
 `expected_sha256`/`expected_text`/`expected_body_hash` → `RDE_CONFLICT`.
 
-**Внешние агенты из GUI (M4.1/M4.2, R-MCP-02/R-MCP-05):** Настройки приложения → «Внешние агенты» →
-«Разрешить доступ внешним агентам (MCP, streamable HTTP)» → «Сохранить»; RDE поднимает встроенный
-фоновый сервер (loopback, эфемерный порт) с bearer-токеном и **read-only** политикой по умолчанию.
-Вторая галочка **«Разрешить агенту изменения в проекте»** (M4.2, по умолчанию выключена) добавляет грант
-`project_write` и GUI-approval: на каждое мутирующее действие RDE показывает диалог «Запрос внешнего
-агента» с превью «Было/Станет»/аргументами и кнопками **«Разрешить один раз / в сессии / Отклонить»**,
-создаёт чекпоинт и пишет решение+`checkpoint_id` в аудит; без ответа 5 минут / при выключении доступа /
-смене проекта / закрытии окна — отказ (fail-closed). `run_script`/`git_commit` из GUI — M4.2b (CLI-гранты
-ниже уже есть). Панель «Агент» показывает статус/URL/режим, токен (по кнопке «Показать токен»), кнопки
-«Копировать адрес/токен», «Остановить/Запустить доступ»; статус-бар — `MCP: on :порт (rw)`. Для
-CI/скриптов — CLI-путь ниже (`--token-file`).
+**Внешние агенты из GUI (M4.1/M4.2/M4.2b, R-MCP-02/R-MCP-05/R-MCP-06):** Настройки приложения →
+«Внешние агенты» → «Разрешить доступ внешним агентам (MCP, streamable HTTP)» → «Сохранить»; RDE
+поднимает встроенный фоновый сервер (loopback, эфемерный порт) с bearer-токеном и **read-only**
+политикой по умолчанию. Вторая галочка **«Разрешить агенту изменения в проекте»** (M4.2, по умолчанию
+выключена) добавляет грант `project_write` и GUI-approval: на каждое мутирующее действие RDE показывает
+диалог «Запрос внешнего агента» с превью «Было/Станет»/аргументами и кнопками **«Разрешить один раз /
+в сессии / Отклонить»**, создаёт чекпоинт и пишет решение+`checkpoint_id` в аудит; без ответа 5 минут /
+при выключении доступа / смене проекта / закрытии окна — отказ (fail-closed). **M4.2b:** под ней —
+**отдельные подгалочки** «Разрешить запуск скриптов проекта (artifact_run)» и «Разрешить git-коммиты
+(git_commit)»; диалог для них показывает цели/`include_dependents`/`force` и предупреждение о
+выполнении кода артефактов (R-RUN-06), `job_id` отмены или сообщение/автора/число файлов коммита.
+**Запуск скриптов возможен только для `trusted`-проекта** (R-RUN-06): если проект не доверенный, рядом
+с галочкой — предупреждение «запуск скриптов отключён» и кнопка **«Пометить проект доверенным…»**,
+открывающая существующий диалог согласия (после подтверждения — `trusted = true` и перезапуск сервера
+с run-грантом). Панель «Агент» показывает статус/URL/режим грантов, токен (по кнопке «Показать
+токен»), кнопки «Копировать адрес/токен», «Остановить/Запустить доступ»; статус-бар — `MCP: on :порт
+(rw+run+git)`. Для CI/скриптов — CLI-путь ниже (`--token-file`, `--allow-run`, `--allow-destructive`).
 
 **Транспорт streamable HTTP (M3, R-MCP-02/R-MCP-05; выключен по умолчанию):**
 `rde mcp serve --project <dir> --transport http --bind 127.0.0.1:8765` — тот же сервер по HTTP

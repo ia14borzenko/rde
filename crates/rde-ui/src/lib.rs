@@ -518,11 +518,19 @@ pub struct ProjectSettingsState {
     new_author_email: String,
 }
 
+/// Зачем пользователю нужно согласие на запуск скриптов проекта (R-RUN-06).
+#[derive(Clone, Debug)]
+enum TrustRequest {
+    /// Обычный поток: обновить артефакты после подтверждения доверия.
+    Update { targets: Option<Vec<String>>, dependents: bool },
+    /// M4.2b: разрешить внешним агентам запускать скрипты (грант `run_script`).
+    AgentRunScript,
+}
+
 /// Диалог согласия на запуск скриптов (R-RUN-06): что запустить после подтверждения.
 #[derive(Clone, Debug)]
 struct TrustDialogState {
-    targets: Option<Vec<String>>,
-    dependents: bool,
+    request: TrustRequest,
 }
 
 /// Диалог «Вставить в документ»: значение/рисунок из артефакта (R-DOC-11) или формула (P3).
@@ -685,6 +693,9 @@ pub struct RdeApp {
     agent_approvals: std::sync::Arc<agent_server::GuiApprovals>,
     /// Текущий диалог подтверждения действия внешнего агента.
     agent_approval_dialog: Option<agent_server::PendingApproval>,
+    /// M4.2b: дополнительные строки контекста для диалога approval (число файлов к коммиту,
+    /// автор, trusted-статус проекта) — считаются один раз при показе запроса.
+    agent_approval_context: Vec<String>,
 }
 
 impl RdeApp {
@@ -755,6 +766,7 @@ impl RdeApp {
             show_agent_token: false,
             agent_approvals: std::sync::Arc::new(agent_server::GuiApprovals::new()),
             agent_approval_dialog: None,
+            agent_approval_context: Vec::new(),
         };
         app.auto_update = app.project.manifest.document_auto_update;
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
@@ -795,14 +807,19 @@ impl RdeApp {
         let options = self.external_agent_options();
         match self.external_agents.start(&root, &options) {
             Ok(()) => {
-                if let agent_server::ExternalAgentStatus::Running(info) = self.external_agents.status(true) {
+                if let agent_server::ExternalAgentStatus::Running { info, grants } =
+                    self.external_agents.status(true)
+                {
+                    let mode = self.external_agent_mode_label();
                     self.push_log(
                         Level::Info,
                         format!(
-                            "Внешние агенты: MCP HTTP {} (loopback, только чтение; токен — в панели «Агент») — R-MCP-02",
-                            info.url()
+                            "Внешние агенты: MCP HTTP {} (loopback, {mode} [{}]; токен — в панели «Агент») — R-MCP-02",
+                            info.url(),
+                            grants.label()
                         ),
                     );
+                    self.log_agent_run_script_trust_hint();
                 }
             }
             Err(error) => {
@@ -813,11 +830,64 @@ impl RdeApp {
         }
     }
 
-    /// Параметры встроенного сервера по настройкам приложения (M4.2: мутации через GUI-approvals).
+    /// M4.2b: желаемый набор грантов внешнего агента по настройкам приложения.
+    ///
+    /// Подгалочки запуска скриптов/git-коммитов действуют только при включённом внешнем доступе
+    /// **и** разрешённых мутациях (иерархия галочек). `run_script` дополнительно требует
+    /// `trusted`-проекта — эффективный грант вычисляет сервер при старте (R-RUN-06).
+    fn external_agent_grants(&self) -> agent_server::ExternalAgentGrants {
+        let mutations = self.app_settings.allow_external_mcp && self.app_settings.allow_agent_mutations;
+        agent_server::ExternalAgentGrants {
+            project_write: mutations,
+            run_script: mutations && self.app_settings.allow_agent_run_script,
+            git_commit: mutations && self.app_settings.allow_agent_git_commit,
+        }
+    }
+
+    /// Человекочитаемый режим **действующих** грантов для панели «Агент»/журнала.
+    fn external_agent_mode_label(&self) -> String {
+        let grants = self.external_agents.grants();
+        if !grants.any() {
+            return "только чтение".to_owned();
+        }
+        let mut parts = Vec::new();
+        if grants.project_write {
+            parts.push("правки");
+        }
+        if grants.run_script {
+            parts.push("запуск скриптов");
+        }
+        if grants.git_commit {
+            parts.push("git-коммиты");
+        }
+        format!("чтение + {} с подтверждением", parts.join("/"))
+    }
+
+    /// R-RUN-06: запуск скриптов разрешён в настройках, но проект не помечен доверенным —
+    /// эффективного гранта нет, нужен явный диалог согласия.
+    fn agent_run_script_trust_required(&self) -> bool {
+        self.app_settings.allow_external_mcp
+            && self.app_settings.allow_agent_mutations
+            && self.app_settings.allow_agent_run_script
+            && !self.project.manifest.trusted
+    }
+
+    /// Записать в журнал предупреждение, если run-грант урезан trusted-гейтом (R-RUN-06).
+    fn log_agent_run_script_trust_hint(&mut self) {
+        if self.external_agents.is_running() && self.agent_run_script_trust_required() {
+            self.push_log(
+                Level::Warn,
+                "Внешние агенты: запуск скриптов отключён — проект не доверенный (R-RUN-06); \
+                 подтвердите доверие в панели «Агент» или в настройках"
+                    .to_owned(),
+            );
+        }
+    }
+
+    /// Параметры встроенного сервера по настройкам приложения (M4.2/M4.2b: гранты через GUI-approvals).
     fn external_agent_options(&self) -> agent_server::ExternalAgentOptions {
         agent_server::ExternalAgentOptions {
-            // Мутации — только если пользователь разрешил И доступ включён (иначе read-only).
-            allow_mutations: self.app_settings.allow_external_mcp && self.app_settings.allow_agent_mutations,
+            grants: self.external_agent_grants(),
             approvals: std::sync::Arc::clone(&self.agent_approvals),
         }
     }
@@ -836,16 +906,19 @@ impl RdeApp {
         self.external_agents_attempted = true;
         match self.external_agents.apply(enabled, &root, &options) {
             Ok(()) => {
-                if let agent_server::ExternalAgentStatus::Running(info) = self.external_agents.status(enabled) {
-                    let mode = if self.external_agents.mutations_enabled() {
-                        "чтение+правки с подтверждением"
-                    } else {
-                        "только чтение"
-                    };
+                if let agent_server::ExternalAgentStatus::Running { info, grants } =
+                    self.external_agents.status(enabled)
+                {
+                    let mode = self.external_agent_mode_label();
                     self.push_log(
                         Level::Info,
-                        format!("Внешние агенты: MCP HTTP {} (loopback, {mode}) — R-MCP-02", info.url()),
+                        format!(
+                            "Внешние агенты: MCP HTTP {} (loopback, {mode} [{}]) — R-MCP-02",
+                            info.url(),
+                            grants.label()
+                        ),
                     );
+                    self.log_agent_run_script_trust_hint();
                 } else if !enabled {
                     self.push_log(Level::Info, "Внешние агенты: доступ по MCP HTTP выключен".to_owned());
                 }
@@ -864,12 +937,52 @@ impl RdeApp {
 
     // ── M4.2: GUI-approvals внешних агентов ─────────────────────────────────
 
+    /// M4.2b: строки контекста для диалога approval (считаются один раз при показе запроса):
+    /// число изменённых/новых файлов и автор для `git_commit`, trusted-статус для `artifact_run`.
+    fn agent_approval_context_lines(
+        pending: &agent_server::PendingApproval,
+        project: &rde_core::Project,
+    ) -> Vec<String> {
+        match pending.tool() {
+            "artifact_run" | "run_cancel" => vec![format!(
+                "Проект: «{}» — {} (запуск скриптов разрешён только доверенному проекту, R-RUN-06)",
+                project.manifest.name,
+                if project.manifest.trusted { "доверенный (trusted = true)" } else { "НЕ доверенный" }
+            )],
+            "git_commit" => {
+                let author = project
+                    .manifest
+                    .authors
+                    .iter()
+                    .find(|author| author.kind == "human")
+                    .or_else(|| project.manifest.authors.iter().find(|author| author.kind == "agent"))
+                    .map(|author| {
+                        let email = if author.email.trim().is_empty() { "rde@localhost" } else { author.email.trim() };
+                        format!("{} <{email}>", author.name.trim())
+                    })
+                    .unwrap_or_else(|| "MCP client <mcp@rde.local>".to_owned());
+                let (files, branch) = match rde_vcs::status(&project.root) {
+                    Ok(status) => (
+                        status.changed.len() + status.untracked.len(),
+                        if status.is_repo { status.branch } else { "git не инициализирован".to_owned() },
+                    ),
+                    Err(_) => (0, "git недоступен".to_owned()),
+                };
+                vec![format!(
+                    "Файлов изменено/новых: {files}; автор коммита: {author}; ветка: {branch}"
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Забрать из очереди ожидающий запрос агента и показать диалог (один за раз).
     pub fn poll_agent_approvals(&mut self) {
         if self.agent_approval_dialog.is_some() {
             return;
         }
         if let Some(pending) = self.agent_approvals.take_pending() {
+            self.agent_approval_context = Self::agent_approval_context_lines(&pending, &self.project);
             self.agent_approval_dialog = Some(pending);
         }
     }
@@ -879,6 +992,7 @@ impl RdeApp {
         if let Some(mut pending) = self.agent_approval_dialog.take() {
             let tool = pending.tool().to_owned();
             pending.decide(decision);
+            self.agent_approval_context.clear();
             let label = match decision {
                 rde_mcp::ApprovalDecision::AllowOnce => "разрешено один раз",
                 rde_mcp::ApprovalDecision::AllowSession => "разрешено в сессии",
@@ -893,6 +1007,7 @@ impl RdeApp {
         if let Some(mut pending) = self.agent_approval_dialog.take() {
             pending.decide(rde_mcp::ApprovalDecision::Deny);
         }
+        self.agent_approval_context.clear();
         self.agent_approvals.deny_all();
     }
 
@@ -2229,7 +2344,7 @@ impl RdeApp {
             return;
         }
         if !self.project.manifest.trusted {
-            self.trust_dialog = Some(TrustDialogState { targets, dependents });
+            self.trust_dialog = Some(TrustDialogState { request: TrustRequest::Update { targets, dependents } });
             return;
         }
         self.start_update(targets, dependents);
@@ -2408,6 +2523,57 @@ impl RdeApp {
     /// Для демо/скриншотов: открыть настройки приложения.
     pub fn demo_open_app_settings(&mut self) {
         self.app_settings_dialog = Some(self.app_settings.clone());
+    }
+
+    /// Для демо/скриншотов: открыть настройки на блоке «Внешние агенты» с включёнными
+    /// мастер-галочками, чтобы были видны подгалочки run/git (M4.2b).
+    pub fn demo_open_app_settings_agents(&mut self) {
+        self.app_settings.allow_external_mcp = true;
+        self.app_settings.allow_agent_mutations = true;
+        self.app_settings_dialog = Some(self.app_settings.clone());
+    }
+
+    /// Для демо/скриншотов и тестов: выдать внешним агентам заданные гранты по-настоящему
+    /// (поднять/перезапустить встроенный MCP-сервер; требует включённого внешнего доступа).
+    pub fn demo_set_agent_grants(&mut self, run_script: bool, git_commit: bool) {
+        self.app_settings.allow_external_mcp = true;
+        self.app_settings.allow_agent_mutations = true;
+        self.app_settings.allow_agent_run_script = run_script;
+        self.app_settings.allow_agent_git_commit = git_commit;
+        self.apply_external_agents_setting();
+    }
+
+    /// Для демо/скриншотов и тестов: показать диалог approval внешнего агента (M4.2b).
+    ///
+    /// `kind`: `artifact_run` | `run_cancel` | `git_commit` (превью действия без реального вызова).
+    pub fn demo_open_agent_approval(&mut self, kind: &str) {
+        let (tool, args) = match kind {
+            "run_cancel" | "cancel" => {
+                ("run_cancel", serde_json::json!({"job_id": "01J0B7X8QW3M4N5P6R7S8T9V0Z"}))
+            }
+            "git_commit" | "git" => (
+                "git_commit",
+                serde_json::json!({"message": "M4.2b: принят лист правок агента", "dry_run": false}),
+            ),
+            _ => (
+                "artifact_run",
+                serde_json::json!({
+                    "targets": ["01ARTSTATS", "01ARTFIG"],
+                    "include_dependents": true,
+                    "force": false
+                }),
+            ),
+        };
+        // Канал ответа держим: в demo-режиме решение принимает пользователь/тест.
+        let _receiver = self.agent_approvals.enqueue(rde_mcp::ApprovalRequest {
+            tool: tool.to_owned(),
+            args_summary: format!("{{\"tool\":\"{tool}\"}}"),
+            args_sha256: "0".repeat(64),
+            destructive: true,
+            requested_by: "mcp".to_owned(),
+            args: Some(args),
+        });
+        self.poll_agent_approvals();
     }
 
     /// Для демо/скриншотов и тестов: выбрать тему оболочки
@@ -2959,12 +3125,13 @@ impl RdeApp {
     // ── статус-бар ──────────────────────────────────────────────────────────
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let pal = theme_colors(ui.ctx().theme());
-        // M4.1: состояние внешних агентов — в строке статуса (видно на всех вкладках).
+        // M4.1/M4.2b: состояние внешних агентов — в строке статуса (видно на всех вкладках).
         let (agent_label, mcp_label, agent_color) = match self.external_agents_status() {
-            agent_server::ExternalAgentStatus::Running(info) => (
+            agent_server::ExternalAgentStatus::Running { info, grants } => (
                 format!("Агент: MCP HTTP :{}", info.addr.port()),
-                if self.external_agents.mutations_enabled() {
-                    format!("MCP: on :{} (rw)", info.addr.port())
+                // M4.2b: действующий режим грантов, например `(rw+run+git)`.
+                if grants.any() {
+                    format!("MCP: on :{} ({})", info.addr.port(), grants.label())
                 } else {
                     format!("MCP: on :{}", info.addr.port())
                 },
@@ -3389,9 +3556,14 @@ impl RdeApp {
         let external_status = self.external_agents_status();
         let external_error = self.external_agents.last_error().map(str::to_owned);
         let show_agent_token = self.show_agent_token;
+        // M4.2b: действующие гранты/режим и trusted-подсказка для run-скриптов (R-RUN-06).
+        let agent_grants = external_status.grants();
+        let agent_mode_label = self.external_agent_mode_label();
+        let run_script_trust_required = self.agent_run_script_trust_required();
         let mut start_external = false;
         let mut stop_external = false;
         let mut toggle_agent_token = false;
+        let mut trust_project_for_agents = false;
         egui::Panel::right("rde_agent")
             .resizable(true)
             .default_size(AGENT_WIDTH)
@@ -3401,7 +3573,7 @@ impl RdeApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("АГЕНТ").small().strong().color(pal.muted));
                     let (status_text, status_color) = match &external_status {
-                        agent_server::ExternalAgentStatus::Running(_) => ("• MCP HTTP", pal.green),
+                        agent_server::ExternalAgentStatus::Running { .. } => ("• MCP HTTP", pal.green),
                         agent_server::ExternalAgentStatus::NotRunning => ("• MCP HTTP: остановлен", pal.amber),
                         agent_server::ExternalAgentStatus::Disabled => ("• не подключён", pal.amber),
                     };
@@ -3420,9 +3592,9 @@ impl RdeApp {
                     ui.label(RichText::new("ВНЕШНИЕ АГЕНТЫ (MCP, HTTP)").small().strong().color(pal.muted));
                     ui.add_space(4.0);
                     match &external_status {
-                        agent_server::ExternalAgentStatus::Running(info) => {
+                        agent_server::ExternalAgentStatus::Running { info, .. } => {
                             ui.label(
-                                RichText::new("Доступ разрешён: только loopback + bearer-токен, режим только чтения.")
+                                RichText::new("Доступ разрешён: только loopback + bearer-токен.")
                                     .small()
                                     .color(pal.muted),
                             );
@@ -3467,22 +3639,66 @@ impl RdeApp {
                                 .color(pal.muted),
                             );
                             ui.add_space(4.0);
-                            if self.external_agents.mutations_enabled() {
+                            if agent_grants.any() {
                                 ui.label(
-                                    RichText::new("Режим: чтение + правки с подтверждением (M4.2)")
-                                        .small()
-                                        .color(pal.amber),
+                                    RichText::new(format!(
+                                        "Режим: {agent_mode_label} [{}] (M4.2b)",
+                                        agent_grants.label()
+                                    ))
+                                    .small()
+                                    .color(pal.amber),
                                 );
+                                if agent_grants.project_write {
+                                    ui.label(
+                                        RichText::new(
+                                            "Правки проекта (документ/заметки/манифесты): подтверждение \
+                                             с превью «Было/Станет», чекпоинт, откат — «Задачи»/чекпоинты.",
+                                        )
+                                        .small()
+                                        .color(pal.muted),
+                                    );
+                                }
+                                if agent_grants.run_script {
+                                    ui.label(
+                                        RichText::new(
+                                            "Запуск скриптов: код артефактов выполняется на вашей машине \
+                                             (R-RUN-06); один job за раз, отмена — run_cancel.",
+                                        )
+                                        .small()
+                                        .color(pal.muted),
+                                    );
+                                }
+                                if agent_grants.git_commit {
+                                    ui.label(
+                                        RichText::new(
+                                            "Git-коммиты: сообщение от агента, автор — из rde.toml; \
+                                             `.rde/**` в коммит не попадает.",
+                                        )
+                                        .small()
+                                        .color(pal.muted),
+                                    );
+                                }
                                 ui.label(
                                     RichText::new(
-                                        "Каждое изменение агента приходит запросом в RDE — подтвердите или \
-                                         отклоните в диалоге; создаётся чекпоинт (откат — «Задачи»/чекпоинты).",
+                                        "Каждое действие агента приходит запросом в RDE — подтвердите или \
+                                         отклоните в диалоге; решение пишется в аудит.",
                                     )
                                     .small()
                                     .color(pal.muted),
                                 );
                             } else {
                                 ui.label(RichText::new("Режим: только чтение").small().color(pal.muted));
+                            }
+                            // R-RUN-06: галочка есть, но проект не доверенный → грант не выдан.
+                            if run_script_trust_required && !agent_grants.run_script {
+                                ui.label(
+                                    RichText::new("Запуск скриптов отключён: проект не доверенный (R-RUN-06).")
+                                        .small()
+                                        .color(pal.amber),
+                                );
+                                if ui.small_button("Пометить проект доверенным…").clicked() {
+                                    trust_project_for_agents = true;
+                                }
                             }
                         }
                         agent_server::ExternalAgentStatus::NotRunning => {
@@ -3494,7 +3710,7 @@ impl RdeApp {
                         agent_server::ExternalAgentStatus::Disabled => {
                             ui.label(RichText::new("Внешний доступ выключен (fail-closed).").small().color(pal.muted));
                             ui.label(
-                                RichText::new("Включить: Настройки → «Внешние агенты» (чтение; правки — отдельная галочка с подтверждением).")
+                                RichText::new("Включить: Настройки → «Внешние агенты» (чтение; правки — отдельная галочка; запуск скриптов/git-коммиты — подгалочки с подтверждением).")
                                     .small()
                                     .color(pal.muted),
                             );
@@ -3562,6 +3778,11 @@ impl RdeApp {
         if stop_external {
             self.app_settings.allow_external_mcp = false;
             self.apply_external_agents_setting();
+        }
+        if trust_project_for_agents {
+            // Существующий диалог согласия R-RUN-06 (общий с «Обновить артефакты»): после
+            // подтверждения — trusted=true, reload и перезапуск MCP-сервера с run-грантом.
+            self.trust_dialog = Some(TrustDialogState { request: TrustRequest::AgentRunScript });
         }
     }
 
@@ -4664,6 +4885,8 @@ impl RdeApp {
         if let Some(mut settings) = self.app_settings_dialog.take() {
             let mut save = false;
             let mut cancel = false;
+            // M4.2b: кнопка «Пометить проект доверенным…» открывает диалог согласия R-RUN-06.
+            let mut trust_for_agents = false;
             // Масштаб интерфейса правится здесь же, но хранится в сессии RdeApp
             // (в схеме AppSettings его нет — владение rde-core, вне scope фазы).
             let mut ui_scale = self.ui_scale;
@@ -4730,16 +4953,53 @@ impl RdeApp {
                                     &mut settings.allow_agent_mutations,
                                     "Разрешить агенту изменения в проекте",
                                 );
+                                ui.label(
+                                    RichText::new(
+                                        "Каждое изменение подтверждается диалогом в RDE; создаётся чекпоинт \
+                                         (авто-откат при ошибке), решение пишется в аудит. Без этой галочки — \
+                                         только чтение (fail-closed, R-MCP-05).",
+                                    )
+                                    .small()
+                                    .color(pal.muted),
+                                );
+                                // M4.2b: два отдельных гранта, а не «полный доступ» (R-AGT-06, R-MCP-05).
+                                ui.add_enabled_ui(settings.allow_agent_mutations, |ui| {
+                                    ui.checkbox(
+                                        &mut settings.allow_agent_run_script,
+                                        "Разрешить запуск скриптов проекта (artifact_run)",
+                                    );
+                                    ui.checkbox(
+                                        &mut settings.allow_agent_git_commit,
+                                        "Разрешить git-коммиты (git_commit)",
+                                    );
+                                });
+                                ui.label(
+                                    RichText::new(
+                                        "Запуск скриптов и коммиты — каждый раз отдельный диалог с превью, \
+                                         чекпоинт и запись в аудит. Запуск скриптов возможен только для \
+                                         доверенного проекта (R-RUN-06); `.rde/**` в коммит не попадает.",
+                                    )
+                                    .small()
+                                    .color(pal.muted),
+                                );
                             });
-                            ui.label(
-                                RichText::new(
-                                    "Каждое изменение подтверждается диалогом в RDE; создаётся чекпоинт \
-                                     (авто-откат при ошибке), решение пишется в аудит. Без этой галочки — \
-                                     только чтение (fail-closed, R-MCP-05).",
-                                )
-                                .small()
-                                .color(pal.muted),
-                            );
+                            // R-RUN-06: галочка стоит, но проект не доверенный — грант не выдаётся.
+                            if settings.allow_external_mcp
+                                && settings.allow_agent_mutations
+                                && settings.allow_agent_run_script
+                                && !self.project.manifest.trusted
+                            {
+                                ui.label(
+                                    RichText::new(
+                                        "Запуск скриптов отключён: проект не доверенный (R-RUN-06).",
+                                    )
+                                    .small()
+                                    .color(pal.amber),
+                                );
+                                if ui.button("Пометить проект доверенным…").clicked() {
+                                    trust_for_agents = true;
+                                }
+                            }
                         });
                         ui.end_row();
                     });
@@ -4752,6 +5012,11 @@ impl RdeApp {
                         }
                     });
                 });
+            if trust_for_agents {
+                // Существующий диалог согласия R-RUN-06 (не дублируем): после подтверждения
+                // trusted=true, перезагрузка проекта и перезапуск MCP-сервера.
+                self.trust_dialog = Some(TrustDialogState { request: TrustRequest::AgentRunScript });
+            }
             if save {
                 let want_system = settings.theme == "system";
                 settings.normalize();
@@ -4860,6 +5125,14 @@ impl RdeApp {
             let mut cancel = false;
             let project_name = self.project.manifest.name.clone();
             let root = self.project.root.display().to_string();
+            // M4.2b: тот же диалог согласия открывает кнопка «Пометить проект доверенным…»
+            // (разрешение внешним агентам запускать скрипты).
+            let for_agents = matches!(state.request, TrustRequest::AgentRunScript);
+            let confirm_label = if for_agents {
+                "Доверяю проекту и разрешить агентам запуск"
+            } else {
+                "Доверяю проекту и запустить"
+            };
             egui::Window::new("Запуск скриптов проекта")
                 .collapsible(false)
                 .resizable(false)
@@ -4871,6 +5144,16 @@ impl RdeApp {
                             .strong()
                             .color(pal.text),
                     );
+                    if for_agents {
+                        ui.label(
+                            RichText::new(
+                                "Запуск скриптов будет доступен внешним агентам (MCP) — каждый запуск \
+                                 дополнительно подтверждается отдельным диалогом.",
+                            )
+                            .small()
+                            .color(pal.text),
+                        );
+                    }
                     ui.add_space(4.0);
                     ui.label(RichText::new(format!("Проект: «{project_name}»")).small().color(pal.text));
                     ui.label(RichText::new(format!("Каталог: {root}")).small().color(pal.muted));
@@ -4887,7 +5170,7 @@ impl RdeApp {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add(egui::Button::new(RichText::new("Доверяю проекту и запустить").color(Color32::WHITE)).fill(pal.accent))
+                            .add(egui::Button::new(RichText::new(confirm_label).color(Color32::WHITE)).fill(pal.accent))
                             .clicked()
                         {
                             confirm = true;
@@ -4902,7 +5185,25 @@ impl RdeApp {
                     Ok(()) => {
                         self.reload_project();
                         self.push_log(Level::Ok, "Проект помечен доверенным (trusted = true): запуск скриптов разрешён");
-                        self.start_update(state.targets, state.dependents);
+                        match state.request {
+                            TrustRequest::Update { targets, dependents } => self.start_update(targets, dependents),
+                            TrustRequest::AgentRunScript => {
+                                // Перезапуск сервера: эффективный run-грант пересчитывается
+                                // (trusted-гейт снят).
+                                self.apply_external_agents_setting();
+                                if self.external_agents.grants().run_script {
+                                    self.push_log(
+                                        Level::Ok,
+                                        "Внешние агенты: запуск скриптов разрешён (каждый запуск — через GUI-подтверждение)",
+                                    );
+                                } else {
+                                    self.push_log(
+                                        Level::Info,
+                                        "Проект доверенный; включите «Разрешить запуск скриптов» в настройках и сохраните",
+                                    );
+                                }
+                            }
+                        }
                     }
                     Err(error) => self.push_log(Level::Warn, format!("Не удалось записать trusted в rde.toml: {error}")),
                 }
@@ -5299,7 +5600,7 @@ impl RdeApp {
         }
     }
 
-    /// M4.2: диалог подтверждения действия внешнего агента (разрешить/отклонить).
+    /// M4.2/M4.2b: диалог подтверждения действия внешнего агента (разрешить/отклонить).
     fn agent_approval_dialog(&mut self, ctx: &egui::Context) {
         let pal = theme_colors(ctx.theme());
         let Some(pending) = self.agent_approval_dialog.as_ref() else { return };
@@ -5307,6 +5608,9 @@ impl RdeApp {
         let destructive = pending.destructive;
         let requested_by = pending.requested_by.clone();
         let preview = pending.preview();
+        // M4.2b: human-readable сводка run/commit + контекст (файлы/автор/trusted).
+        let human_summary = pending.human_summary();
+        let context_lines = self.agent_approval_context.clone();
         let args_summary = pending.args_json_summary();
         let id = pending.id;
         let mut decision: Option<rde_mcp::ApprovalDecision> = None;
@@ -5322,6 +5626,18 @@ impl RdeApp {
                 if destructive {
                     ui.label(RichText::new("внимание: деструктивное действие").small().color(pal.amber));
                 }
+                if let Some(lines) = &human_summary {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Что произойдёт:").small().strong().color(pal.muted));
+                    for line in lines {
+                        ui.add(
+                            egui::Label::new(RichText::new(format!("• {line}")).small().color(pal.text)).wrap(),
+                        );
+                    }
+                }
+                for line in &context_lines {
+                    ui.add(egui::Label::new(RichText::new(line).small().color(pal.muted)).wrap());
+                }
                 ui.add_space(6.0);
                 if let Some((before, after)) = &preview {
                     if let Some(before) = before {
@@ -5333,6 +5649,13 @@ impl RdeApp {
                     ui.label(RichText::new("Станет:").small().strong().color(pal.muted));
                     egui::ScrollArea::vertical().id_salt(("rde_approval_after", id)).max_height(140.0).show(ui, |ui| {
                         ui.add(egui::Label::new(RichText::new(after).monospace()).wrap());
+                    });
+                } else if human_summary.is_some() {
+                    // Превью уже человекочитаемое; сырые аргументы — для аудита/отладки.
+                    ui.collapsing("Аргументы (JSON)", |ui| {
+                        egui::ScrollArea::vertical().id_salt(("rde_approval_args_json", id)).max_height(150.0).show(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(args_summary).monospace()).wrap());
+                        });
                     });
                 } else {
                     ui.label(RichText::new("Аргументы:").small().strong().color(pal.muted));
@@ -9350,7 +9673,7 @@ mod agent_server_ui_tests {
         let status = app.external_agents_status();
         assert!(status.is_running(), "статус: {status:?}");
         let info = match status {
-            super::agent_server::ExternalAgentStatus::Running(info) => info,
+            super::agent_server::ExternalAgentStatus::Running { info, .. } => info,
             other => panic!("ожидался Running, получено {other:?}"),
         };
         assert!(info.addr.ip().is_loopback());
@@ -9379,5 +9702,140 @@ mod agent_server_ui_tests {
         app.app_settings.allow_external_mcp = false;
         app.apply_external_agents_setting();
         assert!(!app.external_agents_status().is_running());
+    }
+
+    /// Kittest-харнесс приложения (без wgpu) — только дерево доступности/layout.
+    fn render(app: RdeApp) -> egui_kittest::Harness<'static, RdeApp> {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness
+    }
+
+    /// M4.2b: две подгалочки грантов (run/git) рендерятся в настройках, кликаются и сохраняются
+    /// тем же сериализатором, что и кнопка «Сохранить» (файл — аддитивные ключи в settings.toml).
+    #[test]
+    fn agent_grant_checkboxes_render_and_persist() {
+        use egui_kittest::kittest::Queryable;
+        let root = temp_demo_copy("grants-settings");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        // Мастер-галочки включены (иначе подгалочки недоступны — иерархия как в диалоге).
+        app.demo_open_app_settings_agents();
+        let mut harness = render(app);
+        let run_label = "Разрешить запуск скриптов проекта (artifact_run)";
+        let git_label = "Разрешить git-коммиты (git_commit)";
+        assert!(harness.query_by_label(run_label).is_some(), "подгалочка run_script в настройках");
+        assert!(harness.query_by_label(git_label).is_some(), "подгалочка git_commit в настройках");
+        // Включаем обе кликами — состояние привязано к диалогу настроек.
+        harness.get_by_label(run_label).click();
+        harness.run_steps(2);
+        harness.get_by_label(git_label).click();
+        harness.run_steps(2);
+        let dialog = harness.state().app_settings_dialog.as_ref().expect("диалог настроек открыт").clone();
+        assert!(dialog.allow_agent_run_script, "клик включает run_script");
+        assert!(dialog.allow_agent_git_commit, "клик включает git_commit");
+        // Сохранение в файл (тот же rde_core::settings::save, что у кнопки «Сохранить»).
+        let path = root.join("settings.toml");
+        rde_core::settings::save_to(&dialog, &path).expect("сохранить настройки");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("allow_agent_run_script = true"), "{text}");
+        assert!(text.contains("allow_agent_git_commit = true"), "{text}");
+        let loaded = rde_core::settings::load_from(&path);
+        assert!(loaded.allow_agent_run_script && loaded.allow_agent_git_commit);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M4.2b: диалог approval для run/git показывает human-readable превью, trusted-контекст
+    /// и кнопки решений (egui_kittest, без окна).
+    #[test]
+    fn agent_approval_dialog_renders_run_and_git_previews() {
+        use egui_kittest::kittest::Queryable;
+        let root = temp_demo_copy("approvals-preview");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        app.demo_open_agent_approval("artifact_run");
+        let mut harness = render(app);
+        assert!(harness.query_by_label("Запрос внешнего агента").is_some(), "окно диалога");
+        assert!(harness.query_by_label("Разрешить один раз").is_some(), "кнопка AllowOnce");
+        assert!(harness.query_by_label("Разрешить в сессии").is_some(), "кнопка AllowSession");
+        assert!(harness.query_by_label("Отклонить").is_some(), "кнопка Deny");
+        assert!(harness.query_by_label("Что произойдёт:").is_some(), "блок сводки действия");
+        assert!(
+            harness.query_all_by_label_contains("R-RUN-06").next().is_some(),
+            "предупреждение о выполнении кода артефактов"
+        );
+        assert!(
+            harness.query_all_by_label_contains("01ARTSTATS").next().is_some(),
+            "цели запуска в превью"
+        );
+        assert!(
+            harness.query_all_by_label_contains("Проект:").next().is_some(),
+            "trusted-статус проекта в контексте"
+        );
+        // Отклонение закрывает диалог; следующий запрос — git-коммит с сообщением агента.
+        harness.state_mut().decide_agent_approval(rde_mcp::ApprovalDecision::Deny);
+        harness.state_mut().demo_open_agent_approval("git_commit");
+        harness.run_steps(3);
+        harness.query_by_label("Инструмент: git_commit").expect("инструмент в диалоге");
+        assert!(
+            harness
+                .query_all_by_label_contains("M4.2b: принят лист правок агента")
+                .next()
+                .is_some(),
+            "сообщение коммита в превью"
+        );
+        assert!(
+            harness.query_all_by_label_contains(".rde/**").next().is_some(),
+            "предупреждение про .rde"
+        );
+        harness.state_mut().decide_agent_approval(rde_mcp::ApprovalDecision::Deny);
+        assert!(harness.state().agent_approval_dialog.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M4.2b: настройки применяются к грантам сервера; run-грант без trusted не выдаётся,
+    /// кнопка «Пометить проект доверенным…» открывает существующий диалог согласия R-RUN-06.
+    #[test]
+    fn agent_grant_settings_apply_and_trust_dialog_is_reused() {
+        let root = temp_demo_copy("grants-apply");
+        rde_core::set_project_trusted(&root, false).unwrap();
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        app.app_settings.allow_external_mcp = true;
+        app.app_settings.allow_agent_mutations = true;
+        app.app_settings.allow_agent_run_script = true;
+        app.app_settings.allow_agent_git_commit = true;
+        app.apply_external_agents_setting();
+        // Проект не trusted → эффективного run-гранта нет, остальные выданы.
+        let running = app.external_agents_status();
+        assert!(running.is_running(), "сервер запущен: {running:?}");
+        assert_eq!(
+            running.grants(),
+            super::agent_server::ExternalAgentGrants {
+                project_write: true,
+                run_script: false,
+                git_commit: true
+            }
+        );
+        assert!(app.agent_run_script_trust_required(), "подсказка про trusted нужна");
+        // Кнопка «Пометить проект доверенным…» (панель/настройки) открывает общий диалог R-RUN-06.
+        app.trust_dialog = Some(super::TrustDialogState { request: super::TrustRequest::AgentRunScript });
+        // Подтверждение согласия (как кнопка диалога): trusted=true → перезагрузка → перезапуск.
+        rde_core::set_project_trusted(&root, true).unwrap();
+        app.trust_dialog = None;
+        app.reload_project();
+        app.apply_external_agents_setting();
+        assert!(app.project.manifest.trusted);
+        assert!(app.external_agents_status().grants().run_script, "после trusted run-грант выдан");
+        assert!(!app.agent_run_script_trust_required());
+        app.app_settings.allow_external_mcp = false;
+        app.apply_external_agents_setting();
+        assert!(!app.external_agents_status().is_running());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
