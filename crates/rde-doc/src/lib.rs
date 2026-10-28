@@ -50,6 +50,13 @@ pub use formula_insert::*;
 pub mod import;
 pub use import::*;
 
+/// R-DOC-44: разбор MathType MTEF v5 → LaTeX (скрытые объекты формул при импорте `.docx`).
+pub mod mtef;
+
+/// R-DOC-44: конверсия MathType OLE-объектов импортированного `.docx` в нативные формулы RDE.
+pub mod math_type;
+pub use math_type::{MathTypeImportReport, RdeFormula};
+
 pub mod suggestions;
 pub use suggestions::*;
 
@@ -57,9 +64,10 @@ mod text_edit;
 pub use text_edit::*;
 
 pub const RDE_NS: &str = "https://rde.dev/ns/doc";
-/// Версия схемы `rde:doc`: 2 — формульные вставки (`kind="formula"`, `render_mode`, `body_hash`).
-/// Пакеты версии 1 читаются (новые поля необязательны); при записи ставится 2 (ADR-0005 §7).
-pub const SCHEMA_VERSION: &str = "2";
+/// Версия схемы `rde:doc`: 3 — скрытые объекты MathType-формул из импорта (`<rde:formulas>`,
+/// R-DOC-44); 2 — формульные вставки (`kind="formula"`, `render_mode`, `body_hash`).
+/// Пакеты версий 1–2 читаются (новые поля необязательны); при записи ставится 3.
+pub const SCHEMA_VERSION: &str = "3";
 pub const RDE_DOC_PART: &str = "customXml/item1.xml";
 pub const RDE_ITEM_PROPS: &str = "customXml/itemProps1.xml";
 pub const RDE_ITEM_RELS: &str = "customXml/_rels/item1.xml.rels";
@@ -150,6 +158,10 @@ pub struct RdeDoc {
     pub body_hash: String,
     pub blocks: Vec<RdeBlock>,
     pub inserts: Vec<RdeInsert>,
+    /// R-DOC-44: скрытые объекты MathType-формул, извлечённые при импорте `.docx`
+    /// (LaTeX + исходный OLE/preview). В текст документа вставлены нативные OMML-формулы.
+    #[serde(default)]
+    pub formulas: Vec<RdeFormula>,
     pub review: RdeReview,
     pub updated_unix: u64,
 }
@@ -163,6 +175,7 @@ impl Default for RdeDoc {
             body_hash: String::new(),
             blocks: Vec::new(),
             inserts: Vec::new(),
+            formulas: Vec::new(),
             review: RdeReview::default(),
             updated_unix: 0,
         }
@@ -348,6 +361,23 @@ pub fn render_rde_doc(doc: &RdeDoc) -> String {
         out.push_str("/>\n");
     }
     out.push_str("  </rde:inserts>\n");
+    if !doc.formulas.is_empty() {
+        out.push_str("  <rde:formulas>\n");
+        for formula in &doc.formulas {
+            out.push_str(&format!(
+                "    <rde:formula id=\"{}\" latex=\"{}\" display=\"{}\" source=\"{}\" preview=\"{}\" mtef_sha256=\"{}\" ole_hex=\"{}\" preview_hex=\"{}\"/>\n",
+                escape_attr(&formula.id),
+                escape_attr(&formula.latex),
+                formula.display,
+                escape_attr(&formula.source),
+                escape_attr(&formula.preview),
+                escape_attr(&formula.mtef_sha256),
+                escape_attr(&formula.ole_hex),
+                escape_attr(&formula.preview_hex)
+            ));
+        }
+        out.push_str("  </rde:formulas>\n");
+    }
     out.push_str(&format!("  <rde:review open=\"{}\" resolved=\"{}\"/>\n", doc.review.open, doc.review.resolved));
     out.push_str("</rde:doc>\n");
     out
@@ -475,6 +505,25 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                                 _ => {}
                             }
                         }
+                    }
+                    "formula" => {
+                        let mut formula = RdeFormula::default();
+                        for attr in event.attributes().flatten() {
+                            let key = local_name(attr.key.as_ref());
+                            let value = unescape(attr.value.as_ref());
+                            match key.as_str() {
+                                "id" => formula.id = value,
+                                "latex" => formula.latex = value,
+                                "display" => formula.display = value == "true",
+                                "source" => formula.source = value,
+                                "preview" => formula.preview = value,
+                                "mtef_sha256" => formula.mtef_sha256 = value,
+                                "ole_hex" => formula.ole_hex = value,
+                                "preview_hex" => formula.preview_hex = value,
+                                _ => {}
+                            }
+                        }
+                        doc.formulas.push(formula);
                     }
                     _ => {}
                 }
@@ -1545,6 +1594,7 @@ pub fn build_rde_doc(clean_docx: &Path, doc_id: &str, template: &str) -> Result<
         body_hash,
         blocks,
         inserts,
+        formulas: Vec::new(),
         review: RdeReview::default(),
         updated_unix: now_unix(),
     })

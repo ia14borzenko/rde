@@ -17,3 +17,6 @@ Cargo.lock.bak
 .DS_Store
 *.swp
 *~
+
+# Локальные артефакты итераций (не продукт)
+/.cache-tmp/

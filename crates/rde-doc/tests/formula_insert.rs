@@ -120,7 +120,7 @@ fn omml_insert_updates_and_roundtrips_through_engine() {
     assert!(document.contains("(1)"), "документно-локальный номер: {document}");
 
     let rde_doc = load_rde_doc(&package).unwrap();
-    assert_eq!(rde_doc.schema_version, "2");
+    assert_eq!(rde_doc.schema_version, rde_doc::SCHEMA_VERSION);
     assert_eq!(rde_doc.inserts.iter().filter(|insert| insert.kind == "formula").count(), 1);
 
     // Статус «актуальна», затем «устарела» после изменения формулы.

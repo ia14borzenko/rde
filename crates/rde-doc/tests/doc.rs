@@ -34,6 +34,7 @@ fn rde_doc_xml_roundtrip_handles_unicode_and_escapes() {
             RdeBlock { id: "b1".into(), path: "0".into(), kind: "heading1".into(), text: "Введение & «кавычки» <x>".into(), para_id: Some("1A2B3C4D".into()) },
             RdeBlock { id: "b2".into(), path: "1".into(), kind: "paragraph".into(), text: "Текст с амперсандом & и \"кавычками\"".into(), para_id: None },
         ],
+        formulas: vec![],
         inserts: vec![RdeInsert {
             id: "i1".into(),
             block: "b3".into(),

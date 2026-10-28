@@ -9,6 +9,13 @@ Third-party components referenced or used as dependencies (attribution):
   RDE embeds WordCraft's document engine and, via the fork branch `rde/main`
   (https://github.com/ia14borzenko/wordcraft-rde), a feature-gated chrome-less
   document view. See docs/wordcraft-fork.md for the change log.
+- **MTEF → LaTeX (MathType-формулы при импорте `.docx`, R-DOC-44)** — собственная реализация
+  разбора MTEF v5 и генерации LaTeX в `rde-doc/src/mtef/`; сверялась с открытыми проектами
+  [mtef-go](https://github.com/zhexiao/mtef-go) (Apache-2.0) и таблицами символов
+  [jure/mathtype](https://github.com/jure/mathtype) / [jure/mathtype_to_mathml](https://github.com/jure)
+  (MIT); производные таблицы символов (`chars.rs`) сохраняют атрибуцию MIT/Apache-2.0.
+- `cfb` (https://github.com/mdsteele/rust-cfb) — MIT/Apache-2.0: чтение OLE Compound File
+  (стрим `Equation Native`); уже в `Cargo.lock` транзитивно через WordCraft.
 - egui / eframe — MIT OR Apache-2.0 (докинг реализован собственным слоем, см. ADR-0003 §1).
 - agent-client-protocol (https://github.com/agentclientprotocol/rust-sdk) — Apache-2.0;
   Rust SDK Agent Client Protocol (ACP) 3.5.0, используется крейтом `rde-agent` как ACP-клиент

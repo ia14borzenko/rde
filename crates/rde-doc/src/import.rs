@@ -21,6 +21,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DOCUMENT_XML, package_info, read_package, save_engine_document};
 
+/// Сводка по MathType-формулам в отчёте импорта (R-DOC-44). Сами скрытые объекты — в `rde:doc`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MathTypeSummary {
+    pub found: usize,
+    pub converted: usize,
+    pub display: usize,
+    pub failed: usize,
+}
+
 /// Отчёт импорта `.docx` (пишется в `import.json` рядом с пакетом и показывается пользователю).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DocImportReport {
@@ -46,6 +55,9 @@ pub struct DocImportReport {
     pub blocks: usize,
     /// Unix-время импорта.
     pub imported_unix: u64,
+    /// R-DOC-44: MathType-формулы, переведённые в нативные (LaTeX извлечён, OLE сохранён скрыто).
+    #[serde(default)]
+    pub math_type: MathTypeSummary,
     /// Предупреждения: что RDE не поддерживает и что может потеряться при последующем сохранении.
     pub warnings: Vec<String>,
 }
@@ -53,8 +65,16 @@ pub struct DocImportReport {
 impl DocImportReport {
     /// Короткая строка для журнала: «N частей, M блоков, K предупреждений».
     pub fn summary(&self) -> String {
+        let math = if self.math_type.found > 0 {
+            format!(
+                ", MathType-формул: {}/{} нативных",
+                self.math_type.converted, self.math_type.found
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "импортирован .docx ({} частей, {} блоков, предупреждений: {})",
+            "импортирован .docx ({} частей, {} блоков{math}, предупреждений: {})",
             self.source_parts.len(),
             self.blocks,
             self.warnings.len()
@@ -124,6 +144,10 @@ pub fn import_docx(
     }
     // Конвертация: WordCraft-модель → OOXML + rde:doc + w14:paraId (штатный путь RDE).
     let rde_doc = save_engine_document(source, package, doc_id_hint, template)?;
+    // R-DOC-44: MathType-объекты → нативные формулы (LaTeX из MTEF) + скрытые объекты в rde:doc.
+    let (math_type, math_warnings) = convert_math_type_in_package(package);
+    let mut warnings = warnings;
+    warnings.extend(math_warnings);
     let info = package_info(package)?;
     let blocks = crate::document_blocks(package).map_err(|error| {
         format!("проверить импортированный документ {}: {error}", package.display())
@@ -141,10 +165,40 @@ pub fn import_docx(
         imported_parts: info.parts.len(),
         blocks: blocks.len(),
         imported_unix: now_unix(),
+        math_type,
         warnings,
     };
     write_provenance(package, &report)?;
     Ok(report)
+}
+
+/// Post-processing импортированного пакета: MathType-объекты → нативные формулы (R-DOC-44).
+///
+/// Ошибка конверсии **не** проваливает импорт: пакет остаётся как есть (формулы видны preview-
+/// картинкой благодаря vendor-патчу WMF-текста), а в отчёт попадает предупреждение.
+fn convert_math_type_in_package(package: &Path) -> (MathTypeSummary, Vec<String>) {
+    match crate::math_type::convert_math_type_objects(package) {
+        Ok(report) => {
+            let summary = MathTypeSummary {
+                found: report.found,
+                converted: report.converted,
+                display: report.display,
+                failed: report.failed,
+            };
+            let mut warnings = report.warnings;
+            if report.converted > 0 {
+                warnings.push(format!(
+                    "MathType-формулы: {} из {} переведены в нативные (LaTeX извлечён из MTEF, OLE сохранён скрыто в rde:doc)",
+                    report.converted, report.found
+                ));
+            }
+            (summary, warnings)
+        }
+        Err(error) => (
+            MathTypeSummary::default(),
+            vec![format!("MathType-формулы не переведены в нативные: {error}")],
+        ),
+    }
 }
 
 /// Записать `import.json` рядом с пакетом (происхождение импорта, R-DOC-39).
@@ -176,7 +230,7 @@ fn analyze_source(parts: &[String], document_xml: &str) -> Vec<String> {
     }
     if has_part("word/embeddings/") {
         warnings.push(
-            "OLE/встроенные объекты (`word/embeddings/*`): могут быть потеряны при сохранении из RDE"
+            "OLE/встроенные объекты (`word/embeddings/*`): MathType-формулы (`Equation.DSMT4`) при импорте переводятся в нативные формулы RDE с сохранением исходника; остальные OLE могут быть потеряны при сохранении из RDE"
                 .to_owned(),
         );
     }

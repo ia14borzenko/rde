@@ -21,6 +21,8 @@ schemars = "1"
 jsonschema = "0.60"
 ulid = "3"
 zip = { version = "3", default-features = false, features = ["deflate"] }
+# R-DOC-44 (импорт MathType): чтение OLE Compound File — стрим `Equation Native` (MTEF).
+cfb = "0.15"
 quick-xml = "0.42"
 sha2 = "0.11"
 rusqlite = { version = "0.41", features = ["bundled"] }

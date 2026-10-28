@@ -4130,6 +4130,8 @@ dependencies = [
 name = "rde-doc"
 version = "0.1.0"
 dependencies = [
+ "cfb",
+ "image",
  "quick-xml 0.42.0",
  "rde-core",
  "rde-dag",
