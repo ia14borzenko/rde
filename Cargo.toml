@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/rde", "crates/rde-core", "crates/rde-dag", "crates/rde-doc", "crates/rde-docx", "crates/rde-env", "crates/rde-hash", "crates/rde-host", "crates/rde-mcp", "crates/rde-run", "crates/rde-sources", "crates/rde-store", "crates/rde-templates", "crates/rde-ui", "crates/rde-vcs", "xtask"]
+members = ["apps/rde", "crates/rde-agent", "crates/rde-core", "crates/rde-dag", "crates/rde-doc", "crates/rde-docx", "crates/rde-env", "crates/rde-hash", "crates/rde-host", "crates/rde-mcp", "crates/rde-run", "crates/rde-sources", "crates/rde-store", "crates/rde-templates", "crates/rde-ui", "crates/rde-vcs", "xtask"]
 # WordCraft vendored as a submodule keeps its own Cargo workspace (workspace-inherited
 # dependencies like `chrono = { workspace = true }`); the outer workspace must not
 # claim it, or those fields would inherit from RDE's manifest.
@@ -40,6 +40,11 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 reqwest = { version = "0.13", default-features = false }
 # M3: криптостойкий токен сессии (getrandom — тот же источник, что у rand/ring).
 getrandom = "0.3"
+# M4.3: официальный Rust SDK Agent Client Protocol (Apache-2.0). Пин точный: в SDK 3.x
+# переписан API (Client/Agent-роли, ConnectionTo, ActiveSession) и он меняется между
+# минорными версиями; фича `process` даёт AcpAgent (спавн DSH как дочернего процесса,
+# stderr-хук, kill process-group при закрытии соединения).
+agent-client-protocol = { version = "=3.5.0", features = ["process"] }
 
 egui = "0.36.2"
 eframe = { version = "0.36.2", default-features = false, features = [
@@ -63,6 +68,7 @@ rde-store = { path = "crates/rde-store" }
 rde-ui = { path = "crates/rde-ui" }
 rde-mcp = { path = "crates/rde-mcp" }
 rde-host = { path = "crates/rde-host" }
+rde-agent = { path = "crates/rde-agent" }
 wordcraft-engine = { path = "vendor/wordcraft/crates/engine" }
 
 # WordCraft pins krilla itself in its own workspace; patches of a dependency's

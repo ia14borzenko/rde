@@ -1,0 +1,20 @@
+[package]
+name = "rde-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDE built-in ACP agent client (DSH): sessions, streaming updates, permissions, fail-closed lifecycle"
+
+[dependencies]
+# M4.3: официальный Rust SDK ACP (Apache-2.0), фича `process` — AcpAgent (спавн DSH).
+# API-обёртка полная: Protocol-типы SDK не протекают в rde-ui (только нейтральные DTO).
+agent-client-protocol = { workspace = true }
+# Каналы команд/событий (tokio mpsc — `sync`), таймауты, current_thread-runtime воркера.
+tokio = { workspace = true, features = ["sync"] }
+# Разбор `rawInput`/`rawOutput` tool-call'ов в нейтральные строки (JSON-строки DTO).
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Фейковый ACP-агент на том же SDK (роль Agent + Channel::duplex) и e2e-пробы.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+serde_json = { workspace = true }

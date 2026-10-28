@@ -14,9 +14,23 @@ DocView. Ещё: [светлая тема](docs/fidelity/gui-p10-document-light.
 
 ## Состояние
 
-Текущая веха — **M4.2b «v0.3: GUI-гранты запуска скриптов и git-коммитов с подтверждением»**
+Текущая веха — **M4.3 «v0.3: встроенный ACP-агент (DSH) и панель чата»**
+(2026-10-28, [ADR-0014](docs/adr/0014-m43-builtin-acp-agent.md)): RDE получил **встроенного агента по
+ACP** — DSH `--profile acp` дочерним процессом, нативная панель чата (статус, «Новый чат»/«История…»/
+«Остановить»/«Закрыть сессию», селекторы модели/reasoning из `configOptions`, поток сообщений/
+размышлений/tool-call'ов/плана, карточки **permission-запросов агента**, поле ввода), **интерактивные
+разрешения агента** (allow/deny → выбранный `optionId`/`cancelled`, аудит `acp_permission` в
+`.rde/agent/audit.log`, fail-closed по таймауту/закрытию/смене проекта) и **история в проекте**
+(`.rde/agent/sessions/<id>/`; DSH историю не реплеит — RDE показывает свой транскрипт, restore =
+`session/resume`). RDE-MCP для встроенного агента — **in-process streamable HTTP на loopback**
+(уточнение §8.7.1: stdio не может показывать GUI-диалоги), поэтому мутации агента идут через
+**существующие** GUI-approvals/чекпоинты/аудит M4.2b; для ACP-агентов без HTTP-MCP — stdio read-only
+fallback. ACP-протокол изолирован в новом крейте **`rde-agent`** (официальный Rust SDK
+`agent-client-protocol =3.5.0`, Apache-2.0); настройка `allow_builtin_agent` по умолчанию **выключена**
+(процесс агента стартует только по «Новый чат»), любой ACP-совместимый агент настраивается командой.
+До M4.3 — **M4.2b «GUI-гранты запуска скриптов и git-коммитов с подтверждением»**
 (2026-10-28, [ADR-0013](docs/adr/0013-m42b-gui-run-git-grants.md)): внешним агентам из GUI доступны
-**два оставшихся гранта** — отдельные подгалочки **«Разрешить запуск скриптов проекта (artifact_run)»**
+**все три гранта** — отдельные подгалочки **«Разрешить запуск скриптов проекта (artifact_run)»**
 и **«Разрешить git-коммиты (git_commit)»** под «Разрешить агенту изменения в проекте». Каждый
 `artifact_run`/`run_cancel`/`git_commit` проходит через тот же диалог confirmation, но с
 **human-readable превью** (цели/флаги запуска + предупреждение о выполнении кода, R-RUN-06;
@@ -51,7 +65,7 @@ suggested edits/ревизии), **M2**
 Прототип **v0.1** закрыт по [`docs/exit-v0.1.md`](docs/exit-v0.1.md) (P5, теги `p5-gates` /
 `v0.1-prototype`) и отполирован в P6–P8.
 
-- **404 теста** (`#[test]`) в 15 пакетах, 16 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
+- **459 тестов** (`#[test]`/`#[tokio::test]`) в 16 пакетах, 16 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
 - Демо-проект [`demo-project/`](demo-project): 12 объектов (вкл. project-level формулу σ, P3),
   документ с 11 живыми вставками; формула σ — режимы **OMML** (номер `(1)`,
   [`docs/fidelity/demo-formula.png`](docs/fidelity/demo-formula.png)) и **SVG-вектор** (P3),
@@ -85,7 +99,7 @@ suggested edits/ревизии), **M2**
 | Источники, PDF/OCR, ревью | импорт BibTeX/RIS/CSL-JSON, PDF-текст/рендер, OCR страницы, комментарии Word и импорт внешнего ревью; веб-архив — при наличии `monolith` |
 | VCS, настройки, гейты | git init/status/commit/revert/log, `.gitignore`/`.gitattributes`, настройки приложения и авторы (вкл. «Разрешить внешним агентам», M4.1), i18n-каркас ru/en, экспорт диагностики, OPC-гейт, корпус docx, `xtask`/CI, перф 10k |
 | Структура и Код документа | **реальные**: блоки/paraId/вставки из `.doc.rde`; манифест объекта + RDE-часть `customXml/item1.xml` |
-| Агент / MCP / ACP | **MCP-сервер — M3/M2.6/M4.1/M4.2/M4.2b** (v0.3): `rde mcp serve` — **stdio (дефолт) + streamable HTTP (opt-in)**, spec 2026-07-28, **29 инструментов** (13 read-only + 8 мутаций M2: манифест/скрипт/запуск/статус/отмена/лог/заметка/git-коммит + 6 документных M2.5: suggested edits `doc_suggest_edit`/`suggestion_list`/`suggestion_accept`/`suggestion_reject`, `doc_replace_range`, `revision_list` + 2 M2.6: `doc_insert`/`doc_delete`) + 4 ресурса `rde://…`, grants+approvals (по умолчанию deny, CLI `--approval=deny\|auto\|allowlist`), чекпоинты `.rde/agent/checkpoints` с авто-откатом, версии документа в store, аудит `.rde/agent/audit.log` (`decision`/`reason`/`checkpoint_id`), коды `RDE_*` ([ADR-0006](docs/adr/0006-mcp-independent-layer.md), [ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md), [ADR-0008](docs/adr/0008-document-suggested-edits-and-revisions.md), [ADR-0009](docs/adr/0009-m3-streamable-http-transport.md), [ADR-0010](docs/adr/0010-m26-insert-delete-paragraphs.md), [ADR-0011](docs/adr/0011-m41-gui-external-agents.md), [ADR-0012](docs/adr/0012-m42-gui-interactive-approvals.md), [ADR-0013](docs/adr/0013-m42b-gui-run-git-grants.md)); HTTP — только loopback + обязательный bearer-токен (`/mcp`, `/health`), 401 → `RDE_UNAUTHORIZED`+аудит; track changes — отдельно; **M4.1:** в настройках приложения — «Разрешить доступ внешним агентам» (встроенный HTTP-сервер, read-only, адрес/токен в панели «Агент», старт/стоп), **M4.2:** «Разрешить агенту изменения в проекте» — мутации с интерактивным подтверждением (превью «Было/Станет», AllowOnce/AllowSession/Deny, чекпоинт+аудит, fail-closed по таймауту/закрытию), **M4.2b:** отдельные подгалочки `run_script`/`git_commit` (превью целей/сообщения/автора, run — только для trusted-проекта, R-RUN-06); встроенный ACP-агент/чат — M4.3 |
+| Агент / MCP / ACP | **MCP-сервер — M3/M2.6/M4.1/M4.2/M4.2b/M4.3** (v0.3): `rde mcp serve` — **stdio (дефолт) + streamable HTTP (opt-in)**, spec 2026-07-28, **29 инструментов** (13 read-only + 8 мутаций M2: манифест/скрипт/запуск/статус/отмена/лог/заметка/git-коммит + 6 документных M2.5: suggested edits `doc_suggest_edit`/`suggestion_list`/`suggestion_accept`/`suggestion_reject`, `doc_replace_range`, `revision_list` + 2 M2.6: `doc_insert`/`doc_delete`) + 4 ресурса `rde://…`, grants+approvals (по умолчанию deny, CLI `--approval=deny\|auto\|allowlist`), чекпоинты `.rde/agent/checkpoints` с авто-откатом, версии документа в store, аудит `.rde/agent/audit.log` (`decision`/`reason`/`checkpoint_id`), коды `RDE_*` ([ADR-0006](docs/adr/0006-mcp-independent-layer.md), [ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md), [ADR-0008](docs/adr/0008-document-suggested-edits-and-revisions.md), [ADR-0009](docs/adr/0009-m3-streamable-http-transport.md), [ADR-0010](docs/adr/0010-m26-insert-delete-paragraphs.md), [ADR-0011](docs/adr/0011-m41-gui-external-agents.md), [ADR-0012](docs/adr/0012-m42-gui-interactive-approvals.md), [ADR-0013](docs/adr/0013-m42b-gui-run-git-grants.md), [ADR-0014](docs/adr/0014-m43-builtin-acp-agent.md)); HTTP — только loopback + обязательный bearer-токен (`/mcp`, `/health`), 401 → `RDE_UNAUTHORIZED`+аудит; track changes — отдельно; **M4.1:** в настройках приложения — «Разрешить доступ внешним агентам» (встроенный HTTP-сервер, read-only, адрес/токен в панели «Агент», старт/стоп), **M4.2:** «Разрешить агенту изменения в проекте» — мутации с интерактивным подтверждением (превью «Было/Станет», AllowOnce/AllowSession/Deny, чекпоинт+аудит, fail-closed по таймауту/закрытию), **M4.2b:** отдельные подгалочки `run_script`/`git_commit` (превью целей/сообщения/автора, run — только для trusted-проекта, R-RUN-06); **M4.3:** встроенный **ACP-агент** (`rde-agent`, Rust SDK `agent-client-protocol 3.5.0`; `dsh --profile acp` по умолчанию, любой ACP-агент настраивается) + панель чата (сессии/история, поток сообщений/размышлений/tool-call/плана, permissions allow/deny, cancel, выбор модели/reasoning), RDE-MCP для сессии — in-process **HTTP-loopback** с approvals M4.2b; транскрипт в `.rde/agent/sessions/`, аудит `acp_permission`; ограничения DSH ACP v1: нет fork/load и image-промптов; URI-чипы/diff-UI — M4.4 |
 
 ## Сборка и запуск
 
@@ -135,14 +149,15 @@ RDE_PROJECT=/путь/к/проекту ./scripts/build.sh run -p rde
 ### Тесты
 
 ```bash
-./scripts/build.sh test --workspace   # 415 тестов (#[test]) в 15 пакетах
+./scripts/build.sh test --workspace   # 459 тестов (#[test]/#[tokio::test]) в 16 пакетах
 ```
 
-Разбивка: core 31, dag 28, ui 71, doc 46, run 14, hash 13, store 12, docx 11, sources 6,
+Разбивка: core 32, dag 28, ui 86, doc 46, run 14, hash 13, store 12, docx 11, sources 6,
 templates 5, env 4, vcs 2, **mcp 88, host 68 (28 unit + 15 headless + 14 mutations + 11 doc_mutations),
-apps/rde (e2e MCP stdio+HTTP) 16**. Тесты, которым нужны
+agent 27 (9 unit + 17 fake-agent + 1 doctest), apps/rde (e2e MCP stdio+HTTP) 17**. Тесты, которым нужны
 внешние инструменты (LibreOffice, poppler, tesseract), проверяют наличие и пропускают проверку,
-если инструмента нет.
+если инструмента нет; e2e встроенного агента (`apps/rde/tests/agent_acp.rs`) пропускается, если в
+PATH нет `dsh`/профиля `acp`.
 
 ### MCP-сервер (stdio + streamable HTTP, v0.3/M2.6)
 
@@ -191,6 +206,29 @@ apps/rde (e2e MCP stdio+HTTP) 16**. Тесты, которым нужны
 с run-грантом). Панель «Агент» показывает статус/URL/режим грантов, токен (по кнопке «Показать
 токен»), кнопки «Копировать адрес/токен», «Остановить/Запустить доступ»; статус-бар — `MCP: on :порт
 (rw+run+git)`. Для CI/скриптов — CLI-путь ниже (`--token-file`, `--allow-run`, `--allow-destructive`).
+
+**Встроенный агент (M4.3, R-AGT-01/02/04/06):** Настройки приложения → «Встроенный агент (ACP)» →
+☑ «Разрешить встроенного агента (ACP: DSH)» + команда `dsh` / args `--profile acp` → «Сохранить».
+Панель «Агент» → блок **«Встроенный агент (ACP)»**: статус (`выкл./не запущен/запуск…/готов/работает…/
+ошибка/отключён`), кнопки **«Новый чат»** (форма грантов сессии: ☑ правки проекта — каждое действие
+через GUI-approval M4.2b; ☐ запуск скриптов — только trusted; ☐ git-коммиты), **«История…»**
+(`session/list` по `cwd` проекта + локальные сессии; restore = `session/resume` — RDE показывает свой
+транскрипт), **«Остановить»** (`session/cancel`), **«Закрыть сессию»** (`session/close` + остановка
+чат-MCP-порта), «Повторить»; селекторы **модели/reasoning** из `configOptions` DSH; лента сообщений/
+размышлений (переключатель «показать размышления», по умолчанию скрыты)/карточек tool-call (title/kind/
+status/content, `rawInput` в collapsing)/плана/карточек **permission-запросов агента** (кнопки по
+`options[].kind`: разрешить/отклонить; решение → выбранный `optionId` или `cancelled`, запись в аудит);
+поле ввода (Enter — отправить, Shift+Enter — перенос); статус-бар — `Агент: ACP — сессия/выкл.`.
+Мутации агента через RDE-инструменты идут **тем же** путём, что у внешних агентов: RDE поднимает
+in-process MCP HTTP **на время чат-сессии** (loopback + bearer; уточнение §8.7.1 — stdio не может
+показывать GUI-диалоги) → approval с превью/чекпоинтом/аудитом M4.2b; ACP-агенты без HTTP-MCP получают
+stdio `rde mcp serve --approval=deny` (read-only, ограничение видно в панели). История — в проекте:
+`.rde/agent/sessions/<id>/session.toml` + `transcript.jsonl` (атомарно, без секретов; в git не
+попадает); решения permission — `.rde/agent/audit.log` (`tool:"acp_permission"`, SHA-256 tool-call
+JSON, `allow|deny`, kind/timeout/cancel). Провайдер/API-ключи — **только в профиле DSH**, RDE их не
+дублирует. Ограничения DSH ACP v1: нет `session/load`/`fork` и image-промптов (R-AGT-04 — деградация
+до текста), история не реплеится, одна активная сессия на проект; LLM-тур — ручная проверка (в CI/песочнице
+проверены только handshake/сессии). Архитектура — [ADR-0014](docs/adr/0014-m43-builtin-acp-agent.md).
 
 **Транспорт streamable HTTP (M3, R-MCP-02/R-MCP-05; выключен по умолчанию):**
 `rde mcp serve --project <dir> --transport http --bind 127.0.0.1:8765` — тот же сервер по HTTP
@@ -295,13 +333,14 @@ rde/
   crates/rde-sources/  # импорт цитат, PDF-текст/рендер, OCR, веб-архив
   crates/rde-vcs/      # git init/status/commit/revert/log/diff, .gitignore/.gitattributes
   crates/rde-mcp/      # MCP-слой (v0.3/M2.6): контракт RdeHost, DTO/схемы, 29 инструментов, ресурсы, grants/approvals, хуки, rmcp-сервер (stdio + streamable HTTP)
+  crates/rde-agent/    # M4.3: ACP-клиент встроенного агента (Rust SDK agent-client-protocol 3.5.0): воркер, сессии, поток session/update, permissions, cancel, fail-closed; нейтральные DTO
   crates/rde-host/     # headless-реализация контракта поверх библиотек RDE (чтение, мутации+чекпоинты, документные правки/ревизии, jobs; без egui/rde-ui)
-  crates/rde-ui/       # лента, панели, вкладки, DocView, темы, шрифты, иконки; встроенный MCP HTTP + GUI-approvals для внешних агентов (M4.1/M4.2)
+  crates/rde-ui/       # лента, панели, вкладки, DocView, темы, шрифты, иконки; встроенный MCP HTTP + GUI-approvals для внешних агентов (M4.1/M4.2) и панель чата встроенного ACP-агента (M4.3)
   demo-project/        # демо-проект: rde.toml, objects/**; документ — .doc.rde
   docs/schema/         # сгенерированные JSON Schema манифестов
   docs/fidelity/       # отчёты docx-гейтов и актуальные скриншоты интерфейса
   docs/tz-03.md        # ТЗ v03 — канон (истина последней инстанции)
-  docs/adr/            # архитектурные решения (0001–0003, 0005–0012)
+  docs/adr/            # архитектурные решения (0001–0003, 0005–0014)
   scripts/build.sh     # cargo-обёртка: target на /srv/yocto/rde-target + guard
   .cargo/config.toml   # target-dir на внешний диск
   vendor/wordcraft/    # git-субмодуль форка ia14borzenko/wordcraft-rde, ветка rde/main
@@ -327,8 +366,12 @@ rde/
   [0011](docs/adr/0011-m41-gui-external-agents.md) (M4.1: внешние агенты из GUI — встроенный MCP HTTP,
   настройка «Разрешить»),
   [0012](docs/adr/0012-m42-gui-interactive-approvals.md) (M4.2: интерактивные GUI-approvals — мутации
-  с подтверждением/превью).
-- [`CHANGELOG.md`](CHANGELOG.md) — история вех M1–P10 и v0.3-M4.2: что добавлено/изменено/исправлено.
+  с подтверждением/превью),
+  [0013](docs/adr/0013-m42b-gui-run-git-grants.md) (M4.2b: GUI-гранты `run_script`/`git_commit` —
+  отдельные подгалочки, human-readable превью, run только для trusted),
+  [0014](docs/adr/0014-m43-builtin-acp-agent.md) (M4.3: встроенный ACP-агент DSH — `rde-agent` на Rust
+  SDK 3.5.0, панель чата, permissions, HTTP-loopback RDE-MCP, транскрипт в проекте).
+- [`CHANGELOG.md`](CHANGELOG.md) — история вех M1–P10 и v0.3-M4.3: что добавлено/изменено/исправлено.
 - [`docs/exit-v0.1.md`](docs/exit-v0.1.md) — exit-критерий v0.1 и что осталось за фазой.
 - [`docs/milestones.md`](docs/milestones.md) — критерии и доказательства вех.
 - [`docs/state.md`](docs/state.md) — снимки состояния проекта и форка.
@@ -354,24 +397,28 @@ rde/
   docx/PDF с гейтами и обмена LaTeX (P5); Word-совместимость svgBlip — по спецификации (Word на
   стенде нет), проверено LO-оракулом; подробности — [ТЗ §5.7.5](docs/tz-03.md) и
   [`docs/state.md`](docs/state.md).
-- **MCP-сервер** — **M3/M2.6/M4.1/M4.2** (v0.3, [ADR-0006](docs/adr/0006-mcp-independent-layer.md),
+- **MCP-сервер** — **M3/M2.6/M4.1/M4.2/M4.2b/M4.3** (v0.3, [ADR-0006](docs/adr/0006-mcp-independent-layer.md),
   [ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md),
   [ADR-0008](docs/adr/0008-document-suggested-edits-and-revisions.md),
   [ADR-0009](docs/adr/0009-m3-streamable-http-transport.md),
   [ADR-0010](docs/adr/0010-m26-insert-delete-paragraphs.md)): `rde mcp serve` (stdio **и** streamable
   HTTP — opt-in, loopback + bearer-токен, spec 2026-07-28, 29 инструментов = 13 read-only + 8 мутаций
   M2 + 6 документных M2.5 + 2 M2.6, 4 ресурса, grants/approvals/чекпоинты, аудит, job-модель запуска,
-  suggested edits/ревизии документа). Не входит в M3 и запланировано: GUI-настройка «Разрешить
-  внешним агентам» и показ адреса/токена (M4; серверный слой `serve_http` готов), TLS/внешние
-  интерфейсы — вне scope (только loopback; внешний доступ — туннель/reverse-proxy пользователя),
-  legacy-сессии MCP/MRTR-approvals — не включены, внешний доступ из GUI — read-only по умолчанию; при явном
-  разрешении — мутации только с интерактивным подтверждением (M4.2; run/git из GUI — M4.2b),
-  символьные диапазоны (run-aware, M2.7) и
+  suggested edits/ревизии документа). Не входит в M3 и запланировано: TLS/внешние интерфейсы — вне
+  scope (только loopback; внешний доступ — туннель/reverse-proxy пользователя),
+  legacy-сессии MCP/MRTR-approvals — не включены; символьные диапазоны (run-aware, M2.7) и
   вставка таблиц/рисунков (M3+), полные track changes Word R-DOC-32 (отдельная веха),
-  ACP-агент/панель чата, GUI-диалог approval с diff, diff-UI suggested edits и URI-чипы (M4);
+  GUI-диалог approval с diff, diff-UI suggested edits и URI-чипы (M4.4);
   MCP-инструментов `checkpoint_*`/`revision_restore` нет (откат — API хоста/UI), jobs не переживают
-  рестарт; правки документа — только простой абзац; панель агента в GUI — честная заглушка
-  «не подключён», быстрые действия работают без агента.
+  рестарт; правки документа — только простой абзац.
+- **Встроенный агент** (M4.3, [ADR-0014](docs/adr/0014-m43-builtin-acp-agent.md)) — **готов**: ACP-клиент
+  `rde-agent` (Rust SDK 3.5.0), `dsh --profile acp` по умолчанию, панель чата, permissions, cancel,
+  история в проекте. Ограничения протокола DSH ACP v1: **нет** `session/load`, `fork`/delete сессий,
+  additional directories и **image-промптов** (R-AGT-04 «скриншот региона в чат» — деградация до
+  текста/метаданных); история **не реплеится** агентом (RDE показывает свой транскрипт, restore =
+  `session/resume`); одна активная сессия на проект; LLM-тур требует провайдерских ключей в профиле
+  DSH (e2e проверяет handshake/сессии, реальный диалог — ручная проверка); ACP-агенты без HTTP-MCP —
+  read-only stdio fallback. URI-чипы/`resource_link` и diff-UI suggested edits — M4.4.
 - **За пределами v0.1** — `.rde`-пакет шаринга (R-ART-10), ГОСТ 2.105 (рамки/штампы) и вузовские
   профили, OCR-гейты — v0.2; полная XSD-валидация ECMA-376 — v1.0.
 - **Word** — Microsoft Word/Word COM на стенде отсутствует: открываемость проверяется LO-оракулом

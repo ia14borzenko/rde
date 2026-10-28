@@ -21,3 +21,5 @@ tokio = { workspace = true, features = ["macros", "process", "time"] }
 serde_json = { workspace = true }
 # Клиент streamable HTTP для e2e (rmcp-клиент принимает reqwest::Client).
 reqwest = { workspace = true }
+# M4.3: e2e настоящего DSH по ACP (`dsh --profile acp`) через клиент rde-agent.
+rde-agent = { workspace = true }

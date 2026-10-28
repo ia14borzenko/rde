@@ -22,6 +22,10 @@ use egui::{Align2, Color32, CornerRadius, FontId, Margin, Rect, RichText, Sense,
 pub mod i18n;
 /// M4.1: встроенный MCP-сервер (streamable HTTP) для внешних агентов.
 pub mod agent_server;
+/// M4.3: состояние панели чата встроенного ACP-агента и транскрипт (R-AGT-02).
+pub mod chat;
+/// M4.3: панель чата встроенного ACP-агента — UI и жизненный цикл (R-AGT-01/06).
+mod chat_panel;
 mod ribbon;
 
 use i18n::{Lang, tr};
@@ -696,11 +700,35 @@ pub struct RdeApp {
     /// M4.2b: дополнительные строки контекста для диалога approval (число файлов к коммиту,
     /// автор, trusted-статус проекта) — считаются один раз при показе запроса.
     agent_approval_context: Vec<String>,
+    // ── M4.3: встроенный ACP-агент (DSH) и панель чата (R-AGT-01/02/06) ────────
+    /// Фоновый клиент встроенного ACP-агента (ленивый старт по «Новый чат»).
+    agent: Option<rde_agent::AgentHandle>,
+    /// Состояние панели чата: статус, транскрипт, permission-запросы, config-options.
+    chat: chat::ChatState,
+    /// RDE-MCP-сервер **для встроенного агента** (отдельный от внешних агентов M4.1).
+    chat_mcp: Option<agent_server::ExternalAgentServer>,
+    /// Очередь GUI-approvals чат-MCP-сервера (отдельная от внешней очереди — M4.2b).
+    chat_approvals: std::sync::Arc<agent_server::GuiApprovals>,
+    /// Желаемые гранты нового чата (R-AGT-06: правки/скрипты/git, фиксируются при `session/new`).
+    chat_grants: chat::ChatGrants,
+    /// Открыта форма «Новый чат» (выбор грантов сессии).
+    chat_setup_open: bool,
+    /// Показывать размышления агента в ленте (по умолчанию скрыты).
+    show_agent_thoughts: bool,
+    /// Поле ввода сообщения агенту.
+    chat_input: String,
+    /// Открыт список истории сессий («История…»).
+    chat_history_open: bool,
+    /// Отложенный старт сессии (new/resume) — до `initialize` или закрытия старой сессии.
+    chat_pending_start: Option<chat::ChatStartIntent>,
+    /// Действие после закрытия текущей сессии (новый чат/resume — «одна активная сессия»).
+    chat_after_close: Option<chat::ChatStartIntent>,
 }
 
 impl RdeApp {
     pub fn new(project: Project) -> Self {
         let app_settings = rde_core::settings::load();
+        let chat_allowed = app_settings.allow_builtin_agent;
         let lang = i18n::lang(&app_settings.language);
         let doc = DocPreview::new(project.document_path());
         let export_dir = project.root.join("exports");
@@ -767,6 +795,17 @@ impl RdeApp {
             agent_approvals: std::sync::Arc::new(agent_server::GuiApprovals::new()),
             agent_approval_dialog: None,
             agent_approval_context: Vec::new(),
+            agent: None,
+            chat: chat::ChatState::new(chat_allowed),
+            chat_mcp: None,
+            chat_approvals: std::sync::Arc::new(agent_server::GuiApprovals::new()),
+            chat_grants: chat::ChatGrants::default(),
+            chat_setup_open: false,
+            show_agent_thoughts: false,
+            chat_input: String::new(),
+            chat_history_open: false,
+            chat_pending_start: None,
+            chat_after_close: None,
         };
         app.auto_update = app.project.manifest.document_auto_update;
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
@@ -977,11 +1016,18 @@ impl RdeApp {
     }
 
     /// Забрать из очереди ожидающий запрос агента и показать диалог (один за раз).
+    ///
+    /// M4.3: очередей две — внешних агентов (M4.2b) и чат-MCP-сервера встроенного агента;
+    /// диалог и решения общие, чтобы UX был одинаковым.
     pub fn poll_agent_approvals(&mut self) {
         if self.agent_approval_dialog.is_some() {
             return;
         }
-        if let Some(pending) = self.agent_approvals.take_pending() {
+        if let Some(pending) = self
+            .agent_approvals
+            .take_pending()
+            .or_else(|| self.chat_approvals.take_pending())
+        {
             self.agent_approval_context = Self::agent_approval_context_lines(&pending, &self.project);
             self.agent_approval_dialog = Some(pending);
         }
@@ -1009,6 +1055,8 @@ impl RdeApp {
         }
         self.agent_approval_context.clear();
         self.agent_approvals.deny_all();
+        // M4.3: чат-MCP-сервер — отдельная очередь, закрывается вместе с чатом.
+        self.chat_approvals.deny_all();
     }
 
     /// Инициализировать git-репозиторий проекта (R-VCS-01) и сделать начальный коммит.
@@ -2717,6 +2765,8 @@ impl RdeApp {
         self.maybe_auto_boot_update();
         self.ensure_external_agents();
         self.poll_agent_approvals();
+        // M4.3: события встроенного ACP-агента дренируем каждый кадр (неблокирующе).
+        self.poll_agent_events();
         self.ui_frames += 1;
         if !self.fonts_installed {
             install_fonts(ui.ctx());
@@ -3148,6 +3198,8 @@ impl RdeApp {
                 pal.muted,
             ),
         };
+        // M4.3: встроенный ACP-агент — отдельный индикатор (`Агент: ACP — готов`).
+        let (acp_label, acp_color) = self.chat_status_line(pal);
         egui::Panel::bottom("rde_status")
             .frame(egui::Frame::new().fill(pal.panel_hi).inner_margin(Margin::symmetric(12, 3)))
             .exact_size(24.0)
@@ -3177,6 +3229,8 @@ impl RdeApp {
                         ui.label(RichText::new(format!("• {} {}", self.project.stale_count(), tr(self.lang, "status.stale"))).small().color(pal.amber));
                         ui.separator();
                         ui.label(RichText::new(agent_label).small().color(agent_color));
+                        ui.separator();
+                        ui.label(RichText::new(acp_label).small().color(acp_color));
                         ui.separator();
                         ui.label(RichText::new(mcp_label).small().color(agent_color));
                         ui.separator();
@@ -3260,10 +3314,10 @@ impl RdeApp {
                                 }
                             }
                             2 => {
-                                ui.label(RichText::new("Внешний доступ — MCP HTTP (M4.1): включается в настройках.").strong().color(pal.text));
-                                ui.label(RichText::new("Статус, адрес и токен — в правой панели «Агент»; встроенный ACP-агент — M4.3.").small().color(pal.muted));
+                                ui.label(RichText::new("Агенты (M4.3): MCP HTTP для внешних + встроенный ACP-агент (DSH).").strong().color(pal.text));
+                                ui.label(RichText::new("Внешний доступ и гранты включаются в настройках; встроенный агент — «Новый чат» в правой панели «Агент» (сессии, история, разрешения агента, отмена).").small().color(pal.muted));
                                 ui.add_space(4.0);
-                                ui.label(RichText::new("Когда появится: запуск артефактов и обновление вставок по запросу, проверка проекта, оформление по ГОСТ — с approvals и аудитом действий.").small().color(pal.muted));
+                                ui.label(RichText::new("Действия агента (правки/запуски/коммиты) идут через диалоги подтверждения с превью, чекпоинтом и аудитом `.rde/agent/audit.log`; URI-чипы и diff-UI — M4.4.").small().color(pal.muted));
                             }
                             _ => {
                                 for line in &log {
@@ -3720,15 +3774,8 @@ impl RdeApp {
                         ui.label(RichText::new(format!("Ошибка: {error}")).small().color(pal.red));
                     }
                     ui.add_space(10.0);
-                    ui.label(RichText::new("ВСТРОЕННЫЙ АГЕНТ (ACP)").small().strong().color(pal.muted));
-                    ui.label(
-                        RichText::new(
-                            "M4.3: чат с агентом через ACP, approvals с diff и откатом. \
-                             Пока доступны только быстрые действия без агента.",
-                        )
-                        .small()
-                        .color(pal.muted),
-                    );
+                    // M4.3: встроенный ACP-агент (чат/сессии/permissions/история/модель).
+                    self.chat_panel_ui(ui);
                     ui.add_space(10.0);
                     ui.label(RichText::new("БЫСТРЫЕ ДЕЙСТВИЯ (без агента)").small().strong().color(pal.muted));
                     ui.add_space(4.0);
@@ -3747,11 +3794,6 @@ impl RdeApp {
                     ui.add_space(10.0);
                     ui.label(RichText::new("Журнал и история запусков — в панели снизу («Задачи»).").small().color(pal.muted));
                 });
-                ui.add_space(4.0);
-                ui.add_enabled(
-                    false,
-                    egui::TextEdit::singleline(&mut String::new()).hint_text("Чат с агентом — M4.3").desired_width(f32::INFINITY),
-                );
             });
         if hide_agent {
             self.show_agent = false;
@@ -4285,6 +4327,9 @@ impl RdeApp {
                 self.refresh_dag_statuses();
                 self.push_log(Level::Ok, format!("Проект открыт: {} ({} объектов)", self.project.name, self.project.object_count()));
                 self.check_external_edit_on_startup();
+                // M4.3: встроенный агент привязан к проекту (cwd сессии) — сессию/процесс
+                // останавливаем fail-closed; следующий чат стартует под новый корень.
+                self.shutdown_chat("смена проекта");
                 // M4.1: внешние агенты привязаны к проекту — перезапустить (или остановить).
                 let enabled = self.app_settings.allow_external_mcp;
                 let project_root = self.project.root.clone();
@@ -4890,6 +4935,10 @@ impl RdeApp {
             // Масштаб интерфейса правится здесь же, но хранится в сессии RdeApp
             // (в схеме AppSettings его нет — владение rde-core, вне scope фазы).
             let mut ui_scale = self.ui_scale;
+            // M4.3: команда/аргументы агента редактируются строкой; применяются при «Сохранить»
+            // (пустая команда → дефолт `dsh`; args — split по пробелам, как в CLI).
+            let mut agent_program_edit = settings.agent_program.clone();
+            let mut agent_args_edit = settings.agent_args.join(" ");
             egui::Window::new(tr(self.lang, "settings.app"))
                 .collapsible(false)
                 .resizable(false)
@@ -5002,6 +5051,69 @@ impl RdeApp {
                             }
                         });
                         ui.end_row();
+                        // M4.3: встроенный ACP-агент (DSH по умолчанию, R-AGT-01).
+                        ui.label(RichText::new("Встроенный агент (ACP)").color(pal.muted));
+                        ui.vertical(|ui| {
+                            ui.checkbox(
+                                &mut settings.allow_builtin_agent,
+                                "Разрешить встроенного агента (ACP: DSH)",
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "Чат с агентом в панели «Агент»: сессии/история, поток сообщений и \
+                                     tool-call'ов, разрешения агента, отмена. Процесс агента стартует \
+                                     только по кнопке «Новый чат» (лениво), по умолчанию выключено \
+                                     (fail-closed, R-AGT-01/06).",
+                                )
+                                .small()
+                                .color(pal.muted),
+                            );
+                            ui.add_enabled_ui(settings.allow_builtin_agent, |ui| {
+                                egui::Grid::new("rde_builtin_agent").num_columns(2).spacing([8.0, 4.0]).show(
+                                    ui,
+                                    |ui| {
+                                        ui.label(RichText::new("команда").small().color(pal.muted));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut agent_program_edit)
+                                                .desired_width(220.0)
+                                                .hint_text("dsh"),
+                                        );
+                                        ui.end_row();
+                                        ui.label(RichText::new("args").small().color(pal.muted));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut agent_args_edit)
+                                                .desired_width(220.0)
+                                                .hint_text("--profile acp"),
+                                        );
+                                        ui.end_row();
+                                        ui.label(RichText::new("модель").small().color(pal.muted));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut settings.agent_model)
+                                                .desired_width(220.0)
+                                                .hint_text("пусто — из configOptions DSH"),
+                                        );
+                                        ui.end_row();
+                                        ui.label(RichText::new("reasoning").small().color(pal.muted));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut settings.agent_reasoning_effort)
+                                                .desired_width(220.0)
+                                                .hint_text("пусто — из configOptions DSH"),
+                                        );
+                                        ui.end_row();
+                                    },
+                                );
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "Провайдер/API-ключи — в профиле DSH (RDE их не дублирует): \
+                                     `dsh --profile acp`, патч профиля правится пользователем; затем \
+                                     перезапуск RDE. Изменение команды/аргументов перезапускает агент.",
+                                )
+                                .small()
+                                .color(pal.muted),
+                            );
+                        });
+                        ui.end_row();
                     });
                     ui.horizontal(|ui| {
                         if ui.button(tr(self.lang, "action.save")).clicked() {
@@ -5019,6 +5131,13 @@ impl RdeApp {
             }
             if save {
                 let want_system = settings.theme == "system";
+                // M4.3: команда/аргументы встроенного агента из строковых полей.
+                settings.agent_program = agent_program_edit.trim().to_owned();
+                if settings.agent_program.is_empty() {
+                    settings.agent_program = "dsh".to_owned();
+                }
+                settings.agent_args = agent_args_edit.split_whitespace().map(str::to_owned).collect();
+                let previous = self.app_settings.clone();
                 settings.normalize();
                 match rde_core::settings::save(&settings) {
                     Ok(path) => {
@@ -5034,6 +5153,14 @@ impl RdeApp {
                             self.app_settings = settings;
                         }
                         self.apply_external_agents_setting();
+                        // M4.3: настройка встроенного агента — выключение/смена команды
+                        // останавливает процесс и сессию (fail-closed, R-AGT-01).
+                        self.apply_builtin_agent_setting();
+                        let agent_config_changed = previous.agent_program != self.app_settings.agent_program
+                            || previous.agent_args != self.app_settings.agent_args;
+                        if agent_config_changed && self.agent.is_some() {
+                            self.shutdown_chat("изменены команда/аргументы агента");
+                        }
                         self.ui_scale = ui_scale.clamp(0.5, 2.5);
                         self.push_log(Level::Ok, format!("Настройки приложения сохранены: {}", path.display()));
                     }
@@ -8000,6 +8127,9 @@ impl Drop for RdeApp {
         // ожидающие approvals отклоняются (fail-closed).
         self.deny_pending_agent_approvals();
         self.external_agents.stop();
+        // M4.3: гасим встроенный ACP-агент (shutdown → session/close → kill process-group SDK),
+        // чат-MCP-сервер и висящие permission-запросы (fail-closed).
+        self.shutdown_chat("выход");
     }
 }
 

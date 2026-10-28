@@ -12,6 +12,43 @@
 
 ### Добавлено
 
+- **M4.3 «v0.3 — встроенный ACP-агент (DSH) и панель чата» (ADR-0014, 2026-10-28)** — RDE получил
+  **встроенного агента по ACP**: новый крейт **`rde-agent`** на официальном Rust SDK
+  `agent-client-protocol =3.5.0` (Apache-2.0, фича `process`) запускает ACP-агент дочерним процессом
+  (дефолт `dsh --profile acp`, любой ACP-совместимый агент настраивается в настройках), делает
+  `initialize` (ACP v1, проверка версии/возможностей), создаёт/перечисляет/возобновляет/закрывает
+  сессии (`session/new|list|resume|close|set_config_option`), стримит `session/update`
+  (сообщения/размышления/tool-call'ы/план/config/usage), отменяет промпт (`session/cancel`) и
+  обрабатывает **permission-запросы агента** (`session/request_permission` → карточка в чате,
+  ответ выбранным `optionId` или `cancelled`; таймаут 300 с → cancelled + отмена промпта;
+  fail-closed при закрытии сессии/панели/приложения/смене проекта; `Drop`/shutdown убивает
+  process-group). RDE-MCP для встроенного агента — **in-process streamable HTTP на loopback**
+  (уточнение ТЗ §8.7.1/R-MCP-02: stdio не может показывать GUI-диалоги): мутации агента идут через
+  **существующие** GUI-approvals/чекпоинты/аудит M4.2b; для ACP-агентов без HTTP-MCP — stdio
+  `rde mcp serve --approval=deny` (read-only fallback). Панель «Агент»: статус, «Новый чат»
+  (гранты сессии: правки вкл/скрипты/git выкл, run — trusted), «История…» (`session/list` +
+  локальные сессии, restore = `session/resume`), «Остановить», «Закрыть сессию», «Повторить»,
+  селекторы модели/reasoning из `configOptions`, лента сообщений/размышлений (переключатель, default
+  off)/tool-call/плана/permission-карточек, лог stderr, ввод (Enter/Shift+Enter); статус-бар
+  `Агент: ACP — …`; настройки `allow_builtin_agent/agent_program/agent_args/agent_model/
+  agent_reasoning_effort` (аддитивно, старые settings.toml читаются). История — RDE пишет транскрипт
+  сам: `.rde/agent/sessions/<id>/session.toml` + `transcript.jsonl` (атомарно, без секретов); решения
+  permission — `.rde/agent/audit.log` (`tool:"acp_permission"`, SHA-256 канонизированного tool-call
+  JSON, `decision:allow|deny`, `reason`=kind/timeout/cancel/disconnected). `rde-mcp`/`rde-host` —
+  **0 правок**, CLI-режимы и бюджет MCP не менялись (29 / 38 103 Б / инструкции 8 886 Б).
+  **Тесты: 459 passed, 0 failed** (415 + 44: `rde-agent` +27 — initialize/капабилити, точные
+  MCP-декларации stdio+http и cwd, set_config_option, порядок updates, permission allow/reject/
+  unknown kind, cancel→cancelled, таймаут, обрыв→Disconnected, list/resume/close, вторая сессия,
+  forward-compat, Drop/shutdown; `rde-ui` +15 — 9 `chat` + 6 `chat_panel` egui_kittest: демо-транскрипт,
+  клик permission→`RespondPermission(optionId)`+аудит, busy/cancel, fail-closed shutdown, транскрипт,
+  блок настроек; `rde-core` +1; `apps/rde` +1 **e2e настоящего DSH** — init/caps, list по cwd,
+  session/new со stdio-декларацией RDE-MCP, close). Headless-скриншоты: панель чата, permission-карточка,
+  настройки, регрессия «Документ». Документы: [ADR-0014](docs/adr/0014-m43-builtin-acp-agent.md),
+  ТЗ §5.9 (R-AGT-01/02/04/06)/§5.10 (R-MCP-02)/§8.7.1/§10.3/§16, [`docs/state.md`](docs/state.md),
+  README, `NOTICE` (+`agent-client-protocol`, Apache-2.0). Ограничения M4.3: у DSH ACP v1 нет
+  `session/load`/`fork`/delete и image-промптов (R-AGT-04 — деградация до текста), история не
+  реплеится (RDE показывает свой транскрипт), одна активная сессия на проект, LLM-тур требует
+  провайдерских ключей DSH (ручная проверка); URI-чипы/diff-UI — M4.4.
 - **M4.2b «v0.3 — GUI-гранты запуска скриптов и git-коммитов с подтверждением» (ADR-0013,
   2026-10-28)** — внешним агентам из GUI теперь доступны **два оставшихся гранта**: в настройках под
   «Разрешить агенту изменения в проекте» появились **отдельные подгалочки** «Разрешить запуск

@@ -22,6 +22,8 @@ rde-store = { workspace = true }
 # M4.1: встроенный MCP-сервер (streamable HTTP) для внешних агентов.
 rde-mcp = { workspace = true }
 rde-host = { workspace = true }
+# M4.3: встроенный ACP-агент (DSH) — нейтральный API/события (протокол только в rde-agent).
+rde-agent = { workspace = true }
 # M4.2: GUI-approvals — async-хук ждёт решения пользователя в blocking-пуле tokio.
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -29,6 +31,8 @@ wordcraft-engine = { workspace = true }
 wordcraft-ui-egui = { path = "../../vendor/wordcraft/crates/ui-egui", features = ["rde-docview"] }
 serde_json = { workspace = true }
 toml = { workspace = true }
+# M4.3: транскрипт чата (.rde/agent/sessions/…) и метаданные сессии — serde-типы.
+serde = { workspace = true }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu"] }

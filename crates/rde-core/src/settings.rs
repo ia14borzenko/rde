@@ -57,6 +57,23 @@ pub struct AppSettings {
     /// GUI-диалог с сообщением/автором; `.rde/**` не коммитится. По умолчанию выключено.
     #[serde(default)]
     pub allow_agent_git_commit: bool,
+    /// M4.3 (R-AGT-01): разрешить **встроенного ACP-агента** (чат в панели «Агент»).
+    /// По умолчанию выключено (fail-closed): процесс агента стартует только по явному «Новый чат».
+    #[serde(default)]
+    pub allow_builtin_agent: bool,
+    /// Команда ACP-агента (по умолчанию `dsh`; допустим любой ACP-совместимый агент).
+    #[serde(default = "default_agent_program")]
+    pub agent_program: String,
+    /// Аргументы команды агента (для DSH — `--profile acp`).
+    #[serde(default = "default_agent_args")]
+    pub agent_args: Vec<String>,
+    /// Предпочтительная модель агента (`configId = model`); пусто — из `configOptions` DSH.
+    /// Провайдер/ключи RDE **не дублирует** — они живут в профиле агента (R-AGT-01).
+    #[serde(default)]
+    pub agent_model: String,
+    /// Предпочтительный уровень размышлений (`configId = reasoning_effort`); пусто — из DSH.
+    #[serde(default)]
+    pub agent_reasoning_effort: String,
 }
 
 fn default_language() -> String {
@@ -70,6 +87,12 @@ fn default_keep_runs() -> usize {
 }
 fn default_keep_txs() -> usize {
     20
+}
+fn default_agent_program() -> String {
+    "dsh".to_owned()
+}
+fn default_agent_args() -> Vec<String> {
+    vec!["--profile".to_owned(), "acp".to_owned()]
 }
 
 impl Default for AppSettings {
@@ -87,6 +110,11 @@ impl Default for AppSettings {
             allow_agent_mutations: false,
             allow_agent_run_script: false,
             allow_agent_git_commit: false,
+            allow_builtin_agent: false,
+            agent_program: default_agent_program(),
+            agent_args: default_agent_args(),
+            agent_model: String::new(),
+            agent_reasoning_effort: String::new(),
         }
     }
 }
@@ -232,6 +260,45 @@ mod tests {
         if std::env::var_os("RDE_PORTABLE").is_none() {
             assert!(portable_settings_path(&dir).is_none());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M4.3 (R-AGT-01): настройки встроенного ACP-агента аддитивны и fail-closed.
+    #[test]
+    fn builtin_agent_settings_are_additive_and_fail_closed() {
+        let dir = tmp("builtin-agent");
+        let path = dir.join("settings.toml");
+        let settings = load_from(&path);
+        assert!(!settings.allow_builtin_agent, "встроенный агент по умолчанию выключен");
+        assert_eq!(settings.agent_program, "dsh", "дефолт — DSH (S16)");
+        assert_eq!(settings.agent_args, vec!["--profile".to_owned(), "acp".to_owned()]);
+        assert!(settings.agent_model.is_empty(), "модель — из configOptions DSH");
+        assert!(settings.agent_reasoning_effort.is_empty());
+        save_to(&settings, &path).unwrap();
+        assert_eq!(load_from(&path), settings);
+        // Старый settings.toml без новых ключей читается без миграции (аддитивные поля).
+        std::fs::write(&path, "schema = \"rde/settings@1\"\nlanguage = \"ru\"\n").unwrap();
+        let old = load_from(&path);
+        assert!(!old.allow_builtin_agent, "старый файл: встроенный агент выключен");
+        assert_eq!(old.agent_program, "dsh");
+        assert_eq!(old.agent_args.len(), 2);
+        // Включение и параметры переживают сохранение/чтение.
+        let mut enabled = AppSettings {
+            allow_builtin_agent: true,
+            agent_program: "/opt/dsh".to_owned(),
+            agent_args: vec!["--profile".to_owned(), "acp".to_owned(), "--verbose".to_owned()],
+            agent_model: "deepseek-v4-pro".to_owned(),
+            agent_reasoning_effort: "max".to_owned(),
+            ..AppSettings::default()
+        };
+        enabled.normalize();
+        save_to(&enabled, &path).unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.allow_builtin_agent);
+        assert_eq!(loaded.agent_program, "/opt/dsh");
+        assert_eq!(loaded.agent_args.len(), 3);
+        assert_eq!(loaded.agent_model, "deepseek-v4-pro");
+        assert_eq!(loaded.agent_reasoning_effort, "max");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

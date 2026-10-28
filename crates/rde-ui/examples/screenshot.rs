@@ -41,6 +41,11 @@ fn main() {
         Some("app-settings") => state.demo_open_app_settings(),
         // M4.2b: настройки с включёнными мастер-галочками (видны подгалочки run/git).
         Some("app-settings-agents") => state.demo_open_app_settings_agents(),
+        // M4.3: настройки с блоком «Встроенный агент (ACP)».
+        Some("app-settings-agent") => state.demo_open_app_settings_agent(),
+        // M4.3: панель чата встроенного ACP-агента (демо-транскрипт) и карточка permission.
+        Some("agent-chat") => state.demo_open_agent_chat(),
+        Some("agent-chat-permission") => state.demo_open_agent_chat_permission(),
         // M4.2b: диалог approval внешнего агента (run/git) и режим грантов в панели «Агент».
         Some("agent-approval") => state.demo_open_agent_approval("artifact_run"),
         Some("agent-approval-git") => state.demo_open_agent_approval("git_commit"),

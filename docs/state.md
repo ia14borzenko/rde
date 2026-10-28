@@ -1379,3 +1379,82 @@ cd rde
 # 4) снять любой грант/выключить доступ/сменить проект/закрыть RDE → сервер перезапущен/остановлен,
 #    ожидающие запросы отклонены (fail-closed).
 ```
+
+## Обновление 2026-10-28 (M4.3: встроенный ACP-агент DSH и панель чата)
+
+Веха **M4.3** фазы v0.3 (ТЗ §5.9 R-AGT-01/02/04/06, §8.7.1, §10.3 п.2; [ADR-0014](adr/0014-m43-builtin-acp-agent.md)):
+в RDE появился **встроенный агент по ACP** (Agent Client Protocol) — DSH `--profile acp` дочерним
+процессом, нативная панель чата, интерактивные permission-запросы агента, история в проекте и
+**те же** GUI-approvals/чекпоинты/аудит M4.2b для мутаций. Официальный Rust SDK
+`agent-client-protocol =3.5.0` (Apache-2.0, фича `process`); ACP-протокол изолирован в новом крейте
+`rde-agent` (SDK-типы не протекают в UI).
+
+| Что | Где |
+|---|---|
+| `rde-agent`: ACP-клиент — фоновый воркер (current_thread-runtime), `initialize` (ACP v1, таймаут 20 с, проверка версии), `session/new|list|resume|close|set_config_option` (setup-таймаут 60 с), промпт с потоком `session/update`, `session/cancel`, `session/request_permission` (ответ выбранным `optionId`/`cancelled`; таймаут решения 300 с → cancelled + отмена промпта), stderr→`Log` с санитизацией, потеря соединения → `Disconnected` + отмена висящих, `Drop`/`shutdown` (SDK убивает process-group); публичный API — нейтральные DTO | [`crates/rde-agent/src/lib.rs`](../crates/rde-agent/src/lib.rs), [`protocol.rs`](../crates/rde-agent/src/protocol.rs), [`client.rs`](../crates/rde-agent/src/client.rs) |
+| `rde-ui::chat`: состояние панели (`ChatState`/`ChatEntry`/`ChatStatus`/`ChatGrants`/`ChatMcpMode`), транскрипт `.rde/agent/sessions/<id>/session.toml` + `transcript.jsonl` (атомарно, temp+rename, без секретов), аудит `acp_permission` (SHA-256 канонизированного tool-call JSON, тела аргументов не пишутся) | [`crates/rde-ui/src/chat.rs`](../crates/rde-ui/src/chat.rs) |
+| `rde-ui::chat_panel`: жизненный цикл (ленивый запуск по «Новый чат», чат-MCP-сервер HTTP-loopback в процессе UI → approvals M4.2b; stdio read-only fallback для агентов без HTTP-MCP; гранты сессии: правки вкл, скрипты/git выкл, run — trusted) и UI панели «Встроенный агент (ACP)»: статус, «Новый чат»/«История…»/«Остановить»/«Закрыть сессию»/«Повторить», селекторы модели/reasoning из `configOptions`, лента сообщений/размышлений (переключатель, default off)/tool-call/плана/permission-карточек, лог stderr, поле ввода (Enter/Shift+Enter) | [`crates/rde-ui/src/chat_panel.rs`](../crates/rde-ui/src/chat_panel.rs), [`lib.rs`](../crates/rde-ui/src/lib.rs) |
+| `rde-core`: аддитивные настройки `allow_builtin_agent=false`, `agent_program="dsh"`, `agent_args=["--profile","acp"]`, `agent_model=""`, `agent_reasoning_effort=""` (старые settings.toml читаются, `normalize()` не тронут) | [`crates/rde-core/src/settings.rs`](../crates/rde-core/src/settings.rs) |
+| GUI: блок настроек «Встроенный агент (ACP)» (галочка, команда/args, модель/reasoning — провайдер/ключи в профиле DSH); статус-бар `Агент: ACP — сессия/выкл./…`; встроенный MCP-сервер чата — отдельная очередь `GuiApprovals` (закрытие чата не отклоняет запросы внешних агентов); demo-хуки + скриншоты `agent-chat`, `agent-chat-permission`, `app-settings-agent` | [`crates/rde-ui/src/lib.rs`](../crates/rde-ui/src/lib.rs), [`examples/screenshot.rs`](../crates/rde-ui/examples/screenshot.rs) |
+| Тесты: `rde-agent` +27 (initialize/капабилити; точные MCP-декларации stdio+http и абсолютный cwd; `set_config_option`; порядок streamed updates; permission allow/reject/unknown kind; cancel → `cancelled`; таймаут permission; обрыв → `Disconnected`; list/resume/close; вторая сессия; forward-compat update; Drop/shutdown; нейтральность API); `rde-ui` +15 (9 `chat` + 6 `chat_panel` egui_kittest: демо-транскрипт, клик permission → `RespondPermission(optionId)` + аудит, busy/cancel, fail-closed shutdown, транскрипт round-trip, блок настроек); `rde-core` +1; `apps/rde` +1 **e2e настоящего DSH** (`tests/agent_acp.rs`, guarded: init/caps, list по cwd, new со stdio-декларацией `rde mcp serve --approval=deny`, close) | [`crates/rde-agent/tests/fake_agent.rs`](../crates/rde-agent/tests/fake_agent.rs), [`apps/rde/tests/agent_acp.rs`](../apps/rde/tests/agent_acp.rs) |
+
+**Поток (M4.3):** «Новый чат» (галочки грантов) → `AgentClient::spawn(dsh --profile acp)` → `initialize`
+(ACP v1; caps: list/resume/close, HTTP-MCP) → RDE поднимает чат-MCP HTTP loopback + bearer →
+`session/new {cwd=проект, mcpServers=[rde HTTP]}` → `SessionOpened` (configOptions: model/reasoning) →
+промпт: поток `session/update`, при вызове RDE-инструментов — **обычный** GUI-approval M4.2b
+(превью/чекпоинт/аудит, `RDE_APPROVAL_DENIED` при Deny) → permission-запрос агента → карточка
+allow/deny → решение в `.rde/agent/audit.log` (`acp_permission`) → «Остановить» = `session/cancel` →
+«Закрыть сессию» = `session/close` + стоп чат-MCP; закрытие RDE/смена проекта/выключение настройки →
+cancelled-ответы, shutdown, процесс агента не остаётся. История: `.rde/agent/sessions/` (RDE-транскрипт;
+DSH историю не реплеит) + `session/list` в «Истории…», restore = `session/resume`.
+
+**Числа M4.3:** `cargo test --workspace` — **459 passed, 0 failed** (M4.2b: 415 + 44); 4-крейтовый
+прогон `-p rde-core -p rde-mcp -p rde-host -p rde-ui` — **274** (было 258); `rde-agent` — **27**
+(9 unit + 17 fake-agent + 1 doctest); инструменты/бюджет MCP не менялись (29 / `tools/list`
+38 103 Б / инструкции 8 886 Б); `rde-mcp`/`rde-host` — **0 правок**; `Cargo.lock` +ACP-зависимость
+(**+37 пакетов**: 652 → 689 — большая часть базовых крейтов уже была в lock; GPL/AGPL/SSPL нет,
+`agent-client-protocol` — Apache-2.0, `r-efi`/`self_cell` — двойные лицензии с MIT/Apache-вариантом,
+`NOTICE` обновлён); `cargo tree -p rde-agent` — без egui/rde-ui/wordcraft; `cargo tree -p rde-mcp` — без
+egui/rde-ui; `check --workspace --all-targets` — без новых предупреждений (2 pre-existing).
+Headless-скриншоты: панель чата с демо-транскриптом, карточка permission, блок настроек, регрессия
+«Документ» — `.cache-tmp/shots/m43-*.png`.
+
+**Ограничения (честно):** DSH ACP v1 **не поддерживает** `session/load`, `fork`/delete сессий и
+additional directories; **нет image/audio/embedded-context промптов** (`promptCapabilities` все false)
+— R-AGT-04 «скриншот региона в чат» в M4.3 не поддержан (деградация до текста/метаданных; image и
+`resource_link` — M4.4/vision-агент); история **не реплеится** агентом — RDE показывает свой
+транскрипт; **fork отсутствует** (restore = `session/resume`); одна активная сессия на проект;
+транскрипт локальный (в git не попадает); **LLM-тур требует ключей провайдера в профиле DSH** — в
+песочнице проверены только handshake/сессии (e2e), реальный диалог — ручная проверка пользователя;
+ACP-агенты без HTTP-MCP — read-only fallback (без GUI-диалогов, ограничение показано в панели);
+TZ-уточнение транспорта встроенного агента: **stdio → HTTP-loopback** (§8.7.1/R-MCP-02, ADR-0014).
+
+**Следующий шаг:** **M4.4** — URI-чипы §8.7.2 (контекст-ссылки в промпт: выделение/блок/PDF-регион/
+артефакт/источник/заметка, `resource_link` + диапазонные чтения) и **diff-UI suggested edits**
+(accept/reject по частям, повторное использование превью M4.2b); затем **M2.7** (run-aware символьные
+диапазоны), отдельная веха — полные track changes R-DOC-32.
+
+**Проверить руками (M4.3):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export CARGO_HOME=/home/admin-pc/proj/rde-dev/.cache-tmp/cargo-home
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+cd rde
+command -v dsh && dsh --version              # 0.2.0-rc.2, профиль acp; ключи — в профиле DSH
+./scripts/build.sh test -p rde-agent -p rde --test agent_acp   # клиент + e2e настоящего DSH
+./scripts/build.sh test --workspace                            # 459 passed
+./scripts/build.sh run -p rde                                  # GUI
+
+# 1) Настройки → «Встроенный агент (ACP)» → ☑ «Разрешить встроенного агента» → «Сохранить»;
+#    панель «Агент» → «Новый чат» (☑ правки проекта, ☐ скрипты, ☐ git) → «Начать чат».
+# 2) Отправить запрос: сообщения/размышления (переключатель)/tool-call'ы/план идут потоком;
+#    «Остановить» → cancelled; «Закрыть сессию» → сессия закрыта, чат-MCP-порт остановлен.
+# 3) Попросить агента изменить документ/заметку → обычный диалог approval M4.2b (превью/чекпоинт/
+#    аудит): Deny → RDE_APPROVAL_DENIED, AllowOnce → правка + чекпоинт.
+# 4) Permission-запрос агента (shell/edit) → карточка allow/deny; решение — .rde/agent/audit.log
+#    (tool=acp_permission); закрыть RDE во время запроса → cancelled, процессов не остаётся.
+# 5) Перезапустить RDE → «История…» → сессия проекта → «Открыть» (resume): виден транскрипт RDE.
+```
+
