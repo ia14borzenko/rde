@@ -124,6 +124,11 @@ fn maybe_run_import_docx(args: &[String]) -> Option<i32> {
     }
 }
 
+/// Ошибка использования `rde import-docx`: код 2 и именно его usage (не MCP-usage).
+fn import_usage(message: impl Into<String>) -> ServeFailure {
+    ServeFailure { message: format!("{}; {IMPORT_DOCX_USAGE}", message.into()), code: 2 }
+}
+
 /// `rde import-docx <source.docx> --project <dir>`: headless-импорт документа (R-DOC-39).
 fn run_import_docx(args: &[String]) -> Result<(), ServeFailure> {
     let mut source: Option<PathBuf> = None;
@@ -143,23 +148,23 @@ fn run_import_docx(args: &[String]) -> Result<(), ServeFailure> {
                 index = next;
             }
             flag if flag.starts_with('-') => {
-                return Err(ServeFailure::usage(format!("неизвестный флаг `{flag}`")));
+                return Err(import_usage(format!("неизвестный флаг `{flag}`")));
             }
             value => {
                 if source.is_some() {
-                    return Err(ServeFailure::usage("лишний позиционный аргумент (нужен один путь к .docx)"));
+                    return Err(import_usage("лишний позиционный аргумент (нужен один путь к .docx)"));
                 }
                 source = Some(PathBuf::from(value));
                 index += 1;
             }
         }
     }
-    let source = source.ok_or_else(|| ServeFailure::usage("не указан путь к .docx"))?;
+    let source = source.ok_or_else(|| import_usage("не указан путь к .docx"))?;
     let root = project
         .or_else(|| std::env::var_os("RDE_PROJECT").map(PathBuf::from))
-        .ok_or_else(|| ServeFailure::usage("не указан проект: `--project <dir>` или `RDE_PROJECT`"))?;
+        .ok_or_else(|| import_usage("не указан проект: `--project <dir>` или `RDE_PROJECT`"))?;
     if !source.is_file() {
-        return Err(ServeFailure::usage(format!("файл импорта не найден: {}", source.display())));
+        return Err(import_usage(format!("файл импорта не найден: {}", source.display())));
     }
     let project = rde_core::load(&root)
         .map_err(|error| ServeFailure::project(format!("проект {}: {error}", root.display())))?;
