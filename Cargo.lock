@@ -4080,6 +4080,7 @@ dependencies = [
  "egui",
  "rde-agent",
  "rde-core",
+ "rde-doc",
  "rde-host",
  "rde-mcp",
  "rde-ui",

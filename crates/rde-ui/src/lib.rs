@@ -644,6 +644,8 @@ pub struct RdeApp {
     /// Фокус на поиске объектов (кнопка «Поиск», меню «Найти», Ctrl+F).
     search_focus: bool,
     open_project_dialog: Option<String>,
+    /// Путь к `.docx` для импорта (R-DOC-39): диалог «Импорт .docx…».
+    import_docx_dialog: Option<String>,
     new_project_dialog: Option<(String, String)>,
     settings_dialog: Option<ProjectSettingsState>,
     check_dialog: Option<String>,
@@ -777,6 +779,7 @@ impl RdeApp {
             inserts_cache: None,
             search_focus: false,
             open_project_dialog: None,
+            import_docx_dialog: None,
             new_project_dialog: None,
             settings_dialog: None,
             check_dialog: None,
@@ -2757,7 +2760,16 @@ impl RdeApp {
         let region = wordcraft_engine::Region::from_tag("ru-RU");
         // RDE — владелец сохранения: редактор работает с временной чистой копией, а запись в
         // проект (.doc.rde) делает RDE по явной команде «Сохранить проект» (см. save_project_document).
-        let copy = std::env::temp_dir().join(format!("rde-embedded-doc-{}.docx", std::process::id()));
+        // Уникальное имя: параллельные тесты (и несколько документов в процессе) не должны
+        // перезаписывать копию друг друга — иначе WordCraft читает чужой/удалённый файл.
+        let unique = {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        let copy = std::env::temp_dir().join(format!(
+            "rde-embedded-doc-{}-{unique}.docx",
+            std::process::id()
+        ));
         if rde_doc::is_rde_package(&doc_path) {
             if let Err(error) = rde_doc::extract_docx(&doc_path, &copy) {
                 self.editor_error = Some(format!("не удалось извлечь .doc.rde: {error}"));
@@ -2889,6 +2901,7 @@ impl RdeApp {
             Cmd::OpenWordCopy => self.export_word_copy(),
             Cmd::ExportProject => self.export_project_archive(),
             Cmd::ImportReview => self.import_review_from_exports(),
+            Cmd::ImportDocx => self.import_docx_dialog = Some(String::new()),
             Cmd::Undo => self.undo_document(false),
             Cmd::Redo => self.undo_document(true),
             Cmd::Find => {
@@ -4291,7 +4304,13 @@ impl RdeApp {
     /// Создать новый документ: `document.toml` + пустой OOXML → `.doc.rde` (WordCraft + rde:doc).
     fn create_document_action(&mut self, title: &str) -> Result<(), String> {
         let dir = rde_core::create_document_stub(&self.project.root, title)?;
-        let temp = std::env::temp_dir().join(format!("rde-new-doc-{}.docx", std::process::id()));
+        // Уникальное имя временного .docx: в тестах действие вызывается параллельно из разных
+        // потоков одного процесса, общий `{pid}.docx` приводил к гонке («missing part»).
+        let unique = {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        let temp = std::env::temp_dir().join(format!("rde-new-doc-{}-{unique}.docx", std::process::id()));
         let doc = wordcraft_engine::doc::Document::default();
         if let Err(error) = wordcraft_engine::io::save_path(&temp, &doc) {
             let _ = fs::remove_dir_all(&dir);
@@ -4319,6 +4338,67 @@ impl RdeApp {
         self.tab = Tab::Document;
         self.push_log(Level::Ok, format!("Создан документ «{}» (.doc.rde)", title.trim()));
         Ok(())
+    }
+
+    /// Импорт чужого `.docx` как **нового** объекта-документа (R-DOC-39, минимальная версия).
+    ///
+    /// Исходник только читается; создаётся `objects/documents/<id>/report.doc.rde` (WordCraft →
+    /// OOXML + `rde:doc` + paraId) и `import.json` с происхождением. Заголовок помечается
+    /// `[IMPORTED]` (R-DOC-39), предупреждения о неподдерживаемых конструкциях — в журнал.
+    fn import_docx_action(&mut self, source: &Path) -> Result<(), String> {
+        let source = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
+        if !source.is_file() {
+            return Err(format!("файл импорта не найден: {}", source.display()));
+        }
+        let stem = source.file_stem().and_then(|stem| stem.to_str()).unwrap_or("документ");
+        let title = format!("[IMPORTED] {stem}");
+        let dir = rde_core::create_document_stub(&self.project.root, &title)?;
+        let cleanup = |dir: &Path| {
+            let _ = fs::remove_dir_all(dir);
+        };
+        let project = match rde_core::load_project(&self.project.root) {
+            Ok(project) => project,
+            Err(error) => {
+                cleanup(&dir);
+                return Err(error);
+            }
+        };
+        let Some(object) = project.objects.iter().find(|object| object.dir == dir).cloned() else {
+            cleanup(&dir);
+            return Err("новый документ не загрузился".to_owned());
+        };
+        let ObjectData::Document(manifest) = &object.data else {
+            cleanup(&dir);
+            return Err("новый объект не является документом".to_owned());
+        };
+        let package = dir.join("report.doc.rde");
+        match rde_doc::import_docx(&source, &package, &manifest.id, &manifest.template) {
+            Ok(report) => {
+                self.reload_project();
+                self.selected = self.project.objects.iter().find(|object| object.dir == dir).map(|object| object.id.clone());
+                self.tab = Tab::Document;
+                self.push_log(Level::Ok, format!("Импортирован .docx «{}»: {}", title, report.summary()));
+                if !report.warnings.is_empty() {
+                    self.push_log(Level::Warn, format!("Импорт .docx: предупреждения ({})", report.warnings.len()));
+                    for warning in report.warnings.iter().take(10) {
+                        self.push_log(Level::Warn, format!("  • {warning}"));
+                    }
+                }
+                self.push_log(
+                    Level::Info,
+                    format!(
+                        "Происхождение: {} (sha256 {}…); отчёт — import.json рядом с пакетом",
+                        report.source.display(),
+                        report.source_sha256.chars().take(12).collect::<String>()
+                    ),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                cleanup(&dir);
+                Err(error)
+            }
+        }
     }
 
     fn rename_object_action(&mut self, id: &str, title: &str) -> Result<(), String> {
@@ -4839,6 +4919,48 @@ impl RdeApp {
             }
             if !open && !cancel {
                 self.open_project_dialog = Some(path);
+            }
+        }
+
+        if let Some(mut path) = self.import_docx_dialog.take() {
+            let mut import = false;
+            let mut cancel = false;
+            egui::Window::new("Импорт .docx")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(620.0);
+                    ui.add(egui::TextEdit::singleline(&mut path).hint_text("Путь к .docx (например, /home/…/vkr.docx)").desired_width(f32::INFINITY));
+                    ui.label(
+                        RichText::new(
+                            "Создаётся новый объект-документ «[IMPORTED] имя»; исходный .docx не изменяется. \
+                             Импорт фиксирует происхождение (sha256) и предупреждает о конструкциях, \
+                             которые RDE не поддерживает (диаграммы, макросы, track changes, поля Word…).",
+                        )
+                        .small()
+                        .color(pal.muted),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Импортировать").clicked() {
+                            import = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if import {
+                let source = PathBuf::from(path.trim());
+                match self.import_docx_action(&source) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        self.push_log(Level::Warn, format!("Импорт .docx: {error}"));
+                        self.import_docx_dialog = Some(path);
+                    }
+                }
+            } else if !cancel {
+                self.import_docx_dialog = Some(path);
             }
         }
 
@@ -9507,6 +9629,36 @@ mod docview_tests {
         assert!(matches!(app.tab, super::Tab::Document));
         app.ensure_editor();
         assert!(app.editor.is_some(), "редактор открывает только что созданный документ: {:?}", app.editor_error);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R-DOC-39 (минимальный импорт): «Файл → Импорт .docx…» создаёт новый объект
+    /// «[IMPORTED] …», пакет валиден, происхождение — в `import.json`, редактор открывается.
+    #[test]
+    fn import_docx_creates_imported_document_and_opens_editor() {
+        let root = temp_demo_copy("import-docx");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        // Проект без документа: импорт создаёт первый документ (основной сценарий нового проекта).
+        let doc_id = app.project.document_object().expect("документ демо").id.clone();
+        rde_core::delete_object(&app.project, &doc_id).expect("удалить демо-документ в корзину");
+        app.reload_project();
+        assert!(app.project.document_object().is_none());
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rde-doc/tests/fixtures/base-report.docx")
+            .canonicalize()
+            .expect("фикстура .docx");
+        let source_before = std::fs::read(&source).unwrap();
+        app.import_docx_action(&source).expect("импорт .docx");
+        let object = app.project.document_object().expect("импортированный документ");
+        assert!(object.title.starts_with("[IMPORTED]"), "маркировка импорта: {}", object.title);
+        let package = app.project.document_path().expect("путь пакета");
+        assert!(package.is_file(), "пакет создан: {}", package.display());
+        assert!(package.parent().unwrap().join("import.json").is_file(), "отчёт о происхождении");
+        assert_eq!(std::fs::read(&source).unwrap(), source_before, "исходный .docx не изменён");
+        assert!(app.project.log.iter().any(|line| line.text.contains("Импортирован .docx")), "отчёт в журнале");
+        app.tab = super::Tab::Document;
+        app.ensure_editor();
+        assert!(app.editor.is_some(), "редактор открывает импортированный документ: {:?}", app.editor_error);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

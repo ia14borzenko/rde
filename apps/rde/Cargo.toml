@@ -13,6 +13,9 @@ rde-ui = { workspace = true }
 # M1: headless MCP-сервер (`rde mcp serve`) — протокольный слой + реализация контракта.
 rde-mcp = { workspace = true }
 rde-host = { workspace = true }
+# R-DOC-39 (минимальный импорт): `rde import-docx` — конвертация .docx → .doc.rde без GUI.
+rde-doc = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # E2E `mcp serve` настоящим rmcp-клиентом: stdio (M1/M2/M2.5) и streamable HTTP (M3).
@@ -23,3 +26,5 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 # M4.3: e2e настоящего DSH по ACP (`dsh --profile acp`) через клиент rde-agent.
 rde-agent = { workspace = true }
+# R-DOC-39: проверки импортированного пакета в e2e `rde import-docx`.
+rde-doc = { workspace = true }

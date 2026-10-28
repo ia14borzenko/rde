@@ -21,6 +21,8 @@ pub(crate) enum Cmd {
     OpenWordCopy,
     ExportProject,
     ImportReview,
+    /// Импорт чужого `.docx` как нового объекта-документа (R-DOC-39, минимальная версия).
+    ImportDocx,
     // Правка
     Undo,
     Redo,
@@ -213,13 +215,22 @@ pub(crate) fn ribbon_groups(tab: RibbonTab) -> &'static [Group] {
             },
             Group {
                 title: "Обмен с Word",
-                slots: &[Slot::Button {
-                    cmd: Cmd::ImportReview,
-                    icon: IC_DOWNLOAD,
-                    label: "Импорт ревью\nиз exports",
-                    tip: "Импорт ревью из exports: самый свежий .docx из exports/ становится новой версией документа",
-                    primary: false,
-                }],
+                slots: &[
+                    Slot::Button {
+                        cmd: Cmd::ImportDocx,
+                        icon: IC_DOWNLOAD,
+                        label: "Импорт\n.docx…",
+                        tip: "Импорт .docx: новый объект-документ «[IMPORTED] …» (исходник не изменяется, отчёт — в журнале)",
+                        primary: false,
+                    },
+                    Slot::Button {
+                        cmd: Cmd::ImportReview,
+                        icon: IC_DOWNLOAD,
+                        label: "Импорт ревью\nиз exports",
+                        tip: "Импорт ревью из exports: самый свежий .docx из exports/ становится новой версией документа",
+                        primary: false,
+                    },
+                ],
             },
         ],
         RibbonTab::Edit => &[

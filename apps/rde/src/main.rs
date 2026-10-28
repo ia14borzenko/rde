@@ -3,6 +3,8 @@
 //! Запуск: `cargo run -p rde` (нужно графическое окружение X11/Wayland).
 //! Headless MCP-сервер (v0.3/M2): `rde mcp serve --project <dir> [--approval=…]` — транспорт stdio;
 //! мутации — только через grants/approvals/чекпоинты (по умолчанию `--approval=deny`, fail-closed).
+//! Импорт `.docx` (R-DOC-39, минимальная версия): `rde import-docx <file.docx> --project <dir>` —
+//! создаёт новый объект-документ «[IMPORTED] …», исходник не изменяется, отчёт — JSON в stdout.
 //! Концепт-скриншот без окна: `cargo run -p rde-ui --example screenshot -- out.png`.
 
 use std::path::PathBuf;
@@ -15,6 +17,10 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // MCP-ветка (v0.3/M1): headless-сервер, GUI не создаётся.
     if let Some(exit_code) = maybe_run_mcp(&args) {
+        std::process::exit(exit_code);
+    }
+    // Ветка импорта .docx (R-DOC-39): headless, GUI не создаётся.
+    if let Some(exit_code) = maybe_run_import_docx(&args) {
         std::process::exit(exit_code);
     }
     let from_args = args
@@ -97,6 +103,108 @@ fn maybe_run_mcp(args: &[String]) -> Option<i32> {
         Err(failure) => {
             eprintln!("RDE MCP: {}", failure.message);
             Some(failure.code)
+        }
+    }
+}
+
+const IMPORT_DOCX_USAGE: &str = "использование: rde import-docx <source.docx> --project <dir> [--title <имя>]\n  создаёт новый объект-документ «[IMPORTED] …» (R-DOC-39); исходный .docx не изменяется;\n  отчёт — JSON в stdout и import.json рядом с пакетом";
+
+/// Распознать `rde import-docx …` до `eframe`: `Some(код выхода)`, если ветка запускалась.
+fn maybe_run_import_docx(args: &[String]) -> Option<i32> {
+    if args.first().map(String::as_str) != Some("import-docx") {
+        return None;
+    }
+    match run_import_docx(&args[1..]) {
+        Ok(()) => Some(0),
+        Err(failure) => {
+            eprintln!("RDE import-docx: {}", failure.message);
+            eprintln!("{IMPORT_DOCX_USAGE}");
+            Some(failure.code)
+        }
+    }
+}
+
+/// `rde import-docx <source.docx> --project <dir>`: headless-импорт документа (R-DOC-39).
+fn run_import_docx(args: &[String]) -> Result<(), ServeFailure> {
+    let mut source: Option<PathBuf> = None;
+    let mut project: Option<PathBuf> = None;
+    let mut title: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--project" => {
+                let (value, next) = flag_value(args, index, "--project")?;
+                project = Some(PathBuf::from(value));
+                index = next;
+            }
+            "--title" => {
+                let (value, next) = flag_value(args, index, "--title")?;
+                title = Some(value);
+                index = next;
+            }
+            flag if flag.starts_with('-') => {
+                return Err(ServeFailure::usage(format!("неизвестный флаг `{flag}`")));
+            }
+            value => {
+                if source.is_some() {
+                    return Err(ServeFailure::usage("лишний позиционный аргумент (нужен один путь к .docx)"));
+                }
+                source = Some(PathBuf::from(value));
+                index += 1;
+            }
+        }
+    }
+    let source = source.ok_or_else(|| ServeFailure::usage("не указан путь к .docx"))?;
+    let root = project
+        .or_else(|| std::env::var_os("RDE_PROJECT").map(PathBuf::from))
+        .ok_or_else(|| ServeFailure::usage("не указан проект: `--project <dir>` или `RDE_PROJECT`"))?;
+    if !source.is_file() {
+        return Err(ServeFailure::usage(format!("файл импорта не найден: {}", source.display())));
+    }
+    let project = rde_core::load(&root)
+        .map_err(|error| ServeFailure::project(format!("проект {}: {error}", root.display())))?;
+    let stem = source.file_stem().and_then(|stem| stem.to_str()).unwrap_or("документ");
+    let title = match title {
+        Some(custom) if !custom.trim().is_empty() => {
+            let custom = custom.trim();
+            if custom.starts_with("[IMPORTED]") { custom.to_owned() } else { format!("[IMPORTED] {custom}") }
+        }
+        _ => format!("[IMPORTED] {stem}"),
+    };
+    let directory = rde_core::create_document_stub(&project.root, &title)
+        .map_err(|error| ServeFailure::project(format!("создать объект-документ: {error}")))?;
+    let reloaded = rde_core::load(&project.root).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&directory);
+        ServeFailure::project(format!("проект после создания объекта: {error}"))
+    })?;
+    let Some(object) = reloaded.objects.iter().find(|object| object.dir == directory) else {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(ServeFailure::server("новый документ не загрузился"));
+    };
+    let rde_core::ObjectData::Document(manifest) = &object.data else {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(ServeFailure::server("новый объект не является документом"));
+    };
+    let package = directory.join("report.doc.rde");
+    match rde_doc::import_docx(&source, &package, &manifest.id, &manifest.template) {
+        Ok(report) => {
+            let json = serde_json::to_string_pretty(&report)
+                .map_err(|error| ServeFailure::server(format!("сериализовать отчёт: {error}")))?;
+            println!("{json}");
+            eprintln!(
+                "RDE import-docx: «{}» → {} ({})",
+                title,
+                package.display(),
+                report.summary()
+            );
+            for warning in &report.warnings {
+                eprintln!("RDE import-docx: ВНИМАНИЕ: {warning}");
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&directory);
+            Err(ServeFailure::project(format!("импорт {}: {error}", source.display())))
         }
     }
 }
