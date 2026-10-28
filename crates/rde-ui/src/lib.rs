@@ -2393,6 +2393,13 @@ impl RdeApp {
                 self.structure_cache = None;
                 if path_changed {
                     self.doc = DocPreview::new(new_path);
+                    // Смена/появление/удаление документа: редактор и его ошибка относятся к прежнему
+                    // пути. Без сброса после «в проекте нет документа» ошибка оставалась на экране
+                    // даже когда документ уже создан (stale editor_error, ensure_editor early-return).
+                    self.editor = None;
+                    self.editor_error = None;
+                    self.inserts_cache = None;
+                    self.comments_cache = None;
                 }
                 self.refresh_dag_statuses();
                 self.refresh_git_status();
@@ -9473,6 +9480,33 @@ mod docview_tests {
         app.demo_set_theme("dark");
         app.demo_set_theme("light (позже)");
         assert_eq!(app.app_settings.theme, "dark");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Регрессия: в новом проекте без документа вкладка «Документ» ставила
+    /// `editor_error="в проекте нет документа"`; после создания документа ошибка оставалась
+    /// (reload_project не сбрасывал editor/editor_error, ensure_editor выходил early-return).
+    #[test]
+    fn creating_document_after_empty_project_clears_stale_editor_error() {
+        let root = temp_demo_copy("doc-create-after-empty");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let doc_id = app.project.document_object().expect("документ демо").id.clone();
+        // Проект без документа (как сразу после «Новый проект»).
+        rde_core::delete_object(&app.project, &doc_id).expect("удалить документ в корзину");
+        app.reload_project();
+        assert!(app.project.document_object().is_none());
+        app.tab = super::Tab::Document;
+        app.ensure_editor();
+        assert!(app.editor.is_none());
+        assert_eq!(app.editor_error.as_deref(), Some("в проекте нет документа"));
+
+        // Кнопка «Новый объект → Документ» (тот же путь, что в UI).
+        app.create_object_action(super::UiObjectKind::Document, "main").expect("создать документ");
+        assert!(app.project.document_object().is_some(), "документ появился в модели проекта");
+        assert!(app.editor_error.is_none(), "устаревшая ошибка редактора сброшена: {:?}", app.editor_error);
+        assert!(matches!(app.tab, super::Tab::Document));
+        app.ensure_editor();
+        assert!(app.editor.is_some(), "редактор открывает только что созданный документ: {:?}", app.editor_error);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
