@@ -19,7 +19,9 @@ use wordcraft_engine::Session;
 /// Менять при обновлении пина `vendor/wordcraft` — кэши формул инвалидируются осознанно.
 pub const FORMULA_RENDERER_ID: &str = "wordcraft";
 /// Версия рендерера: WordCraft v0.10.0 (пин форка) + RDE-пайплайн SVG.
-pub const FORMULA_RENDERER_VERSION: &str = "0.10.0+rde1";
+/// `rde2` — кроп кэшей по ink-bbox PDF (скобки/линейки формул рисуются путями, а не текстом);
+/// ранее отрендеренные SVG/PNG невалидны для новой версии и пересобираются по `renderer`-хэшу.
+pub const FORMULA_RENDERER_VERSION: &str = "0.10.0+rde2";
 
 /// Скомпилированные кэши формулы.
 #[derive(Clone, Debug, Default)]
@@ -136,7 +138,7 @@ fn pdf_to_formula_svg_png(pdf: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), Stri
         run_checked(Command::new("pdftocairo").arg("-svg").arg(&pdf_path).arg(&svg_path))?;
         let svg = std::fs::read(&svg_path).map_err(|e| format!("прочитать svg: {e}"))?;
         let svg_text = String::from_utf8_lossy(&svg).to_string();
-        let (x, y, w, h) = pdf_text_bbox(&pdf_path, 2.0)?;
+        let (x, y, w, h) = pdf_ink_bbox(&pdf_path, &dir, 2.0)?;
         let cropped = crop_svg(&svg_text, x, y, w, h)?;
         let png = rasterize_svg(cropped.as_bytes()).ok();
         Ok((cropped.into_bytes(), png))
@@ -164,36 +166,43 @@ fn run_checked(command: &mut Command) -> Result<(), String> {
     Ok(())
 }
 
-fn run_capture(command: &mut Command) -> Result<String, String> {
-    let output = command.output().map_err(|e| format!("запустить {}: {e}", command.get_program().to_string_lossy()))?;
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
+/// Bbox всего, что нарисовано на странице PDF формулы, в pt + отступ: (x, y, w, h).
+///
+/// Раньше bbox брался из текстового слоя (`pdftotext -bbox`), но MathType-подобные скобки,
+/// линейки дробей и знаки больших операторов в векторном PDF идут **путями**, а не текстом, и
+/// обрезались: формулы с `\left( ... \right)` теряли закрывающую скобку. Растеризуем страницу
+/// (poppler `pdftoppm`) и берём ink-bbox по непустым пикселям — это покрывает и текст, и пути.
+const BBOX_DPI: u32 = 150;
 
-/// Bbox текста формулы в PDF (`pdftotext -bbox`) + отступ; возвращает (x, y, w, h) в pt.
-fn pdf_text_bbox(pdf: &Path, pad: f64) -> Result<(f64, f64, f64, f64), String> {
-    let html = run_capture(Command::new("pdftotext").arg("-bbox").arg(pdf).arg("-"))?;
-    let attr = |line: &str, name: &str| -> Option<f64> {
-        let index = line.find(&format!("{name}=\""))?;
-        let rest = &line[index + name.len() + 2..];
-        let end = rest.find('"')?;
-        rest[..end].parse().ok()
-    };
-    let mut min = (f64::INFINITY, f64::INFINITY);
-    let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for line in html.lines().filter(|line| line.contains("<word ")) {
-        if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (attr(line, "xMin"), attr(line, "yMin"), attr(line, "xMax"), attr(line, "yMax")) {
-            min.0 = min.0.min(x0);
-            min.1 = min.1.min(y0);
-            max.0 = max.0.max(x1);
-            max.1 = max.1.max(y1);
+fn pdf_ink_bbox(pdf: &Path, work: &Path, pad: f64) -> Result<(f64, f64, f64, f64), String> {
+    let prefix = work.join("bbox");
+    run_checked(Command::new("pdftoppm").arg("-r").arg(BBOX_DPI.to_string()).arg("-gray").arg("-png").arg("-singlefile").arg(pdf).arg(&prefix))?;
+    let page = prefix.with_extension("png");
+    let image = image::open(&page).map_err(|e| format!("decode pdf raster: {e}"))?.to_luma8();
+    let (width, height) = image.dimensions();
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for (x, y, pixel) in image.enumerate_pixels() {
+        // Фон страницы белый; всё темнее почти белого — «чернила» (антиалиасинг тоже ловим).
+        if pixel.0[0] < 250 {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
         }
     }
-    if !min.0.is_finite() || !max.0.is_finite() {
-        return Err("в PDF не найден текстовый bbox формулы (SVG-кроп невозможен)".to_owned());
+    if x0 == u32::MAX || x1 < x0 || y1 < y0 {
+        return Err("в PDF формула не нарисована (нет ни одного пикселя)".to_owned());
     }
-    let x = (min.0 - pad).max(0.0);
-    let y = (min.1 - pad).max(0.0);
-    Ok((x, y, (max.0 - min.0 + 2.0 * pad).max(1.0), (max.1 - min.1 + 2.0 * pad).max(1.0)))
+    let scale = 72.0 / f64::from(BBOX_DPI);
+    let (page_w, page_h) = (f64::from(width) * scale, f64::from(height) * scale);
+    let (min_x, min_y) = (f64::from(x0) * scale, f64::from(y0) * scale);
+    // +1px, чтобы антиалиасинг на границе не обрезался.
+    let (max_x, max_y) = (f64::from(x1 + 1) * scale, f64::from(y1 + 1) * scale);
+    let x = (min_x - pad).max(0.0);
+    let y = (min_y - pad).max(0.0);
+    let w = (max_x - min_x + 2.0 * pad).min(page_w - x).max(1.0);
+    let h = (max_y - min_y + 2.0 * pad).min(page_h - y).max(1.0);
+    Ok((x, y, w, h))
 }
 
 /// Обрезать SVG до bbox формулы правкой `viewBox`/`width`/`height` (pdftocairo -svg не кропает
