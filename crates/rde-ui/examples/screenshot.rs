@@ -3,15 +3,23 @@
 //!
 //! `cargo run -p rde-ui --example screenshot -- /path/out.png [tab] [объект]`
 //! tab: document|structure|artifacts|source|code; объект: id или часть названия.
+//! Проект: `RDE_PROJECT=<dir>` (иначе демо-проект) — удобно снимать реальные проекты.
 
-use rde_core::demo;
+use std::path::Path;
+
 use rde_ui::RdeApp;
 
 fn main() {
     let out = std::env::args().nth(1).unwrap_or_else(|| "/tmp/rde-concept.png".to_owned());
     let tab = std::env::args().nth(2);
     let select = std::env::args().nth(3);
-    let mut state = RdeApp::new(demo());
+    let mut state = RdeApp::new(match std::env::var_os("RDE_PROJECT") {
+        Some(root) => rde_core::load_project(Path::new(&root)).unwrap_or_else(|error| {
+            eprintln!("RDE_PROJECT={}: {error}", Path::new(&root).display());
+            std::process::exit(2);
+        }),
+        None => rde_core::demo(),
+    });
     if let Some(tab) = tab {
         state.demo_select_tab(&tab);
     }

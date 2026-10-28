@@ -740,14 +740,41 @@ pub struct RdeApp {
     suggestions_demo: Option<Vec<rde_doc::SuggestedEdit>>,
 }
 
+/// Документ, открываемый при старте: самый свежий по mtime пакета (в проекте может быть несколько
+/// документов: пустой `main` и импортированный `.docx` — открываем тот, что меняли последним).
+/// Если mtime недоступен — первый документ проекта.
+fn initial_document_path(project: &rde_core::Project) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for object in project.objects.iter() {
+        let ObjectData::Document(manifest) = &object.data else { continue };
+        let path = object.dir.join(&manifest.file);
+        let Ok(mtime) = fs::metadata(&path).and_then(|meta| meta.modified()) else { continue };
+        if best.as_ref().map(|(known, _)| mtime > *known).unwrap_or(true) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, path)| path).or_else(|| project.document_path())
+}
+
 impl RdeApp {
     pub fn new(project: Project) -> Self {
         let app_settings = rde_core::settings::load();
         let chat_allowed = app_settings.allow_builtin_agent;
         let lang = i18n::lang(&app_settings.language);
-        let doc = DocPreview::new(project.document_path());
+        let doc = DocPreview::new(initial_document_path(&project));
         let export_dir = project.root.join("exports");
-        let selected = project.document_object().map(|object| object.id.clone());
+        let selected = doc
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(|dir| {
+                project
+                    .objects
+                    .iter()
+                    .find(|object| object.dir == dir && matches!(object.data, ObjectData::Document(_)))
+            })
+            .map(|object| object.id.clone())
+            .or_else(|| project.document_object().map(|object| object.id.clone()));
         let mut app = Self {
             project,
             tab: Tab::Document,
@@ -1124,7 +1151,7 @@ impl RdeApp {
             self.push_log(Level::Warn, "Сохранить проект: редактор не открыт");
             return;
         };
-        let Some(document_object) = self.project.document_object().cloned() else {
+        let Some(document_object) = self.active_document_object().cloned() else {
             self.push_log(Level::Warn, "Сохранить проект: в проекте нет документа");
             return;
         };
@@ -1135,7 +1162,11 @@ impl RdeApp {
         } else {
             document_object.dir.join("report.doc.rde")
         };
-        let temp = std::env::temp_dir().join(format!("rde-save-{}.docx", std::process::id()));
+        let unique = {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        let temp = std::env::temp_dir().join(format!("rde-save-{}-{unique}.docx", std::process::id()));
         if let Err(error) = wordcraft_engine::io::save_path(&temp, &editor.app.session.doc) {
             self.push_log(Level::Warn, format!("Сохранить проект: не удалось сохранить OOXML: {error}"));
             return;
@@ -1172,7 +1203,7 @@ impl RdeApp {
     /// Оформить документ шаблоном (ГОСТ 7.32-2017) и/или вставить библиографию проекта.
     /// Работает на извлечённой копии, результат сохраняется обратно в `.doc.rde`.
     pub fn update_document_package(&mut self, apply_gost: bool, with_bibliography: bool) {
-        let Some(path) = self.project.document_path() else {
+        let Some(path) = self.active_document_path() else {
             self.push_log(Level::Warn, "Оформление: в проекте нет документа");
             return;
         };
@@ -1183,12 +1214,16 @@ impl RdeApp {
         if self.editor.is_some() {
             self.save_project_document();
         }
-        let Some(document_object) = self.project.document_object().cloned() else {
+        let Some(document_object) = self.active_document_object().cloned() else {
             self.push_log(Level::Warn, "Оформление: объект документа не найден");
             return;
         };
         let ObjectData::Document(manifest) = &document_object.data else { return };
-        let work = std::env::temp_dir().join(format!("rde-format-{}", std::process::id()));
+        let unique = {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        let work = std::env::temp_dir().join(format!("rde-format-{}-{unique}", std::process::id()));
         let _ = fs::remove_dir_all(&work);
         if let Err(error) = fs::create_dir_all(&work) {
             self.push_log(Level::Warn, format!("Оформление: {error}"));
@@ -1262,7 +1297,7 @@ impl RdeApp {
                 let manifest_path = document_object.dir.join("document.toml");
                 let _ = set_manifest_string(&manifest_path, "template", &template_id);
                 self.editor = None;
-                self.doc = DocPreview::new(self.project.document_path());
+                self.doc = DocPreview::new(self.active_document_path());
                 self.structure_cache = None;
                 self.reload_project();
                 self.push_log(
@@ -1286,7 +1321,7 @@ impl RdeApp {
     /// Открыть копию документа в Word: экспортировать чистый `.docx` в `exports/` и, если есть
     /// графическая сессия, попробовать открыть системным обработчиком (headless — только путь).
     pub fn export_word_copy(&mut self) {
-        let Some(package) = self.project.document_path() else {
+        let Some(package) = self.active_document_path() else {
             self.push_log(Level::Warn, "Копия для Word: в проекте нет документа");
             return;
         };
@@ -1312,7 +1347,7 @@ impl RdeApp {
     /// Импорт внешнего ревью: взять самый свежий `.docx` из `exports/` (после правок в Word),
     /// принять его как новую версию документа, сохранив RDE-метаданные.
     pub fn import_review_from_exports(&mut self) {
-        let Some(package) = self.project.document_path() else {
+        let Some(package) = self.active_document_path() else {
             self.push_log(Level::Warn, "Импорт ревью: в проекте нет документа");
             return;
         };
@@ -1365,7 +1400,7 @@ impl RdeApp {
 
     /// Открыть диалог вставки: `value|figure|table|constant|crossref|citation|date` (R-DOC-11).
     fn open_insert_dialog(&mut self, kind: &str) {
-        if self.project.document_path().is_none() {
+        if self.active_document_path().is_none() {
             self.push_log(Level::Warn, "Вставка: в проекте нет документа");
             return;
         }
@@ -1504,7 +1539,7 @@ impl RdeApp {
 
     /// Подтвердить вставку: разрешить значение/рисунок из артефакта и записать в `.doc.rde`.
     fn confirm_insert(&mut self, dialog: InsertDialogState) {
-        let Some(package) = self.project.document_path() else {
+        let Some(package) = self.active_document_path() else {
             self.push_log(Level::Warn, "Вставка: в проекте нет документа");
             return;
         };
@@ -1674,7 +1709,7 @@ impl RdeApp {
         // Версия документа в store (транзакция с корнем document/<id>).
         match result {
             Ok((report, hash)) => {
-                let doc_id = self.project.document_object().and_then(|object| match &object.data {
+                let doc_id = self.active_document_object().and_then(|object| match &object.data {
                     ObjectData::Document(manifest) => Some(manifest.id.clone()),
                     _ => None,
                 });
@@ -1684,7 +1719,7 @@ impl RdeApp {
                     }
                 }
                 self.editor = None;
-                self.doc = DocPreview::new(self.project.document_path());
+                self.doc = DocPreview::new(self.active_document_path());
                 self.structure_cache = None;
                 self.inserts_cache = None;
                 self.reload_project();
@@ -1767,7 +1802,7 @@ impl RdeApp {
     /// «Принять формулы как объекты» (P3, ADR-0005 §7): OMML вне реестра → project-level формулы +
     /// вставки-ссылки. Явная команда; при открытии документа ничего не меняется. Идемпотентна.
     pub fn migrate_document_formulas(&mut self) {
-        let Some(package) = self.project.document_path() else {
+        let Some(package) = self.active_document_path() else {
             self.push_log(Level::Warn, "Миграция формул: в проекте нет документа");
             return;
         };
@@ -1858,16 +1893,14 @@ impl RdeApp {
         }
         match rde_doc::migrate_formulas(&package, &plans) {
             Ok(report) => {
-                if let (Some(store), Some(doc_id)) = (
-                    self.store.as_mut(),
-                    self.project.document_object().and_then(|object| match &object.data {
-                        ObjectData::Document(manifest) => Some(manifest.id.clone()),
-                        _ => None,
-                    }),
-                ) {
+                let doc_id = self.active_document_object().and_then(|object| match &object.data {
+                    ObjectData::Document(manifest) => Some(manifest.id.clone()),
+                    _ => None,
+                });
+                if let (Some(store), Some(doc_id)) = (self.store.as_mut(), doc_id) {
                     let _ = rde_doc::commit_document(&self.project.root, &package, &doc_id, store, "formula migrate");
                 }
-                self.doc = DocPreview::new(self.project.document_path());
+                self.doc = DocPreview::new(self.active_document_path());
                 self.structure_cache = None;
                 self.inserts_cache = None;
                 self.reload_project();
@@ -1941,7 +1974,7 @@ impl RdeApp {
     /// Кандидат на откат обновления документа (транзакция store с корнем `document/<id>`).
     fn doc_rollback_candidate(&self) -> Option<rde_store::RollbackCandidate> {
         let store = self.store.as_ref()?;
-        let document_object = self.project.document_object()?;
+        let document_object = self.active_document_object()?;
         let ObjectData::Document(manifest) = &document_object.data else { return None };
         let root = rde_doc::document_root_name(&manifest.id);
         store
@@ -1957,8 +1990,8 @@ impl RdeApp {
             self.push_log(Level::Info, "Откат документа: нет транзакций обновления документа");
             return;
         };
-        let Some(package) = self.project.document_path() else { return };
-        let doc_id = self.project.document_object().and_then(|object| match &object.data {
+        let Some(package) = self.active_document_path() else { return };
+        let doc_id = self.active_document_object().and_then(|object| match &object.data {
             ObjectData::Document(manifest) => Some(manifest.id.clone()),
             _ => None,
         });
@@ -1968,7 +2001,7 @@ impl RdeApp {
             Ok(_) => match rde_doc::restore_document_from_store(&self.project.root, &package, &doc_id, store) {
                 Ok(Some(_)) => {
                     self.editor = None;
-                    self.doc = DocPreview::new(self.project.document_path());
+                    self.doc = DocPreview::new(self.active_document_path());
                     self.structure_cache = None;
                     self.reload_project();
                     self.push_log(Level::Ok, format!("Документ откачен к предыдущей версии (транзакция {})", candidate.txid.chars().take(10).collect::<String>()));
@@ -2042,7 +2075,7 @@ impl RdeApp {
                     ),
                 );
                 self.reload_project();
-                self.doc = DocPreview::new(self.project.document_path());
+                self.doc = DocPreview::new(self.active_document_path());
             }
             Ok(None) => self.push_log(Level::Info, "Откат артефактов: нет транзакций обновления"),
             Err(error) => self.push_log(Level::Warn, format!("Откат артефактов: {error}")),
@@ -2083,7 +2116,7 @@ impl RdeApp {
         if !self.auto_update || self.auto_updating {
             return;
         }
-        let Some(package) = self.project.document_path() else { return };
+        let Some(package) = self.active_document_path() else { return };
         let Ok(rde_doc) = rde_doc::load_rde_doc(&package) else { return };
         if rde_doc.inserts.iter().all(|insert| insert.target.is_empty()) {
             return;
@@ -2098,7 +2131,7 @@ impl RdeApp {
     /// «Обновить документ»: значения/рисунки вставок из артефактов, перенумерация подписей,
     /// пересохранение `.doc.rde` — транзакционно (бэкап + версия в store + diff) (R-DOC-11/12).
     pub fn update_project_document(&mut self) {
-        let Some(package) = self.project.document_path() else {
+        let Some(package) = self.active_document_path() else {
             self.push_log(Level::Warn, "Обновить документ: в проекте нет документа");
             return;
         };
@@ -2192,7 +2225,7 @@ impl RdeApp {
                 }
             }
         }
-        let Some(doc_id) = self.project.document_object().and_then(|object| match &object.data {
+        let Some(doc_id) = self.active_document_object().and_then(|object| match &object.data {
             ObjectData::Document(manifest) => Some(manifest.id.clone()),
             _ => None,
         }) else {
@@ -2304,7 +2337,7 @@ impl RdeApp {
                     .filter(|status| status.state == rde_doc::FormulaInsertState::Stale)
                     .count();
                 self.editor = None;
-                self.doc = DocPreview::new(self.project.document_path());
+                self.doc = DocPreview::new(self.active_document_path());
                 self.structure_cache = None;
                 self.reload_project();
                 self.push_log(
@@ -2385,11 +2418,80 @@ impl RdeApp {
         self.formula_labels = self.formula_tree_labels();
     }
 
+    /// Объект-документ, с которым сейчас работает редактор (R-DOC-39/multi-doc).
+    ///
+    /// В проекте может быть несколько документов (например, импортированный `.docx` рядом с
+    /// прежним «main»). Редактор/сохранение/обновление должны работать с **активным** документом
+    /// (`self.doc.path`), а не с первым по порядку объектов. Если активного пути нет — первый
+    /// документ проекта (обычный случай одного документа).
+    fn active_document_object(&self) -> Option<&rde_core::Object> {
+        if let Some(path) = self.doc.path.as_deref() {
+            if let Some(dir) = path.parent() {
+                if let Some(object) = self.project.objects.iter().find(|object| {
+                    object.dir == dir && matches!(object.data, ObjectData::Document(_))
+                }) {
+                    return Some(object);
+                }
+            }
+        }
+        self.project.document_object()
+    }
+
+    /// Путь рабочего файла активного документа.
+    fn active_document_path(&self) -> Option<PathBuf> {
+        self.active_document_object().map(|object| {
+            let file = match &object.data {
+                ObjectData::Document(manifest) => manifest.file.clone(),
+                _ => String::new(),
+            };
+            object.dir.join(file)
+        })
+    }
+
+    /// Переключить редактор на другой документ (без перезагрузки проекта): сбросить редактор и
+    /// кэши, относящиеся к прежнему пакету (R-DOC-39: импорт не должен открывать чужой «main»).
+    fn activate_document_path(&mut self, path: PathBuf) {
+        if self.doc.path.as_ref() == Some(&path) {
+            return;
+        }
+        // Не теряем правки при переключении: RDE — владелец сохранения, поэтому текущий
+        // открытый документ сохраняется в проект перед сменой активного.
+        if self.editor.is_some() {
+            self.save_project_document();
+        }
+        self.doc = DocPreview::new(Some(path));
+        self.editor = None;
+        self.editor_error = None;
+        self.structure_cache = None;
+        self.inserts_cache = None;
+        self.comments_cache = None;
+    }
+
+    /// Активировать документ, выбранный в дереве/инспекторе (если это объект-документ).
+    fn activate_document_object(&mut self, object: &rde_core::Object) {
+        if let ObjectData::Document(manifest) = &object.data {
+            self.activate_document_path(object.dir.join(&manifest.file));
+        }
+    }
+
     /// Перезагрузить проект с диска и обновить статусы/документ.
     fn reload_project(&mut self) {
         match rde_core::load_project(&self.project.root) {
             Ok(project) => {
-                let new_path = project.document_path();
+                // Активный документ сохраняем, если он ещё существует (multi-doc); иначе — первый.
+                let active_exists = self
+                    .doc
+                    .path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(|dir| {
+                        project
+                            .objects
+                            .iter()
+                            .any(|object| object.dir == dir && matches!(object.data, ObjectData::Document(_)))
+                    })
+                    .unwrap_or(false);
+                let new_path = if active_exists { self.doc.path.clone() } else { project.document_path() };
                 let path_changed = new_path != self.doc.path;
                 self.auto_update = project.manifest.document_auto_update;
                 self.project = project;
@@ -2700,6 +2802,7 @@ impl RdeApp {
                 ObjectKind::Repository => Tab::Artifacts,
                 ObjectKind::Formula => Tab::Artifacts,
             };
+            self.activate_document_object(&object);
         }
     }
 
@@ -3566,7 +3669,7 @@ impl RdeApp {
             self.create_dialog = Some(CreateDialogState { kind: UiObjectKind::Core(NewObjectKind::ComputeArtifact), title: String::new() });
         }
         if let Some(id) = clicked {
-            if let Some(object) = self.project.object(&id) {
+            if let Some(object) = self.project.object(&id).cloned() {
                 self.tab = match object.kind {
                     ObjectKind::Document => Tab::Document,
                     ObjectKind::Artifact | ObjectKind::Constants => Tab::Artifacts,
@@ -3574,6 +3677,8 @@ impl RdeApp {
                     ObjectKind::Repository => Tab::Artifacts,
                     ObjectKind::Formula => Tab::Artifacts,
                 };
+                // Выбор документа в дереве переключает редактор (несколько документов в проекте).
+                self.activate_document_object(&object);
             }
             self.selected = Some(id);
         }
@@ -3602,6 +3707,7 @@ impl RdeApp {
                         ObjectKind::Repository => Tab::Artifacts,
                         ObjectKind::Formula => Tab::Artifacts,
                     };
+                    self.activate_document_object(&object);
                 }
             }
             TreeAction::Rename(id) => {
@@ -3906,6 +4012,7 @@ impl RdeApp {
         self.selected = Some(object.id.clone());
         self.show_inspector = true;
         self.tab = tab;
+        self.activate_document_object(&object);
         if matches!(&object.data, ObjectData::Artifact(_)) {
             // Рабочее место артефакта: входы/генерация/результат — открываем результат
             // под выбранный объект (как «Открыть» из контекстного меню дерева).
@@ -4375,9 +4482,24 @@ impl RdeApp {
         match rde_doc::import_docx(&source, &package, &manifest.id, &manifest.template) {
             Ok(report) => {
                 self.reload_project();
-                self.selected = self.project.objects.iter().find(|object| object.dir == dir).map(|object| object.id.clone());
+                let imported = self.project.objects.iter().find(|object| object.dir == dir).cloned();
+                self.selected = imported.as_ref().map(|object| object.id.clone());
                 self.tab = Tab::Document;
+                // Импортированный документ становится активным: даже если в проекте уже был
+                // другой документ, редактор открывает именно его (а не первый по порядку).
+                if let Some(object) = imported.as_ref() {
+                    self.activate_document_object(object);
+                }
                 self.push_log(Level::Ok, format!("Импортирован .docx «{}»: {}", title, report.summary()));
+                let document_count = self.project.documents().count();
+                if document_count > 1 {
+                    self.push_log(
+                        Level::Info,
+                        format!(
+                            "В проекте {document_count} документа: активен импортированный; выбор другого документа в дереве переключает редактор"
+                        ),
+                    );
+                }
                 if !report.warnings.is_empty() {
                     self.push_log(Level::Warn, format!("Импорт .docx: предупреждения ({})", report.warnings.len()));
                     for warning in report.warnings.iter().take(10) {
@@ -4420,7 +4542,7 @@ impl RdeApp {
 
     /// Проверка внешних правок документа при открытии проекта (M3/M5).
     fn check_external_edit_on_startup(&mut self) {
-        if let Some(path) = self.project.document_path() {
+        if let Some(path) = self.active_document_path() {
             if rde_doc::is_rde_package(&path) {
                 match rde_doc::check_external_edit(&path) {
                     Ok(check) if check.verdict != rde_doc::EditVerdict::NotModified => self.push_log(
@@ -4447,7 +4569,7 @@ impl RdeApp {
                     .document_object()
                     .map(|object| object.id.clone())
                     .or_else(|| self.project.objects.first().map(|object| object.id.clone()));
-                self.doc = DocPreview::new(self.project.document_path());
+                self.doc = DocPreview::new(self.active_document_path());
                 self.editor = None;
                 self.editor_error = None;
                 self.structure_cache = None;
@@ -4679,7 +4801,7 @@ impl RdeApp {
             Ok(sync) => lines.extend(sync.lines().map(str::to_owned)),
             Err(error) => lines.push(format!("Git: ошибка — {error}")),
         }
-        if let Some(path) = self.project.document_path() {
+        if let Some(path) = self.active_document_path() {
             if rde_doc::is_rde_package(&path) {
                 match rde_doc::check_external_edit(&path) {
                     Ok(check) => {
@@ -4878,7 +5000,7 @@ impl RdeApp {
                     Ok(count) => {
                         self.push_log(Level::Ok, format!("Проект восстановлен из {}: файлов {}", archive.display(), count));
                         self.editor = None;
-                        self.doc = DocPreview::new(self.project.document_path());
+                        self.doc = DocPreview::new(self.active_document_path());
                         self.structure_cache = None;
                         self.inserts_cache = None;
                         self.reload_project();
@@ -6341,7 +6463,7 @@ impl RdeApp {
     fn structure_tab(&mut self, ui: &mut egui::Ui) {
         let pal = theme_colors(ui.ctx().theme());
         if self.structure_cache.is_none() {
-            let path = self.project.document_path();
+            let path = self.active_document_path();
             self.structure_cache = Some(match path {
                 Some(path) => extract_document_structure(&path).map_err(|error| format!("{}: {error}", path.display())),
                 None => Err("в проекте нет документа".to_owned()),
@@ -6349,7 +6471,7 @@ impl RdeApp {
         }
         let cache = self.structure_cache.clone();
         // Число вставок из rde:doc (кэш по пути пакета).
-        let package_key = self.project.document_path().map(|path| path.display().to_string()).unwrap_or_default();
+        let package_key = self.active_document_path().map(|path| path.display().to_string()).unwrap_or_default();
         if self.inserts_cache.as_ref().map(|(key, _)| key != &package_key).unwrap_or(true) {
             let inserts = self
                 .project
@@ -6363,7 +6485,7 @@ impl RdeApp {
         let inserts_count = inserts.len();
         let mut clicked_block: Option<(usize, String)> = None;
         // M4.4: «В чат» из строки блока — чип `rde://doc/<id>#block/<bN>` (§8.7.2).
-        let document_id = self.project.document_object().map(|object| object.id.clone()).unwrap_or_default();
+        let document_id = self.active_document_object().map(|object| object.id.clone()).unwrap_or_default();
         let mut attach_block_uri: Option<String> = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Блоки документа").strong().color(pal.text));
@@ -6550,7 +6672,7 @@ impl RdeApp {
         }
         // Применяем правки стиля/формата вставок (R-DOC-11/25).
         if !pending_insert_edits.is_empty() || !pending_insert_updates.is_empty() {
-            let Some(package) = self.project.document_path() else { return };
+            let Some(package) = self.active_document_path() else { return };
             for (insert_id, style, format) in &pending_insert_edits {
                 if let Err(error) = rde_doc::apply_insert_style(&package, insert_id, style) {
                     self.push_log(Level::Warn, format!("Вставка {insert_id}: стиль не применён — {error}"));
@@ -6599,7 +6721,7 @@ impl RdeApp {
             }
         }
         if let Some((number, text)) = clicked_block {
-            if let Some(document) = self.project.document_object() {
+            if let Some(document) = self.active_document_object() {
                 self.selected = Some(document.id.clone());
             }
             // Выбранный блок — якорь для вставок (P8-B1).
@@ -9659,6 +9781,53 @@ mod docview_tests {
         app.tab = super::Tab::Document;
         app.ensure_editor();
         assert!(app.editor.is_some(), "редактор открывает импортированный документ: {:?}", app.editor_error);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Несколько документов в проекте: активный документ следует за импортом/выбором в дереве,
+    /// сохранение пишет активный пакет, а не первый «main» (R-DOC-39 + multi-doc).
+    #[test]
+    fn multiple_documents_activate_selected_and_save_targets_active() {
+        let root = temp_demo_copy("multi-doc");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let main_pkg = app.project.document_path().expect("main-документ демо");
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rde-doc/tests/fixtures/base-report.docx")
+            .canonicalize()
+            .expect("фикстура .docx");
+        app.import_docx_action(&source).expect("импорт .docx");
+        // Импортированный документ стал активным, хотя в проекте уже был «main».
+        let imported_pkg = app.active_document_path().expect("активный документ");
+        assert_ne!(imported_pkg, main_pkg, "активен импортированный, а не main");
+        assert_eq!(app.doc.path.as_ref(), Some(&imported_pkg));
+        assert!(
+            app.active_document_object().unwrap().title.starts_with("[IMPORTED]"),
+            "активный объект — импортированный"
+        );
+        app.ensure_editor();
+        assert!(app.editor.is_some(), "редактор открывает импортированный: {:?}", app.editor_error);
+        // «Сохранить проект» пишет активный пакет; main не перезаписывается.
+        let main_before = std::fs::read(&main_pkg).unwrap();
+        let imported_before = std::fs::read(&imported_pkg).unwrap();
+        app.save_project_document();
+        assert_eq!(std::fs::read(&main_pkg).unwrap(), main_before, "main не перезаписан сохранением");
+        assert_ne!(std::fs::read(&imported_pkg).unwrap(), imported_before, "импортированный документ сохранён");
+        // Выбор «main» в дереве переключает редактор обратно на main.
+        let main_id = app
+            .project
+            .documents()
+            .find(|object| object.dir.join("report.doc.rde") == main_pkg)
+            .map(|object| object.id.clone())
+            .expect("id main-документа");
+        app.apply_tree_action(super::TreeAction::Open(main_id));
+        assert_eq!(app.doc.path.as_ref(), Some(&main_pkg), "выбор main активирует main");
+        // Рестарт приложения: открывается самый свежий документ (импортированный), а не пустой main.
+        let restarted = RdeApp::new(rde_core::load_project(&root).unwrap());
+        assert_eq!(
+            restarted.doc.path.as_ref(),
+            Some(&imported_pkg),
+            "при старте открыт импортированный (свежий) документ"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
