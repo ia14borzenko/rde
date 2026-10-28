@@ -12,6 +12,45 @@
 
 ### Добавлено
 
+- **M4.4 «v0.3 — контекст-ссылки §8.7.2 и diff-UI правок агента» (ADR-0015, 2026-10-28)** — в чат
+  встроенного ACP-агента можно прикладывать **чипы контекста** (R-AGT-03): блок/абзац/комментарий
+  документа, страница или выделенный **регион PDF** (bbox в точках), выход артефакта, источник,
+  заметка, проект/шаблон. URI-схема §8.7.2 — новый модуль **`rde-core::context_ref`** без зависимостей
+  от doc/PDF (8 видов, percent-encoding, строгая валидация id/`page`/bbox/`pageSize`; 7 unit-тестов);
+  разрешение — `rde-ui::context_refs` (`document_blocks`/`comments`, PDF `pdf_page_text`/`pdf_page_size`,
+  текст не-PDF источника, выход артефакта, заметка, проект/шаблон); revision-scoped `@rev`/`content_hash`/
+  `out_hash` при устаревании помечаются «ссылка обновлена» (re-anchor по `block_id`/`paraId`).
+  **Тело агенту не копируется** (R-AGT-08): в ACP-промпт уходит `PromptAttachment` →
+  `ContentBlock::ResourceLink` (uri/name/mimeType/description с указанием MCP-инструмента и аргументов;
+  `rde_agent::prompt_with_attachments`, fake-agent тест), чтение — ленивое через RDE-MCP
+  (`doc_read`/`artifact_read`/`file_read`). Кнопки «В чат»: **структура документа** (колонка «в чат»
+  у каждого блока), **инспектор объекта**, **просмотр PDF** (страница / drag-регион → bbox в точках
+  PDF, рендер `pdftoppm` в `.rde/cache/pdf-pages`, кнопка «Закрыть просмотр»); очередь вложений и чипы
+  в сообщении (`ChatEntry::User.refs`, `serde(default)` — транскрипты M4.3 читаются), дедупликация,
+  «×»/«очистить». **Diff-UI suggested edits** (R-AGT-05; `rde-ui::suggestions_ui`): окно «Правки
+  агента» с word-diff (LCS; красное зачёркнутое/зелёное добавленное, `+N/−M слов`),
+  «Принять»/«Отклонить»/«Отклонить все»/«Обновить», история решений; вход — лента «Агент → Правки
+  агента…» и «Правки… (N)» в панели чата (бейдж обновляется по `PromptFinished`). Accept переиспользует
+  безопасный путь MCP `suggestion_accept`: `CheckpointStore::create` (tool `suggestion_accept`,
+  SHA-256 канонизированных аргументов без тел) + `backup_package` + `Suggestions::apply` (проверки
+  `base_body_hash`/`expected_text`, R-DOC-13) + `commit_document_with` (версия документа в store) +
+  аудит `allow` + `checkpoint_id`; при ошибке — откат файлов + `rolled_back` + аудит `deny`/`apply_error`;
+  reject — решение пользователя + аудит `deny`; **human-in-the-loop** (агент не может принять правку
+  сам). **`rde-mcp`/`rde-host` — 0 правок**, бюджет MCP не менялся (29 / 38 103 Б / 8 886 Б); новых
+  зависимостей нет (`Cargo.lock` без изменений). **Тесты: 482 passed, 0 failed** (459 + 23: `rde-ui`
+  +15 — 5 `context_refs` (resolve всех видов, re-anchor, bbox→points, MIME), 6 `suggestions_ui`
+  (word-diff/LCS-fallback; accept с чекпоинтом+версией+аудитом; stale-rollback; reject/reject-all+аудит;
+  kittest-окно), 2 `chat` (attach/dedupe/remove, refs в транскрипте, обратная совместимость), 2
+  `chat_panel` (чипы в панели, `resource_link` через mock-агент); `rde-core` +7 `context_ref`;
+  `rde-agent` +1 `resource_link`-вложения; `rde-sources` — расширен PDF-тест текста/размера страницы).
+  `cargo check --workspace --all-targets` — 0 новых предупреждений (2 прежних). Headless-скриншоты
+  (`.cache-tmp/shots/`): чат с чипами контекста, окно правок с word-diff, PDF-регион с bbox, структура
+  с колонкой «в чат», инспектор с «В чат». Документы: [ADR-0015](docs/adr/0015-m44-context-refs-and-diff-ui.md),
+  ТЗ §0.2/§5.9 (R-AGT-03/04/05)/§8.7.2/§8.7.3/§10.3/§16, [`docs/state.md`](docs/state.md), README.
+  Ограничения M4.4: PDF-источник/заметки отдают сниппет текста (у RDE-MCP нет `pdf_*`/`note_read`) —
+  eager-деградация; изображение региона в промпт не отправляется (DSH ACP v1 `image=false`) — регион =
+  текст страницы + `page/bbox/pageSize`; комментарии адресуются числовым `w:id`; «В чат» из выделения
+  DocView не начат; полные track changes Word R-DOC-32 — отдельная веха.
 - **M4.3 «v0.3 — встроенный ACP-агент (DSH) и панель чата» (ADR-0014, 2026-10-28)** — RDE получил
   **встроенного агента по ACP**: новый крейт **`rde-agent`** на официальном Rust SDK
   `agent-client-protocol =3.5.0` (Apache-2.0, фича `process`) запускает ACP-агент дочерним процессом

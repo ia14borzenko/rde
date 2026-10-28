@@ -17,6 +17,8 @@ pub mod project;
 pub mod selector;
 pub mod settings;
 pub mod value_format;
+/// M4.4: контекст-ссылки Cursor-like (§8.7.2 ТЗ, R-AGT-03) — URI-схема `rde://…`.
+pub mod context_ref;
 
 pub use manifest::{
     ArtifactManifest, AuthorManifest, ConstantSource, ConstantValue, DocumentManifest, FormulaFragment,

@@ -422,6 +422,54 @@ pub fn pdf_page_count(path: &Path) -> Result<u32, String> {
     Err("pdfinfo: не найдено число страниц".to_owned())
 }
 
+/// Текстовый слой одной страницы PDF (`pdftotext -f/-l`); страницы нумеруются с 1.
+///
+/// Нужно контекст-ссылкам RDE (M4.4, §8.7.2): чип `rde://source/<id>?page=N` резолвится в
+/// текст конкретной страницы без чтения всего PDF.
+pub fn pdf_page_text(path: &Path, page: u32) -> Result<String, String> {
+    if page == 0 {
+        return Err("страницы нумеруются с 1".to_owned());
+    }
+    let page_arg = page.to_string();
+    let path_str = path.to_string_lossy().to_string();
+    let bytes = run_tool(
+        "pdftotext",
+        &["-layout", "-enc", "UTF-8", "-f", &page_arg, "-l", &page_arg, &path_str, "-"],
+    )?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// Размер страницы PDF в точках (`pdfinfo -f N -l N` → `Page size: W x H pts`); страницы с 1.
+///
+/// Нужен для пересчёта региона (bbox) между растром и PDF-координатами в контекст-ссылках
+/// (M4.4): `rde://source/<id>?page=N&bbox=…&pageSize=W,H`.
+pub fn pdf_page_size(path: &Path, page: u32) -> Result<(f32, f32), String> {
+    if page == 0 {
+        return Err("страницы нумеруются с 1".to_owned());
+    }
+    let page_arg = page.to_string();
+    let path_str = path.to_string_lossy().to_string();
+    let bytes = run_tool("pdfinfo", &["-f", &page_arg, "-l", &page_arg, &path_str])?;
+    let text = String::from_utf8_lossy(&bytes);
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Page size:") {
+            // Пример: `Page size: 595.276 x 841.89 pts (A4)`.
+            let values = rest.split('(').next().unwrap_or(rest).trim();
+            let mut parts = values.split(" x ");
+            let width = parts.next().and_then(|value| value.trim().parse::<f32>().ok());
+            let height = parts
+                .next()
+                .map(|value| value.trim().trim_end_matches("pts").trim())
+                .and_then(|value| value.parse::<f32>().ok());
+            if let (Some(width), Some(height)) = (width, height) {
+                return Ok((width, height));
+            }
+            return Err(format!("pdfinfo Page size: не разобран `{rest}`"));
+        }
+    }
+    Err("pdfinfo: не найден размер страницы".to_owned())
+}
+
 /// Отрисовать страницу PDF в PNG (`pdftoppm`, 150 dpi по умолчанию).
 pub fn render_pdf_page(path: &Path, page: u32, out_png: &Path) -> Result<PathBuf, String> {
     if page == 0 {

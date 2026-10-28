@@ -130,9 +130,20 @@ fn pdf_text_render_and_ocr() {
     if tool("pdftotext") {
         let text = pdf_text(&pdf).unwrap();
         assert!(text.contains("RDE") || text.contains("Введение"), "текст PDF: {text:.200}");
+        // M4.4: текст одной страницы — основа контекст-ссылки `rde://source/…?page=N`.
+        let page_text = pdf_page_text(&pdf, 1).unwrap();
+        assert!(
+            page_text.contains("RDE") || page_text.contains("Введение"),
+            "текст страницы 1: {page_text:.200}"
+        );
+        assert!(pdf_page_text(&pdf, 0).is_err(), "страницы нумеруются с 1");
     }
     if tool("pdfinfo") {
         assert!(pdf_page_count(&pdf).unwrap() >= 1);
+        // M4.4: размер страницы (точки) — для пересчёта bbox региона.
+        let (width, height) = pdf_page_size(&pdf, 1).expect("размер страницы");
+        assert!(width > 0.0 && height > 0.0, "размер страницы: {width}x{height}");
+        assert!(pdf_page_size(&pdf, 0).is_err(), "страницы нумеруются с 1");
     }
     if tool("pdftoppm") {
         let png = render_pdf_page(&pdf, 1, &dir.join("page.png")).unwrap();

@@ -1458,3 +1458,94 @@ command -v dsh && dsh --version              # 0.2.0-rc.2, профиль acp; �
 # 5) Перезапустить RDE → «История…» → сессия проекта → «Открыть» (resume): виден транскрипт RDE.
 ```
 
+## Обновление 2026-10-28 (M4.4: контекст-ссылки §8.7.2 и diff-UI правок агента)
+
+**Сделано.** Реализована веха **M4.4** («v0.3: контекст-ссылки и diff-UI suggested edits»,
+[ADR-0015](adr/0015-m44-context-refs-and-diff-ui.md)):
+
+- **URI-схема §8.7.2** в новом модуле `rde-core::context_ref` (без зависимостей от doc/PDF): 8 видов
+  (`rde://project/…`, `doc/…@rev#block|para|comment/…`, `source/…/<hash>?page&bbox&pageSize`,
+  `artifact/…@out_hash/<relpath>`, `note/…`, `template/…@version`), `parse`/`to_uri`/`Display`,
+  percent-encoding, строгая валидация; 7 unit-тестов. `rde-sources`: `pdf_page_text`/`pdf_page_size`.
+- **Разрешение ссылок** `rde-ui::context_refs::resolve_ref`: блок/абзац/комментарий документа
+  (`document_blocks`/`comments`), источник (PDF: текст/размер страницы; не-PDF: текст файла),
+  выход артефакта (защита relpath), заметка, проект/шаблон; revision-scoped `@rev` vs `body_hash`,
+  `content_hash`/`out_hash` → «ссылка обновлена» + re-anchor по `block_id`/`paraId`. Тело **не
+  копируется** в промпт: `resource_link` несёт URI/имя/MIME/подсказку MCP-инструмента (R-AGT-08);
+  исключение (честно) — PDF/заметки: короткий сниппет в `description` (у RDE-MCP нет `pdf_*`/`note_read`).
+- **Чипы «В чат»**: структура документа (колонка «в чат» у каждого блока, вторая после «№»),
+  инспектор объекта (документ→проект, источник, заметка, артефакт→первый выход), PDF-просмотр
+  (страница / drag-регион; bbox в точках PDF из `pageSize`/растра, рендер `pdftoppm` 150 dpi в
+  `.rde/cache/pdf-pages`, высота просмотра ≤420 px). Очередь вложений `ChatState.attachments`,
+  чипы в сообщении (`ChatEntry::User.refs`, `serde(default)` — транскрипты M4.3 читаются),
+  дедупликация/удаление/«очистить».
+- **ACP-промпт**: `rde_agent::PromptAttachment` + `AgentHandle::prompt_with_attachments` →
+  `ContentBlock::ResourceLink` после Text (uri/name/mimeType/description); fake-agent тест.
+- **diff-UI suggested edits** `rde-ui::suggestions_ui` (R-AGT-05): word-diff LCS «было/станет»
+  (fallback для >600 слов, `+N/−M слов`), окно «Правки агента» (pending, «Принять»/«Отклонить»/
+  «Отклонить все»/«Обновить», история решений), точки входа — лента «Агент → Правки агента…» и
+  «Правки… (N)» в панели чата (бейдж по `PromptFinished`/после решения). Accept = путь MCP
+  `suggestion_accept`: `CheckpointStore::create` (tool `suggestion_accept`) + `backup_package` +
+  `Suggestions::apply` (R-DOC-13) + `commit_document_with` (версия в store) + аудит `allow` +
+  `checkpoint_id`; ошибка → откат файлов + `rolled_back` + аудит `deny/apply_error`; reject —
+  решение пользователя + аудит `deny`; human-in-the-loop.
+- **0 правок** в `rde-mcp`/`rde-host`; бюджет MCP не менялся (29 / 38 103 Б / 8 886 Б); новых
+  зависимостей/лицензионных изменений нет.
+
+**Тесты/числа.** `cargo test --workspace` — **482 passed, 0 failed** (M4.3: 459): `rde-ui` 101
+(+15: 5 `context_refs` + 6 `suggestions_ui` (word-diff/LCS-fallback, accept с чекпоинтом+версией+
+аудитом, stale-rollback, reject/reject-all+аудит, kittest-окно) + 2 `chat` (attach/dedupe/remove,
+refs в транскрипте, обратная совместимость) + 2 `chat_panel` (чипы в панели, `resource_link` через
+mock-агент)); `rde-core` 38 (+7 `context_ref`); `rde-agent` 28 (+1 `resource_link`-вложения, 18
+fake-agent); `rde-sources` 6 (расширен PDF-тест текста/размера страницы); `cargo check --workspace
+--all-targets` — 0 новых предупреждений (2 прежних: `rde-run/tests/run.rs`, `rde-core/src/ops.rs`).
+Скриншоты (headless egui_kittest) — `.cache-tmp/shots/m44-*.png`: чат с чипами контекста и полем
+ввода, окно правок с word-diff, PDF-регион с выделением и bbox, структура с колонкой «в чат»,
+инспектор заметки с «В чат».
+
+**Ограничения (честно).** PDF-источник/заметки: тело не читается RDE-MCP (`pdf_*`/`note_read` не
+реализованы) — в `description` уходит сниппет текста (eager-деградация; при появлении инструментов —
+заменить на lazy). Изображение региона в промпт не отправляется (DSH ACP v1
+`promptCapabilities.image=false`) — регион = текст страницы + `page/bbox/pageSize`; кроп-изображение —
+вместе с vision-агентом. Комментарии адресуются числовым `w:id` (ULID импорта ревью в `CommentInfo`
+пока не сохраняется). Встроенные шаблоны v1 без поля версии — versioned-ссылка помечается «обновлена».
+«В чат» из **выделения текста в DocView** не реализовано (структура/инспектор/PDF); quote-selector для
+исчезнувших блоков отложен; сниппет ограничен 1200 символами. Реальный LLM-тур встроенного агента —
+по-прежнему ручная проверка (ключи провайдера в профиле DSH); e2e — handshake/сессии M4.3.
+
+**Следующий шаг:** **M2.7** — run-aware символьные диапазоны (`doc_read_range`/`doc_replace_range` по
+символам с run-сохранением) и полировка v0.3: п.5/п.6 §10.3 (token-economy замер после +1 инструмента,
+документация подключения внешних агентов), затем exit-критерий v0.3 (сценарии «прочитай раздел 2.3»,
+«перепиши абзац с ссылкой», «график артефактом», «обновление»); полные track changes Word R-DOC-32 —
+отдельная веха.
+
+**Проверить руками (M4.4):**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/home/admin-pc/proj/rde-dev/rde/target
+export CARGO_HOME=/home/admin-pc/proj/rde-dev/.cache-tmp/cargo-home
+export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache
+
+# 1) Сборка/тесты (быстро: только затронутые крейты)
+./scripts/build.sh test -p rde-core -p rde-agent -p rde-ui -p rde-sources   # 173 passed
+./scripts/build.sh test --workspace                                         # 482 passed
+
+# 2) GUI (демо-проект открывается по умолчанию; --project / RDE_PROJECT — другой проект)
+./scripts/build.sh run -p rde
+
+# 3) Скриншоты M4.4 (headless, без окна; пути — .cache-tmp/shots/)
+./scripts/build.sh run -p rde-ui --example screenshot -- .cache-tmp/shots/m44-agent-chat-context.png   document '' 2 agent-chat-context dark tall
+./scripts/build.sh run -p rde-ui --example screenshot -- .cache-tmp/shots/m44-agent-suggestions.png   document '' 2 agent-suggestions dark tall
+./scripts/build.sh run -p rde-ui --example screenshot -- .cache-tmp/shots/m44-source-pdf-region.png   source '' 0 source-pdf-region dark tall
+
+# Что проверить руками:
+# a) «Структура» → у блока кнопка «→ чат» → в панели «Агент» строка «Контекст (1): …»; отправить
+#    сообщение в открытой сессии → у агента tool-call doc_read (не тело целиком), чип остаётся в
+#    сообщении; «×»/«очистить» убирают чипы.
+# b) «Источник» (PDF) → «страница»/drag по странице → «В чат: выделенный регион» → чип с bbox;
+#    подсказка показывает page/bbox/pageSize и что тело агенту не копируется.
+# c) Попросить агента «перепиши раздел 2.3»/создать suggested edit (или взять существующие правки) →
+#    «Правки агента…» → word-diff; «Принять» → документ изменился, чекпоинт+версия+аудит
+#    (.rde/agent/checkpoints, .rde/agent/audit.log, история store); «Отклонить» → pending снят.
+```

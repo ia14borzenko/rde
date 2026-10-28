@@ -545,6 +545,24 @@ pub enum AgentEvent {
     },
 }
 
+/// Контекст-ссылка RDE в промпте агента (§8.7.2 ТЗ, M4.4).
+///
+/// Передаётся отдельным блоком `ContentBlock::ResourceLink` рядом с текстом промпта: агент
+/// видит URI и описание, а тело контекста читает **лениво** через RDE-MCP-инструменты
+/// (диапазонные чтения `doc_read`, `file_read`, `artifact_read`, …). Это экономит контекст
+/// (R-AGT-08): в промпте нет тел документов/файлов, только ссылки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptAttachment {
+    /// Канонический URI `rde://…` (см. `rde_core::context_ref::ContextRef`).
+    pub uri: String,
+    /// Человекочитаемое имя ссылки (для агента/логов).
+    pub name: String,
+    /// MIME-тип содержимого (если известен).
+    pub mime_type: Option<String>,
+    /// Подсказка агенту, как читать тело (`doc_read {doc_id, block_id}`, …).
+    pub description: Option<String>,
+}
+
 /// Команда клиенту (публичная для тестового mock-канала и логов; UI ходит через методы).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentCommand {
@@ -575,6 +593,8 @@ pub enum AgentCommand {
     Prompt {
         /// Текст промпта.
         text: String,
+        /// Контекст-ссылки RDE (§8.7.2) — передаются агенту как `resource_link`-блоки.
+        attachments: Vec<PromptAttachment>,
     },
     /// Отменить текущий промпт (`session/cancel`).
     Cancel,

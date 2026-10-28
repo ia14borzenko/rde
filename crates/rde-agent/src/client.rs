@@ -26,7 +26,8 @@ use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectTo, Connect
 
 use crate::protocol;
 use crate::{
-    AgentCommand, AgentConfig, AgentError, AgentEvent, McpServerSpec, PermissionDecision, Result,
+    AgentCommand, AgentConfig, AgentError, AgentEvent, McpServerSpec, PermissionDecision,
+    PromptAttachment, Result,
 };
 
 /// Грейс-период graceful shutdown при [`AgentHandle::shutdown`]/[`Drop`], с.
@@ -197,7 +198,19 @@ impl AgentHandle {
 
     /// Отправить промпт в активную сессию (`session/prompt`).
     pub fn prompt(&self, text: impl Into<String>) -> Result<()> {
-        self.send(AgentCommand::Prompt { text: text.into() })
+        self.prompt_with_attachments(text, Vec::new())
+    }
+
+    /// Отправить промпт с контекст-ссылками RDE (§8.7.2, M4.4): текст + `resource_link`-блоки.
+    ///
+    /// Тела контекста **не** передаются: агент видит URI/имя/описание и читает тело лениво
+    /// через RDE-MCP (`doc_read`, `file_read`, `artifact_read`…; R-AGT-08).
+    pub fn prompt_with_attachments(
+        &self,
+        text: impl Into<String>,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<()> {
+        self.send(AgentCommand::Prompt { text: text.into(), attachments })
     }
 
     /// Отменить текущий промпт (`session/cancel`) — кнопка «Остановить».
@@ -654,7 +667,7 @@ where
                                 events.send(AgentEvent::SessionClosed { session_id });
                         }
                     }
-                    AgentCommand::Prompt { text } => {
+                    AgentCommand::Prompt { text, attachments } => {
                         let Some(state) = session.as_mut() else {
                             let _ = events.send(AgentEvent::Error {
                                 message: "нет открытой сессии: нажмите «Новый чат»".to_owned(),
@@ -671,10 +684,22 @@ where
                             continue;
                         }
                         let session_id = state.id.clone();
-                        let request = schema::PromptRequest::new(
-                            state.id.clone(),
-                            vec![schema::ContentBlock::Text(schema::TextContent::new(text))],
-                        );
+                        // M4.4: текст + контекст-ссылки отдельными `resource_link`-блоками
+                        // (агент читает тела лениво через RDE-MCP; R-AGT-08).
+                        let mut blocks =
+                            vec![schema::ContentBlock::Text(schema::TextContent::new(text))];
+                        for attachment in attachments {
+                            let mut link =
+                                schema::ResourceLink::new(attachment.name, attachment.uri);
+                            if let Some(mime_type) = attachment.mime_type {
+                                link = link.mime_type(mime_type);
+                            }
+                            if let Some(description) = attachment.description {
+                                link = link.description(description);
+                            }
+                            blocks.push(schema::ContentBlock::ResourceLink(link));
+                        }
+                        let request = schema::PromptRequest::new(state.id.clone(), blocks);
                         let prompt_events = events.clone();
                         let prompt_session = session_id.clone();
                         let registered = cx.send_request(request).on_receiving_result(

@@ -46,6 +46,10 @@ fn main() {
         // M4.3: панель чата встроенного ACP-агента (демо-транскрипт) и карточка permission.
         Some("agent-chat") => state.demo_open_agent_chat(),
         Some("agent-chat-permission") => state.demo_open_agent_chat_permission(),
+        // M4.4: чат с чипами контекст-ссылок (§8.7.2) и окно diff-UI правок агента (R-AGT-05).
+        Some("agent-chat-context") => state.demo_open_agent_chat_with_context(),
+        Some("agent-suggestions") => state.demo_open_suggestions(),
+        Some("source-pdf-region") => state.demo_open_pdf_region(),
         // M4.2b: диалог approval внешнего агента (run/git) и режим грантов в панели «Агент».
         Some("agent-approval") => state.demo_open_agent_approval("artifact_run"),
         Some("agent-approval-git") => state.demo_open_agent_approval("git_commit"),

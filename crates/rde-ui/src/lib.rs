@@ -26,6 +26,10 @@ pub mod agent_server;
 pub mod chat;
 /// M4.3: панель чата встроенного ACP-агента — UI и жизненный цикл (R-AGT-01/06).
 mod chat_panel;
+/// M4.4: контекст-ссылки §8.7.2 (чипы «В чат», разрешение в тело, PDF-регион).
+mod context_refs;
+/// M4.4: diff-UI suggested edits (R-AGT-05) — pending-правки, word-diff, accept/reject.
+mod suggestions_ui;
 mod ribbon;
 
 use i18n::{Lang, tr};
@@ -723,6 +727,15 @@ pub struct RdeApp {
     chat_pending_start: Option<chat::ChatStartIntent>,
     /// Действие после закрытия текущей сессии (новый чат/resume — «одна активная сессия»).
     chat_after_close: Option<chat::ChatStartIntent>,
+    // ── M4.4: контекст-ссылки и diff-UI правок ──────────────────────────────
+    /// Просмотр страницы PDF с выбором региона для чипа `rde://source/…?page=&bbox=` (§8.7.2).
+    pdf_region: Option<context_refs::PdfRegionView>,
+    /// Открыто окно «Правки агента» (diff-UI suggested edits, R-AGT-05).
+    show_suggestions: bool,
+    /// Ревизия списка pending-правок (кэш; перечитывается при изменении каталога/по действию).
+    suggestions_cache: Option<Vec<rde_doc::SuggestedEdit>>,
+    /// Демо/тест: подменить список правок без записи в проект (скриншоты/egui_kittest).
+    suggestions_demo: Option<Vec<rde_doc::SuggestedEdit>>,
 }
 
 impl RdeApp {
@@ -806,6 +819,10 @@ impl RdeApp {
             chat_history_open: false,
             chat_pending_start: None,
             chat_after_close: None,
+            pdf_region: None,
+            show_suggestions: false,
+            suggestions_cache: None,
+            suggestions_demo: None,
         };
         app.auto_update = app.project.manifest.document_auto_update;
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
@@ -2835,6 +2852,8 @@ impl RdeApp {
         if self.ui_frames > 1 {
             self.dialogs(ui.ctx());
             self.dialogs_extra(ui.ctx());
+            // M4.4: окно ревью правок агента (diff-UI suggested edits).
+            self.suggestions_window(ui.ctx());
         }
     }
 
@@ -2944,6 +2963,8 @@ impl RdeApp {
                 );
             }
             Cmd::Audit => self.audit_dialog = Some(self.audit_lines()),
+            // M4.4: diff-UI suggested edits — pending-правки агента с word-diff и решениями.
+            Cmd::AgentSuggestions => self.open_suggestions(),
             Cmd::About => self.about_open = true,
         }
     }
@@ -3887,6 +3908,8 @@ impl RdeApp {
         let mut word_copy_clicked = false;
         let mut review_import_clicked = false;
         let mut migrate_formulas_clicked = false;
+        // M4.4: «В чат» — приложить контекст-ссылку выбранного объекта к следующему промпту.
+        let mut attach_chat = false;
         // Инспектор (19-8): 340 px по умолчанию, перетаскивается в диапазоне 280–480 px —
         // центр документа и DAG не должны обрезаться. Ширины — константы раскладки выше.
         egui::Panel::right("rde_inspector")
@@ -3939,6 +3962,20 @@ impl RdeApp {
                             rename_clicked = true;
                         }
                     });
+                    });
+                    // M4.4: контекст-ссылка §8.7.2 — «В чат» выбранного объекта (чип к промпту).
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let w = grid_column_width(ui, 2);
+                        let uri = self.context_uri_for_object(object).ok();
+                        let resp = ui
+                            .add_enabled_ui(uri.is_some(), |ui| btn_w(ui, Role::Secondary, Some(IC_RENAME), "В чат", w))
+                            .inner
+                            .on_disabled_hover_text("для этого объекта контекст-ссылки §8.7.2 нет");
+                        if resp.clicked() {
+                            attach_chat = true;
+                        }
                     });
                     ui.add_space(12.0);
                     ui.separator();
@@ -4220,6 +4257,14 @@ impl RdeApp {
             }
             if migrate_formulas_clicked {
                 self.migrate_document_formulas();
+            }
+            if attach_chat {
+                match self.context_uri_for_object(object) {
+                    Ok(uri) => {
+                        self.attach_context_uri(&uri);
+                    }
+                    Err(error) => self.push_log(Level::Warn, format!("«В чат»: {error}")),
+                }
             }
         }
     }
@@ -6188,6 +6233,9 @@ impl RdeApp {
         let inserts: Vec<rde_doc::RdeInsert> = self.inserts_cache.as_ref().map(|(_, inserts)| inserts.clone()).unwrap_or_default();
         let inserts_count = inserts.len();
         let mut clicked_block: Option<(usize, String)> = None;
+        // M4.4: «В чат» из строки блока — чип `rde://doc/<id>#block/<bN>` (§8.7.2).
+        let document_id = self.project.document_object().map(|object| object.id.clone()).unwrap_or_default();
+        let mut attach_block_uri: Option<String> = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Блоки документа").strong().color(pal.text));
             if let Some(Ok((blocks, figures))) = &cache {
@@ -6211,8 +6259,11 @@ impl RdeApp {
         egui::ScrollArea::both().id_salt("rde_struct_scroll").auto_shrink([false, false]).show(ui, |ui| {
             match cache {
                 Some(Ok((blocks, _figures))) => {
-                    egui::Grid::new("rde_blocks").num_columns(5).spacing([4.0, 2.0]).striped(true).show(ui, |ui| {
+                    egui::Grid::new("rde_blocks").num_columns(6).spacing([4.0, 2.0]).striped(true).show(ui, |ui| {
                         pad_cell(ui, |ui| ui.label(RichText::new("№").small().color(pal.muted)));
+                        // M4.4: «В чат» — вторая колонка, чтобы кнопка была видна без
+                        // горизонтальной прокрутки (широкая колонка «содержимое» — последняя).
+                        pad_cell(ui, |ui| ui.label(RichText::new("в чат").small().color(pal.muted)));
                         pad_cell(ui, |ui| ui.label(RichText::new("тип").small().color(pal.muted)));
                         pad_cell(ui, |ui| ui.label(RichText::new("стиль").small().color(pal.muted)));
                         pad_cell(ui, |ui| ui.label(RichText::new("путь (block)").small().color(pal.muted)));
@@ -6220,6 +6271,18 @@ impl RdeApp {
                         ui.end_row();
                         for block in &blocks {
                             pad_cell(ui, |ui| ui.label(RichText::new(block.number.to_string()).monospace().size(11.0).color(pal.muted)));
+                            // M4.4: чип контекст-ссылки на этот блок для следующего запроса.
+                            pad_cell(ui, |ui| {
+                                if ui
+                                    .small_button("→ чат")
+                                    .on_hover_text("Приложить блок к следующему сообщению агента (rde://doc/… #block)")
+                                    .clicked()
+                                {
+                                    attach_block_uri = Some(
+                                        crate::context_refs::block_uri_for(&document_id, block.number),
+                                    );
+                                }
+                            });
                             // H2/H — осветлённый синий читается только на тёмном;
                             // на светлом берём акцент (контраст ≥ 4.5:1).
                             let h2 = match ui.ctx().theme() {
@@ -6416,6 +6479,10 @@ impl RdeApp {
         }
         if insert_update_requested {
             self.update_project_document();
+        }
+        // M4.4: чип блока из строки «структура» — приложить к следующему сообщению агента.
+        if let Some(uri) = attach_block_uri {
+            self.attach_context_uri(&uri);
         }
     }
     fn artifacts_tab(&mut self, ui: &mut egui::Ui) {
@@ -7313,12 +7380,48 @@ impl RdeApp {
                     self.pdf_cache = Some((key, info));
                 }
                 if let Some((_, info)) = &self.pdf_cache {
+                    let info = info.clone();
                     ui.add_space(6.0);
-                    match info {
+                    match &info {
                         Ok(info) => {
                             ui.label(RichText::new(format!("PDF · {} стр. · текстовый слой {} символов", info.pages, info.text.chars().count())).small().color(pal.muted));
+                            // M4.4: контекст-ссылка «В чат» — страница или выделенный регион PDF
+                            // (§8.7.2, сценарий C4: выбранный фрагмент → чип с page/bbox).
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.label(RichText::new("Контекст-ссылка «В чат» (§8.7.2)").small().strong().color(pal.muted));
+                            ui.horizontal(|ui| {
+                                let page = self
+                                    .pdf_region
+                                    .as_ref()
+                                    .filter(|view| view.path == path)
+                                    .map(|view| view.page)
+                                    .unwrap_or(1);
+                                let mut page_edit = page;
+                                ui.label(RichText::new("страница").small().color(pal.muted));
+                                let changed = ui
+                                    .add(egui::DragValue::new(&mut page_edit).range(1..=info.pages.max(1)).speed(1.0))
+                                    .changed();
+                                let page_edit = if changed { page_edit } else { page };
+                                self.ensure_pdf_region(&path, page_edit);
+                                if ui.button(RichText::new("Закрыть просмотр").size(11.0)).clicked() {
+                                    self.pdf_region = None;
+                                }
+                            });
+                            if self.pdf_region.as_ref().is_some_and(|view| view.path == path) {
+                                self.pdf_region_ui(ui, &source_id);
+                            } else {
+                                ui.label(
+                                    RichText::new("Откройте просмотр страницы, чтобы выделить регион мышью.")
+                                        .small()
+                                        .color(pal.muted),
+                                );
+                            }
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.label(RichText::new("Текстовый слой (стр. 1)").small().strong().color(pal.muted));
                             let excerpt: String = info.text.chars().take(600).collect();
-                            egui::ScrollArea::vertical().id_salt("rde_pdf_text").max_height(160.0).show(ui, |ui| {
+                            egui::ScrollArea::vertical().id_salt("rde_pdf_text").max_height(120.0).show(ui, |ui| {
                                 ui.label(RichText::new(excerpt).monospace().size(11.0).color(pal.text));
                             });
                             if ui.button(RichText::new("OCR страницы 1").size(12.0)).clicked() {

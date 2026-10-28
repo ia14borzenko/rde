@@ -182,6 +182,15 @@ impl PermissionChoice {
     }
 }
 
+/// Контекст-ссылка в сообщении пользователя (чип §8.7.2): URI + подпись.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatRef {
+    /// Канонический URI `rde://…` (`rde_core::context_ref::ContextRef`).
+    pub uri: String,
+    /// Подпись чипа (человекочитаемая, без секретов).
+    pub label: String,
+}
+
 /// Запись транскрипта чата (сериализуется в `transcript.jsonl` без секретов).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "entry", rename_all = "snake_case")]
@@ -190,6 +199,9 @@ pub enum ChatEntry {
     User {
         /// Текст.
         text: String,
+        /// Контекст-ссылки-чипы, приложенные к сообщению (M4.4).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        refs: Vec<ChatRef>,
     },
     /// Сообщение агента.
     Assistant {
@@ -255,7 +267,7 @@ impl ChatEntry {
     /// Текст для поиска/копирования (простые записи).
     pub fn text(&self) -> &str {
         match self {
-            ChatEntry::User { text }
+            ChatEntry::User { text, .. }
             | ChatEntry::Assistant { text }
             | ChatEntry::Thought { text }
             | ChatEntry::Error { text }
@@ -453,6 +465,8 @@ pub struct ChatState {
     pub usage: Option<(u64, u64, Option<String>)>,
     /// Открытый поток текста.
     stream: Option<(usize, StreamKind)>,
+    /// Контекст-ссылки, приложенные к следующему сообщению (чипы «В чат», M4.4).
+    pub attachments: Vec<ChatRef>,
 }
 
 impl ChatState {
@@ -471,6 +485,7 @@ impl ChatState {
         self.config_options.clear();
         self.pending.clear();
         self.stream = None;
+        self.attachments.clear();
         self.mcp_mode = ChatMcpMode::None;
         self.last_prompt = None;
         self.session_title = None;
@@ -742,11 +757,42 @@ impl ChatState {
         }
     }
 
+    /// Приложить контекст-ссылку к следующему сообщению (дедупликация по URI).
+    ///
+    /// Возвращает `false`, если такая ссылка уже приложена.
+    pub fn attach_ref(&mut self, chat_ref: ChatRef) -> bool {
+        if self.attachments.iter().any(|existing| existing.uri == chat_ref.uri) {
+            return false;
+        }
+        self.attachments.push(chat_ref);
+        true
+    }
+
+    /// Убрать чип по индексу.
+    pub fn remove_attachment(&mut self, index: usize) {
+        if index < self.attachments.len() {
+            self.attachments.remove(index);
+        }
+    }
+
+    /// Очистить вложения.
+    pub fn clear_attachments(&mut self) {
+        self.attachments.clear();
+    }
+
     /// Отправить пользовательскую запись в транскрипт и в статус «работает».
+    ///
+    /// Вложения-чипы фиксируются в записи и очищаются (передаются агенту при отправке).
     pub fn mark_prompt_sent(&mut self, text: &str) {
+        let refs = std::mem::take(&mut self.attachments);
+        self.mark_prompt_sent_with_refs(text, refs);
+    }
+
+    /// Как [`Self::mark_prompt_sent`], но с явным списком чипов (демо/тесты).
+    pub fn mark_prompt_sent_with_refs(&mut self, text: &str, refs: Vec<ChatRef>) {
         self.close_stream();
         self.last_prompt = Some(text.to_owned());
-        self.entries.push(ChatEntry::User { text: text.to_owned() });
+        self.entries.push(ChatEntry::User { text: text.to_owned(), refs });
         self.status = ChatStatus::Busy;
         self.last_error = None;
         self.error_hint = None;
@@ -1010,7 +1056,7 @@ mod tests {
         let loaded = load_session_meta(&root, "session-42").expect("метаданные читаются");
         assert_eq!(loaded, meta);
         let entries = vec![
-            ChatEntry::User { text: "вопрос".to_owned() },
+            ChatEntry::User { text: "вопрос".to_owned(), refs: Vec::new() },
             ChatEntry::Assistant { text: "ответ".to_owned() },
             ChatEntry::ToolCall {
                 id: "tc-1".to_owned(),
@@ -1099,5 +1145,78 @@ mod tests {
         assert_eq!(chat.config_value("model").as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(chat.current_model().as_deref(), Some("deepseek-v4-flash"));
         assert!(chat.config_value("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn context_refs_attach_dedupe_remove_and_land_in_user_message() {
+        let mut chat = ChatState::new(true);
+        let block = ChatRef {
+            uri: "rde://doc/DOC#block/b3".to_owned(),
+            label: "doc DOC: блок b3".to_owned(),
+        };
+        let source = ChatRef {
+            uri: "rde://source/SRC?page=37".to_owned(),
+            label: "источник SRC: с. 37".to_owned(),
+        };
+        assert!(chat.attach_ref(block.clone()));
+        assert!(!chat.attach_ref(block.clone()), "дубликат по URI не прикладывается");
+        assert!(chat.attach_ref(source.clone()));
+        assert_eq!(chat.attachments.len(), 2);
+        chat.remove_attachment(0);
+        assert_eq!(chat.attachments, vec![source.clone()]);
+        // Отправка: чипы фиксируются в записи пользователя и очищаются из вложений.
+        chat.mark_prompt_sent("перепиши блок");
+        assert!(chat.attachments.is_empty(), "после отправки чипы уходят в сообщение");
+        let user = chat
+            .entries
+            .last()
+            .expect("запись пользователя");
+        match user {
+            ChatEntry::User { text, refs } => {
+                assert_eq!(text, "перепиши блок");
+                assert_eq!(refs, &vec![source.clone()]);
+            }
+            other => panic!("ожидался User: {other:?}"),
+        }
+        // Очистка передумавших вложений.
+        let _ = chat.attach_ref(block);
+        chat.clear_attachments();
+        assert!(chat.attachments.is_empty());
+        // Прямой вариант с явными чипами (демо/тест) не трогает очередь вложений.
+        let _ = chat.attach_ref(source.clone());
+        chat.mark_prompt_sent_with_refs("ещё", vec![source.clone()]);
+        assert_eq!(chat.attachments.len(), 1, "явный список не очищает очередь");
+    }
+
+    #[test]
+    fn transcript_without_refs_field_remains_readable() {
+        let root = temp_project("refs-backcompat");
+        let entries = vec![ChatEntry::User {
+            text: "старое сообщение".to_owned(),
+            refs: vec![ChatRef {
+                uri: "rde://note/N1".to_owned(),
+                label: "заметка «Идеи»".to_owned(),
+            }],
+        }];
+        let path = save_transcript(&root, "session-refs", &entries).expect("транскрипт");
+        let loaded = load_transcript(&root, "session-refs");
+        assert_eq!(loaded, entries, "refs сохраняются в JSONL и читаются обратно");
+        // Транскрипт M4.3 (без поля refs) читается: serde(default) — обратная совместимость.
+        std::fs::write(
+            &path,
+            "{\"entry\":\"user\",\"text\":\"без чипов\"}\n\
+             {\"entry\":\"assistant\",\"text\":\"ответ\"}\n",
+        )
+        .unwrap();
+        let loaded = load_transcript(&root, "session-refs");
+        assert_eq!(loaded.len(), 2);
+        match &loaded[0] {
+            ChatEntry::User { text, refs } => {
+                assert_eq!(text, "без чипов");
+                assert!(refs.is_empty());
+            }
+            other => panic!("ожидался User: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

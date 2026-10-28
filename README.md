@@ -14,7 +14,20 @@ DocView. Ещё: [светлая тема](docs/fidelity/gui-p10-document-light.
 
 ## Состояние
 
-Текущая веха — **M4.3 «v0.3: встроенный ACP-агент (DSH) и панель чата»**
+Текущая веха — **M4.4 «v0.3: контекст-ссылки §8.7.2 и diff-UI правок агента»**
+(2026-10-28, [ADR-0015](docs/adr/0015-m44-context-refs-and-diff-ui.md)): в чат встроенного ACP-агента
+можно прикладывать **чипы контекста** — блок/абзац/комментарий документа, страница или выделенный
+**регион PDF** (bbox в точках, кэш растра), выход артефакта, источник, заметка, проект/шаблон — из
+структуры документа, инспектора и просмотра PDF. Тело агенту **не копируется**: уходит
+`resource_link` с URI/именем/MIME/подсказкой MCP-инструмента, чтение — ленивое (R-AGT-08);
+revision-scoped ссылки при устаревании помечаются «обновлена» (re-anchor по `paraId`/`block_id`).
+Второй блок — **diff-UI suggested edits** (R-AGT-05): окно «Правки агента» с word-diff «было/станет»
+(+N/−M слов), «Принять»/«Отклонить»/«Отклонить все», история решений; принятие идёт тем же безопасным
+путём, что MCP-инструмент `suggestion_accept` — чекпоинт `.rde/agent/checkpoints`, бэкап пакета,
+версия документа в store, аудит `suggestion_accept`/`suggestion_reject` (human-in-the-loop: агент не
+может принять правку сам). `rde-mcp`/`rde-host` — **0 правок**, бюджет MCP не менялся
+(29 / 38 103 Б / 8 886 Б).
+До M4.4 — **M4.3 «v0.3: встроенный ACP-агент (DSH) и панель чата»**
 (2026-10-28, [ADR-0014](docs/adr/0014-m43-builtin-acp-agent.md)): RDE получил **встроенного агента по
 ACP** — DSH `--profile acp` дочерним процессом, нативная панель чата (статус, «Новый чат»/«История…»/
 «Остановить»/«Закрыть сессию», селекторы модели/reasoning из `configOptions`, поток сообщений/
@@ -230,6 +243,21 @@ JSON, `allow|deny`, kind/timeout/cancel). Провайдер/API-ключи — 
 до текста), история не реплеится, одна активная сессия на проект; LLM-тур — ручная проверка (в CI/песочнице
 проверены только handshake/сессии). Архитектура — [ADR-0014](docs/adr/0014-m43-builtin-acp-agent.md).
 
+**Контекст-ссылки и diff-UI правок (M4.4, R-AGT-03/05/08; [ADR-0015](docs/adr/0015-m44-context-refs-and-diff-ui.md)):**
+кнопки **«В чат»** — в колонке «в чат» таблицы «Структура» (у каждого блока), в инспекторе объекта
+(документ → проект, источник, заметка, артефакт → первый выход) и в просмотре PDF-источника
+(«В чат: страница N» / «В чат: выделенный регион» после drag-выделения на отрисованной странице;
+bbox пересчитывается в точки PDF и показывается в подсказке). Приложенные ссылки — **чипы** строкой
+«Контекст (N):» над полем ввода (× удаляет, «очистить» — все); при отправке тело не копируется —
+агент получает `resource_link` (uri/name/mimeType/description с указанием MCP-инструмента и
+аргументов) и читает лениво. Ограничения честные: PDF-источник и заметки RDE-MCP читать пока не умеет
+(`pdf_*`/`note_read` не реализованы) — в их `description` уходит короткий сниппет текста; image-регион
+не отправляется (DSH ACP v1 `promptCapabilities.image=false`) — регион = текст страницы + `page`/`bbox`/
+`pageSize`. **Правки агента:** лента «Агент → Правки агента…» или кнопка **«Правки… (N)»** в панели
+чата открывают окно word-diff; «Принять» — чекпоинт + версия документа + аудит (как MCP
+`suggestion_accept`), «Отклонить» — решение пользователя с аудитом; частичное принятие — pending-список
+по одной правке. История версий — «История документа»/store; окно показывает последние решения.
+
 **Транспорт streamable HTTP (M3, R-MCP-02/R-MCP-05; выключен по умолчанию):**
 `rde mcp serve --project <dir> --transport http --bind 127.0.0.1:8765` — тот же сервер по HTTP
 (`POST /mcp`, spec 2026-07-28 stateless) + диагностический `GET /health` (без токена и без данных
@@ -333,14 +361,14 @@ rde/
   crates/rde-sources/  # импорт цитат, PDF-текст/рендер, OCR, веб-архив
   crates/rde-vcs/      # git init/status/commit/revert/log/diff, .gitignore/.gitattributes
   crates/rde-mcp/      # MCP-слой (v0.3/M2.6): контракт RdeHost, DTO/схемы, 29 инструментов, ресурсы, grants/approvals, хуки, rmcp-сервер (stdio + streamable HTTP)
-  crates/rde-agent/    # M4.3: ACP-клиент встроенного агента (Rust SDK agent-client-protocol 3.5.0): воркер, сессии, поток session/update, permissions, cancel, fail-closed; нейтральные DTO
+  crates/rde-agent/    # M4.3/M4.4: ACP-клиент встроенного агента (Rust SDK agent-client-protocol 3.5.0): воркер, сессии, поток session/update, permissions, cancel, fail-closed; resource_link-вложения промпта; нейтральные DTO
   crates/rde-host/     # headless-реализация контракта поверх библиотек RDE (чтение, мутации+чекпоинты, документные правки/ревизии, jobs; без egui/rde-ui)
-  crates/rde-ui/       # лента, панели, вкладки, DocView, темы, шрифты, иконки; встроенный MCP HTTP + GUI-approvals для внешних агентов (M4.1/M4.2) и панель чата встроенного ACP-агента (M4.3)
+  crates/rde-ui/       # лента, панели, вкладки, DocView, темы, шрифты, иконки; встроенный MCP HTTP + GUI-approvals для внешних агентов (M4.1/M4.2), панель чата встроенного ACP-агента (M4.3), контекст-ссылки/чипы §8.7.2 и diff-UI suggested edits (M4.4)
   demo-project/        # демо-проект: rde.toml, objects/**; документ — .doc.rde
   docs/schema/         # сгенерированные JSON Schema манифестов
   docs/fidelity/       # отчёты docx-гейтов и актуальные скриншоты интерфейса
   docs/tz-03.md        # ТЗ v03 — канон (истина последней инстанции)
-  docs/adr/            # архитектурные решения (0001–0003, 0005–0014)
+  docs/adr/            # архитектурные решения (0001–0003, 0005–0015)
   scripts/build.sh     # cargo-обёртка: target на /srv/yocto/rde-target + guard
   .cargo/config.toml   # target-dir на внешний диск
   vendor/wordcraft/    # git-субмодуль форка ia14borzenko/wordcraft-rde, ветка rde/main
@@ -370,8 +398,11 @@ rde/
   [0013](docs/adr/0013-m42b-gui-run-git-grants.md) (M4.2b: GUI-гранты `run_script`/`git_commit` —
   отдельные подгалочки, human-readable превью, run только для trusted),
   [0014](docs/adr/0014-m43-builtin-acp-agent.md) (M4.3: встроенный ACP-агент DSH — `rde-agent` на Rust
-  SDK 3.5.0, панель чата, permissions, HTTP-loopback RDE-MCP, транскрипт в проекте).
-- [`CHANGELOG.md`](CHANGELOG.md) — история вех M1–P10 и v0.3-M4.3: что добавлено/изменено/исправлено.
+  SDK 3.5.0, панель чата, permissions, HTTP-loopback RDE-MCP, транскрипт в проекте),
+  [0015](docs/adr/0015-m44-context-refs-and-diff-ui.md) (M4.4: контекст-ссылки §8.7.2 — URI-схема,
+  чипы, `resource_link`, PDF-регион; diff-UI suggested edits — word-diff, accept с
+  чекпоинтом/версией/аудитом).
+- [`CHANGELOG.md`](CHANGELOG.md) — история вех M1–P10 и v0.3-M4.4: что добавлено/изменено/исправлено.
 - [`docs/exit-v0.1.md`](docs/exit-v0.1.md) — exit-критерий v0.1 и что осталось за фазой.
 - [`docs/milestones.md`](docs/milestones.md) — критерии и доказательства вех.
 - [`docs/state.md`](docs/state.md) — снимки состояния проекта и форка.
@@ -408,7 +439,7 @@ rde/
   scope (только loopback; внешний доступ — туннель/reverse-proxy пользователя),
   legacy-сессии MCP/MRTR-approvals — не включены; символьные диапазоны (run-aware, M2.7) и
   вставка таблиц/рисунков (M3+), полные track changes Word R-DOC-32 (отдельная веха),
-  GUI-диалог approval с diff, diff-UI suggested edits и URI-чипы (M4.4);
+  GUI-диалог approval с diff (M4.2), diff-UI suggested edits и URI-чипы (M4.4) — готовы;
   MCP-инструментов `checkpoint_*`/`revision_restore` нет (откат — API хоста/UI), jobs не переживают
   рестарт; правки документа — только простой абзац.
 - **Встроенный агент** (M4.3, [ADR-0014](docs/adr/0014-m43-builtin-acp-agent.md)) — **готов**: ACP-клиент
@@ -418,7 +449,11 @@ rde/
   текста/метаданных); история **не реплеится** агентом (RDE показывает свой транскрипт, restore =
   `session/resume`); одна активная сессия на проект; LLM-тур требует провайдерских ключей в профиле
   DSH (e2e проверяет handshake/сессии, реальный диалог — ручная проверка); ACP-агенты без HTTP-MCP —
-  read-only stdio fallback. URI-чипы/`resource_link` и diff-UI suggested edits — M4.4.
+  read-only stdio fallback. **M4.4** — URI-чипы/`resource_link` и diff-UI suggested edits **готовы**
+  ([ADR-0015](docs/adr/0015-m44-context-refs-and-diff-ui.md)): оговорки — PDF/заметки отдают сниппет
+  (нет MCP `pdf_*`/`note_read`), image-регион не отправляется (регион = текст страницы + bbox),
+  комментарии адресуются числовым `w:id`, «В чат» из выделения DocView — не начат (структура/
+  инспектор/PDF).
 - **За пределами v0.1** — `.rde`-пакет шаринга (R-ART-10), ГОСТ 2.105 (рамки/штампы) и вузовские
   профили, OCR-гейты — v0.2; полная XSD-валидация ECMA-376 — v1.0.
 - **Word** — Microsoft Word/Word COM на стенде отсутствует: открываемость проверяется LO-оракулом

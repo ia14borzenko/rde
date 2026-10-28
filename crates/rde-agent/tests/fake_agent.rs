@@ -720,6 +720,67 @@ async fn prompt_streams_updates_in_order_and_finishes() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// M4.4: контекст-ссылки RDE уходят агенту отдельными `resource_link`-блоками (тела — нет,
+/// агент читает лениво через MCP; §8.7.2/R-AGT-08).
+#[tokio::test(flavor = "current_thread")]
+async fn prompt_with_attachments_sends_resource_links() {
+    let (state, _agent, transport) = start_fake(FakeConfig {
+        stream_updates: false,
+        ..FakeConfig::default()
+    });
+    let mut handle = spawn_client(transport);
+    wait_started(&mut handle).await;
+    let root = temp_dir("attachments");
+    open_session(&mut handle, &root).await;
+    handle
+        .prompt_with_attachments(
+            "прочитай блок и перепиши",
+            vec![
+                rde_agent::PromptAttachment {
+                    uri: "rde://doc/DOC@rev1#block/b3".to_owned(),
+                    name: "Блок b3".to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    description: Some("doc_read {doc_id: \"DOC\", block_id: \"b3\"}".to_owned()),
+                },
+                rde_agent::PromptAttachment {
+                    uri: "rde://source/SRC?page=37&bbox=10.00,20.00,210.00,220.00".to_owned(),
+                    name: "Источник, стр. 37".to_owned(),
+                    mime_type: None,
+                    description: None,
+                },
+            ],
+        )
+        .expect("prompt with attachments");
+    wait_for(&mut handle, |event| matches!(event, AgentEvent::PromptFinished { .. }), "PromptFinished").await;
+    let request = {
+        let shared = lock(&state);
+        shared.recorded.prompts.last().cloned().expect("промпт записан агентом")
+    };
+    assert_eq!(request.prompt.len(), 3, "текст + два resource_link: {:?}", request.prompt);
+    match &request.prompt[0] {
+        schema::ContentBlock::Text(text) => assert_eq!(text.text, "прочитай блок и перепиши"),
+        other => panic!("ожидался Text: {other:?}"),
+    }
+    match &request.prompt[1] {
+        schema::ContentBlock::ResourceLink(link) => {
+            assert_eq!(link.uri, "rde://doc/DOC@rev1#block/b3");
+            assert_eq!(link.name, "Блок b3");
+            assert_eq!(link.mime_type.as_deref(), Some("text/plain"));
+            assert!(link.description.as_deref().unwrap_or_default().contains("doc_read"));
+        }
+        other => panic!("ожидался ResourceLink: {other:?}"),
+    }
+    match &request.prompt[2] {
+        schema::ContentBlock::ResourceLink(link) => {
+            assert_eq!(link.uri, "rde://source/SRC?page=37&bbox=10.00,20.00,210.00,220.00");
+            assert_eq!(link.name, "Источник, стр. 37");
+            assert!(link.mime_type.is_none());
+        }
+        other => panic!("ожидался ResourceLink: {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn permission_request_is_answered_with_selected_option_id() {
     let (state, _agent, transport) = start_fake(FakeConfig {
@@ -1052,7 +1113,7 @@ async fn mock_handle_records_neutral_commands_and_errors_have_no_sdk_types() {
     handle.prompt("привет").expect("prompt");
     assert_eq!(
         mock.recv_command_timeout(Duration::from_secs(1)),
-        Some(AgentCommand::Prompt { text: "привет".to_owned() })
+        Some(AgentCommand::Prompt { text: "привет".to_owned(), attachments: Vec::new() })
     );
     handle.new_session(std::path::PathBuf::from("/tmp/project"), Vec::new()).expect("new_session");
     assert!(matches!(

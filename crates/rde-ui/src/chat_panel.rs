@@ -19,8 +19,10 @@ use rde_agent::{
     PermissionDecision, PermissionRequestInfo,
 };
 use rde_core::Level;
+use rde_core::ObjectData;
 
 use crate::RdeApp;
+use crate::Tab;
 use crate::agent_server::{
     ExternalAgentGrants, ExternalAgentOptions, ExternalAgentServer, ExternalAgentStatus,
 };
@@ -381,11 +383,14 @@ impl RdeApp {
             self.push_log(Level::Warn, "Встроенный агент: нет открытой сессии — «Новый чат»");
             return;
         }
+        // M4.4: приложенные контекст-ссылки (§8.7.2) уходят `resource_link`-блоками; тело агент
+        // читает лениво через RDE-MCP (R-AGT-08).
+        let attachments = self.prompt_attachments();
         let Some(agent) = self.agent.as_ref() else {
             self.push_log(Level::Warn, "Встроенный агент: процесс не запущен");
             return;
         };
-        match agent.prompt(text.clone()) {
+        match agent.prompt_with_attachments(text.clone(), attachments) {
             Ok(()) => {
                 self.chat_input.clear();
                 self.chat.mark_prompt_sent(&text);
@@ -519,6 +524,11 @@ impl RdeApp {
                 AgentEvent::PromptFinished { stop_reason, .. } => {
                     self.chat.apply_prompt_finished(&stop_reason);
                     transcript_dirty = true;
+                    // M4.4: агент мог создать suggested edits — обновляем бейдж/список правок.
+                    let pending = self.refresh_suggestions();
+                    if pending > 0 {
+                        self.push_log(Level::Info, format!("Правки агента: ожидают решения — {pending}"));
+                    }
                 }
                 AgentEvent::ConfigOptionsUpdated { config_options, .. } => {
                     self.chat.apply_config_options(&config_options);
@@ -670,6 +680,20 @@ impl RdeApp {
                 .clicked()
             {
                 close = true;
+            }
+            // M4.4: ревью правок агента (diff-UI suggested edits, R-AGT-05).
+            let pending_suggestions = self.pending_suggestions();
+            let suggestions_label = if pending_suggestions > 0 {
+                format!("Правки… ({pending_suggestions})")
+            } else {
+                "Правки…".to_owned()
+            };
+            if ui
+                .button(suggestions_label)
+                .on_hover_text("Suggested edits агента: word-diff, принять/отклонить (с чекпоинтом и аудитом)")
+                .clicked()
+            {
+                self.open_suggestions();
             }
             if ui
                 .add_enabled(
@@ -886,10 +910,22 @@ impl RdeApp {
                 }
                 for entry in &entries {
                     match entry {
-                        ChatEntry::User { text } => {
+                        ChatEntry::User { text, refs } => {
                             ui.label(
                                 egui::RichText::new(format!("Вы: {text}")).size(12.0).color(pal.text),
                             );
+                            if !refs.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    for chat_ref in refs {
+                                        ui.label(
+                                            egui::RichText::new(format!("🔗 {}", chat_ref.label))
+                                                .size(10.5)
+                                                .color(pal.accent),
+                                        )
+                                        .on_hover_text(&chat_ref.uri);
+                                    }
+                                });
+                            }
                         }
                         ChatEntry::Assistant { text } => {
                             ui.label(
@@ -1053,6 +1089,57 @@ impl RdeApp {
             });
         }
 
+        // ── M4.4: приложенные контекст-ссылки (чипы «В чат», §8.7.2) ──
+        if !self.chat.attachments.is_empty() {
+            ui.add_space(4.0);
+            let mut remove_index: Option<usize> = None;
+            let mut clear_all = false;
+            egui::Frame::new()
+                .fill(pal.panel_hi)
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Контекст ({}):",
+                                self.chat.attachments.len()
+                            ))
+                            .small()
+                            .color(pal.muted),
+                        );
+                        for (index, chat_ref) in self.chat.attachments.iter().enumerate() {
+                            if ui
+                                .small_button(format!("🔗 {}  ✕", chat_ref.label))
+                                .on_hover_text(format!(
+                                    "{}\nТело агенту не копируется — он читает его по ссылке (R-AGT-08).",
+                                    chat_ref.uri
+                                ))
+                                .clicked()
+                            {
+                                remove_index = Some(index);
+                            }
+                        }
+                        if ui.small_button("очистить").clicked() {
+                            clear_all = true;
+                        }
+                    });
+                });
+            if clear_all {
+                self.chat.clear_attachments();
+            } else if let Some(index) = remove_index {
+                self.chat.remove_attachment(index);
+            }
+        } else if self.chat.session_id.is_some() {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(
+                    "Контекст: «В чат» в структуре документа, инспекторе объекта или источнике PDF.",
+                )
+                .small()
+                .color(pal.muted),
+            );
+        }
+
         // ── поле ввода + отправка ──
         ui.add_space(6.0);
         let mut input = std::mem::take(&mut self.chat_input);
@@ -1127,6 +1214,17 @@ impl RdeApp {
         chat.entries = vec![
             ChatEntry::User {
                 text: "Перепиши раздел 2.3 и добавь ссылку на источник".to_owned(),
+                refs: vec![
+                    crate::chat::ChatRef {
+                        uri: "rde://doc/01JDOCDEMO@b7f3c9#para/1A2B3C4D".to_owned(),
+                        label: "блок документа: раздел 2.3".to_owned(),
+                    },
+                    crate::chat::ChatRef {
+                        uri: "rde://source/01JSRCPDF/9f2c?page=37&bbox=72.00,120.00,523.00,360.00&pageSize=595.28,841.89"
+                            .to_owned(),
+                        label: "источник: PDF с. 37 (регион)".to_owned(),
+                    },
+                ],
             },
             ChatEntry::Thought {
                 text: "Нужно прочитать текущую версию раздела и найти подходящий источник.".to_owned(),
@@ -1198,6 +1296,76 @@ impl RdeApp {
         self.app_settings.agent_program = "dsh".to_owned();
         self.app_settings.agent_args = vec!["--profile".to_owned(), "acp".to_owned()];
         self.app_settings_dialog = Some(self.app_settings.clone());
+    }
+
+    /// Для демо/скриншотов M4.4: чат с приложенными контекст-ссылками (§8.7.2) и чипами
+    /// в поле ввода: блок документа, регион PDF-страницы, выход артефакта.
+    pub fn demo_open_agent_chat_with_context(&mut self) {
+        self.demo_open_agent_chat();
+        // Короткий транскрипт: чипы контекста и поле ввода должны попасть в кадр скриншота.
+        self.chat.entries = vec![
+            ChatEntry::User {
+                text: "Сравни выделенный фрагмент источника с блоком 2.3 и предложи правку".to_owned(),
+                refs: vec![
+                    chat::ChatRef {
+                        uri: "rde://doc/01M5VJ1JG04TFF59TDWH9EDD1R#block/b7".to_owned(),
+                        label: "doc 01M5VJ1JG0…: блок b7 (heading2)".to_owned(),
+                    },
+                ],
+            },
+            ChatEntry::Assistant {
+                text: "Прочитал блок 2.3 и страницу 37 источника. Предлагаю правку с ссылкой [1]: \
+                       откройте «Правки…» → word-diff → «Принять»."
+                    .to_owned(),
+            },
+            ChatEntry::Stop { reason: "end_turn".to_owned() },
+        ];
+        self.chat.attachments = vec![
+            chat::ChatRef {
+                uri: "rde://doc/01M5VJ1JG04TFF59TDWH9EDD1R#block/b7".to_owned(),
+                label: "блок b7".to_owned(),
+            },
+            chat::ChatRef {
+                uri: "rde://source/01M5RJHSQJN42R7JNPTPD5N0?page=1&bbox=72.00,120.00,523.00,360.00&pageSize=595.28,841.89"
+                    .to_owned(),
+                label: "PDF с. 1, регион".to_owned(),
+            },
+            chat::ChatRef {
+                uri: "rde://artifact/01M5VJ1JG0ART0000000000000@9f2c2000/report.csv".to_owned(),
+                label: "report.csv".to_owned(),
+            },
+        ];
+        self.chat_input = "Сравни выделенный фрагмент источника с блоком 2.3 и предложи правку".to_owned();
+    }
+
+    /// Для демо/скриншотов M4.4: вкладка «Источники» с просмотром PDF-страницы и выделенным
+    /// регионом (bbox), откуда чип уходит в чат (§8.7.2, сценарий C4).
+    pub fn demo_open_pdf_region(&mut self) {
+        // Демо-выделение региона включается переменной окружения (см. PdfRegionView).
+        unsafe { std::env::set_var("RDE_DEMO_PDF_REGION", "1") };
+        let source = self
+            .project
+            .objects
+            .iter()
+            .find(|object| {
+                matches!(&object.data, ObjectData::Source(source)
+                    if source.file.as_deref().is_some_and(|file| file.to_ascii_lowercase().ends_with(".pdf")))
+            })
+            .cloned();
+        if let Some(source) = source {
+            self.selected = Some(source.id.clone());
+            self.tab = Tab::Source;
+            self.show_inspector = true;
+            if let ObjectData::Source(metadata) = &source.data {
+                if let Some(file) = &metadata.file {
+                    let path = source.dir.join(file);
+                    self.ensure_pdf_region(&path, 1);
+                }
+            }
+            self.push_log(Level::Info, "Демо: PDF-источник — выделен регион страницы 1".to_owned());
+        } else {
+            self.push_log(Level::Warn, "Демо: в проекте нет PDF-источника".to_owned());
+        }
     }
 
     /// Тестовый хук: подключить mock-агент (нейтральные каналы, без процесса).
@@ -1343,6 +1511,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         copy(&rde_core::demo_project_dir(), &root);
+        // Скопированная блокировка store принадлежит другому процессу/запуску — снимаем,
+        // иначе тест получит «хранилище занято» (в копии владельца нет).
+        let _ = std::fs::remove_file(root.join(".rde/lock"));
         root
     }
 
@@ -1506,7 +1677,10 @@ mod tests {
         app.chat_input = "привет, агент".to_owned();
         app.send_chat_prompt();
         match mock.recv_command_timeout(Duration::from_secs(3)) {
-            Some(rde_agent::AgentCommand::Prompt { text }) => assert_eq!(text, "привет, агент"),
+            Some(rde_agent::AgentCommand::Prompt { text, attachments }) => {
+                assert_eq!(text, "привет, агент");
+                assert!(attachments.is_empty(), "без чипов вложений нет");
+            }
             other => panic!("ожидался Prompt, получено {other:?}"),
         }
         assert_eq!(app.chat.status, ChatStatus::Busy);
@@ -1649,6 +1823,88 @@ mod tests {
         );
         assert!(app.chat.last_error.is_some(), "причина в панели");
         app.shutdown_chat("тест");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M4.4: чип «В чат» из реального объекта уходит агенту `resource_link`-блоком (тело — лениво
+    /// через MCP), фиксируется в сообщении пользователя и очищается из очереди вложений.
+    #[test]
+    fn context_ref_chip_is_sent_as_resource_link() {
+        let (mut app, root) = app_with_project("context-chips");
+        let mut mock = app.demo_attach_mock_agent();
+        open_mock_session(&mut app, &mut mock, "session-context", &root);
+        let note_id = app
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(&object.data, ObjectData::Note(_)))
+            .map(|object| object.id.clone())
+            .expect("в демо-проекте есть заметка");
+        let uri = rde_core::context_ref::ContextRef::Note { note_id }.to_uri();
+        assert!(app.attach_context_uri(&uri), "чип приложен");
+        assert!(!app.attach_context_uri(&uri), "дубликат по URI не прикладывается");
+        assert_eq!(app.chat.attachments.len(), 1);
+        assert!(app.show_agent, "панель агента открыта для показа чипа");
+        app.chat_input = "что в заметке?".to_owned();
+        app.send_chat_prompt();
+        match mock.recv_command_timeout(Duration::from_secs(3)) {
+            Some(rde_agent::AgentCommand::Prompt { text, attachments }) => {
+                assert_eq!(text, "что в заметке?");
+                assert_eq!(attachments.len(), 1, "одна ссылка — один resource_link");
+                assert_eq!(attachments[0].uri, uri);
+                assert!(attachments[0].name.contains("заметка"), "{}", attachments[0].name);
+                assert!(
+                    attachments[0].description.as_deref().unwrap_or_default().contains("RDE-контекст"),
+                    "подсказка агенту: {:?}",
+                    attachments[0].description
+                );
+            }
+            other => panic!("ожидался Prompt, получено {other:?}"),
+        }
+        assert!(app.chat.attachments.is_empty(), "после отправки очередь чипов пуста");
+        let last_user = app
+            .chat
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry, ChatEntry::User { .. }))
+            .expect("сообщение пользователя");
+        match last_user {
+            ChatEntry::User { refs, .. } => {
+                assert_eq!(refs.len(), 1);
+                assert_eq!(refs[0].uri, uri);
+            }
+            other => panic!("ожидался User: {other:?}"),
+        }
+        app.shutdown_chat("тест");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M4.4: панель чата показывает чипы приложенного контекста и подсказку, если контекста нет.
+    #[test]
+    fn chat_panel_shows_context_chips() {
+        let (mut app, root) = app_with_project("context-chips-ui");
+        app.demo_open_agent_chat_with_context();
+        let harness = render(app);
+        use egui_kittest::kittest::Queryable;
+        assert!(
+            harness.query_all_by_label_contains("Контекст (3):").next().is_some(),
+            "строка вложений с числом чипов"
+        );
+        assert!(
+            harness.query_all_by_label_contains("report.csv").next().is_some(),
+            "чип выхода артефакта"
+        );
+        assert!(
+            harness.query_all_by_label_contains("PDF с. 1, регион").next().is_some(),
+            "чип региона PDF-источника"
+        );
+        // Кнопки управления чипами отрисованы; логика attach/remove/clear — unit-тест chat.rs.
+        assert!(
+            harness.get_all_by_label("очистить").next().is_some(),
+            "кнопка «очистить» в строке контекста"
+        );
+        assert_eq!(harness.state().chat.attachments.len(), 3);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

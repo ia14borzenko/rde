@@ -6,8 +6,8 @@
 //! `MENU_MODEL`, и тест ниже требует, чтобы каждый из них был на какой-то вкладке ленты.
 
 use super::{
-    IC_ADD, IC_ARTIFACT, IC_CHECK, IC_CODE, IC_CONST, IC_DOC, IC_DOWNLOAD, IC_EXPORT, IC_INSPECT, IC_NOTE, IC_OPEN, IC_REPO, IC_SAVE,
-    IC_SEARCH, IC_SOURCE, IC_TREE, IC_UPDATE,
+    IC_ADD, IC_ARTIFACT, IC_CHECK, IC_CODE, IC_CONST, IC_DOC, IC_DOWNLOAD, IC_EXPORT, IC_INSPECT, IC_NOTE, IC_OPEN, IC_RENAME,
+    IC_REPO, IC_SAVE, IC_SEARCH, IC_SOURCE, IC_TREE, IC_UPDATE,
 };
 
 /// Команда оболочки. Одна точка входа для ленты, строки режимов и (бывшего) меню.
@@ -66,6 +66,8 @@ pub(crate) enum Cmd {
     ToggleServiceObjects,
     // Агент / Помощь
     Audit,
+    /// M4.4: окно ревью правок агента (diff-UI suggested edits).
+    AgentSuggestions,
     About,
     // Масштаб — на ленте (вкладка «Документ», группа «Масштаб», слот `Slot::Zoom`): из строки
     // вкладок центра он убран (§19-7).
@@ -392,7 +394,8 @@ pub(crate) fn ribbon_groups(tab: RibbonTab) -> &'static [Group] {
         RibbonTab::Agent => &[Group {
             title: "Агент",
             slots: &[
-                Slot::Note("MCP/ACP — v0.3 (не подключён)"),
+                Slot::Note("MCP/ACP — v0.3"),
+                Slot::Button { cmd: Cmd::AgentSuggestions, icon: IC_RENAME, label: "Правки\nагента…", tip: "Правки агента (suggested edits): diff, принять/отклонить", primary: false },
                 Slot::Button { cmd: Cmd::Audit, icon: IC_CHECK, label: "Аудит\nдействий…", tip: "Аудит действий…", primary: false },
             ],
         }],
