@@ -23,6 +23,8 @@ pub(crate) enum Cmd {
     ImportReview,
     /// Импорт чужого `.docx` как нового объекта-документа (R-DOC-39, минимальная версия).
     ImportDocx,
+    /// Импорт цитат BibTeX/RIS/CSL-JSON → объекты-источники проекта (rde-sources).
+    ImportCitations,
     // Правка
     Undo,
     Redo,
@@ -78,6 +80,66 @@ pub(crate) enum Cmd {
     // Единственная команда, которая не на ленте: контролы предпросмотра страниц (лента в этом
     // режиме не показывается, поэтому кнопка живёт в панели предпросмотра).
     UpdateInserts,
+}
+
+#[cfg(test)]
+impl Cmd {
+    /// Полный реестр команд диспетчера (лента + панельные контролы). Тест ниже требует, чтобы
+    /// каждая команда была достижима из GUI (на ленте) или явно исключена с причиной — так новая
+    /// команда не может «молча» остаться без кнопки.
+    pub(crate) const ALL: &'static [Cmd] = &[
+        Cmd::NewProject,
+        Cmd::OpenProject,
+        Cmd::SaveProject,
+        Cmd::ExportDocx,
+        Cmd::OpenWordCopy,
+        Cmd::ExportProject,
+        Cmd::ImportReview,
+        Cmd::ImportDocx,
+        Cmd::ImportCitations,
+        Cmd::Undo,
+        Cmd::Redo,
+        Cmd::Find,
+        Cmd::NewObject,
+        Cmd::UpdateDocument,
+        Cmd::ToggleAutoUpdate,
+        Cmd::RollbackDocument,
+        Cmd::RollbackArtifacts,
+        Cmd::InsertValue,
+        Cmd::InsertFigure,
+        Cmd::InsertTable,
+        Cmd::InsertConstant,
+        Cmd::InsertCrossref,
+        Cmd::InsertCitation,
+        Cmd::InsertDate,
+        Cmd::InsertFormula,
+        Cmd::MigrateFormulas,
+        Cmd::ApplyGost,
+        Cmd::InsertBibliography,
+        Cmd::Zoom100,
+        Cmd::PageWidth,
+        Cmd::ZoomOut,
+        Cmd::ZoomIn,
+        Cmd::CheckProject,
+        Cmd::UpdateAll,
+        Cmd::Settings,
+        Cmd::AppSettings,
+        Cmd::ExportDiagnostics,
+        Cmd::GitInit,
+        Cmd::GitCommit,
+        Cmd::GitHistory,
+        Cmd::BackupProject,
+        Cmd::RestoreBackup,
+        Cmd::ToggleTree,
+        Cmd::ToggleAgent,
+        Cmd::ToggleLogs,
+        Cmd::ToggleInspector,
+        Cmd::ToggleServiceObjects,
+        Cmd::Audit,
+        Cmd::AgentSuggestions,
+        Cmd::About,
+        Cmd::UpdateInserts,
+    ];
 }
 
 /// Вкладки ленты (порядок — как в WordCraft: файл, правка, главная, вставка, …).
@@ -226,11 +288,21 @@ pub(crate) fn ribbon_groups(tab: RibbonTab) -> &'static [Group] {
                     Slot::Button {
                         cmd: Cmd::ImportReview,
                         icon: IC_DOWNLOAD,
-                        label: "Импорт ревью\nиз exports",
-                        tip: "Импорт ревью из exports: самый свежий .docx из exports/ становится новой версией документа",
+                        label: "Импорт ревью\nиз Word…",
+                        tip: "Импорт ревью: .docx после правок в Word становится новой версией документа (выбор файла; пусто — свежий из exports/)",
                         primary: false,
                     },
                 ],
+            },
+            Group {
+                title: "Источники",
+                slots: &[Slot::Button {
+                    cmd: Cmd::ImportCitations,
+                    icon: IC_SOURCE,
+                    label: "Импорт\nцитат…",
+                    tip: "Импорт цитат BibTeX/RIS/CSL-JSON: создать объекты-источники проекта с библиографией",
+                    primary: false,
+                }],
             },
         ],
         RibbonTab::Edit => &[
@@ -489,6 +561,27 @@ mod tests {
     fn menu_model_keeps_all_original_items() {
         let total: usize = MENU_MODEL.iter().map(|(_, cmds)| cmds.len()).sum();
         assert_eq!(total, 35);
+    }
+
+    /// (а2) Каждая команда диспетчера достижима из GUI: на ленте или в явном исключении
+    /// с причиной (новая команда не может молча остаться без кнопки).
+    #[test]
+    fn every_command_is_reachable_or_documented_exception() {
+        let ribbon = ribbon_cmds();
+        // Не на ленте по устройству UI (не «забыли»):
+        // • UpdateInserts — кнопка панели предпросмотра страниц (лента там не показывается);
+        // • Zoom* / PageWidth — кластер масштаба `Slot::Zoom` (отрисовка в lib.rs, не Slot::Button).
+        let exceptions = [Cmd::UpdateInserts, Cmd::Zoom100, Cmd::PageWidth, Cmd::ZoomOut, Cmd::ZoomIn];
+        for cmd in Cmd::ALL {
+            assert!(
+                ribbon.contains(cmd) || exceptions.contains(cmd),
+                "команда {cmd:?} недостижима из GUI: нет на ленте и нет в документированных исключениях"
+            );
+        }
+        // Каждая команда ленты присутствует в реестре (обратная полнота).
+        for cmd in ribbon {
+            assert!(Cmd::ALL.contains(&cmd), "команда {cmd:?} есть на ленте, но забыта в Cmd::ALL");
+        }
     }
 
     /// Вкладок девять, у каждой есть хотя бы одна группа с хотя бы одним слотом.

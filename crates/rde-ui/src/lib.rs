@@ -31,7 +31,10 @@ mod context_refs;
 /// M4.4: diff-UI suggested edits (R-AGT-05) — pending-правки, word-diff, accept/reject.
 mod suggestions_ui;
 mod ribbon;
+/// GUI-02: системный выбор файла/папки («Проводник…», ADR-0017) — фоновый, с деградацией.
+pub mod file_dialog;
 
+use file_dialog::{FileDialogService, PathTarget, PickKind, PickRequest};
 use i18n::{Lang, tr};
 use ribbon::{Cmd, RibbonTab, Slot, ribbon_groups};
 use rde_core::{CreateRequest, Freshness, Level, NewObjectKind, ObjectData, ObjectKind, Project};
@@ -447,6 +450,8 @@ enum TreeAction {
     Ocr(String),
     Reveal(String),
     Inspect(String),
+    /// GUI-02: свойства источника/репозитория (path/url/kind задаются в диалоге).
+    Properties(String),
 }
 
 /// Состояние диалога создания объекта.
@@ -539,6 +544,116 @@ enum TrustRequest {
 #[derive(Clone, Debug)]
 struct TrustDialogState {
     request: TrustRequest,
+}
+
+/// «Открыть проект…»: путь к каталогу + последняя ошибка (валидация/открытие).
+/// Диалог не закрывается при ошибке — причина видна под полем, ввод остаётся редактируемым.
+#[derive(Clone, Debug, Default)]
+struct OpenProjectDialog {
+    path: String,
+    error: String,
+    /// Первый кадр диалога — фокус в поле пути.
+    focused: bool,
+}
+
+/// «Импорт .docx…»: путь к файлу, необязательное имя документа и ошибка импорта.
+#[derive(Clone, Debug, Default)]
+struct ImportDocxDialog {
+    path: String,
+    /// Пользовательское имя документа (как `rde import-docx --title`); пусто — из имени файла.
+    title: String,
+    error: String,
+    focused: bool,
+}
+
+/// «Новый проект…»: каталог, название и ошибка создания.
+#[derive(Clone, Debug, Default)]
+struct NewProjectDialog {
+    path: String,
+    name: String,
+    error: String,
+    focused: bool,
+}
+
+/// «Импорт ревью»: путь к `.docx` после правок в Word (пусто — самый свежий из `exports/`).
+#[derive(Clone, Debug, Default)]
+struct ImportReviewDialog {
+    path: String,
+    error: String,
+    focused: bool,
+}
+
+/// «Импорт цитат»: BibTeX / RIS / CSL-JSON → объекты-источники (rde-sources).
+#[derive(Clone, Debug, Default)]
+struct ImportCitationsDialog {
+    path: String,
+    error: String,
+    focused: bool,
+}
+
+/// «Свойства источника»: локатор (файл или URL), дата получения; файл можно прикрепить.
+#[derive(Clone, Debug, Default)]
+pub struct SourceEditDialog {
+    id: String,
+    kind: String,
+    file: String,
+    url: String,
+    retrieved: String,
+    error: String,
+    focused: bool,
+}
+
+/// «Свойства репозитория»: вид (`internal|external|git`) и путь.
+#[derive(Clone, Debug, Default)]
+pub struct RepositoryEditDialog {
+    id: String,
+    kind: String,
+    path: String,
+    error: String,
+    focused: bool,
+}
+
+/// Редактор заметки проекта (MCP-паритет `note_write`: правки из GUI).
+#[derive(Clone, Debug, Default)]
+struct NoteEditorState {
+    id: String,
+    text: String,
+    dirty: bool,
+    error: String,
+}
+
+/// Уровень подсказки под полем пути: зелёный/нейтральный/жёлтый/красный.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathCheckLevel {
+    Ok,
+    Hint,
+    Warn,
+    Error,
+}
+
+/// Результат проверки пути до действия: «путь существует/того типа» + понятное сообщение.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PathCheck {
+    level: PathCheckLevel,
+    text: String,
+}
+
+impl PathCheck {
+    fn ok(text: impl Into<String>) -> Self {
+        Self { level: PathCheckLevel::Ok, text: text.into() }
+    }
+    fn hint(text: impl Into<String>) -> Self {
+        Self { level: PathCheckLevel::Hint, text: text.into() }
+    }
+    fn warn(text: impl Into<String>) -> Self {
+        Self { level: PathCheckLevel::Warn, text: text.into() }
+    }
+    fn error(text: impl Into<String>) -> Self {
+        Self { level: PathCheckLevel::Error, text: text.into() }
+    }
+    fn is_error(&self) -> bool {
+        self.level == PathCheckLevel::Error
+    }
 }
 
 /// Диалог «Вставить в документ»: значение/рисунок из артефакта (R-DOC-11) или формула (P3).
@@ -643,10 +758,22 @@ pub struct RdeApp {
     inserts_cache: Option<(String, Vec<rde_doc::RdeInsert>)>,
     /// Фокус на поиске объектов (кнопка «Поиск», меню «Найти», Ctrl+F).
     search_focus: bool,
-    open_project_dialog: Option<String>,
-    /// Путь к `.docx` для импорта (R-DOC-39): диалог «Импорт .docx…».
-    import_docx_dialog: Option<String>,
-    new_project_dialog: Option<(String, String)>,
+    /// Диалог «Открыть проект…» (путь + ошибка; «Проводник…», недавние проекты).
+    open_project_dialog: Option<OpenProjectDialog>,
+    /// Диалог «Импорт .docx…» (R-DOC-39): путь, имя документа, ошибка.
+    import_docx_dialog: Option<ImportDocxDialog>,
+    /// Диалог «Импорт ревью из Word»: путь к .docx (пусто — свежий из exports/).
+    import_review_dialog: Option<ImportReviewDialog>,
+    /// Диалог «Импорт цитат» (BibTeX/RIS/CSL-JSON).
+    import_citations_dialog: Option<ImportCitationsDialog>,
+    /// Диалог «Новый проект…» (каталог + название + ошибка).
+    new_project_dialog: Option<NewProjectDialog>,
+    /// Диалог «Свойства источника» (file/url + прикрепление файла).
+    source_edit_dialog: Option<SourceEditDialog>,
+    /// Диалог «Свойства репозитория» (path/kind).
+    repo_edit_dialog: Option<RepositoryEditDialog>,
+    /// Редактор заметки во вкладке «Источник».
+    note_editor: Option<NoteEditorState>,
     settings_dialog: Option<ProjectSettingsState>,
     check_dialog: Option<String>,
     audit_dialog: Option<Vec<String>>,
@@ -738,6 +865,19 @@ pub struct RdeApp {
     suggestions_cache: Option<Vec<rde_doc::SuggestedEdit>>,
     /// Демо/тест: подменить список правок без записи в проект (скриншоты/egui_kittest).
     suggestions_demo: Option<Vec<rde_doc::SuggestedEdit>>,
+    // ── GUI-02: «Проводник…» и недавние проекты (ADR-0017) ────────────────────
+    /// Фоновый системный выбор файла/папки (kdialog/zenity; деградация без графики).
+    file_dialog: FileDialogService,
+    /// Готовые выборы, ещё не разложенные по полям диалогов (адрес → путь).
+    picked_paths: Vec<(PathTarget, PathBuf)>,
+    /// Ошибки backend'а выбора (адрес → сообщение): показываются в диалоге, поле редактируемо.
+    picker_errors: Vec<(PathTarget, String)>,
+    /// Куда вернуть фокус после выбора — кнопка «ОК» соответствующего диалога.
+    picker_focus_ok: Vec<PathTarget>,
+    /// Демо/тест: подменённая история проектов (скриншоты, kittest) вместо файла конфига.
+    demo_recent_projects: Option<Vec<rde_core::RecentProject>>,
+    /// Файл истории проектов: `None` — не записывать (тесты); по умолчанию — из конфига RDE.
+    recent_projects_file: Option<PathBuf>,
 }
 
 /// Документ, открываемый при старте: самый свежий по mtime пакета (в проекте может быть несколько
@@ -807,7 +947,12 @@ impl RdeApp {
             search_focus: false,
             open_project_dialog: None,
             import_docx_dialog: None,
+            import_review_dialog: None,
+            import_citations_dialog: None,
             new_project_dialog: None,
+            source_edit_dialog: None,
+            repo_edit_dialog: None,
+            note_editor: None,
             settings_dialog: None,
             check_dialog: None,
             audit_dialog: None,
@@ -853,6 +998,23 @@ impl RdeApp {
             show_suggestions: false,
             suggestions_cache: None,
             suggestions_demo: None,
+            file_dialog: FileDialogService::new(),
+            picked_paths: Vec::new(),
+            picker_errors: Vec::new(),
+            picker_focus_ok: Vec::new(),
+            demo_recent_projects: None,
+            // В unit-тестах история не пишется в конфиг пользователя (тесты создают много
+            // временных проектов); тесты, проверяющие историю, задают путь явно.
+            recent_projects_file: {
+                #[cfg(test)]
+                {
+                    None
+                }
+                #[cfg(not(test))]
+                {
+                    Some(rde_core::recent_projects_path())
+                }
+            },
         };
         app.auto_update = app.project.manifest.document_auto_update;
         // R-RUN-08: ретенция запусков (логи/провенанс не растут бесконечно).
@@ -1344,13 +1506,8 @@ impl RdeApp {
         }
     }
 
-    /// Импорт внешнего ревью: взять самый свежий `.docx` из `exports/` (после правок в Word),
-    /// принять его как новую версию документа, сохранив RDE-метаданные.
-    pub fn import_review_from_exports(&mut self) {
-        let Some(package) = self.active_document_path() else {
-            self.push_log(Level::Warn, "Импорт ревью: в проекте нет документа");
-            return;
-        };
+    /// Самый свежий `.docx` в `exports/` (кандидат для «Импорт ревью из Word»).
+    pub fn latest_export_docx(&self) -> Option<PathBuf> {
         let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(&self.export_dir)
             .into_iter()
             .flatten()
@@ -1366,11 +1523,37 @@ impl RdeApp {
             })
             .collect();
         candidates.sort_by(|a, b| b.0.cmp(&a.0));
-        let Some((_, external)) = candidates.first() else {
-            self.push_log(Level::Warn, format!("Импорт ревью: в {} нет .docx", self.export_dir.display()));
-            return;
+        candidates.first().map(|(_, path)| path.clone())
+    }
+
+    /// Импорт внешнего ревью: `Some(path)` — конкретный `.docx` (выбор «Проводник…»),
+    /// `None` — самый свежий `.docx` из `exports/` (прежнее поведение кнопки).
+    pub fn import_review_from_exports(&mut self) {
+        if let Err(error) = self.import_review_action(None) {
+            self.push_log(Level::Warn, format!("Импорт ревью: {error}"));
+        }
+    }
+
+    /// Общая операция импорта ревью: RDE-часть (.doc.rde), doc_id и вставки сохраняются.
+    pub fn import_review_action(&mut self, source: Option<&Path>) -> Result<(), String> {
+        let Some(package) = self.active_document_path() else {
+            return Err("в проекте нет документа".to_owned());
         };
-        match rde_doc::import_external_review(&package, external) {
+        if !rde_doc::is_rde_package(&package) {
+            return Err("документ ещё не в .doc.rde — сначала «Сохранить проект»".to_owned());
+        }
+        let external = match source {
+            Some(path) => {
+                if !path.is_file() {
+                    return Err(format!("файл ревью не найден: {}", path.display()));
+                }
+                path.to_path_buf()
+            }
+            None => self
+                .latest_export_docx()
+                .ok_or_else(|| format!("в {} нет .docx — укажите файл вручную", self.export_dir.display()))?,
+        };
+        match rde_doc::import_external_review(&package, &external) {
             Ok(report) => {
                 self.comments_cache = None;
                 self.reload_project();
@@ -1383,8 +1566,9 @@ impl RdeApp {
                         report.comments_after
                     ),
                 );
+                Ok(())
             }
-            Err(error) => self.push_log(Level::Warn, format!("Импорт ревью: {error}")),
+            Err(error) => Err(error),
         }
     }
 
@@ -2766,6 +2950,81 @@ impl RdeApp {
         self.open_insert_dialog(kind);
     }
 
+    // ── GUI-02: демо/скриншоты диалогов путей и «Проводника…» (ADR-0017) ────
+
+    /// Демо: «Открыть проект» с заданным путём (по умолчанию — текущий проект).
+    pub fn demo_open_open_project_dialog(&mut self) {
+        self.open_project_dialog = Some(OpenProjectDialog {
+            path: self.project.root.display().to_string(),
+            error: String::new(),
+            focused: false,
+        });
+    }
+
+    /// Демо: подменить историю «Недавние проекты» (скриншоты без реальных каталогов).
+    pub fn demo_set_recent_projects(&mut self, projects: Vec<rde_core::RecentProject>) {
+        self.demo_recent_projects = Some(projects);
+    }
+
+    /// Демо: «Импорт .docx» с заданным путём (для скриншота валидации — можно битый).
+    pub fn demo_open_import_docx_dialog(&mut self, path: &str) {
+        self.import_docx_dialog = Some(ImportDocxDialog {
+            path: path.to_owned(),
+            title: String::new(),
+            error: String::new(),
+            focused: false,
+        });
+    }
+
+    /// Демо: «Новый проект» с заданным каталогом.
+    pub fn demo_open_new_project_dialog(&mut self, path: &str) {
+        self.new_project_dialog = Some(NewProjectDialog {
+            path: path.to_owned(),
+            name: String::new(),
+            error: String::new(),
+            focused: false,
+        });
+    }
+
+    /// Демо: «Импорт цитат» с заданным файлом.
+    pub fn demo_open_import_citations_dialog(&mut self, path: &str) {
+        self.import_citations_dialog = Some(ImportCitationsDialog {
+            path: path.to_owned(),
+            error: String::new(),
+            focused: false,
+        });
+    }
+
+    /// Демо: «Импорт ревью из Word» с заданным путём (пусто — свежий из exports/).
+    pub fn demo_open_import_review_dialog(&mut self, path: &str) {
+        self.import_review_dialog = Some(ImportReviewDialog {
+            path: path.to_owned(),
+            error: String::new(),
+            focused: false,
+        });
+    }
+
+    /// Демо: «Свойства источника» (первый источник проекта).
+    pub fn demo_open_source_edit(&mut self) {
+        let id = self.project.sources().next().map(|source| source.id.clone());
+        if let Some(id) = id {
+            self.open_source_edit(&id);
+        }
+    }
+
+    /// Демо: «Свойства репозитория» (первый репозиторий проекта).
+    pub fn demo_open_repository_edit(&mut self) {
+        if let Some(id) = self
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(object.data, ObjectData::Repository(_)))
+            .map(|object| object.id.clone())
+        {
+            self.open_repository_edit(&id);
+        }
+    }
+
     /// Для демо/скриншотов: показать служебные объекты (формулы) в дереве (P3).
     pub fn demo_show_service_objects(&mut self) {
         self.show_service_objects = true;
@@ -2906,6 +3165,8 @@ impl RdeApp {
         self.poll_agent_approvals();
         // M4.3: события встроенного ACP-агента дренируем каждый кадр (неблокирующе).
         self.poll_agent_events();
+        // GUI-02: результаты фонового «Проводник…» раскладываем по полям диалогов (ADR-0017).
+        self.poll_file_dialog();
         self.ui_frames += 1;
         if !self.fonts_installed {
             install_fonts(ui.ctx());
@@ -2970,7 +3231,18 @@ impl RdeApp {
             self.search_focus = true;
         }
         if save {
-            self.save_project_document();
+            // Ctrl+S: в редакторе заметки сохраняем заметку, иначе — проект (владелец сохранения RDE).
+            let note_dirty = self.note_editor.as_ref().is_some_and(|editor| editor.dirty);
+            let note_selected = self
+                .selected
+                .clone()
+                .and_then(|id| self.project.object(&id))
+                .is_some_and(|object| matches!(object.data, ObjectData::Note(_)));
+            if note_dirty && note_selected {
+                self.save_note_editor();
+            } else {
+                self.save_project_document();
+            }
         }
         if undo && self.editor.is_some() {
             self.undo_document(false);
@@ -3010,6 +3282,156 @@ impl RdeApp {
         self.project.log.push(rde_core::LogLine { time: "сейчас", level, text: text.into() });
     }
 
+    // ── «Проводник…»: системный выбор файла/папки (ADR-0017) ─────────────────
+    // Диалог идёт в фоновом потоке; результат раскладывается по полям в `poll_file_dialog`
+    // (раз в кадр). Ошибка backend'а не блокирует ввод: поле остаётся редактируемым, в журнал
+    // пишется «введите путь вручную».
+
+    /// Подменить backend выбора (kittest/скриншоты: фейк вместо системного окна).
+    pub fn set_file_dialog_backend(&mut self, backend: Arc<dyn file_dialog::PickerBackend>) {
+        self.file_dialog.set_backend(backend);
+    }
+
+    /// Файл истории недавних проектов (`None` — не записывать; тесты/демо).
+    pub fn set_recent_projects_file(&mut self, path: Option<PathBuf>) {
+        self.recent_projects_file = path;
+    }
+
+    /// Подменить историю проектов для диалога (скриншоты/тесты).
+    pub fn set_demo_recent_projects(&mut self, projects: Option<Vec<rde_core::RecentProject>>) {
+        self.demo_recent_projects = projects;
+    }
+
+    /// Недавние проекты для диалога «Открыть проект…»: только существующие каталоги с `rde.toml`
+    /// (запись могла остаться от удалённого/перемещённого проекта — не показываем мёртвые пути).
+    fn recent_projects(&self) -> Vec<rde_core::RecentProject> {
+        // Демо/тест-подмена показывается как есть (скриншоты без реальных каталогов);
+        // история из конфига фильтруется: удалённые/перемещённые проекты не предлагаем.
+        if let Some(projects) = &self.demo_recent_projects {
+            return projects.clone();
+        }
+        rde_core::load_recent_projects()
+            .into_iter()
+            .filter(|project| Path::new(&project.path).join("rde.toml").is_file())
+            .collect()
+    }
+
+    /// Записать проект, с которым приложение стартовало (CLI/`run.sh`), в «Недавние проекты»:
+    /// иначе проект, открытый аргументом, не попадал в историю GUI.
+    pub fn record_startup_project(&mut self) {
+        let name = self.project.manifest.name.clone();
+        let root = self.project.root.clone();
+        self.record_recent_project(&root, &name);
+    }
+
+    /// Запомнить открытый проект в истории (`~/.config/rde/recent-projects.toml` + `last-project`).
+    pub fn record_recent_project(&mut self, root: &Path, name: &str) {
+        let Some(file) = self.recent_projects_file.clone() else { return };
+        match rde_core::settings::record_recent_project_in(&file, root, name) {
+            Ok(path) => self.push_log(Level::Info, format!("Проект добавлен в недавние: {}", path.display())),
+            Err(error) => self.push_log(Level::Warn, format!("История проектов: {error}")),
+        }
+    }
+
+    /// Запустить фоновый системный выбор для конкретного поля (кнопка «Проводник…»).
+    pub fn request_pick(&mut self, ctx: &egui::Context, target: PathTarget, request: PickRequest) {
+        if !self.file_dialog.spawn(ctx, target, request) {
+            self.push_log(Level::Info, "Диалог выбора уже открыт — дождитесь его закрытия");
+        }
+    }
+
+    /// Разложить результаты фонового выбора и записать ошибки деградации в журнал.
+    pub fn poll_file_dialog(&mut self) {
+        for done in self.file_dialog.poll() {
+            match done.result {
+                Ok(Some(path)) => {
+                    self.picker_errors.retain(|(target, _)| target != &done.target);
+                    self.picked_paths.retain(|(target, _)| target != &done.target);
+                    self.picked_paths.push((done.target.clone(), path));
+                    self.picker_focus_ok.push(done.target);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // Ошибка backend'а — не «тихая»: журнал + подпись в диалоге, поле редактируемо.
+                    // Контракт backend'ов: любая ошибка объясняет, что делать (ручной ввод).
+                    let error = if error.contains(file_dialog::MANUAL_HINT) {
+                        error
+                    } else {
+                        format!("{error} — {}", file_dialog::MANUAL_HINT)
+                    };
+                    self.picker_errors.retain(|(target, _)| target != &done.target);
+                    self.picker_errors.push((done.target.clone(), error.clone()));
+                    self.push_log(Level::Warn, error);
+                }
+            }
+        }
+    }
+
+    /// Забранный путь для поля (если в этом кадре пришёл выбор).
+    fn take_picked_path(&mut self, target: &PathTarget) -> Option<PathBuf> {
+        let index = self.picked_paths.iter().position(|(candidate, _)| candidate == target)?;
+        Some(self.picked_paths.remove(index).1)
+    }
+
+    /// Ошибка backend'а для поля (показывается под полем в диалоге).
+    fn take_picker_error(&mut self, target: &PathTarget) -> Option<String> {
+        let index = self.picker_errors.iter().position(|(candidate, _)| candidate == target)?;
+        Some(self.picker_errors.remove(index).1)
+    }
+
+    /// Нужно ли вернуть фокус на «ОК» после успешного выбора (клавиатурный сценарий).
+    fn take_picker_focus_ok(&mut self, target: &PathTarget) -> bool {
+        let index = self.picker_focus_ok.iter().position(|candidate| candidate == target);
+        match index {
+            Some(index) => {
+                self.picker_focus_ok.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Идёт ли сейчас выбор для этого поля (кнопка показывает «…»).
+    fn picker_busy(&self, target: &PathTarget) -> bool {
+        self.file_dialog.in_flight() == Some(target)
+    }
+
+    /// Стартовый каталог диалога: текущий путь поля → его каталог → корень проекта.
+    fn pick_start_dir(&self, current: &str) -> PathBuf {
+        let current = current.trim();
+        if !current.is_empty() {
+            let path = Path::new(current);
+            if path.is_dir() {
+                return path.to_path_buf();
+            }
+            if let Some(parent) = path.parent()
+                && parent.is_dir()
+            {
+                return parent.to_path_buf();
+            }
+        }
+        self.project.root.clone()
+    }
+
+    /// Открыть путь в системном файловом менеджере (в headless — честная запись в журнал).
+    pub fn open_in_file_manager(&mut self, path: &Path) {
+        if !path.exists() {
+            self.push_log(Level::Warn, format!("Файловый менеджер: путь не найден: {}", path.display()));
+            return;
+        }
+        #[cfg(unix)]
+        if file_dialog::graphical_session_available() {
+            match std::process::Command::new("xdg-open").arg(path).spawn() {
+                Ok(_) => {
+                    self.push_log(Level::Info, format!("Открыто в файловом менеджере: {}", path.display()));
+                    return;
+                }
+                Err(error) => self.push_log(Level::Warn, format!("xdg-open: {error} — {}", path.display())),
+            }
+        }
+        self.push_log(Level::Info, format!("Файловый менеджер недоступен (нет графической сессии): {}", path.display()));
+    }
+
     // ── лента RDE и диспетчер команд ────────────────────────────────────────
     // Лента — вкладки сверху, группы команд с подписями снизу (образец WordCraft; данные — в
     // `ribbon.rs`). Все команды идут через `run_cmd`: лента, строка режимов и бывшее меню
@@ -3020,9 +3442,20 @@ impl RdeApp {
         match cmd {
             Cmd::NewProject => {
                 let base = self.project.root.parent().map(|parent| parent.to_path_buf()).unwrap_or_else(|| self.project.root.clone());
-                self.new_project_dialog = Some((base.join("rde-project").display().to_string(), "Новый проект RDE".to_owned()));
+                self.new_project_dialog = Some(NewProjectDialog {
+                    path: base.join("rde-project").display().to_string(),
+                    name: "Новый проект RDE".to_owned(),
+                    error: String::new(),
+                    focused: false,
+                });
             }
-            Cmd::OpenProject => self.open_project_dialog = Some(self.project.root.display().to_string()),
+            Cmd::OpenProject => {
+                self.open_project_dialog = Some(OpenProjectDialog {
+                    path: self.project.root.display().to_string(),
+                    error: String::new(),
+                    focused: false,
+                });
+            }
             Cmd::SaveProject => self.save_project_document(),
             Cmd::ExportDocx => {
                 self.ensure_editor();
@@ -3030,8 +3463,11 @@ impl RdeApp {
             }
             Cmd::OpenWordCopy => self.export_word_copy(),
             Cmd::ExportProject => self.export_project_archive(),
-            Cmd::ImportReview => self.import_review_from_exports(),
-            Cmd::ImportDocx => self.import_docx_dialog = Some(String::new()),
+            // «Импорт ревью»: диалог с выбором .docx (пусто — самый свежий из exports/).
+            Cmd::ImportReview => self.import_review_dialog = Some(ImportReviewDialog::default()),
+            Cmd::ImportDocx => self.import_docx_dialog = Some(ImportDocxDialog::default()),
+            // «Импорт цитат»: BibTeX/RIS/CSL-JSON → объекты-источники (rde-sources).
+            Cmd::ImportCitations => self.import_citations_dialog = Some(ImportCitationsDialog::default()),
             Cmd::Undo => self.undo_document(false),
             Cmd::Redo => self.undo_document(true),
             Cmd::Find => {
@@ -3063,9 +3499,9 @@ impl RdeApp {
             Cmd::PageWidth => self.run_editor_action("view.pageWidth"),
             Cmd::ZoomOut => self.run_editor_action("view.zoomOut"),
             Cmd::ZoomIn => self.run_editor_action("view.zoomIn"),
-            Cmd::UpdateInserts => {
-                self.push_log(Level::Info, "Обновление вставок документа: транзакция появится в следующей итерации (сейчас mock)");
-            }
+            // «Обновить вставки» (панель предпросмотра) — та же операция, что «Обновить документ»:
+            // пересчёт живых вставок, перенумерация подписей и пересохранение .doc.rde транзакцией.
+            Cmd::UpdateInserts => self.update_project_document(),
             Cmd::CheckProject => self.run_project_check(),
             Cmd::UpdateAll => self.request_update(None, true),
             Cmd::Settings => {
@@ -3122,7 +3558,15 @@ impl RdeApp {
     /// Запуск действия редактора WordCraft по id (масштаб). Без открытого редактора — no-op.
     fn run_editor_action(&mut self, id: &'static str) {
         if let Some(ed) = &mut self.editor {
-            let _ = ed.app.run(id, serde_json::json!({}));
+            if let Err(error) = ed.app.run(id, serde_json::json!({})) {
+                self.push_log(Level::Warn, format!("Действие редактора «{id}»: {error}"));
+            }
+        } else {
+            // Раньше это был «тихий» no-op: кнопка масштаба без открытого редактора молчала.
+            self.push_log(
+                Level::Info,
+                "Масштаб документа доступен в режиме редактора (RDE/WordCraft): переключите режим на вкладке «Документ»",
+            );
         }
     }
 
@@ -3132,7 +3576,48 @@ impl RdeApp {
         match cmd {
             Cmd::Undo => self.editor.as_ref().is_some_and(|editor| editor.app.session.can_undo()),
             Cmd::Redo => self.editor.as_ref().is_some_and(|editor| editor.app.session.can_redo()),
+            // Команды, которым нужен документ проекта: в пустом проекте они недоступны с причиной
+            // в тултипе, а не «тихим» предупреждением в журнале после клика.
+            Cmd::ExportDocx
+            | Cmd::OpenWordCopy
+            | Cmd::UpdateDocument
+            | Cmd::RollbackDocument
+            | Cmd::ApplyGost
+            | Cmd::InsertBibliography
+            | Cmd::MigrateFormulas
+            | Cmd::InsertValue
+            | Cmd::InsertFigure
+            | Cmd::InsertTable
+            | Cmd::InsertConstant
+            | Cmd::InsertCrossref
+            | Cmd::InsertCitation
+            | Cmd::InsertDate
+            | Cmd::InsertFormula => self.project.document_path().is_some(),
             _ => true,
+        }
+    }
+
+    /// Причина недоступности команды для тултипа (пусто — команда доступна).
+    fn cmd_disabled_reason(&self, cmd: Cmd) -> &'static str {
+        match cmd {
+            Cmd::Undo => "нечего отменять",
+            Cmd::Redo => "нечего повторять",
+            Cmd::ExportDocx
+            | Cmd::OpenWordCopy
+            | Cmd::UpdateDocument
+            | Cmd::RollbackDocument
+            | Cmd::ApplyGost
+            | Cmd::InsertBibliography
+            | Cmd::MigrateFormulas
+            | Cmd::InsertValue
+            | Cmd::InsertFigure
+            | Cmd::InsertTable
+            | Cmd::InsertConstant
+            | Cmd::InsertCrossref
+            | Cmd::InsertCitation
+            | Cmd::InsertDate
+            | Cmd::InsertFormula => "в проекте нет документа",
+            _ => "",
         }
     }
 
@@ -3210,7 +3695,13 @@ impl RdeApp {
             Slot::Button { cmd, icon, label, tip, primary } => {
                 let enabled = self.cmd_enabled(cmd);
                 let role = if primary { Role::Primary } else { Role::Ghost };
-                let resp = ribbon_button(ui, role, icon, label, tip, vec2(RIBBON_BUTTON_W, RIBBON_BUTTON_H), enabled, false).on_hover_text(tip);
+                // Недоступная команда объясняет причину в тултипе (а не молчит).
+                let hover = match self.cmd_disabled_reason(cmd) {
+                    "" => tip.to_owned(),
+                    reason => format!("{tip}\nНедоступно: {reason}"),
+                };
+                let resp = ribbon_button(ui, role, icon, label, tip, vec2(RIBBON_BUTTON_W, RIBBON_BUTTON_H), enabled, false)
+                    .on_hover_text(hover);
                 (enabled && resp.clicked()).then_some(cmd)
             }
             Slot::Toggle { cmd, icon, label, tip } => {
@@ -3634,7 +4125,7 @@ impl RdeApp {
                                                 action = Some(TreeAction::WordCopy);
                                                 ui.close();
                                             }
-                                            if ui.button("Импорт ревью из exports").clicked() {
+                                            if ui.button("Импорт ревью из Word…").clicked() {
                                                 action = Some(TreeAction::ImportReview);
                                                 ui.close();
                                             }
@@ -3645,6 +4136,23 @@ impl RdeApp {
                                                 action = Some(TreeAction::Ocr(obj.id.clone()));
                                                 ui.close();
                                             }
+                                            if ui
+                                                .button("Свойства источника…")
+                                                .on_hover_text("Файл/URL источника, прикрепление файла («Проводник…»), дата получения")
+                                                .clicked()
+                                            {
+                                                action = Some(TreeAction::Properties(obj.id.clone()));
+                                                ui.close();
+                                            }
+                                        }
+                                        ObjectData::Repository(_)
+                                            if ui
+                                                .button("Свойства репозитория…")
+                                                .on_hover_text("Тип (internal/external/git) и путь репозитория")
+                                                .clicked() =>
+                                        {
+                                            action = Some(TreeAction::Properties(obj.id.clone()));
+                                            ui.close();
                                         }
                                         _ => {}
                                     }
@@ -3763,11 +4271,17 @@ impl RdeApp {
             TreeAction::Ocr(id) => self.ocr_source(&id),
             TreeAction::Reveal(path) => {
                 let path = PathBuf::from(path);
-                #[cfg(unix)]
-                if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
-                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
-                }
+                // Один путь «открыть в файловом менеджере» (headless — честная запись в журнал).
+                self.open_in_file_manager(&path);
                 self.push_log(Level::Info, format!("Каталог: {}", path.display()));
+            }
+            TreeAction::Properties(id) => {
+                let kind = self.project.object(&id).map(|object| object.kind);
+                match kind {
+                    Some(ObjectKind::Source) => self.open_source_edit(&id),
+                    Some(ObjectKind::Repository) => self.open_repository_edit(&id),
+                    _ => self.push_log(Level::Info, "Свойства задаются для источников и репозиториев"),
+                }
             }
         }
     }
@@ -3962,7 +4476,7 @@ impl RdeApp {
                     if btn(ui, Role::Secondary, Some(IC_DOC), "Оформить документ по ГОСТ").clicked() {
                         gost = true;
                     }
-                    if btn(ui, Role::Secondary, Some(IC_DOWNLOAD), "Импорт ревью из exports").clicked() {
+                    if btn(ui, Role::Secondary, Some(IC_DOWNLOAD), "Импорт ревью из Word…").clicked() {
                         review = true;
                     }
                     ui.add_space(10.0);
@@ -4010,16 +4524,15 @@ impl RdeApp {
 
     /// Цель «Открыть» из инспектора: вкладка, где объект реально показан.
     /// Документ → вкладка Документ, артефакт (включая константы — у них то же
-    /// рабочее место) → Артефакты, источник → Источник. У заметок и репозиториев
-    /// центрального вьюера нет (вкладки Источник/Артефакты показали бы чужой
-    /// объект через fallback на первый источник/артефакт) — их показывает только
-    /// сам инспектор, открывать нечего.
+    /// рабочее место) → Артефакты, источник → Источник, заметка → Источник (там её
+    /// редактор). У репозитория центрального вьюера нет — только «Свойства репозитория…».
     fn inspector_open_tab(object: &rde_core::Object) -> Option<Tab> {
         match &object.data {
             ObjectData::Document(_) => Some(Tab::Document),
             ObjectData::Artifact(_) => Some(Tab::Artifacts),
             ObjectData::Source(_) => Some(Tab::Source),
-            ObjectData::Note(_) | ObjectData::Repository(_) => None,
+            ObjectData::Note(_) => Some(Tab::Source),
+            ObjectData::Repository(_) => None,
             // Формула — служебный объект (ADR-0005): отдельного вьюера пока нет (P3/P4).
             ObjectData::Formula(_) => None,
         }
@@ -4062,6 +4575,9 @@ impl RdeApp {
         let mut word_copy_clicked = false;
         let mut review_import_clicked = false;
         let mut migrate_formulas_clicked = false;
+        // GUI-02: свойства источника/репозитория и «Показать каталог» из инспектора.
+        let mut edit_properties_clicked = false;
+        let mut reveal_dir_clicked = false;
         // M4.4: «В чат» — приложить контекст-ссылку выбранного объекта к следующему промпту.
         let mut attach_chat = false;
         // Инспектор (19-8): 340 px по умолчанию, перетаскивается в диапазоне 280–480 px —
@@ -4299,13 +4815,26 @@ impl RdeApp {
                                     field_row(ui, "библиография", &reference.title, false);
                                 }
                             }
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if btn_w(ui, Role::Secondary, Some(IC_SOURCE), "Свойства источника…", grid_column_width(ui, 1)).clicked() {
+                                    edit_properties_clicked = true;
+                                }
+                            });
+                            if btn_w(ui, Role::Ghost, Some(IC_FOLDER), "Показать каталог", grid_column_width(ui, 1)).clicked() {
+                                reveal_dir_clicked = true;
+                            }
                         }
                         ObjectData::Note(note) => {
                             field_row(ui, "файл", &note.file, false);
                             let path = object.dir.join(&note.file);
+                            ui.add_space(4.0);
+                            if btn_w(ui, Role::Primary, Some(IC_OPEN), "Открыть заметку", grid_column_width(ui, 1)).clicked() {
+                                open_clicked = true;
+                            }
                             if let Ok(text) = std::fs::read_to_string(&path) {
                                 ui.add_space(4.0);
-                                ui.label(RichText::new("содержимое").small().color(pal.muted));
+                                ui.label(RichText::new("содержимое (первые 400 символов)").small().color(pal.muted));
                                 let preview: String = text.chars().take(400).collect();
                                 ui.label(RichText::new(preview).size(12.0).color(pal.text));
                             }
@@ -4313,6 +4842,17 @@ impl RdeApp {
                         ObjectData::Repository(repo) => {
                             field_row(ui, "kind", &repo.kind, false);
                             field_row(ui, "path", &repo.path, true);
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if btn_w(ui, Role::Secondary, Some(IC_REPO), "Свойства репозитория…", grid_column_width(ui, 1)).clicked() {
+                                    edit_properties_clicked = true;
+                                }
+                            });
+                            let repo_path = Path::new(&repo.path);
+                            let resolved = if repo_path.is_absolute() { repo_path.to_path_buf() } else { self.project.root.join(repo_path) };
+                            if btn_w(ui, Role::Ghost, Some(IC_FOLDER), "Показать каталог", grid_column_width(ui, 1)).clicked() {
+                                self.open_in_file_manager(&resolved);
+                            }
                         }
                         ObjectData::Document(document) => {
                             field_row(ui, "файл", &document.file, false);
@@ -4352,7 +4892,7 @@ impl RdeApp {
                                     if btn_w(ui, Role::Secondary, Some(IC_OPEN), "Открыть копию в Word", w).clicked() {
                                         word_copy_clicked = true;
                                     }
-                                    if btn_w(ui, Role::Secondary, Some(IC_DOWNLOAD), "Импорт ревью из exports", w).clicked() {
+                                    if btn_w(ui, Role::Secondary, Some(IC_DOWNLOAD), "Импорт ревью из Word…", w).clicked() {
                                         review_import_clicked = true;
                                     }
                                 });
@@ -4411,6 +4951,16 @@ impl RdeApp {
             }
             if migrate_formulas_clicked {
                 self.migrate_document_formulas();
+            }
+            if edit_properties_clicked {
+                match object.data {
+                    ObjectData::Source(_) => self.open_source_edit(&object.id),
+                    ObjectData::Repository(_) => self.open_repository_edit(&object.id),
+                    _ => self.push_log(Level::Info, "Свойства задаются для источников и репозиториев"),
+                }
+            }
+            if reveal_dir_clicked {
+                self.open_in_file_manager(&object.dir);
             }
             if attach_chat {
                 match self.context_uri_for_object(object) {
@@ -4480,14 +5030,23 @@ impl RdeApp {
     /// OOXML + `rde:doc` + paraId) и `import.json` с происхождением. Заголовок помечается
     /// `[IMPORTED]` (R-DOC-39), предупреждения о неподдерживаемых конструкциях — в журнал.
     fn import_docx_action(&mut self, source: &Path) -> Result<(), String> {
+        self.import_docx_action_with_title(source, None)
+    }
+
+    /// То же, но с именем документа (паритет CLI `rde import-docx --title`): `None` — из имени
+    /// файла; префикс `[IMPORTED] ` добавляется, если пользователь его не написал.
+    fn import_docx_action_with_title(&mut self, source: &Path, custom_title: Option<&str>) -> Result<(), String> {
         let source = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
         if !source.is_file() {
             return Err(format!("файл импорта не найден: {}", source.display()));
         }
         let stem = source.file_stem().and_then(|stem| stem.to_str()).unwrap_or("документ");
-        let title = format!("[IMPORTED] {stem}");
-        let dir = rde_core::create_document_stub(&self.project.root, &title)?;
-        let cleanup = |dir: &Path| {
+        let title = match custom_title.map(str::trim).filter(|title| !title.is_empty()) {
+            Some(custom) if custom.starts_with("[IMPORTED]") => custom.to_owned(),
+            Some(custom) => format!("[IMPORTED] {custom}"),
+            None => format!("[IMPORTED] {stem}"),
+        };
+        let dir = rde_core::create_document_stub(&self.project.root, &title)?;        let cleanup = |dir: &Path| {
             let _ = fs::remove_dir_all(dir);
         };
         let project = match rde_core::load_project(&self.project.root) {
@@ -4567,6 +5126,203 @@ impl RdeApp {
         Ok(())
     }
 
+    // ── GUI-02: цитаты и свойства источников/репозиториев ───────────────────
+
+    /// Импорт цитат из BibTeX/RIS/CSL-JSON в объекты-источники (rde-sources).
+    /// Возвращает человекочитаемую сводку для журнала; все записи создаются до ошибки
+    /// или не создаются вовсе (ошибка разбора — до записи).
+    pub fn import_citations_action(&mut self, path: &Path) -> Result<String, String> {
+        let text = fs::read_to_string(path).map_err(|error| format!("не удалось прочитать {}: {error}", path.display()))?;
+        let format = rde_sources::CitationFormat::detect(&text);
+        let references = format.parse(&text).map_err(|error| format!("разбор цитат: {error}"))?;
+        if references.is_empty() {
+            return Err("в файле не найдено ни одной записи".to_owned());
+        }
+        let created = rde_sources::import_citations(&self.project.root, &references)?;
+        self.reload_project();
+        let first_titles: Vec<String> = references.iter().take(3).map(|reference| reference.title.clone()).collect();
+        let more = if references.len() > 3 { format!(", и ещё {}", references.len() - 3) } else { String::new() };
+        Ok(format!(
+            "Импорт цитат: создано источников {} ({}); первые: {}{}",
+            created.len(),
+            match format {
+                rde_sources::CitationFormat::Bibtex => "BibTeX",
+                rde_sources::CitationFormat::Ris => "RIS",
+                rde_sources::CitationFormat::CslJson => "CSL-JSON",
+            },
+            first_titles.join("; "),
+            more
+        ))
+    }
+
+    /// Открыть диалог «Свойства источника» для объекта.
+    pub fn open_source_edit(&mut self, id: &str) {
+        let Some(object) = self.project.object(id).cloned() else {
+            self.push_log(Level::Warn, format!("Источник {id} не найден"));
+            return;
+        };
+        let ObjectData::Source(source) = &object.data else {
+            self.push_log(Level::Warn, "«Свойства источника» доступны только для источников");
+            return;
+        };
+        self.source_edit_dialog = Some(SourceEditDialog {
+            id: id.to_owned(),
+            kind: if source.kind.is_empty() { "file".to_owned() } else { source.kind.clone() },
+            file: source.file.clone().unwrap_or_default(),
+            url: source.url.clone().unwrap_or_default(),
+            retrieved: source.retrieved_at.clone().unwrap_or_default(),
+            error: String::new(),
+            focused: false,
+        });
+    }
+
+    /// Открыть диалог «Свойства репозитория» для объекта.
+    pub fn open_repository_edit(&mut self, id: &str) {
+        let Some(object) = self.project.object(id).cloned() else {
+            self.push_log(Level::Warn, format!("Репозиторий {id} не найден"));
+            return;
+        };
+        let ObjectData::Repository(repo) = &object.data else {
+            self.push_log(Level::Warn, "«Свойства репозитория» доступны только для репозиториев");
+            return;
+        };
+        self.repo_edit_dialog = Some(RepositoryEditDialog {
+            id: id.to_owned(),
+            kind: if repo.kind.is_empty() { "internal".to_owned() } else { repo.kind.clone() },
+            path: repo.path.clone(),
+            error: String::new(),
+            focused: false,
+        });
+    }
+
+    /// Сохранить свойства источника: локатор (файл копируется в объект) и дата получения.
+    pub fn save_source_edit(&mut self, dialog: &SourceEditDialog) -> Result<(), String> {
+        let object = self.project.object(&dialog.id).cloned().ok_or_else(|| format!("источник {} не найден", dialog.id))?;
+        let ObjectData::Source(source) = &object.data else {
+            return Err("объект не является источником".to_owned());
+        };
+        let mut manifest_updates: Vec<(&str, String)> = Vec::new();
+        match dialog.kind.trim() {
+            "url" => {
+                let url = dialog.url.trim();
+                if url.is_empty() {
+                    return Err("для источника-URL укажите адрес".to_owned());
+                }
+                manifest_updates.push(("kind", "url".to_owned()));
+                manifest_updates.push(("url", url.to_owned()));
+            }
+            "repo" => {
+                manifest_updates.push(("kind", "repo".to_owned()));
+                if !dialog.url.trim().is_empty() {
+                    manifest_updates.push(("url", dialog.url.trim().to_owned()));
+                }
+            }
+            _ => {
+                let file_field = dialog.file.trim();
+                if file_field.is_empty() {
+                    return Err("укажите файл источника («Проводник…») или выберите тип URL".to_owned());
+                }
+                let candidate = Path::new(file_field);
+                // Уже лежит в объекте (относительный путь из source.toml) — оставить как есть;
+                // иначе прикрепить: скопировать файл в каталог объекта-источника.
+                let inside = !candidate.is_absolute() && object.dir.join(candidate).is_file();
+                let file_name = if inside {
+                    file_field.to_owned()
+                } else {
+                    self.attach_source_file(&object.dir, candidate, source.file.as_deref())?
+                };
+                manifest_updates.push(("kind", "file".to_owned()));
+                manifest_updates.push(("file", file_name));
+            }
+        }
+        if !dialog.retrieved.trim().is_empty() {
+            manifest_updates.push(("retrieved_at", dialog.retrieved.trim().to_owned()));
+        }
+        let manifest_path = object.dir.join("source.toml");
+        for (key, value) in &manifest_updates {
+            set_manifest_string(&manifest_path, key, value)?;
+        }
+        // Локатор другого типа не должен «висеть» в манифесте (file у URL-источника и наоборот).
+        let keep: Vec<&str> = manifest_updates.iter().map(|(key, _)| *key).collect();
+        for key in ["file", "url"] {
+            if !keep.contains(&key) {
+                let _ = set_manifest_optional_string(&manifest_path, key, None);
+            }
+        }
+        self.reload_project();
+        self.push_log(Level::Ok, format!("Источник «{}» сохранён", object.title));
+        Ok(())
+    }
+
+    /// Скопировать файл в каталог объекта-источника (оригинал не изменяется) и вернуть
+    /// относительное имя файла для `source.toml`. Файл, который уже лежит в каталоге объекта,
+    /// используется как есть.
+    fn attach_source_file(&self, object_dir: &Path, picked: &Path, existing: Option<&str>) -> Result<String, String> {
+        if !picked.is_file() {
+            return Err(format!("файл источника не найден: {}", picked.display()));
+        }
+        let inside = picked.canonicalize().ok().and_then(|canonical| {
+            object_dir
+                .canonicalize()
+                .ok()
+                .filter(|dir| canonical.starts_with(dir))
+                .and_then(|_| canonical.file_name().map(|name| name.to_string_lossy().to_string()))
+        });
+        if let Some(name) = inside {
+            return Ok(name);
+        }
+        let file_name = picked
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .ok_or_else(|| "у выбранного файла нет имени".to_owned())?;
+        // Не затирать другой прикреплённый файл с тем же именем: уникализировать.
+        let mut target = object_dir.join(&file_name);
+        if target.is_file() && existing != Some(file_name.as_str()) {
+            let stem = picked.file_stem().map(|stem| stem.to_string_lossy().to_string()).unwrap_or_else(|| "source".to_owned());
+            let ext = picked.extension().map(|ext| ext.to_string_lossy().to_string()).unwrap_or_default();
+            let mut index = 1;
+            loop {
+                let candidate = if ext.is_empty() { format!("{stem}-{index}") } else { format!("{stem}-{index}.{ext}") };
+                target = object_dir.join(&candidate);
+                if !target.exists() {
+                    return self.copy_source_file(picked, &target).map(|_| candidate);
+                }
+                index += 1;
+                if index > 1000 {
+                    return Err(format!("не удалось подобрать имя для {}", picked.display()));
+                }
+            }
+        }
+        self.copy_source_file(picked, &target)?;
+        Ok(file_name)
+    }
+
+    fn copy_source_file(&self, from: &Path, to: &Path) -> Result<(), String> {
+        fs::copy(from, to).map(|_| ()).map_err(|error| format!("копировать {} → {}: {error}", from.display(), to.display()))
+    }
+
+    /// Сохранить свойства репозитория (`repo.toml`: kind/path).
+    pub fn save_repository_edit(&mut self, dialog: &RepositoryEditDialog) -> Result<(), String> {
+        let object = self.project.object(&dialog.id).cloned().ok_or_else(|| format!("репозиторий {} не найден", dialog.id))?;
+        if !matches!(object.data, ObjectData::Repository(_)) {
+            return Err("объект не является репозиторием".to_owned());
+        }
+        let path_text = dialog.path.trim();
+        if path_text.is_empty() {
+            return Err("путь репозитория не может быть пустым".to_owned());
+        }
+        let kind = match dialog.kind.trim() {
+            "internal" | "external" | "git" => dialog.kind.trim().to_owned(),
+            other => return Err(format!("неизвестный тип репозитория «{other}» (internal|external|git)")),
+        };
+        let manifest_path = object.dir.join("repo.toml");
+        set_manifest_string(&manifest_path, "kind", &kind)?;
+        set_manifest_string(&manifest_path, "path", path_text)?;
+        self.reload_project();
+        self.push_log(Level::Ok, format!("Репозиторий «{}» сохранён: {kind} · {path_text}", object.title));
+        Ok(())
+    }
+
     /// Проверка внешних правок документа при открытии проекта (M3/M5).
     fn check_external_edit_on_startup(&mut self) {
         if let Some(path) = self.active_document_path() {
@@ -4637,7 +5393,11 @@ impl RdeApp {
                     if self.editor.is_some() {
                         self.save_project_document();
                     }
+                    let name = rde_core::load_project(path).map(|project| project.name).unwrap_or_default();
                     self.open_project(path);
+                    if !name.is_empty() {
+                        self.record_recent_project(path, &name);
+                    }
                 } else {
                     self.push_log(
                         Level::Warn,
@@ -4725,6 +5485,9 @@ impl RdeApp {
         }
         self.open_project(root);
         self.push_log(Level::Ok, format!("Создан проект «{}»: {}", name.trim(), root.display()));
+        // GUI-02: новый проект сразу попадает в «Недавние проекты» (и в last-project для run.sh).
+        let project_name = self.project.manifest.name.clone();
+        self.record_recent_project(root, &project_name);
         for note in notes {
             self.push_log(Level::Info, format!("Проект: {note}"));
         }
@@ -5122,115 +5885,834 @@ impl RdeApp {
                 self.backup_dialog = Some(backups);
             }
         }
-        if let Some(mut path) = self.open_project_dialog.take() {
+        // ── «Открыть проект…»: «Проводник…», недавние проекты, проверка пути ────
+        if let Some(mut dialog) = self.open_project_dialog.take() {
+            // Результат системного выбора (пришёл в этом кадре) → поле пути, ошибка сброшена.
+            if let Some(picked) = self.take_picked_path(&file_dialog::PathTarget::OpenProject) {
+                dialog.path = picked.display().to_string();
+                dialog.error.clear();
+            }
+            let picker_error = self.take_picker_error(&file_dialog::PathTarget::OpenProject);
+            let focus_ok = self.take_picker_focus_ok(&file_dialog::PathTarget::OpenProject);
+            let busy = self.picker_busy(&file_dialog::PathTarget::OpenProject);
+            let start = self.pick_start_dir(&dialog.path);
+            let recent = self.recent_projects();
             let mut open = false;
             let mut cancel = false;
+            let mut pick = false;
+            let mut reveal = false;
+            let mut closed = false;
+            let check = validate_project_dir(&dialog.path);
+            let can_open = !check.is_error();
+            let focus_field = !dialog.focused;
             egui::Window::new("Открыть проект")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
                 .show(ctx, |ui| {
-                    ui.set_min_width(520.0);
-                    ui.add(egui::TextEdit::singleline(&mut path).hint_text("Путь к каталогу с rde.toml").desired_width(f32::INFINITY));
-                    ui.label(RichText::new("Нужен каталог, в котором есть rde.toml").small().color(pal.muted));
+                    ui.set_width(640.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Открыть").clicked() {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut dialog.path)
+                                .hint_text("Путь к каталогу с rde.toml")
+                                .desired_width(500.0),
+                        );
+                        if focus_field {
+                            response.request_focus();
+                        }
+                        if response.changed() {
+                            dialog.error.clear();
+                        }
+                        if picker_button(ui, busy).clicked() {
+                            pick = true;
+                        }
+                    });
+                    path_caption_ui(ui, pal, &dialog.path);
+                    path_check_ui(ui, pal, &check, picker_error.as_deref());
+                    if !dialog.error.is_empty() {
+                        ui.label(RichText::new(&dialog.error).small().color(pal.red));
+                    }
+                    if !recent.is_empty() {
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.label(RichText::new("Недавние проекты").small().strong().color(pal.muted));
+                        egui::ScrollArea::vertical().id_salt("rde_recent_projects").max_height(132.0).show(ui, |ui| {
+                            for project in &recent {
+                                ui.horizontal(|ui| {
+                                    let label = if project.name.trim().is_empty() {
+                                        ellipsize_path(&project.path, 46)
+                                    } else {
+                                        project.name.clone()
+                                    };
+                                    if ui
+                                        .add(egui::Button::new(RichText::new(label).size(12.5)))
+                                        .on_hover_text(&project.path)
+                                        .clicked()
+                                    {
+                                        dialog.path = project.path.clone();
+                                        open = true;
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(ellipsize_path(&project.path, 58)).small().color(pal.muted),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                            }
+                        });
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let ok = ui.add_enabled(
+                            can_open,
+                            egui::Button::new("Открыть").min_size(vec2(96.0, 24.0)),
+                        );
+                        let ok = if focus_ok && can_open {
+                            ok.request_focus();
+                            ok
+                        } else {
+                            ok
+                        };
+                        let hint = if can_open { "Открыть выбранный проект" } else { "Сначала укажите каталог с rde.toml" };
+                        if ok.on_hover_text(hint).clicked() {
                             open = true;
                         }
                         if ui.button("Отмена").clicked() {
                             cancel = true;
                         }
+                        if !dialog.path.trim().is_empty() && ui.button("Показать каталог").clicked() {
+                            reveal = true;
+                        }
                     });
+                    ui.label(
+                        RichText::new("Enter — открыть · Esc — отмена · «Проводник…» — системный выбор папки")
+                            .small()
+                            .color(pal.muted),
+                    );
                 });
-            if open {
-                let root = PathBuf::from(path.trim());
-                if root.join("rde.toml").is_file() {
-                    self.open_project(&root);
-                } else {
-                    self.push_log(Level::Warn, format!("Открыть проект: в {} нет rde.toml", root.display()));
+            dialog.focused = true;
+            if pick {
+                self.request_pick(
+                    ctx,
+                    file_dialog::PathTarget::OpenProject,
+                    PickRequest::new("Открыть проект RDE", PickKind::Folder).with_start(start),
+                );
+            } else if cancel || dialog_escape_pressed(ctx) {
+                closed = true;
+            } else if (open || dialog_confirm_pressed(ctx)) && can_open {
+                let root = PathBuf::from(dialog.path.trim());
+                match rde_core::load_project(&root) {
+                    Ok(project) => {
+                        let name = project.name.clone();
+                        self.open_project(&root);
+                        self.record_recent_project(&root, &name);
+                        closed = true;
+                    }
+                    Err(error) => {
+                        dialog.error = format!("Не удалось открыть проект: {error}");
+                        self.push_log(Level::Warn, format!("Открыть проект: {error}"));
+                    }
                 }
             }
-            if !open && !cancel {
-                self.open_project_dialog = Some(path);
+            if reveal {
+                self.open_in_file_manager(Path::new(dialog.path.trim()));
+            }
+            if !closed {
+                self.open_project_dialog = Some(dialog);
             }
         }
 
-        if let Some(mut path) = self.import_docx_dialog.take() {
+        // ── «Импорт .docx…»: «Проводник…» (фильтр .docx), имя документа, проверка пути ──
+        if let Some(mut dialog) = self.import_docx_dialog.take() {
+            if let Some(picked) = self.take_picked_path(&file_dialog::PathTarget::ImportDocx) {
+                dialog.path = picked.display().to_string();
+                dialog.error.clear();
+            }
+            let picker_error = self.take_picker_error(&file_dialog::PathTarget::ImportDocx);
+            let focus_ok = self.take_picker_focus_ok(&file_dialog::PathTarget::ImportDocx);
+            let busy = self.picker_busy(&file_dialog::PathTarget::ImportDocx);
+            let start = self.pick_start_dir(&dialog.path);
             let mut import = false;
             let mut cancel = false;
+            let mut pick = false;
+            let mut reveal = false;
+            let mut closed = false;
+            let check = validate_docx_file(&dialog.path);
+            let can_import = !check.is_error();
+            let focus_field = !dialog.focused;
             egui::Window::new("Импорт .docx")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
                 .show(ctx, |ui| {
-                    ui.set_min_width(620.0);
-                    ui.add(egui::TextEdit::singleline(&mut path).hint_text("Путь к .docx (например, /home/…/vkr.docx)").desired_width(f32::INFINITY));
+                    ui.set_width(680.0);
+                    ui.horizontal(|ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut dialog.path)
+                                .hint_text("Путь к .docx (например, /home/…/vkr.docx)")
+                                .desired_width(520.0),
+                        );
+                        if focus_field {
+                            response.request_focus();
+                        }
+                        if response.changed() {
+                            dialog.error.clear();
+                        }
+                        if picker_button(ui, busy).clicked() {
+                            pick = true;
+                        }
+                    });
+                    path_caption_ui(ui, pal, &dialog.path);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Имя документа").small().color(pal.muted));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dialog.title)
+                                .hint_text("пусто — из имени файла (будет «[IMPORTED] имя»)")
+                                .desired_width(360.0),
+                        );
+                    });
+                    path_check_ui(ui, pal, &check, picker_error.as_deref());
+                    if !dialog.error.is_empty() {
+                        ui.label(RichText::new(&dialog.error).small().color(pal.red));
+                    }
                     ui.label(
                         RichText::new(
                             "Создаётся новый объект-документ «[IMPORTED] имя»; исходный .docx не изменяется. \
-                             Импорт фиксирует происхождение (sha256) и предупреждает о конструкциях, \
-                             которые RDE не поддерживает (диаграммы, макросы, track changes, поля Word…).",
+                             Импорт фиксирует происхождение (sha256), конвертирует MathType-формулы в нативные \
+                             (R-DOC-44) и предупреждает о неподдерживаемых конструкциях (диаграммы, макросы, \
+                             track changes, поля Word…).",
                         )
                         .small()
                         .color(pal.muted),
                     );
                     ui.horizontal(|ui| {
-                        if ui.button("Импортировать").clicked() {
+                        let button = ui.add_enabled(
+                            can_import,
+                            egui::Button::new("Импортировать").min_size(vec2(112.0, 24.0)),
+                        );
+                        let button = if focus_ok && can_import {
+                            button.request_focus();
+                            button
+                        } else {
+                            button
+                        };
+                        let hint = if can_import { "Импортировать .docx в текущий проект" } else { "Сначала выберите существующий .docx" };
+                        if button.on_hover_text(hint).clicked() {
                             import = true;
                         }
                         if ui.button("Отмена").clicked() {
                             cancel = true;
                         }
+                        if !dialog.path.trim().is_empty() && ui.button("Показать папку").clicked() {
+                            reveal = true;
+                        }
                     });
+                    ui.label(
+                        RichText::new("Enter — импортировать · Esc — отмена · «Проводник…» — выбор файла .docx")
+                            .small()
+                            .color(pal.muted),
+                    );
                 });
-            if import {
-                let source = PathBuf::from(path.trim());
-                match self.import_docx_action(&source) {
-                    Ok(()) => {}
+            dialog.focused = true;
+            if pick {
+                self.request_pick(
+                    ctx,
+                    file_dialog::PathTarget::ImportDocx,
+                    PickRequest::new("Импорт .docx", PickKind::file("Документы Word", &["docx"])).with_start(start),
+                );
+            } else if cancel || dialog_escape_pressed(ctx) {
+                closed = true;
+            } else if (import || dialog_confirm_pressed(ctx)) && can_import {
+                let source = PathBuf::from(dialog.path.trim());
+                let title = dialog.title.trim().to_owned();
+                match self.import_docx_action_with_title(&source, (!title.is_empty()).then_some(title.as_str())) {
+                    Ok(()) => closed = true,
                     Err(error) => {
+                        dialog.error = format!("Импорт не выполнен: {error}");
                         self.push_log(Level::Warn, format!("Импорт .docx: {error}"));
-                        self.import_docx_dialog = Some(path);
                     }
                 }
-            } else if !cancel {
-                self.import_docx_dialog = Some(path);
+            }
+            if reveal {
+                let path = PathBuf::from(dialog.path.trim());
+                let dir = if path.is_dir() { path } else { path.parent().map(Path::to_path_buf).unwrap_or_default() };
+                if !dir.as_os_str().is_empty() {
+                    self.open_in_file_manager(&dir);
+                }
+            }
+            if !closed {
+                self.import_docx_dialog = Some(dialog);
             }
         }
 
-        if let Some((mut path, mut name)) = self.new_project_dialog.take() {
+        // ── «Новый проект…»: «Проводник…», проверка каталога, понятная ошибка ────
+        if let Some(mut dialog) = self.new_project_dialog.take() {
+            if let Some(picked) = self.take_picked_path(&file_dialog::PathTarget::NewProjectDir) {
+                dialog.path = picked.display().to_string();
+                if dialog.name.trim().is_empty() || dialog.name == "Новый проект RDE" {
+                    // Имя по умолчанию — из имени каталога (пользователь может поправить).
+                    if let Some(name) = picked.file_name().and_then(|name| name.to_str()) {
+                        dialog.name = name.to_owned();
+                    }
+                }
+                dialog.error.clear();
+            }
+            let picker_error = self.take_picker_error(&file_dialog::PathTarget::NewProjectDir);
+            let focus_ok = self.take_picker_focus_ok(&file_dialog::PathTarget::NewProjectDir);
+            let busy = self.picker_busy(&file_dialog::PathTarget::NewProjectDir);
+            let start = self.pick_start_dir(&dialog.path);
             let mut create = false;
             let mut cancel = false;
+            let mut pick = false;
+            let mut closed = false;
+            let check = validate_new_project_dir(&dialog.path);
+            let can_create = !check.is_error();
+            let focus_field = !dialog.focused;
             egui::Window::new("Новый проект")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
                 .show(ctx, |ui| {
-                    ui.set_min_width(520.0);
+                    ui.set_width(640.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Каталог").color(pal.muted));
-                        ui.add(egui::TextEdit::singleline(&mut path).desired_width(f32::INFINITY));
+                        ui.label(RichText::new("Каталог").small().color(pal.muted));
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut dialog.path)
+                                .hint_text("Путь к новому каталогу проекта")
+                                .desired_width(500.0),
+                        );
+                        if focus_field {
+                            response.request_focus();
+                        }
+                        if response.changed() {
+                            dialog.error.clear();
+                        }
+                        if picker_button(ui, busy).clicked() {
+                            pick = true;
+                        }
                     });
+                    path_caption_ui(ui, pal, &dialog.path);
+                    path_check_ui(ui, pal, &check, picker_error.as_deref());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Название").color(pal.muted));
-                        ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
+                        ui.label(RichText::new("Название").small().color(pal.muted));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dialog.name)
+                                .hint_text("Название проекта (пусто — из имени каталога)")
+                                .desired_width(520.0),
+                        );
                     });
+                    if !dialog.error.is_empty() {
+                        ui.label(RichText::new(&dialog.error).small().color(pal.red));
+                    }
                     ui.horizontal(|ui| {
-                        if ui.button("Создать").clicked() {
+                        let button = ui.add_enabled(
+                            can_create,
+                            egui::Button::new("Создать").min_size(vec2(96.0, 24.0)),
+                        );
+                        let button = if focus_ok && can_create {
+                            button.request_focus();
+                            button
+                        } else {
+                            button
+                        };
+                        let hint = if can_create { "Создать проект в этом каталоге" } else { "Исправьте путь: каталог занят или это не каталог" };
+                        if button.on_hover_text(hint).clicked() {
                             create = true;
                         }
                         if ui.button("Отмена").clicked() {
                             cancel = true;
                         }
                     });
+                    ui.label(
+                        RichText::new("Enter — создать · Esc — отмена · «Проводник…» — выбор каталога")
+                            .small()
+                            .color(pal.muted),
+                    );
                 });
-            if create {
-                let root = PathBuf::from(path.trim());
-                if let Err(error) = self.create_project_ui(&root, &name) {
-                    self.push_log(Level::Warn, format!("Новый проект: {error}"));
+            dialog.focused = true;
+            if pick {
+                self.request_pick(
+                    ctx,
+                    file_dialog::PathTarget::NewProjectDir,
+                    PickRequest::new("Каталог нового проекта RDE", PickKind::Folder).with_start(start),
+                );
+            } else if cancel || dialog_escape_pressed(ctx) {
+                closed = true;
+            } else if (create || dialog_confirm_pressed(ctx)) && can_create {
+                let root = PathBuf::from(dialog.path.trim());
+                let mut name = dialog.name.trim().to_owned();
+                if name.is_empty() {
+                    name = root.file_name().and_then(|name| name.to_str()).unwrap_or("Новый проект RDE").to_owned();
+                }
+                match self.create_project_ui(&root, &name) {
+                    Ok(()) => closed = true,
+                    Err(error) => {
+                        dialog.error = format!("Проект не создан: {error}");
+                        self.push_log(Level::Warn, format!("Новый проект: {error}"));
+                    }
                 }
             }
-            if !create && !cancel {
-                self.new_project_dialog = Some((path, name));
+            if !closed {
+                self.new_project_dialog = Some(dialog);
+            }
+        }
+
+        // ── «Импорт ревью из Word»: выбрать .docx или взять свежий из exports/ ────
+        if let Some(mut dialog) = self.import_review_dialog.take() {
+            if let Some(picked) = self.take_picked_path(&file_dialog::PathTarget::ImportReview) {
+                dialog.path = picked.display().to_string();
+                dialog.error.clear();
+            }
+            let picker_error = self.take_picker_error(&file_dialog::PathTarget::ImportReview);
+            let focus_ok = self.take_picker_focus_ok(&file_dialog::PathTarget::ImportReview);
+            let busy = self.picker_busy(&file_dialog::PathTarget::ImportReview);
+            let start = self.pick_start_dir(&dialog.path);
+            let latest_export = self.latest_export_docx();
+            let mut import = false;
+            let mut cancel = false;
+            let mut pick = false;
+            let mut closed = false;
+            // Пустое поле — не ошибка: берём самый свежий .docx из exports/.
+            let check = if dialog.path.trim().is_empty() {
+                match &latest_export {
+                    Some(path) => PathCheck::hint(format!("Пусто — будет взят свежий из exports/: {}", path.display())),
+                    None => PathCheck::error("Пусто, а в exports/ нет .docx — укажите файл вручную"),
+                }
+            } else {
+                validate_docx_file(&dialog.path)
+            };
+            let can_import = !check.is_error();
+            let focus_field = !dialog.focused;
+            egui::Window::new("Импорт ревью из Word")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_width(680.0);
+                    ui.horizontal(|ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut dialog.path)
+                                .hint_text("Путь к .docx после правок в Word (пусто — свежий из exports/)")
+                                .desired_width(520.0),
+                        );
+                        if focus_field {
+                            response.request_focus();
+                        }
+                        if response.changed() {
+                            dialog.error.clear();
+                        }
+                        if picker_button(ui, busy).clicked() {
+                            pick = true;
+                        }
+                    });
+                    path_caption_ui(ui, pal, &dialog.path);
+                    path_check_ui(ui, pal, &check, picker_error.as_deref());
+                    if !dialog.error.is_empty() {
+                        ui.label(RichText::new(&dialog.error).small().color(pal.red));
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Выбранный .docx становится новой версией активного документа: RDE-часть (.doc.rde), \
+                             doc_id и вставки сохраняются, комментарии Word импортируются в ревью.",
+                        )
+                        .small()
+                        .color(pal.muted),
+                    );
+                    ui.horizontal(|ui| {
+                        let button = ui.add_enabled(
+                            can_import,
+                            egui::Button::new("Импортировать").min_size(vec2(112.0, 24.0)),
+                        );
+                        let button = if focus_ok && can_import {
+                            button.request_focus();
+                            button
+                        } else {
+                            button
+                        };
+                        if button.on_hover_text("Принять .docx как новую версию документа").clicked() {
+                            import = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                        if !dialog.path.trim().is_empty()
+                            && ui.button("Сбросить (свежий из exports)").clicked()
+                        {
+                            dialog.path.clear();
+                            dialog.error.clear();
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Enter — импортировать · Esc — отмена · «Проводник…» — выбор файла .docx")
+                            .small()
+                            .color(pal.muted),
+                    );
+                });
+            dialog.focused = true;
+            if pick {
+                self.request_pick(
+                    ctx,
+                    file_dialog::PathTarget::ImportReview,
+                    PickRequest::new("Импорт ревью: .docx после правок в Word", PickKind::file("Документы Word", &["docx"]))
+                        .with_start(start),
+                );
+            } else if cancel || dialog_escape_pressed(ctx) {
+                closed = true;
+            } else if (import || dialog_confirm_pressed(ctx)) && can_import {
+                let source = (!dialog.path.trim().is_empty()).then(|| PathBuf::from(dialog.path.trim()));
+                match self.import_review_action(source.as_deref()) {
+                    Ok(()) => closed = true,
+                    Err(error) => {
+                        dialog.error = format!("Ревью не импортировано: {error}");
+                        self.push_log(Level::Warn, format!("Импорт ревью: {error}"));
+                    }
+                }
+            }
+            if !closed {
+                self.import_review_dialog = Some(dialog);
+            }
+        }
+
+        // ── «Импорт цитат»: BibTeX/RIS/CSL-JSON → объекты-источники ─────────────
+        if let Some(mut dialog) = self.import_citations_dialog.take() {
+            if let Some(picked) = self.take_picked_path(&file_dialog::PathTarget::ImportCitations) {
+                dialog.path = picked.display().to_string();
+                dialog.error.clear();
+            }
+            let picker_error = self.take_picker_error(&file_dialog::PathTarget::ImportCitations);
+            let focus_ok = self.take_picker_focus_ok(&file_dialog::PathTarget::ImportCitations);
+            let busy = self.picker_busy(&file_dialog::PathTarget::ImportCitations);
+            let start = self.pick_start_dir(&dialog.path);
+            let mut import = false;
+            let mut cancel = false;
+            let mut pick = false;
+            let mut closed = false;
+            let check = validate_citations_file(&dialog.path);
+            let can_import = !check.is_error();
+            let focus_field = !dialog.focused;
+            egui::Window::new("Импорт цитат")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_width(680.0);
+                    ui.horizontal(|ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut dialog.path)
+                                .hint_text("Путь к файлу .bib / .ris / .json (CSL-JSON)")
+                                .desired_width(520.0),
+                        );
+                        if focus_field {
+                            response.request_focus();
+                        }
+                        if response.changed() {
+                            dialog.error.clear();
+                        }
+                        if picker_button(ui, busy).clicked() {
+                            pick = true;
+                        }
+                    });
+                    path_caption_ui(ui, pal, &dialog.path);
+                    path_check_ui(ui, pal, &check, picker_error.as_deref());
+                    if !dialog.error.is_empty() {
+                        ui.label(RichText::new(&dialog.error).small().color(pal.red));
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Каждая запись становится объектом-источником проекта с библиографией ([reference]): \
+                             далее источник доступен для цитат в документе и библиографии по ГОСТ.",
+                        )
+                        .small()
+                        .color(pal.muted),
+                    );
+                    ui.horizontal(|ui| {
+                        let button = ui.add_enabled(
+                            can_import,
+                            egui::Button::new("Импортировать").min_size(vec2(112.0, 24.0)),
+                        );
+                        let button = if focus_ok && can_import {
+                            button.request_focus();
+                            button
+                        } else {
+                            button
+                        };
+                        if button.on_hover_text("Импортировать записи как источники проекта").clicked() {
+                            import = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Enter — импортировать · Esc — отмена · «Проводник…» — выбор файла цитат")
+                            .small()
+                            .color(pal.muted),
+                    );
+                });
+            dialog.focused = true;
+            if pick {
+                self.request_pick(
+                    ctx,
+                    file_dialog::PathTarget::ImportCitations,
+                    PickRequest::new(
+                        "Импорт цитат: BibTeX / RIS / CSL-JSON",
+                        PickKind::File {
+                            filters: vec![
+                                file_dialog::FileFilter::new("Библиография", &["bib", "ris", "json"]),
+                                file_dialog::FileFilter::new("Все файлы", &[]),
+                            ],
+                        },
+                    )
+                    .with_start(start),
+                );
+            } else if cancel || dialog_escape_pressed(ctx) {
+                closed = true;
+            } else if (import || dialog_confirm_pressed(ctx)) && can_import {
+                let source = PathBuf::from(dialog.path.trim());
+                match self.import_citations_action(&source) {
+                    Ok(summary) => {
+                        self.push_log(Level::Ok, summary);
+                        closed = true;
+                    }
+                    Err(error) => {
+                        dialog.error = format!("Цитаты не импортированы: {error}");
+                        self.push_log(Level::Warn, format!("Импорт цитат: {error}"));
+                    }
+                }
+            }
+            if !closed {
+                self.import_citations_dialog = Some(dialog);
+            }
+        }
+
+        // ── «Свойства источника»: файл/URL + библиография (иначе задать путь негде) ──
+        if let Some(mut dialog) = self.source_edit_dialog.take() {
+            if let Some(picked) = self.take_picked_path(&file_dialog::PathTarget::SourceFile(dialog.id.clone())) {
+                dialog.file = picked.display().to_string();
+                dialog.kind = "file".to_owned();
+                dialog.error.clear();
+            }
+            let picker_error = self.take_picker_error(&file_dialog::PathTarget::SourceFile(dialog.id.clone()));
+            let focus_ok = self.take_picker_focus_ok(&file_dialog::PathTarget::SourceFile(dialog.id.clone()));
+            let busy = self.picker_busy(&file_dialog::PathTarget::SourceFile(dialog.id.clone()));
+            let start = self.pick_start_dir(&dialog.file);
+            let title = self.project.object(&dialog.id).map(|object| object.title.clone()).unwrap_or_else(|| dialog.id.clone());
+            let mut save = false;
+            let mut cancel = false;
+            let mut pick = false;
+            let mut reveal = false;
+            let mut closed = false;
+            let object_dir = self.project.object(&dialog.id).map(|object| object.dir.clone()).unwrap_or_else(|| self.project.root.clone());
+            let file_check = validate_source_file_in(&object_dir, &dialog.file);
+            let can_save = if dialog.kind == "url" {
+                !dialog.url.trim().is_empty()
+            } else {
+                !file_check.is_error()
+            };
+            let focus_field = !dialog.focused;
+            egui::Window::new("Свойства источника")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_width(660.0);
+                    ui.label(RichText::new(&title).strong().color(pal.text));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Тип").small().color(pal.muted));
+                        egui::ComboBox::from_id_salt("rde_source_kind")
+                            .selected_text(dialog.kind.clone())
+                            .show_ui(ui, |ui| {
+                                for (kind, label) in [("file", "файл (PDF/изображение/текст)"), ("url", "веб-страница (URL)"), ("repo", "репозиторий")] {
+                                    ui.selectable_value(&mut dialog.kind, kind.to_owned(), label);
+                                }
+                            });
+                    });
+                    if dialog.kind == "url" {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("URL").small().color(pal.muted));
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut dialog.url)
+                                    .hint_text("https://…")
+                                    .desired_width(480.0),
+                            );
+                            if focus_field {
+                                response.request_focus();
+                            }
+                        });
+                        ui.label(RichText::new("Для веб-источника файл не нужен: сохраняется только URL").small().color(pal.muted));
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Файл").small().color(pal.muted));
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut dialog.file)
+                                    .hint_text("Путь к файлу источника или выберите «Проводник…»")
+                                    .desired_width(480.0),
+                            );
+                            if focus_field {
+                                response.request_focus();
+                            }
+                            if picker_button(ui, busy).clicked() {
+                                pick = true;
+                            }
+                        });
+                        path_caption_ui(ui, pal, &dialog.file);
+                        path_check_ui(ui, pal, &file_check, picker_error.as_deref());
+                        ui.label(
+                            RichText::new("Выбранный файл будет скопирован в объект-источник (рядом с source.toml), оригинал не изменяется")
+                                .small()
+                                .color(pal.muted),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Получен").small().color(pal.muted));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dialog.retrieved)
+                                .hint_text("дата получения, например 2026-10-29")
+                                .desired_width(180.0),
+                        );
+                    });
+                    if !dialog.error.is_empty() {
+                        ui.label(RichText::new(&dialog.error).small().color(pal.red));
+                    }
+                    ui.horizontal(|ui| {
+                        let button = ui.add_enabled(can_save, egui::Button::new("Сохранить").min_size(vec2(96.0, 24.0)));
+                        let button = if focus_ok && can_save {
+                            button.request_focus();
+                            button
+                        } else {
+                            button
+                        };
+                        if button.on_hover_text("Записать source.toml и перечитать проект").clicked() {
+                            save = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                        if !dialog.file.trim().is_empty() && ui.button("Показать файл").clicked() {
+                            reveal = true;
+                        }
+                    });
+                    ui.label(RichText::new("Enter — сохранить · Esc — отмена").small().color(pal.muted));
+                });
+            dialog.focused = true;
+            if pick {
+                self.request_pick(
+                    ctx,
+                    file_dialog::PathTarget::SourceFile(dialog.id.clone()),
+                    PickRequest::new("Файл источника", PickKind::any_file()).with_start(start),
+                );
+            } else if cancel || dialog_escape_pressed(ctx) {
+                closed = true;
+            } else if (save || dialog_confirm_pressed(ctx)) && can_save {
+                match self.save_source_edit(&dialog) {
+                    Ok(()) => closed = true,
+                    Err(error) => {
+                        dialog.error = format!("Источник не сохранён: {error}");
+                        self.push_log(Level::Warn, format!("Свойства источника: {error}"));
+                    }
+                }
+            }
+            if reveal {
+                let resolved = resolve_source_file_path(&object_dir, &dialog.file);
+                self.open_in_file_manager(&resolved);
+            }
+            if !closed {
+                self.source_edit_dialog = Some(dialog);
+            }
+        }
+
+        // ── «Свойства репозитория»: kind + путь (в GUI задать было негде) ───────
+        if let Some(mut dialog) = self.repo_edit_dialog.take() {
+            if let Some(picked) = self.take_picked_path(&file_dialog::PathTarget::RepositoryPath(dialog.id.clone())) {
+                dialog.path = picked.display().to_string();
+                dialog.error.clear();
+            }
+            let picker_error = self.take_picker_error(&file_dialog::PathTarget::RepositoryPath(dialog.id.clone()));
+            let focus_ok = self.take_picker_focus_ok(&file_dialog::PathTarget::RepositoryPath(dialog.id.clone()));
+            let busy = self.picker_busy(&file_dialog::PathTarget::RepositoryPath(dialog.id.clone()));
+            let start = self.pick_start_dir(&dialog.path);
+            let title = self.project.object(&dialog.id).map(|object| object.title.clone()).unwrap_or_else(|| dialog.id.clone());
+            let mut save = false;
+            let mut cancel = false;
+            let mut pick = false;
+            let mut closed = false;
+            let check = validate_directory(&dialog.path);
+            let can_save = !check.is_error();
+            let focus_field = !dialog.focused;
+            egui::Window::new("Свойства репозитория")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_width(640.0);
+                    ui.label(RichText::new(&title).strong().color(pal.text));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Тип").small().color(pal.muted));
+                        egui::ComboBox::from_id_salt("rde_repo_kind")
+                            .selected_text(dialog.kind.clone())
+                            .show_ui(ui, |ui| {
+                                for (kind, label) in [("internal", "internal (каталог проекта)"), ("external", "external (внешний каталог)"), ("git", "git (клон — фаза 2)")] {
+                                    ui.selectable_value(&mut dialog.kind, kind.to_owned(), label);
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Путь").small().color(pal.muted));
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut dialog.path)
+                                .hint_text("Путь к каталогу репозитория (относительный или абсолютный)")
+                                .desired_width(480.0),
+                        );
+                        if focus_field {
+                            response.request_focus();
+                        }
+                        if picker_button(ui, busy).clicked() {
+                            pick = true;
+                        }
+                    });
+                    path_caption_ui(ui, pal, &dialog.path);
+                    path_check_ui(ui, pal, &check, picker_error.as_deref());
+                    if !dialog.error.is_empty() {
+                        ui.label(RichText::new(&dialog.error).small().color(pal.red));
+                    }
+                    ui.horizontal(|ui| {
+                        let button = ui.add_enabled(can_save, egui::Button::new("Сохранить").min_size(vec2(96.0, 24.0)));
+                        let button = if focus_ok && can_save {
+                            button.request_focus();
+                            button
+                        } else {
+                            button
+                        };
+                        if button.on_hover_text("Записать repo.toml и перечитать проект").clicked() {
+                            save = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    ui.label(RichText::new("Enter — сохранить · Esc — отмена").small().color(pal.muted));
+                });
+            dialog.focused = true;
+            if pick {
+                self.request_pick(
+                    ctx,
+                    file_dialog::PathTarget::RepositoryPath(dialog.id.clone()),
+                    PickRequest::new("Каталог репозитория", PickKind::Folder).with_start(start),
+                );
+            } else if cancel || dialog_escape_pressed(ctx) {
+                closed = true;
+            } else if (save || dialog_confirm_pressed(ctx)) && can_save {
+                match self.save_repository_edit(&dialog) {
+                    Ok(()) => closed = true,
+                    Err(error) => {
+                        dialog.error = format!("Репозиторий не сохранён: {error}");
+                        self.push_log(Level::Warn, format!("Свойства репозитория: {error}"));
+                    }
+                }
+            }
+            if !closed {
+                self.repo_edit_dialog = Some(dialog);
             }
         }
 
@@ -5346,6 +6828,15 @@ impl RdeApp {
             // (пустая команда → дефолт `dsh`; args — split по пробелам, как в CLI).
             let mut agent_program_edit = settings.agent_program.clone();
             let mut agent_args_edit = settings.agent_args.join(" ");
+            // GUI-02: «Проводник…» для программы агента (был только ручной ввод пути).
+            if let Some(picked) = self.take_picked_path(&file_dialog::PathTarget::AgentProgram) {
+                agent_program_edit = picked.display().to_string();
+            }
+            let picker_error = self.take_picker_error(&file_dialog::PathTarget::AgentProgram);
+            let program_busy = self.picker_busy(&file_dialog::PathTarget::AgentProgram);
+            let agent_program_start = self.pick_start_dir(&agent_program_edit);
+            let program_check = validate_agent_program(&agent_program_edit);
+            let mut pick_agent_program = false;
             egui::Window::new(tr(self.lang, "settings.app"))
                 .collapsible(false)
                 .resizable(false)
@@ -5480,11 +6971,19 @@ impl RdeApp {
                                     ui,
                                     |ui| {
                                         ui.label(RichText::new("команда").small().color(pal.muted));
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut agent_program_edit)
-                                                .desired_width(220.0)
-                                                .hint_text("dsh"),
-                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut agent_program_edit)
+                                                    .desired_width(220.0)
+                                                    .hint_text("dsh"),
+                                            );
+                                            if picker_button(ui, program_busy).clicked() {
+                                                pick_agent_program = true;
+                                            }
+                                        });
+                                        ui.end_row();
+                                        ui.label(RichText::new("проверка").small().color(pal.muted));
+                                        path_check_ui(ui, pal, &program_check, picker_error.as_deref());
                                         ui.end_row();
                                         ui.label(RichText::new("args").small().color(pal.muted));
                                         ui.add(
@@ -5531,6 +7030,17 @@ impl RdeApp {
                         }
                     });
                 });
+            // GUI-02: системный выбор программы агента (фоновый, результат подставлен выше).
+            if pick_agent_program {
+                self.request_pick(
+                    ctx,
+                    file_dialog::PathTarget::AgentProgram,
+                    PickRequest::new("Программа ACP-агента", PickKind::any_file()).with_start(agent_program_start),
+                );
+            }
+            if dialog_escape_pressed(ctx) {
+                cancel = true;
+            }
             if trust_for_agents {
                 // Существующий диалог согласия R-RUN-06 (не дублируем): после подтверждения
                 // trusted=true, перезагрузка проекта и перезапуск MCP-сервера.
@@ -7619,8 +9129,131 @@ impl RdeApp {
         }
     }
 
+    /// Редактор заметки проекта (паритет MCP `note_write`): Markdown-файл заметки можно
+    /// править и сохранять из GUI (раньше был только предпросмотр в инспекторе).
+    fn note_editor_ui(&mut self, ui: &mut egui::Ui, note: &rde_core::Object) {
+        let pal = theme_colors(ui.ctx().theme());
+        let ObjectData::Note(manifest) = &note.data else { return };
+        let path = note.dir.join(&manifest.file);
+        // Загрузка при выборе другой заметки (правки не теряем молча: dirty остаётся в состоянии).
+        let need_load = self.note_editor.as_ref().map(|editor| editor.id != note.id).unwrap_or(true);
+        if need_load {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| format!("# не удалось прочитать {}: {error}\n", path.display()));
+            self.note_editor = Some(NoteEditorState { id: note.id.clone(), text, dirty: false, error: String::new() });
+        }
+        let mut save = false;
+        let mut revert = false;
+        let mut reveal = false;
+        let mut editor = self.note_editor.take().unwrap_or_default();
+        ui.add_space(10.0);
+        ui.vertical(|ui| {
+            egui::Frame::new()
+                .fill(pal.panel_hi)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(14))
+                .show(ui, |ui| {
+                    ui.set_max_width(860.0);
+                    ui.label(RichText::new(format!("▤  {}", note.title)).size(FS_DISPLAY).strong().color(pal.text));
+                    ui.label(
+                        RichText::new(format!("Заметка проекта · {} · {}", fresh_label(note.freshness), path.display()))
+                            .small()
+                            .color(pal.muted),
+                    );
+                    ui.add_space(8.0);
+                    let changed = ui
+                        .add(
+                            egui::TextEdit::multiline(&mut editor.text)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(22),
+                        )
+                        .changed();
+                    if changed {
+                        editor.dirty = true;
+                    }
+                    if !editor.error.is_empty() {
+                        ui.label(RichText::new(&editor.error).small().color(pal.red));
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let button = ui.add_enabled(editor.dirty, egui::Button::new("Сохранить заметку"));
+                        if button.clicked() {
+                            save = true;
+                        }
+                        if ui.add_enabled(editor.dirty, egui::Button::new("Отменить правки")).clicked() {
+                            revert = true;
+                        }
+                        if ui.button("Показать каталог").clicked() {
+                            reveal = true;
+                        }
+                        ui.label(
+                            RichText::new(if editor.dirty { "есть несохранённые правки · Ctrl+S — сохранить" } else { "Ctrl+S — сохранить" })
+                                .small()
+                                .color(if editor.dirty { pal.amber } else { pal.muted }),
+                        );
+                    });
+                });
+        });
+        if save {
+            match std::fs::write(&path, &editor.text) {
+                Ok(()) => {
+                    editor.dirty = false;
+                    editor.error.clear();
+                    self.push_log(Level::Ok, format!("Заметка «{}» сохранена: {}", note.title, path.display()));
+                }
+                Err(error) => {
+                    editor.error = format!("не удалось сохранить {}: {error}", path.display());
+                    self.push_log(Level::Warn, format!("Заметка: {}", editor.error));
+                }
+            }
+        }
+        if revert {
+            editor.text = std::fs::read_to_string(&path).unwrap_or_default();
+            editor.dirty = false;
+            editor.error.clear();
+        }
+        if reveal {
+            self.open_in_file_manager(&note.dir);
+        }
+        self.note_editor = Some(editor);
+    }
+
+    /// Сохранить заметку из Ctrl+S (когда редактор заметки активен и есть правки).
+    pub fn save_note_editor(&mut self) -> bool {
+        let (Some(note), Some(editor)) = (
+            self.selected.clone().and_then(|id| self.project.object(&id).cloned()),
+            self.note_editor.clone(),
+        ) else {
+            return false;
+        };
+        let ObjectData::Note(manifest) = &note.data else { return false };
+        let path = note.dir.join(&manifest.file);
+        match std::fs::write(&path, &editor.text) {
+            Ok(()) => {
+                if let Some(state) = self.note_editor.as_mut() {
+                    state.dirty = false;
+                    state.error.clear();
+                }
+                self.push_log(Level::Ok, format!("Заметка «{}» сохранена: {}", note.title, path.display()));
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Заметка: не удалось сохранить {}: {error}", path.display())),
+        }
+        true
+    }
+
     fn source_tab(&mut self, ui: &mut egui::Ui) {
         let pal = theme_colors(ui.ctx().theme());
+        // Заметка выбрана в дереве → редактируемый текст заметки (вкладка «Источник»).
+        if let Some(note) = self
+            .selected
+            .clone()
+            .and_then(|id| self.project.object(&id).cloned())
+            .filter(|object| matches!(object.data, ObjectData::Note(_)))
+        {
+            self.note_editor_ui(ui, &note);
+            return;
+        }
         let selected = self.selected.clone();
         let is_source = |o: &&rde_core::Object| matches!(o.data, ObjectData::Source(_));
         let source = self
@@ -7647,6 +9280,8 @@ impl RdeApp {
         let mut open_source = false;
         let mut copy_locator = false;
         let mut show_in_tree = false;
+        let mut edit_source = false;
+        let mut reveal_dir = false;
         let locator = src.file.clone().or_else(|| src.url.clone()).unwrap_or_default();
         let retrieved = src.retrieved_at.clone().unwrap_or_else(|| "—".to_owned());
         let reference = src.reference.clone();
@@ -7702,6 +9337,21 @@ impl RdeApp {
                         }
                         if ui.button(RichText::new("Показать в дереве").size(12.0)).clicked() {
                             show_in_tree = true;
+                        }
+                        // GUI-02: путь/URL источника задаётся здесь (раньше в GUI было негде).
+                        if ui
+                            .button(RichText::new("Свойства источника…").size(12.0))
+                            .on_hover_text("Задать файл/URL источника, прикрепить файл («Проводник…»), дату получения")
+                            .clicked()
+                        {
+                            edit_source = true;
+                        }
+                        if ui
+                            .button(RichText::new("Показать каталог").size(12.0))
+                            .on_hover_text("Открыть каталог объекта-источника в файловом менеджере")
+                            .clicked()
+                        {
+                            reveal_dir = true;
                         }
                     });
                 });
@@ -7823,15 +9473,19 @@ impl RdeApp {
             let target = source_file.as_ref().map(|file| obj.dir.join(file)).or_else(|| source_url.clone().map(PathBuf::from));
             match target {
                 Some(path) if path.exists() => {
-                    #[cfg(unix)]
-                    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
-                        let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
-                    }
+                    // Один путь «открыть в системном обработчике» для всех мест (ADR-0017 §4).
+                    self.open_in_file_manager(&path);
                     self.push_log(Level::Info, format!("Источник открыт: {}", path.display()));
                 }
                 Some(path) => self.push_log(Level::Info, format!("Источник: {}", path.display())),
-                None => self.push_log(Level::Warn, "У источника нет файла/URL"),
+                None => self.push_log(Level::Warn, "У источника нет файла/URL — задайте его в «Свойства источника…»"),
             }
+        }
+        if edit_source {
+            self.open_source_edit(&obj.id);
+        }
+        if reveal_dir {
+            self.open_in_file_manager(&obj.dir);
         }
         if copy_locator {
             let locator = source_file.clone().or(source_url.clone()).unwrap_or_default();
@@ -8005,27 +9659,72 @@ fn set_manifest_value(path: &Path, key: &str, value: &str) -> Result<(), String>
         other if other.parse::<f64>().is_ok() && !other.is_empty() => other.to_owned(),
         other => format!("{other:?}"),
     };
+    // Ключи верхнего уровня живут в «шапке» до первой таблицы `[section]`/`[[array]]`:
+    // вставлять/заменять их можно ТОЛЬКО там — иначе `file = …` попадёт в `[reference]`
+    // (source.toml), а `title` заменит заголовок библиографической записи.
     let mut out = String::with_capacity(text.len() + rendered.len() + key.len() + 8);
     let mut replaced = false;
+    let mut in_sections = false;
+    let prefix = format!("{key} =");
     for line in text.lines() {
+        if !in_sections && line.starts_with('[') {
+            in_sections = true;
+            if !replaced {
+                // Новый ключ верхнего уровня — перед первой таблицей.
+                out.push_str(&format!("{key} = {rendered}\n"));
+                replaced = true;
+            }
+        }
         let trimmed = line.trim_start();
-        if !replaced && trimmed.starts_with(&format!("{key} =")) && !line.starts_with(' ') {
+        if !in_sections && !replaced && trimmed.starts_with(&prefix) && !line.starts_with(' ') {
             out.push_str(&format!("{key} = {rendered}\n"));
             replaced = true;
-        } else {
-            out.push_str(line);
-            out.push('\n');
+            continue;
         }
+        out.push_str(line);
+        out.push('\n');
     }
     if !replaced {
         out.push_str(&format!("{key} = {rendered}\n"));
     }
-    // Валидация до записи: TOML + типы ProjectManifest (в т.ч. document_auto_update: bool).
-    let _: toml::Value = toml::from_str(&out).map_err(|e| format!("rde.toml: {e}"))?;
-    let _: rde_core::ProjectManifest = toml::from_str(&out).map_err(|e| format!("rde.toml: {e}"))?;
+    // Валидация до записи: TOML — всегда; типы ProjectManifest — только для rde.toml
+    // (остальные манифесты имеют свои схемы: document.toml/source.toml/repo.toml…).
+    let _: toml::Value = toml::from_str(&out).map_err(|e| format!("{}: {e}", path.display()))?;
+    if path.file_name().and_then(|name| name.to_str()) == Some("rde.toml") {
+        let _: rde_core::ProjectManifest = toml::from_str(&out).map_err(|e| format!("rde.toml: {e}"))?;
+    }
     let tmp = path.with_extension("toml.tmp");
     fs::write(&tmp, out).map_err(|e| format!("записать {}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| format!("заменить {}: {e}", path.display()))
+}
+
+/// Строковое поле манифеста: `Some(value)` — записать/заменить, `None` — удалить ключ
+/// (например, переключение источника `file` → `url` не должно оставлять старый локатор).
+fn set_manifest_optional_string(path: &Path, key: &str, value: Option<&str>) -> Result<(), String> {
+    let Some(value) = value else {
+        let text = fs::read_to_string(path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
+        let mut out = String::with_capacity(text.len());
+        let mut in_sections = false;
+        let mut removed = false;
+        let prefix = format!("{key} =");
+        for line in text.lines() {
+            if line.starts_with('[') {
+                in_sections = true;
+            }
+            let trimmed = line.trim_start();
+            if !removed && !in_sections && trimmed.starts_with(&prefix) && !line.starts_with(' ') {
+                removed = true;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        let _: toml::Value = toml::from_str(&out).map_err(|e| format!("{}: {e}", path.display()))?;
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, out).map_err(|e| format!("записать {}: {e}", tmp.display()))?;
+        return fs::rename(&tmp, path).map_err(|e| format!("заменить {}: {e}", path.display()));
+    };
+    set_manifest_value(path, key, value)
 }
 
 /// Строковое значение в `rde.toml` (совместимость): ошибки возвращаются вызывающему.
@@ -8055,7 +9754,7 @@ fn btn(ui: &mut egui::Ui, role: Role, icon: Option<&str>, label: &str) -> egui::
 
 /// Кнопка 32 px заданной ширины — для сеток инспектора (кнопки одной группы — равной ширины).
 /// Подпись обрезается по фактической ширине колонки (полная — в подсказке): иначе длинная
-/// подпись («Импорт ревью из exports») раздувает инспектор за его default width (§19-8).
+/// подпись («Импорт ревью из Word…») раздувает инспектор за его default width (§19-8).
 fn btn_w(ui: &mut egui::Ui, role: Role, icon: Option<&str>, label: &str, width: f32) -> egui::Response {
     let icon_prefix = icon.map(|icon| format!("{icon}  ")).unwrap_or_default();
     let padding = 2.0 * ui.spacing().button_padding.x;
@@ -8250,9 +9949,17 @@ fn field_row(ui: &mut egui::Ui, label: &str, value: &str, monospace: bool) {
         ui.spacing_mut().item_spacing.y = 2.0;
         ui.label(RichText::new(label).size(FS_CAPTION).color(pal.muted));
         if monospace {
-            ui.label(RichText::new(value).monospace().size(FS_MONO).color(pal.text));
+            // Длинные пути/id в узком инспекторе не должны вылезать за панель: обрезаем с «…»,
+            // полное значение — в тултипе.
+            let short = ellipsize_path(value, 44);
+            ui.add(
+                egui::Label::new(RichText::new(short).monospace().size(FS_MONO).color(pal.text))
+                    .truncate()
+                    .sense(Sense::hover()),
+            )
+            .on_hover_text(value);
         } else {
-            ui.label(RichText::new(value).size(FS_BODY).color(pal.text));
+            ui.add(egui::Label::new(RichText::new(value).size(FS_BODY).color(pal.text)).wrap());
         }
     });
     ui.add_space(6.0);
@@ -8328,6 +10035,255 @@ fn ellipsize(s: &str, max: usize) -> String {
     match chars.nth(max) {
         Some((idx, _)) => format!("{}…", &s[..idx]),
         None => s.to_owned(),
+    }
+}
+
+// ── «Проводник…»: проверка путей и виджеты (ADR-0017) ───────────────────────
+// Валидация — до действия: опечатка/не тот тип файла видны под полем сразу (красным),
+// а кнопка действия disabled с причиной в тултипе.
+
+/// Сжать длинный путь для подписи: начало и конец, многоточие посередине (полный — в тултипе).
+fn ellipsize_path(path: &str, max: usize) -> String {
+    let count = path.chars().count();
+    if count <= max || max < 8 {
+        return path.to_owned();
+    }
+    let head = (max - 3) / 2;
+    let tail = max - 3 - head;
+    let head_text: String = path.chars().take(head).collect();
+    let tail_text: String = path.chars().skip(count - tail).collect();
+    format!("{head_text}…{tail_text}")
+}
+
+/// Подпись под полем пути: сообщение проверки + вспомогательная строка (ошибка backend'а).
+fn path_check_ui(ui: &mut egui::Ui, pal: ThemeColors, check: &PathCheck, picker_error: Option<&str>) {
+    if let Some(error) = picker_error {
+        ui.label(RichText::new(error).small().color(pal.red));
+    }
+    let color = match check.level {
+        PathCheckLevel::Ok => pal.green,
+        PathCheckLevel::Hint => pal.muted,
+        PathCheckLevel::Warn => pal.amber,
+        PathCheckLevel::Error => pal.red,
+    };
+    if !check.text.is_empty() {
+        ui.label(RichText::new(&check.text).small().color(color));
+    }
+}
+
+/// Кнопка «Проводник…» рядом с полем пути. `busy` — системный диалог уже открыт.
+fn picker_button(ui: &mut egui::Ui, busy: bool) -> egui::Response {
+    let label = if busy { format!("{IC_FOLDER}  Проводник… (ожидание)") } else { format!("{IC_FOLDER}  Проводник…") };
+    ui.add_enabled(!busy, egui::Button::new(RichText::new(label).size(12.0)))
+        .on_hover_text(file_dialog::backend_hint())
+        .on_disabled_hover_text("Системный диалог уже открыт — выберите файл в нём или отмените")
+}
+
+/// Enter в диалоге — основное действие (кроме многострочных полей: там Ctrl+Enter).
+fn dialog_confirm_pressed(ctx: &egui::Context) -> bool {
+    ctx.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift)
+}
+
+/// Esc в диалоге — отмена/закрытие.
+fn dialog_escape_pressed(ctx: &egui::Context) -> bool {
+    ctx.input(|input| input.key_pressed(egui::Key::Escape))
+}
+
+
+/// Подпись с полным путём в тултипе (для полей и инспектора).
+fn path_caption_ui(ui: &mut egui::Ui, pal: ThemeColors, path: &str) {
+    // Подпись нужна только для длинных путей (эллипсис + полный путь в тултипе);
+    // короткий путь уже виден в поле целиком — не дублируем строку в диалоге.
+    if path.trim().is_empty() || path.trim().chars().count() <= 84 {
+        return;
+    }
+    ui.add(
+        egui::Label::new(RichText::new(ellipsize_path(path.trim(), 84)).small().color(pal.muted))
+            .truncate()
+            .sense(Sense::hover()),
+    )
+    .on_hover_text(path.trim());
+}
+
+/// Проверка каталога проекта (в нём есть `rde.toml`).
+fn validate_project_dir(path: &str) -> PathCheck {
+    let path = path.trim();
+    if path.is_empty() {
+        return PathCheck::hint("Укажите каталог проекта — в нём должен быть rde.toml");
+    }
+    let dir = Path::new(path);
+    if !dir.exists() {
+        return PathCheck::error(format!("Каталог не найден: {path}"));
+    }
+    if !dir.is_dir() {
+        return PathCheck::error("Это файл, а нужен каталог проекта (с rde.toml)");
+    }
+    if !dir.join("rde.toml").is_file() {
+        return PathCheck::error("В каталоге нет rde.toml — это не проект RDE");
+    }
+    PathCheck::ok("✓ rde.toml найден — можно открывать")
+}
+
+/// Проверка каталога для нового проекта: не занят проектом, пустой (или ещё не создан).
+fn validate_new_project_dir(path: &str) -> PathCheck {
+    let path = path.trim();
+    if path.is_empty() {
+        return PathCheck::hint("Укажите каталог для нового проекта (он будет создан)");
+    }
+    let dir = Path::new(path);
+    if dir.exists() {
+        if !dir.is_dir() {
+            return PathCheck::error("Это файл, а нужен каталог проекта");
+        }
+        if dir.join("rde.toml").is_file() {
+            return PathCheck::error("Проект уже существует — откройте его («Файл → Открыть проект…»)");
+        }
+        if std::fs::read_dir(dir).map(|mut entries| entries.next().is_some()).unwrap_or(true) {
+            return PathCheck::error("Каталог не пуст — выберите пустой каталог или новый путь");
+        }
+        return PathCheck::ok("✓ Каталог пуст — проект будет создан здесь");
+    }
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        return PathCheck::warn(format!("Родительский каталог будет создан: {}", parent.display()));
+    }
+    PathCheck::ok("✓ Каталог будет создан")
+}
+
+/// Проверка файла `.docx` (импорт документа/ревью).
+fn validate_docx_file(path: &str) -> PathCheck {
+    let path = path.trim();
+    if path.is_empty() {
+        return PathCheck::hint("Укажите путь к .docx");
+    }
+    let file = Path::new(path);
+    if !file.exists() {
+        return PathCheck::error(format!("Файл не найден: {path}"));
+    }
+    if !file.is_file() {
+        return PathCheck::error("Это каталог, а нужен файл .docx");
+    }
+    if file.extension().and_then(|ext| ext.to_str()).map(|ext| !ext.eq_ignore_ascii_case("docx")).unwrap_or(true) {
+        return PathCheck::error("Нужен файл .docx (импорт поддерживает только его)");
+    }
+    match std::fs::metadata(file) {
+        Ok(meta) => PathCheck::ok(format!("✓ .docx найден · {}", human_size(meta.len()))),
+        Err(error) => PathCheck::warn(format!("Файл найден, но не читается: {error}")),
+    }
+}
+
+/// Проверка файла цитат (BibTeX/RIS/CSL-JSON).
+fn validate_citations_file(path: &str) -> PathCheck {
+    let path = path.trim();
+    if path.is_empty() {
+        return PathCheck::hint("Укажите файл .bib / .ris / .json");
+    }
+    let file = Path::new(path);
+    if !file.is_file() {
+        return PathCheck::error(format!("Файл не найден: {path}"));
+    }
+    let ext = file.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !matches!(ext.as_str(), "bib" | "ris" | "json") {
+        return PathCheck::error("Поддерживаются .bib (BibTeX), .ris (RIS) и .json (CSL-JSON)");
+    }
+    PathCheck::ok("✓ файл цитат найден")
+}
+
+/// Проверка «программы ACP-агента»: имя в PATH или полный путь к исполняемому файлу.
+fn validate_agent_program(path: &str) -> PathCheck {
+    let path = path.trim();
+    if path.is_empty() {
+        return PathCheck::hint("Пусто — используется «dsh» из PATH");
+    }
+    if path.contains('/') {
+        let file = Path::new(path);
+        if !file.exists() {
+            return PathCheck::error("Файл программы не найден");
+        }
+        if file.is_dir() {
+            return PathCheck::error("Это каталог, а нужен исполняемый файл");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if file.metadata().map(|meta| meta.permissions().mode() & 0o111 == 0).unwrap_or(true) {
+                return PathCheck::warn("Файл не исполняемый (chmod +x)");
+            }
+        }
+        return PathCheck::ok("✓ программа найдена");
+    }
+    match file_dialog::find_in_path(path) {
+        Some(found) => PathCheck::ok(format!("✓ найдено в PATH: {}", found.display())),
+        None => PathCheck::warn("Не найдено в PATH — проверьте имя программы"),
+    }
+}
+
+/// Проверка пути к файлу источника. Относительный путь трактуется от каталога объекта
+/// (в `source.toml` хранятся пути вида `files/report.pdf`), абсолютный — как есть.
+fn validate_source_file_in(object_dir: &Path, path: &str) -> PathCheck {
+    let path = path.trim();
+    if path.is_empty() {
+        return PathCheck::hint("Файл не прикреплён — укажите путь или оставьте источник-URL");
+    }
+    let file = resolve_source_file_path(object_dir, path);
+    if !file.exists() {
+        return PathCheck::error(format!("Файл не найден: {path}"));
+    }
+    if file.is_dir() {
+        return PathCheck::error("Это каталог — для источника нужен файл");
+    }
+    match std::fs::metadata(&file) {
+        Ok(meta) => {
+            let already_inside = file.starts_with(object_dir);
+            let suffix = if already_inside { "файл в объекте-источнике" } else { "будет скопирован в объект" };
+            PathCheck::ok(format!("✓ файл найден · {} · {suffix}", human_size(meta.len())))
+        }
+        Err(error) => PathCheck::warn(format!("Файл не читается: {error}")),
+    }
+}
+
+/// Разрешить путь файла источника: абсолютный — как есть, относительный — от каталога объекта.
+fn resolve_source_file_path(object_dir: &Path, path: &str) -> PathBuf {
+    let candidate = Path::new(path.trim());
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        object_dir.join(candidate)
+    }
+}
+
+/// Проверка файла источника без привязки к объекту (абсолютные пути; только тесты).
+#[cfg(test)]
+fn validate_source_file(path: &str) -> PathCheck {
+    validate_source_file_in(Path::new("."), path)
+}
+
+/// Проверка каталога (например, пути репозитория).
+fn validate_directory(path: &str) -> PathCheck {
+    let path = path.trim();
+    if path.is_empty() {
+        return PathCheck::hint("Укажите каталог");
+    }
+    let dir = Path::new(path);
+    if !dir.exists() {
+        return PathCheck::error(format!("Каталог не найден: {path}"));
+    }
+    if !dir.is_dir() {
+        return PathCheck::error("Это файл, а нужен каталог");
+    }
+    PathCheck::ok("✓ каталог найден")
+}
+
+/// Размер в человекочитаемом виде (для подсказок полей пути).
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} МБ", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} КБ", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} Б")
     }
 }
 
@@ -9070,6 +11026,8 @@ mod docview_tests {
         let root = parent.join("new-project");
         let demo_copy = temp_demo_copy("project-create");
         let mut app = RdeApp::new(rde_core::load_project(&demo_copy).unwrap());
+        // GUI-02: история недавних проектов не должна трогать конфиг пользователя в тестах.
+        app.set_recent_projects_file(None);
 
         app.create_project_ui(&root, "UI-проект").expect("создать проект");
         assert_eq!(app.project.root, root);
@@ -9570,6 +11528,7 @@ mod docview_tests {
         std::fs::create_dir_all(&parent).unwrap();
         let root = parent.join("git-project");
         let mut app = RdeApp::new(rde_core::demo());
+        app.set_recent_projects_file(None);
         app.create_project_ui(&root, "Git-проект").expect("создать проект");
         let status = app.git_status.clone().expect("статус git");
         assert!(status.is_repo, "новый проект инициализируется в git: {status:?}");
@@ -9765,6 +11724,7 @@ mod docview_tests {
         let root = temp_demo_copy("inspector-open-none");
         let project = rde_core::load_project(&root).unwrap();
         let mut app = RdeApp::new(project);
+        // GUI-02: заметка теперь открывается — вкладка «Источник», редактор заметки.
         let note = app
             .project
             .objects
@@ -9772,14 +11732,23 @@ mod docview_tests {
             .find(|object| matches!(object.data, rde_core::ObjectData::Note(_)))
             .map(|object| object.id.clone())
             .expect("заметка в демо-проекте");
-        // У заметки центрального вьюера нет: кнопка disabled, переход — false,
-        // вкладка и выбор не меняются, не паникует.
-        assert!(super::RdeApp::inspector_open_tab(app.project.object(&note).unwrap()).is_none());
+        assert!(super::RdeApp::inspector_open_tab(app.project.object(&note).unwrap()).is_some());
         app.tab = super::Tab::Document;
-        app.selected = Some(note.clone());
-        assert!(!app.open_inspector_object(&note));
-        assert!(app.tab == super::Tab::Document);
+        app.selected = None;
+        assert!(app.open_inspector_object(&note));
+        assert!(app.tab == super::Tab::Source, "редактор заметки живёт на вкладке «Источник»");
         assert_eq!(app.selected.as_deref(), Some(note.as_str()));
+        // Формула — служебный объект без отдельного вьюера: кнопка disabled, перехода нет.
+        if let Some(formula) = app
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(object.data, rde_core::ObjectData::Formula(_)))
+            .map(|object| object.id.clone())
+        {
+            assert!(super::RdeApp::inspector_open_tab(app.project.object(&formula).unwrap()).is_none());
+            assert!(!app.open_inspector_object(&formula));
+        }
         // Репозиторий — тоже нечего открывать (показывает только инспектор).
         if let Some(repo) = app
             .project
@@ -10597,6 +12566,470 @@ mod agent_server_ui_tests {
         app.app_settings.allow_external_mcp = false;
         app.apply_external_agents_setting();
         assert!(!app.external_agents_status().is_running());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// GUI-02 (ADR-0017): «Проводник…», валидация путей, недавние проекты и закрытые GUI-дыры
+/// (свойства источников/репозиториев, редактор заметок, импорт цитат, «Обновить вставки»).
+#[cfg(test)]
+mod gui_path_tests {
+    use super::file_dialog::test_support::{FakePicker, ScriptedReply};
+    use super::file_dialog::PickerBackend;
+    use super::ribbon::Cmd;
+    use super::{PickKind, RdeApp, Tab};
+    use egui_kittest::kittest::Queryable;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    /// Фикстура реального `.docx` из тестов rde-doc (импорт/ревью/структура).
+    fn fixture_docx() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rde-doc/tests/fixtures/base-report.docx")
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("rde-gui-path-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn copy_tree(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(&*name, ".rde" | "exports" | "__pycache__" | "out" | ".venv") {
+                continue;
+            }
+            let path = entry.path();
+            let target = dst.join(&*name);
+            if path.is_dir() {
+                copy_tree(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    fn demo_copy(name: &str) -> PathBuf {
+        let root = temp_root(name);
+        let project = root.join("project");
+        copy_tree(&rde_core::demo_project_dir(), &project);
+        project
+    }
+
+    fn picker_app(name: &str) -> (RdeApp, PathBuf) {
+        let root = demo_copy(name);
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        // История проектов в тестах не должна трогать конфиг пользователя.
+        app.set_recent_projects_file(None);
+        (app, root)
+    }
+
+    /// Подменить backend «Проводника…» фейком и вернуть handle для проверки запросов.
+    fn with_fake_picker(app: &mut RdeApp, replies: Vec<ScriptedReply>) -> Arc<FakePicker> {
+        let fake = Arc::new(FakePicker::new(replies));
+        app.set_file_dialog_backend(Arc::clone(&fake) as Arc<dyn PickerBackend>);
+        fake
+    }
+
+    fn render(app: RdeApp) -> egui_kittest::Harness<'static, RdeApp> {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..6 {
+            harness.step();
+        }
+        harness
+    }
+
+    fn click_label(harness: &egui_kittest::Harness<'static, RdeApp>, label: &str) {
+        let node = harness
+            .query_all_by_label_contains(label)
+            .next()
+            .unwrap_or_else(|| panic!("в дереве доступности нет кнопки «{label}»"));
+        node.click();
+    }
+
+    fn logs(app: &RdeApp) -> String {
+        app.project.log.iter().map(|line| line.text.clone()).collect::<Vec<_>>().join("\n")
+    }
+
+    // ── валидация путей (до действия, понятные сообщения) ───────────────────
+
+    #[test]
+    fn path_validators_report_typos_and_wrong_types() {
+        use super::{validate_agent_program, validate_citations_file, validate_docx_file, validate_new_project_dir, validate_project_dir, validate_source_file};
+        // Проект: пусто → подсказка; нет каталога → ошибка; файл вместо каталога → ошибка;
+        // каталог без rde.toml → ошибка; настоящий проект → ок.
+        assert!(!validate_project_dir("").is_error());
+        assert!(validate_project_dir("/нет/такого/каталога-12345").is_error());
+        let root = temp_root("validators");
+        std::fs::write(root.join("файл.txt"), "x").unwrap();
+        assert!(validate_project_dir(&root.join("файл.txt").display().to_string()).is_error());
+        assert!(validate_project_dir(&root.display().to_string()).is_error(), "нет rde.toml");
+        std::fs::write(root.join("rde.toml"), "schema = \"rde/project@1\"\n").unwrap();
+        assert!(!validate_project_dir(&root.display().to_string()).is_error());
+        // Новый проект: занятый каталог → ошибка, непустой → ошибка, пустой → ок.
+        assert!(validate_new_project_dir(&root.display().to_string()).is_error(), "проект уже есть");
+        let occupied = root.join("occupied");
+        std::fs::create_dir_all(&occupied).unwrap();
+        std::fs::write(occupied.join("мусор"), "x").unwrap();
+        assert!(validate_new_project_dir(&occupied.display().to_string()).is_error());
+        assert!(!validate_new_project_dir(&root.join("fresh-project").display().to_string()).is_error());
+        // .docx: битое расширение/каталог/несуществующий файл.
+        let docx = root.join("отчёт.docx");
+        std::fs::write(&docx, "PK").unwrap();
+        assert!(!validate_docx_file(&docx.display().to_string()).is_error());
+        let doc = root.join("отчёт.doc");
+        std::fs::write(&doc, "x").unwrap();
+        let check = validate_docx_file(&doc.display().to_string());
+        assert!(check.is_error(), "{check:?}");
+        assert!(check.text.contains(".docx"), "объясняет, что нужен .docx: {check:?}");
+        assert!(validate_docx_file(&root.display().to_string()).is_error());
+        // Цитаты: формат проверяется.
+        let bib = root.join("refs.bib");
+        std::fs::write(&bib, "@book{a, title={A}}").unwrap();
+        assert!(!validate_citations_file(&bib.display().to_string()).is_error());
+        assert!(validate_citations_file(&doc.display().to_string()).is_error());
+        // Источник: файл обязателен.
+        assert!(validate_source_file(&root.display().to_string()).is_error());
+        assert!(!validate_source_file(&docx.display().to_string()).is_error());
+        // Программа агента: имя из PATH — предупреждение или ок, но не ошибка блокировки;
+        // абсолютный путь к несуществующему файлу — ошибка.
+        let missing = validate_agent_program("/нет/такой/программы-dsh");
+        assert!(missing.is_error());
+        assert!(!validate_agent_program("").is_error());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn long_paths_are_ellipsized_but_keep_ends() {
+        let path = "/home/user/Документы/rdeprojects/очень-длинный-проект-по-РСА/objects/sources/01ABC/report.pdf";
+        let short = super::ellipsize_path(path, 40);
+        assert!(short.chars().count() <= 40, "{short}");
+        assert!(short.contains('…'), "середина заменена многоточием: {short}");
+        assert!(short.starts_with("/home/user"), "начало пути сохранено: {short}");
+        assert!(short.ends_with("report.pdf"), "конец пути сохранён: {short}");
+        assert_eq!(super::ellipsize_path("/tmp/a", 80), "/tmp/a");
+    }
+
+    /// Запись полей манифеста не должна «уезжать» в таблицы: `file`/`url`/`retrieved_at`
+    /// остаются ключами верхнего уровня, `[reference]` не затирается.
+    #[test]
+    fn manifest_setters_keep_toml_sections() {
+        let root = temp_root("manifest-sections");
+        let path = root.join("source.toml");
+        std::fs::write(
+            &path,
+            "schema = \"rde/source@1\"\nid = \"01\"\ntitle = \"Источник\"\nkind = \"file\"\nfile = \"a.pdf\"\n\n[reference]\ntitle = \"Статья\"\nyear = 2020\n",
+        )
+        .unwrap();
+        super::set_manifest_string(&path, "file", "b.pdf").unwrap();
+        super::set_manifest_string(&path, "url", "https://example.org").unwrap();
+        super::set_manifest_optional_string(&path, "file", None).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        let table = value.as_table().unwrap();
+        assert_eq!(table.get("url").and_then(|value| value.as_str()), Some("https://example.org"));
+        assert!(table.get("file").is_none(), "file удалён: {text}");
+        // [reference] не тронут.
+        assert_eq!(
+            table.get("reference").and_then(|value| value.get("title")).and_then(|value| value.as_str()),
+            Some("Статья"),
+            "{text}"
+        );
+        assert_eq!(table.get("title").and_then(|value| value.as_str()), Some("Источник"), "верхний title не задет");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── «Проводник…»: клик по кнопке → фоновый выбор → путь в поле ─────────
+
+    #[test]
+    fn picker_button_fills_import_docx_dialog_path() {
+        let (mut app, root) = picker_app("picker-import");
+        let fake = with_fake_picker(&mut app, vec![ScriptedReply::Selected(PathBuf::from("/tmp/выбранный-отчёт.docx"))]);
+        app.run_cmd(Cmd::ImportDocx);
+        let mut harness = render(app);
+        click_label(&harness, "Проводник");
+        harness.run_steps(8);
+        let dialog = harness.state().import_docx_dialog.as_ref().expect("диалог импорта открыт");
+        assert_eq!(dialog.path, "/tmp/выбранный-отчёт.docx", "путь подставлен из системного выбора");
+        assert!(dialog.error.is_empty());
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 1, "клик по кнопке вызвал системный диалог ровно один раз");
+        assert_eq!(requests[0].title, "Импорт .docx");
+        match &requests[0].kind {
+            PickKind::File { filters } => {
+                assert!(filters.iter().any(|filter| filter.extensions == vec!["docx".to_owned()]), "{filters:?}");
+            }
+            other => panic!("ожидался выбор файла .docx, получено {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn picker_folder_for_open_project_and_cancel_keeps_path() {
+        let (mut app, root) = picker_app("picker-open");
+        let fake = with_fake_picker(&mut app, vec![ScriptedReply::Cancelled]);
+        app.run_cmd(Cmd::OpenProject);
+        let mut harness = render(app);
+        click_label(&harness, "Проводник");
+        harness.run_steps(8);
+        // Отмена: путь не меняется, ошибок нет, диалог остаётся открытым.
+        let dialog = harness.state().open_project_dialog.as_ref().expect("диалог открыт");
+        assert_eq!(dialog.path, root.display().to_string());
+        assert!(!logs(harness.state()).contains("введите путь вручную"), "отмена — не ошибка");
+        match &fake.requests()[0].kind {
+            PickKind::Folder => {}
+            other => panic!("«Открыть проект» должен выбирать каталог, получено {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn picker_error_logs_manual_hint_and_keeps_field() {
+        let (mut app, root) = picker_app("picker-error");
+        with_fake_picker(&mut app, vec![ScriptedReply::Failed("нет zenity/диалога".to_owned())]);
+        app.run_cmd(Cmd::ImportDocx);
+        let mut harness = render(app);
+        click_label(&harness, "Проводник");
+        harness.run_steps(8);
+        let text = logs(harness.state());
+        assert!(text.contains("введите путь вручную"), "деградация подсказывает ручной ввод: {text}");
+        let dialog = harness.state().import_docx_dialog.as_ref().expect("диалог не закрылся");
+        assert!(dialog.path.is_empty(), "поле не меняется при ошибке backend'а");
+        // Поле остаётся рабочим: ручной ввод пути + импорт (покрыто отдельным тестом ниже).
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── сквозные сценарии: открыть проект, импорт, новый проект ────────────
+
+    #[test]
+    fn recent_project_click_opens_project() {
+        let (mut app, root) = picker_app("recent-open");
+        let second = temp_root("recent-open-second").join("Второй проект");
+        rde_core::create_project(&second, "Второй проект").unwrap();
+        app.set_demo_recent_projects(Some(vec![rde_core::RecentProject {
+            path: second.display().to_string(),
+            name: "Второй проект".to_owned(),
+            opened_unix: 1,
+        }]));
+        app.run_cmd(Cmd::OpenProject);
+        let mut harness = render(app);
+        click_label(&harness, "Второй проект");
+        harness.run_steps(8);
+        let opened = harness.state().project.root.clone();
+        let expected = std::fs::canonicalize(&second).unwrap();
+        assert_eq!(std::fs::canonicalize(&opened).unwrap(), expected, "клик по недавнему проекту открыл его");
+        assert!(harness.state().open_project_dialog.is_none(), "диалог закрылся после открытия");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    #[test]
+    fn import_docx_action_from_gui_path_creates_imported_document() {
+        let (mut app, root) = picker_app("import-action");
+        let fixture = fixture_docx();
+        assert!(fixture.is_file(), "фикстура .docx: {}", fixture.display());
+        let before = app.project.documents().count();
+        app.import_docx_action_with_title(&fixture, Some("Отчёт ВКР")).expect("импорт .docx по пути из «Проводника…»");
+        assert_eq!(app.project.documents().count(), before + 1);
+        let imported = app
+            .project
+            .documents()
+            .find(|object| object.title == "[IMPORTED] Отчёт ВКР")
+            .expect("новый объект-документ «[IMPORTED] …»");
+        assert!(imported.dir.join("report.doc.rde").is_file(), "пакет .doc.rde создан");
+        assert!(logs(&app).contains("Импортирован .docx"), "{}", logs(&app));
+        // Ручной ввод имени без префикса: префикс добавляется, как в CLI.
+        app.import_docx_action(&fixture).expect("импорт без имени");
+        let stem_title = format!("[IMPORTED] {}", fixture.file_stem().unwrap().to_string_lossy());
+        assert!(app.project.documents().any(|object| object.title == stem_title), "{stem_title}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_project_from_gui_writes_recents_and_last_project() {
+        let (mut app, root) = picker_app("new-project");
+        let parent = temp_root("new-project-parent");
+        let target = parent.join("проект-из-gui");
+        app.set_recent_projects_file(Some(parent.join("recent-projects.toml")));
+        app.create_project_ui(&target, "Проект из GUI").expect("создать проект");
+        assert_eq!(app.project.manifest.name, "Проект из GUI");
+        let recent_file = parent.join("recent-projects.toml");
+        let recent = rde_core::load_recent_projects_from(&recent_file);
+        let canonical = std::fs::canonicalize(&target).unwrap();
+        assert_eq!(recent[0].path, canonical.display().to_string(), "новый проект — первым в истории");
+        assert_eq!(recent[0].name, "Проект из GUI");
+        let last = std::fs::read_to_string(parent.join("last-project")).unwrap();
+        assert_eq!(last.trim(), canonical.display().to_string(), "last-project для scripts/run.sh");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    // ── закрытые GUI-дыры: источник/репозиторий/заметка/цитаты/вставки ─────
+
+    #[test]
+    fn source_properties_attach_file_and_switch_to_url() {
+        let (mut app, root) = picker_app("source-attach");
+        let external = root.join("внешний-конспект.md");
+        std::fs::write(&external, "# Конспект статьи\n\nТекст.").unwrap();
+        let source = app.project.sources().next().cloned().expect("источник в демо-проекте");
+        app.open_source_edit(&source.id);
+        let mut dialog = app.source_edit_dialog.clone().expect("диалог свойств");
+        dialog.kind = "file".to_owned();
+        dialog.file = external.display().to_string();
+        app.save_source_edit(&dialog).expect("сохранить источник с файлом");
+
+        let reloaded = app.project.object(&source.id).cloned().expect("источник на месте");
+        let rde_core::ObjectData::Source(manifest) = &reloaded.data else { panic!("не источник") };
+        let file = manifest.file.clone().expect("file записан");
+        assert_eq!(file, "внешний-конспект.md");
+        assert!(reloaded.dir.join(&file).is_file(), "файл скопирован в объект-источник");
+        assert_eq!(std::fs::read_to_string(reloaded.dir.join(&file)).unwrap(), "# Конспект статьи\n\nТекст.");
+        assert!(external.is_file(), "оригинал не изменяется/не удаляется");
+
+        // Переключение на URL: file убирается, url появляется — локатор не «висит» двойным.
+        app.open_source_edit(&source.id);
+        let mut dialog = app.source_edit_dialog.clone().expect("диалог свойств");
+        dialog.kind = "url".to_owned();
+        dialog.url = "https://example.org/paper".to_owned();
+        dialog.file = external.display().to_string();
+        app.save_source_edit(&dialog).expect("сохранить URL-источник");
+        let reloaded = app.project.object(&source.id).cloned().unwrap();
+        let rde_core::ObjectData::Source(manifest) = &reloaded.data else { panic!("не источник") };
+        assert_eq!(manifest.kind, "url");
+        assert_eq!(manifest.url.as_deref(), Some("https://example.org/paper"));
+        assert!(manifest.file.is_none(), "старый файл удалён из манифеста");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repository_properties_persist_kind_and_path() {
+        let (mut app, root) = picker_app("repo-edit");
+        let repo = app
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(object.data, rde_core::ObjectData::Repository(_)))
+            .cloned()
+            .expect("репозиторий в демо-проекте");
+        app.open_repository_edit(&repo.id);
+        let mut dialog = app.repo_edit_dialog.clone().expect("диалог свойств репозитория");
+        dialog.kind = "external".to_owned();
+        dialog.path = "/home/user/исходники".to_owned();
+        // Путь не существует → понятная ошибка валидации до сохранения (диалог), но запись
+        // манифеста допустима: проверяем и валидатор отдельно, и запись.
+        assert!(super::validate_directory(&dialog.path).is_error());
+        app.save_repository_edit(&dialog).expect("сохранить репозиторий");
+        let reloaded = app.project.object(&repo.id).cloned().unwrap();
+        let rde_core::ObjectData::Repository(manifest) = &reloaded.data else { panic!("не репозиторий") };
+        assert_eq!(manifest.kind, "external");
+        assert_eq!(manifest.path, "/home/user/исходники");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn note_editor_saves_markdown_content() {
+        let (mut app, root) = picker_app("note-edit");
+        let note = app
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(object.data, rde_core::ObjectData::Note(_)))
+            .cloned()
+            .expect("заметка в демо-проекте");
+        app.selected = Some(note.id.clone());
+        app.note_editor = Some(super::NoteEditorState {
+            id: note.id.clone(),
+            text: "# Новая заметка\n\nПравка из GUI.".to_owned(),
+            dirty: true,
+            error: String::new(),
+        });
+        assert!(app.save_note_editor(), "Ctrl+S в редакторе заметки сохранил её");
+        let rde_core::ObjectData::Note(manifest) = &note.data else { panic!("не заметка") };
+        let text = std::fs::read_to_string(note.dir.join(&manifest.file)).unwrap();
+        assert!(text.contains("Правка из GUI"), "{text}");
+        assert!(!app.note_editor.as_ref().unwrap().dirty, "после сохранения правок нет");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn citations_import_creates_source_objects() {
+        let (mut app, root) = picker_app("citations");
+        let bib = root.join("refs.bib");
+        std::fs::write(
+            &bib,
+            "@book{cumming2005,\n  author = {Cumming, I. G. and Wong, F. H.},\n  title = {Digital Processing of SAR Data},\n  year = {2005}\n}\n@article{moreira2013,\n  author = {Moreira, A.},\n  title = {A Tutorial on SAR},\n  year = {2013}\n}\n",
+        )
+        .unwrap();
+        let before = app.project.sources().count();
+        let summary = app.import_citations_action(&bib).expect("импорт цитат");
+        assert_eq!(app.project.sources().count(), before + 2, "два источника созданы");
+        assert!(summary.contains("создано источников 2"), "{summary}");
+        let titles: Vec<String> = app
+            .project
+            .sources()
+            .filter_map(|object| match &object.data {
+                rde_core::ObjectData::Source(source) => source.reference.as_ref().map(|reference| reference.title.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(titles.iter().any(|title| title.contains("Digital Processing")), "{titles:?}");
+        // Битый файл — понятная ошибка, ничего не создано.
+        let broken = root.join("broken.bib");
+        std::fs::write(&broken, "не цитаты вовсе").unwrap();
+        let before = app.project.sources().count();
+        assert!(app.import_citations_action(&broken).is_err());
+        assert_eq!(app.project.sources().count(), before, "ошибка не создаёт частичных объектов");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_inserts_command_updates_document_instead_of_mock_log() {
+        let (mut app, root) = picker_app("update-inserts");
+        app.run_cmd(Cmd::UpdateInserts);
+        let text = logs(&app);
+        assert!(!text.contains("сейчас mock"), "заглушка убрана: {text}");
+        assert!(
+            text.contains("Документ обновлён") || text.contains("Обновить документ"),
+            "«Обновить вставки» реально обновляет документ: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recent_history_records_plain_open_via_api() {
+        let (mut app, root) = picker_app("record-open");
+        let parent = temp_root("record-open-http");
+        app.set_recent_projects_file(Some(parent.join("recent-projects.toml")));
+        let name = app.project.manifest.name.clone();
+        app.record_recent_project(&root, &name);
+        let recent = rde_core::load_recent_projects_from(&parent.join("recent-projects.toml"));
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].name, name);
+        assert!(recent[0].path.ends_with("project"), "канонизированный путь проекта: {}", recent[0].path);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Заметка/источник открываются на вкладке «Источник» (а не показывают чужой объект).
+    #[test]
+    fn note_and_source_open_on_source_tab() {
+        let (mut app, root) = picker_app("tabs");
+        let note = app
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(object.data, rde_core::ObjectData::Note(_)))
+            .map(|object| object.id.clone())
+            .expect("заметка");
+        app.apply_tree_action(super::TreeAction::Open(note.clone()));
+        assert!(app.tab == Tab::Source, "заметка открывается на вкладке «Источник»");
+        assert_eq!(app.selected.as_deref(), Some(note.as_str()));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

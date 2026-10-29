@@ -36,7 +36,11 @@ pub use project::{
     Freshness, Group, Issue, Level, LogLine, Object, ObjectData, ObjectKind, Project, load_project,
 };
 pub use selector::{SelectorMatch, expand_selector, glob_match, is_glob};
-pub use settings::{AppSettings, config_dir, load_from as load_app_settings, save_to as save_app_settings};
+pub use settings::{
+    AppSettings, RecentProject, config_dir, last_project_path, load_from as load_app_settings,
+    load_recent_projects, load_recent_projects_from, record_recent_project,
+    record_recent_project_in, recent_projects_path, save_to as save_app_settings,
+};
 
 /// Новый ULID для объектов проекта (единая точка генерации id).
 pub fn new_id() -> String {

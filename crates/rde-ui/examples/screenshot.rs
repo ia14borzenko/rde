@@ -65,6 +65,55 @@ fn main() {
         Some("artifact-inputs") => state.demo_set_artifact_section("inputs"),
         Some("artifact-generation") => state.demo_set_artifact_section("generation"),
         Some("artifact-result") => state.demo_set_artifact_section("result"),
+        // GUI-02 (ADR-0017): диалоги путей с «Проводник…», недавними проектами и валидацией.
+        Some("open-project-dialog") => {
+            // История «Недавние проекты» — демо-записи (пути могут быть не на этой машине).
+            state.demo_set_recent_projects(vec![
+                rde_core::RecentProject {
+                    path: "/home/user/Документы/rdeprojects/вкр-2026".to_owned(),
+                    name: "ВКР — исследование РСА".to_owned(),
+                    opened_unix: 1_790_000_000,
+                },
+                rde_core::RecentProject {
+                    path: "/home/user/Документы/rdeprojects/статья-радиолокация".to_owned(),
+                    name: "Статья: радиолокация".to_owned(),
+                    opened_unix: 1_789_000_000,
+                },
+                rde_core::RecentProject {
+                    path: "/home/user/Документы/rdeprojects/учебный-проект".to_owned(),
+                    name: "Учебный проект".to_owned(),
+                    opened_unix: 1_788_000_000,
+                },
+            ]);
+            state.demo_open_open_project_dialog();
+        }
+        Some("import-docx-dialog") => {
+            // Существующий .docx (фикстура RDE) — «зелёная» проверка пути.
+            let fixture = std::env::current_dir()
+                .map(|dir| dir.join("crates/rde-doc/tests/fixtures/base-report.docx"))
+                .unwrap_or_default();
+            state.demo_open_import_docx_dialog(&fixture.display().to_string());
+        }
+        Some("import-docx-dialog-invalid") => {
+            // Опечатка в пути — понятная ошибка до действия (красная подпись, «Импортировать» disabled).
+            state.demo_open_import_docx_dialog("/home/user/Документы/отчёт-2026.doc");
+        }
+        Some("new-project-dialog") => {
+            let path = state.project.root.join("новый-проект");
+            state.demo_open_new_project_dialog(&path.display().to_string());
+        }
+        Some("import-citations-dialog") => {
+            // Демо-файл BibTeX во временном каталоге: показывает валидный путь.
+            let path = std::env::temp_dir().join("rde-demo-citations.bib");
+            let _ = std::fs::write(
+                &path,
+                "@book{cumming2005,\n  author = {Cumming, I. G. and Wong, F. H.},\n  title = {Digital Processing of Synthetic Aperture Radar Data},\n  year = {2005}\n}\n",
+            );
+            state.demo_open_import_citations_dialog(&path.display().to_string());
+        }
+        Some("import-review-dialog") => state.demo_open_import_review_dialog(""),
+        Some("source-edit-dialog") => state.demo_open_source_edit(),
+        Some("repository-edit-dialog") => state.demo_open_repository_edit(),
         _ => {}
     }
 

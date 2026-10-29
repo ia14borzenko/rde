@@ -7,8 +7,12 @@
 //! Расположение: `$RDE_CONFIG_DIR/settings.toml`, иначе `$XDG_CONFIG_HOME/rde/settings.toml`,
 //! иначе `~/.config/rde/settings.toml`; в portable-режиме — `.rde/app-settings.toml` рядом с
 //! проектом (если задан `RDE_PORTABLE=1`).
+//!
+//! Здесь же — **недавние проекты** (`recent-projects.toml`, GUI-история «Открыть проект…») и
+//! совместимый с `scripts/run.sh` файл `last-project` (одна строка — путь последнего проекта).
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -192,6 +196,116 @@ pub fn save_to(settings: &AppSettings, path: &Path) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
+// ── недавние проекты (GUI «Открыть проект…») ────────────────────────────────
+// Отдельный от настроек файл: история открытий — не настройка и не должна затираться при
+// сохранении `settings.toml`. Формат — аддитивный TOML (как и все манифесты проекта).
+
+/// Схема файла недавних проектов.
+pub const RECENT_PROJECTS_SCHEMA: &str = "rde/recent-projects@1";
+
+/// Сколько последних проектов помнить (старые вытесняются).
+pub const RECENT_PROJECTS_LIMIT: usize = 10;
+
+fn default_recent_schema() -> String {
+    RECENT_PROJECTS_SCHEMA.to_owned()
+}
+
+/// Одна запись истории: путь к каталогу с `rde.toml` + имя проекта на момент открытия.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentProject {
+    pub path: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub opened_unix: u64,
+}
+
+/// Содержимое `recent-projects.toml`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentProjects {
+    #[serde(default = "default_recent_schema")]
+    pub schema: String,
+    #[serde(default)]
+    pub projects: Vec<RecentProject>,
+}
+
+impl Default for RecentProjects {
+    fn default() -> Self {
+        Self { schema: default_recent_schema(), projects: Vec::new() }
+    }
+}
+
+/// Файл истории проектов: `$RDE_CONFIG_DIR/recent-projects.toml` (иначе `~/.config/rde/…`).
+pub fn recent_projects_path() -> PathBuf {
+    config_dir().join("recent-projects.toml")
+}
+
+/// Файл «последний проект» — его же читает `scripts/run.sh` при запуске без аргумента.
+pub fn last_project_path() -> PathBuf {
+    config_dir().join("last-project")
+}
+
+/// Прочитать историю проектов (пустой список, если файла нет/он повреждён; битые записи
+/// отбрасываются, дубликаты схлопываются — файл мог править человек).
+pub fn load_recent_projects() -> Vec<RecentProject> {
+    load_recent_projects_from(&recent_projects_path())
+}
+
+/// Прочитать историю проектов из конкретного файла (тесты/portable).
+pub fn load_recent_projects_from(path: &Path) -> Vec<RecentProject> {
+    let mut list = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<RecentProjects>(&text).ok())
+        .map(|file| file.projects)
+        .unwrap_or_default();
+    normalize_recent(&mut list);
+    list
+}
+
+/// Схлопнуть дубликаты (первое вхождение — самое свежее), выкинуть пустые пути, ограничить лимит.
+fn normalize_recent(list: &mut Vec<RecentProject>) {
+    let mut seen = std::collections::BTreeSet::new();
+    list.retain(|entry| {
+        let path = entry.path.trim();
+        !path.is_empty() && seen.insert(path.to_owned())
+    });
+    list.truncate(RECENT_PROJECTS_LIMIT);
+}
+
+/// Записать проект в историю (в начало, без дубликатов) и обновить `last-project`.
+pub fn record_recent_project(root: &Path, name: &str) -> Result<PathBuf, String> {
+    record_recent_project_in(&recent_projects_path(), root, name)
+}
+
+/// То же, но с явными путями (тесты/portable). `last-project` пишется рядом с файлом истории.
+pub fn record_recent_project_in(path: &Path, root: &Path, name: &str) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut list = load_recent_projects_from(path);
+    let root_text = root.display().to_string();
+    list.retain(|entry| entry.path != root_text);
+    list.insert(
+        0,
+        RecentProject { path: root_text.clone(), name: name.trim().to_owned(), opened_unix: now_unix() },
+    );
+    normalize_recent(&mut list);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("создать {}: {e}", parent.display()))?;
+    }
+    let file = RecentProjects { schema: RECENT_PROJECTS_SCHEMA.to_owned(), projects: list };
+    let text = toml::to_string_pretty(&file).map_err(|e| format!("recent-projects.toml: {e}"))?;
+    std::fs::write(path, text).map_err(|e| format!("записать {}: {e}", path.display()))?;
+    // Совместимость с scripts/run.sh: он открывает проект из `last-project` (одна строка).
+    if let Some(parent) = path.parent() {
+        let last = parent.join("last-project");
+        let _ = std::fs::write(last, format!("{root_text}\n"));
+    }
+    Ok(root)
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +413,47 @@ mod tests {
         assert_eq!(loaded.agent_args.len(), 3);
         assert_eq!(loaded.agent_model, "deepseek-v4-pro");
         assert_eq!(loaded.agent_reasoning_effort, "max");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Недавние проекты: запись без дубликатов в начало, лимит, last-project для run.sh.
+    #[test]
+    fn recent_projects_record_dedupe_and_limit() {
+        let dir = tmp("recent");
+        let file = dir.join("recent-projects.toml");
+        // Пустой/битый файл — не ошибка: пустая история.
+        assert!(load_recent_projects_from(&file).is_empty());
+        std::fs::write(&file, "not toml [").unwrap();
+        assert!(load_recent_projects_from(&file).is_empty());
+
+        // Проекты — реальные каталоги (record канонизирует путь).
+        let mut roots = Vec::new();
+        for index in 0..(RECENT_PROJECTS_LIMIT + 2) {
+            let root = dir.join(format!("project-{index}"));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("rde.toml"), "schema = \"rde/project@1\"\n").unwrap();
+            roots.push(root);
+        }
+        for (index, root) in roots.iter().enumerate() {
+            record_recent_project_in(&file, root, &format!("Проект {index}")).unwrap();
+        }
+        let list = load_recent_projects_from(&file);
+        assert_eq!(list.len(), RECENT_PROJECTS_LIMIT, "лимит истории");
+        let newest = std::fs::canonicalize(roots.last().unwrap()).unwrap();
+        assert_eq!(list[0].path, newest.display().to_string(), "свежий проект — первым");
+        assert_eq!(list[0].name, format!("Проект {}", roots.len() - 1));
+        assert!(list[0].opened_unix > 0, "время открытия записано");
+        // Повторное открытие не дублирует запись, а поднимает её наверх.
+        let old = std::fs::canonicalize(&roots[1]).unwrap();
+        record_recent_project_in(&file, &roots[1], "Проект 1 заново").unwrap();
+        let list = load_recent_projects_from(&file);
+        assert_eq!(list.len(), RECENT_PROJECTS_LIMIT, "дубликат не увеличивает историю");
+        assert_eq!(list[0].path, old.display().to_string());
+        assert_eq!(list[0].name, "Проект 1 заново");
+        assert_eq!(list.iter().filter(|entry| entry.path == old.display().to_string()).count(), 1);
+        // last-project (совместимость с scripts/run.sh) — путь последнего открытого проекта.
+        let last = std::fs::read_to_string(dir.join("last-project")).unwrap();
+        assert_eq!(last.trim(), old.display().to_string());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

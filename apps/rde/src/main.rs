@@ -53,12 +53,16 @@ fn main() -> eframe::Result<()> {
             .with_title(APP_TITLE),
         ..Default::default()
     };
+    // GUI-02 (ADR-0017): проект, открытый аргументом/`run.sh`, сразу попадает в «Недавние
+    // проекты» и в `last-project` — следующий `./scripts/run.sh` без аргумента откроет его же.
+    let mut app = RdeApp::new(project);
+    app.record_startup_project();
     eframe::run_native(
         "RDE",
         options,
         Box::new(|cc| {
             let _ = cc;
-            Ok(Box::new(RdeFrame(RdeApp::new(project))))
+            Ok(Box::new(RdeFrame(app)))
         }),
     )
 }
