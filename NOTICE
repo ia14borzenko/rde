@@ -25,6 +25,10 @@ Third-party components referenced or used as dependencies (attribution):
 - xtask tooling and Cargo dependencies are attributed in Cargo.lock and their own licenses.
 - pdfium (https://github.com/chromium/pdfium) — BSD-3-Clause; pdfium-render — MIT/Apache-2.0.
 - monolith (https://github.com/Y2Z/monolith) — CC0-1.0.
+- kdialog (KDE, https://invent.kde.org/utilities/kdialog) — GPL-2.0-or-later; zenity (GNOME,
+  https://gitlab.gnome.org/GNOME/zenity) — LGPL-2.1. Optional external CLI for the system
+  file/folder picker («Проводник…», ADR-0017): not bundled and not linked, invoked only when present
+  in the user's desktop environment; without them RDE asks to type the path manually.
 - DejaVu Sans / DejaVu Sans Mono / DejaVu Sans Bold (subset) — bundled in `crates/rde-ui/fonts/`:
   Copyright (c) 2003 by Bitstream, Inc.; DejaVu changes are public domain (Bitstream Vera license,
   permissive, attribution required). Used for the RDE shell UI and bold section headings.
