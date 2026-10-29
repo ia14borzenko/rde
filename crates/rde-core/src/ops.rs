@@ -591,6 +591,21 @@ pub fn create_project(root: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Сменить схему нумерации формул документа в `document.toml` (ADR-0018): `continuous` —
+/// сквозная, `section` — по разделам (ГОСТ). Валидирует манифест после записи.
+pub fn set_document_formula_numbering(manifest_path: &Path, scheme: &str) -> Result<(), String> {
+    let text = fs::read_to_string(manifest_path).map_err(|e| format!("прочитать {}: {e}", manifest_path.display()))?;
+    let mut manifest: crate::manifest::DocumentManifest =
+        toml::from_str(&text).map_err(|e| format!("разобрать {}: {e}", manifest_path.display()))?;
+    if !matches!(scheme, "continuous" | "section") {
+        return Err(format!("неизвестная схема нумерации формул: {scheme} (ожидается continuous|section)"));
+    }
+    manifest.formula_numbering = scheme.to_owned();
+    let text = toml::to_string_pretty(&manifest).map_err(|e| format!("document.toml: {e}"))?;
+    fs::write(manifest_path, text).map_err(|e| format!("записать {}: {e}", manifest_path.display()))?;
+    validate_manifest(ManifestKind::Document, manifest_path)
+}
+
 /// Создать каталог документа и `document.toml` (без OOXML-пакета: пакет собирает вызывающий слой,
 /// у которого есть движок WordCraft — см. `RdeApp::create_document_action`).
 pub fn create_document_stub(root: &Path, title: &str) -> Result<PathBuf, String> {
@@ -602,7 +617,7 @@ pub fn create_document_stub(root: &Path, title: &str) -> Result<PathBuf, String>
     let dir = root.join("objects/documents").join(&id);
     fs::create_dir_all(&dir).map_err(|e| format!("создать каталог документа: {e}"))?;
     let manifest = format!(
-        "schema = \"{}\"\nid = \"{id}\"\ntitle = {}\ntemplate = \"gost-7.32-2017\"\nfile = \"report.doc.rde\"\n",
+        "schema = \"{}\"\nid = \"{id}\"\ntitle = {}\ntemplate = \"gost-7.32-2017\"\nfile = \"report.doc.rde\"\nformula_numbering = \"continuous\"\n",
         crate::manifest::SCHEMA_DOCUMENT,
         toml_string(title)
     );

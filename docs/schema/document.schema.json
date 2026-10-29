@@ -6,6 +6,11 @@
       "description": "Рабочий файл документа (в M3 — `.doc.rde`, пока `.docx`).",
       "type": "string"
     },
+    "formula_numbering": {
+      "default": "continuous",
+      "description": "Схема нумерации формул документа (ADR-0018): `continuous` (сквозная, по умолчанию) или\n`section` (по разделам, ГОСТ `(2.1)`; приложения `(А.1)`). Номер — документно-локальный\n(ADR-0005 §3.1), назначается RDE, а не набирается руками.",
+      "type": "string"
+    },
     "id": {
       "type": "string"
     },

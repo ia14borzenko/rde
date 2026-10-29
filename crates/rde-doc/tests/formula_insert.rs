@@ -108,7 +108,7 @@ fn omml_insert_updates_and_roundtrips_through_engine() {
     let body_v1 = compiled_body("\\sigma=\\frac{F}{A}", true, "act-v1", true);
     let report = add_formula_insert(
         &package,
-        FormulaInsertRequest { body: body_v1.clone(), render_mode: "omml".to_owned(), anchor_block: None },
+        FormulaInsertRequest { body: body_v1.clone(), render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, },
     )
     .expect("вставка формулы");
     assert_eq!(report.insert.kind, "formula");
@@ -151,7 +151,13 @@ fn omml_insert_updates_and_roundtrips_through_engine() {
     assert!(document.contains("<m:oMathPara"), "OMML обновлённой формулы: {document}");
     let statuses = formula_insert_statuses(&package, &availability_v2).unwrap();
     assert_eq!(statuses[0].state, FormulaInsertState::Fresh, "{}", statuses[0].detail);
-    assert_eq!(load_rde_doc(&package).unwrap().inserts[0].hash.as_deref(), Some("act-v2"));
+    let updated_insert = &load_rde_doc(&package).unwrap().inserts[0];
+    assert_eq!(updated_insert.hash.as_deref(), Some("act-v2"));
+    assert!(
+        updated_insert.target.ends_with("@act-v2"),
+        "целевой URI обновлён вместе с act_key (иначе инспектор показывает «устарела»): {}",
+        updated_insert.target
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -166,7 +172,7 @@ fn svg_insert_keeps_media_rels_and_content_types() {
     let body_v1 = compiled_body("\\sigma=\\frac{F}{A}", true, "act-svg", true);
     let report = add_formula_insert(
         &package,
-        FormulaInsertRequest { body: body_v1.clone(), render_mode: "svg".to_owned(), anchor_block: None },
+        FormulaInsertRequest { body: body_v1.clone(), render_mode: "svg".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, },
     )
     .expect("вставка svg-формулы");
     let document = body(&package);
@@ -231,7 +237,7 @@ fn missing_target_and_manual_edit_are_noted_not_overwritten() {
     let body_v1 = compiled_body("\\sigma=\\frac{F}{A}", true, "act-v1", true);
     let report = add_formula_insert(
         &package,
-        FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None },
+        FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, },
     )
     .unwrap();
 
@@ -344,7 +350,7 @@ fn rollback_transaction_restores_previous_formula_insert() {
     let package = new_package(&root);
     let mut store = rde_store::Store::open(&root).unwrap();
     let body_v1 = compiled_body("\\sigma=\\frac{F}{A}", true, "act-v1", true);
-    add_formula_insert(&package, FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None }).unwrap();
+    add_formula_insert(&package, FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, }).unwrap();
     let before = body(&package);
     rde_doc::commit_document(&root, &package, DOC_ID, &mut store, "v1").unwrap();
 
@@ -359,6 +365,7 @@ fn rollback_transaction_restores_previous_formula_insert() {
         &BTreeMap::new(),
         &BTreeMap::new(),
         &bodies_v2,
+        rde_doc::FormulaNumbering::Continuous,
         &BTreeMap::new(),
         Some(serde_json::json!({ "kind": "document-formula-update", "formulas": [] })),
         &mut store,
@@ -444,7 +451,7 @@ fn input_change_marks_instale_then_updates_in_one_transaction() {
     let package = new_package(&root);
     let package = {
         let body_v1 = body_from_state(&store, FORMULA_ID, &prepared.state, "\\sigma=42", true);
-        add_formula_insert(&package, FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None }).expect("вставка");
+        add_formula_insert(&package, FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, }).expect("вставка");
         package
     };
     let availability = BTreeMap::from([(FORMULA_ID.to_owned(), FormulaAvailability::Current(act_key_v1.clone()))]);
@@ -474,6 +481,7 @@ fn input_change_marks_instale_then_updates_in_one_transaction() {
         &BTreeMap::new(),
         &BTreeMap::new(),
         &bodies,
+        rde_doc::FormulaNumbering::Continuous,
         &roots,
         Some(payload),
         &mut store,

@@ -63,11 +63,20 @@ pub use suggestions::*;
 mod text_edit;
 pub use text_edit::*;
 
+/// ADR-0018: схемы нумерации формул (сквозная/по разделам, приложения) в контексте документа.
+pub mod formula_numbering;
+pub use formula_numbering::{FormulaNumber, FormulaNumbering, SectionHeading, SectionScan, number_formulas, scan_sections};
+
+/// ADR-0018: бандл math-шрифта формул (STIX Two Math, OFL 1.1) и его регистрация в FontDb.
+pub mod math_font;
+pub use math_font::{MATH_FONT_COPYRIGHT, MATH_FONT_FAMILY, MATH_FONT_FILE, ensure_registered as ensure_math_font};
+
 pub const RDE_NS: &str = "https://rde.dev/ns/doc";
-/// Версия схемы `rde:doc`: 3 — скрытые объекты MathType-формул из импорта (`<rde:formulas>`,
-/// R-DOC-44); 2 — формульные вставки (`kind="formula"`, `render_mode`, `body_hash`).
-/// Пакеты версий 1–2 читаются (новые поля необязательны); при записи ставится 3.
-pub const SCHEMA_VERSION: &str = "3";
+/// Версия схемы `rde:doc`: 4 — отображаемый номер формулы `number_text` (схемы нумерации
+/// «по разделам»/приложения, ADR-0018); 3 — скрытые объекты MathType-формул из импорта
+/// (`<rde:formulas>`, R-DOC-44); 2 — формульные вставки (`kind="formula"`, `render_mode`,
+/// `body_hash`). Пакеты версий 1–4 читаются (новые поля необязательны); при записи ставится 4.
+pub const SCHEMA_VERSION: &str = "4";
 pub const RDE_DOC_PART: &str = "customXml/item1.xml";
 pub const RDE_ITEM_PROPS: &str = "customXml/itemProps1.xml";
 pub const RDE_ITEM_RELS: &str = "customXml/_rels/item1.xml.rels";
@@ -105,8 +114,14 @@ pub struct RdeInsert {
     /// URI цели: `rde://artifact/<id>@<out_hash>/<selector>` или `rde://source/<id>`.
     pub target: String,
     pub caption: String,
+    /// Документно-локальный номер формулы (`RdeInsert.number` — порядковый индекс; для формул
+    /// равен номеру при сквозной схеме) (ADR-0005 §3.1).
     #[serde(default)]
     pub number: Option<u32>,
+    /// Отображаемый номер формулы без скобок: `"2.1"`, `"А.1"` (схема «по разделам», ADR-0018);
+    /// `None` — взять `number` (сквозная схема/совместимость с v3).
+    #[serde(default)]
+    pub number_text: Option<String>,
     #[serde(default)]
     pub hash: Option<String>,
     /// Кэш значения вставки (R-DOC-11): то, что показано в документе.
@@ -328,6 +343,9 @@ pub fn render_rde_doc(doc: &RdeDoc) -> String {
         if let Some(number) = insert.number {
             out.push_str(&format!(" number=\"{number}\""));
         }
+        if let Some(number_text) = &insert.number_text {
+            out.push_str(&format!(" number_text=\"{}\"", escape_attr(number_text)));
+        }
         if let Some(hash) = &insert.hash {
             out.push_str(&format!(" hash=\"{}\"", escape_attr(hash)));
         }
@@ -459,6 +477,7 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                             target: String::new(),
                             caption: String::new(),
                             number: None,
+                            number_text: None,
                             hash: None,
                             cached: String::new(),
                             selector: String::new(),
@@ -480,6 +499,7 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                                 "target" => insert.target = value,
                                 "caption" => insert.caption = value,
                                 "number" => insert.number = value.parse().ok(),
+                                "number_text" => insert.number_text = (!value.is_empty()).then_some(value),
                                 "hash" => insert.hash = Some(value),
                                 "cached" => insert.cached = value,
                                 "selector" => insert.selector = value,
@@ -1461,6 +1481,8 @@ pub fn check_external_edit(package: &Path) -> Result<ExternalEditCheck, String> 
 // ── работа с WordCraft-моделью ────────────────────────────────────────────────
 
 fn open_engine(path: &Path) -> Result<wordcraft_engine::doc::Document, String> {
+    // Math-шрифт формул (ADR-0018) — до первой вёрстки/рендера; идемпотентно.
+    math_font::ensure_registered();
     let region = wordcraft_engine::Region::from_tag("ru-RU");
     wordcraft_engine::io::open_path_in(path, None, &region).map(|(doc, _encrypted)| doc)
 }
@@ -1477,6 +1499,134 @@ pub fn open_document(path: &Path) -> Result<(wordcraft_engine::doc::Document, bo
     } else {
         open_engine(path).map(|doc| (doc, false))
     }
+}
+
+// ── экспорт .docx: math-шрифт, близкий к Times New Roman (ADR-0018) ──────────
+
+/// Выбранный для экспорта math-шрифт: `RDE_EXPORT_MATH_FONT` (пусто/`cambria` — не менять;
+/// иначе имя семейства), по умолчанию бандл [`math_font::MATH_FONT_FAMILY`].
+pub fn export_math_font_family() -> Option<String> {
+    match std::env::var("RDE_EXPORT_MATH_FONT") {
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() || value.eq_ignore_ascii_case("cambria") || value.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(value.to_owned())
+            }
+        }
+        Err(_) => Some(math_font::MATH_FONT_FAMILY.to_owned()),
+    }
+}
+
+/// Version-independent settings-патч экспортируемой копии: `m:mathPr/m:mathFont` и `w:rFonts`
+/// math-ранов → выбранный Times-подобный math-шрифт (STIX Two Math, OFL). Word на стенде нет:
+/// соответствие «по спецификации + LO-оракул» (ADR-0018), честное ограничение — в `docs/fidelity`.
+pub fn patch_export_math_font(docx: &Path) -> Result<bool, String> {
+    let Some(family) = export_math_font_family() else { return Ok(false) };
+    patch_export_math_font_with(docx, &family)
+}
+
+/// То же с явным семейством (для тестов/настроек).
+pub fn patch_export_math_font_with(docx: &Path, family: &str) -> Result<bool, String> {
+    let entries = read_package(docx)?.entries;
+    let mut entries = entries;
+    let changed = patch_math_font_entries(&mut entries, family)?;
+    if changed {
+        write_entries_atomic(&entries, docx)?;
+    }
+    Ok(changed)
+}
+
+/// Патч частей пакета: `word/settings.xml` (`m:mathPr/m:mathFont`) и `word/document.xml`
+/// (`w:rFonts` math-ранов «Cambria Math» → family). Возвращает, были ли изменения.
+fn patch_math_font_entries(entries: &mut BTreeMap<String, Vec<u8>>, family: &str) -> Result<bool, String> {
+    const MATH_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
+    let family_attr = escape_attr(family);
+    let mut changed = false;
+    // Прежний math-шрифт из settings.xml (повторный экспорт уже пропатченной копии).
+    let previous_math_font = entries
+        .get("word/settings.xml")
+        .map(|settings| String::from_utf8_lossy(settings).to_string())
+        .and_then(|xml| {
+            let start = xml.find("<m:mathFont")?;
+            let end = xml[start..].find("/>")? + start;
+            let block = &xml[start..end];
+            let marker = "m:val=\"";
+            let index = block.find(marker)? + marker.len();
+            let rest = &block[index..];
+            Some(rest[..rest.find('"')?].to_owned())
+        });
+    // 1) settings.xml: m:mathPr с m:mathFont (если mathPr уже есть — заменяем/добавляем mathFont).
+    if let Some(settings) = entries.get_mut("word/settings.xml") {
+        let mut xml = String::from_utf8_lossy(settings).to_string();
+        let math_font = format!("<m:mathFont m:val=\"{family_attr}\"/>");
+        if let Some(start) = xml.find("<m:mathPr") {
+            let Some(rel_end) = xml[start..].find("</m:mathPr>") else { return Err("settings.xml: незакрытый m:mathPr".to_owned()) };
+            let end = start + rel_end;
+            let block = xml[start..end].to_string();
+            let new_block = if let Some(font_start) = block.find("<m:mathFont") {
+                let Some(font_rel_end) = block[font_start..].find("/>") else { return Err("settings.xml: m:mathFont".to_owned()) };
+                let font_end = font_start + font_rel_end + 2;
+                if block[font_start..font_end].contains(&family_attr) {
+                    block.clone()
+                } else {
+                    format!("{}{}{}", &block[..font_start], math_font, &block[font_end..])
+                }
+            } else {
+                // mathFont — первый ребёнок m:mathPr (порядок CT_MathPr).
+                let after_open = block.find('>').map(|offset| offset + 1).unwrap_or(block.len());
+                format!("{}{}{}", &block[..after_open], math_font, &block[after_open..])
+            };
+            if new_block != block {
+                xml = format!("{}{}{}", &xml[..start], new_block, &xml[end..]);
+                changed = true;
+            }
+        } else {
+            // Нет m:mathPr — добавляем после открывающего тега w:settings (с локальным xmlns:m).
+            let Some(open_end) = xml.find("<w:settings").and_then(|start| xml[start..].find('>').map(|offset| start + offset + 1)) else {
+                return Err("settings.xml: нет w:settings".to_owned());
+            };
+            let block = format!("<m:mathPr xmlns:m=\"{MATH_NS}\">{math_font}</m:mathPr>");
+            xml = format!("{}{}{}", &xml[..open_end], block, &xml[open_end..]);
+            changed = true;
+        }
+        *settings = xml.into_bytes();
+    } else {
+        return Err("в пакете нет word/settings.xml".to_owned());
+    }
+    // 2) document.xml: rFonts math-ранов (writer WordCraft ставит Cambria Math только им).
+    if let Some(document) = entries.get_mut(DOCUMENT_XML) {
+        let xml = String::from_utf8_lossy(document).to_string();
+        let mut old_families: Vec<String> = vec!["Cambria Math".to_owned(), math_font::MATH_FONT_FAMILY.to_owned()];
+        if let Some(previous) = &previous_math_font {
+            old_families.push(previous.clone());
+        }
+        old_families.sort();
+        old_families.dedup();
+        let mut patched = xml.clone();
+        for old in old_families {
+            if old == family {
+                continue;
+            }
+            patched = patched
+                .replace(&format!("w:ascii=\"{old}\""), &format!("w:ascii=\"{family_attr}\""))
+                .replace(&format!("w:hAnsi=\"{old}\""), &format!("w:hAnsi=\"{family_attr}\""));
+        }
+        if patched != xml {
+            *document = patched.into_bytes();
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Экспортировать `.doc.rde` в чистый `.docx` для Word: пакет без RDE-частей + best-effort math-шрифт
+/// (ADR-0018, `m:mathPr/m:mathFont` и `w:rFonts` math-ранов; Word на стенде нет — см. fidelity).
+pub fn export_docx(package: &Path, out_docx: &Path) -> Result<PackageInfo, String> {
+    let info = extract_docx(package, out_docx)?;
+    patch_export_math_font(out_docx)?;
+    Ok(info)
 }
 
 /// Является ли файл `.doc.rde`-пакетом.
@@ -1616,6 +1766,7 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 target: String::new(),
                 caption: caption.clone(),
                 number: caption_number(&caption).or(Some(counter)),
+                number_text: None,
                 hash: None,
                 cached: String::new(),
                 selector: String::new(),
@@ -1635,6 +1786,7 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 target: String::new(),
                 caption: block.text.clone(),
                 number: caption_number(&block.text),
+                number_text: None,
                 hash: None,
                 cached: block.text.clone(),
                 selector: String::new(),
@@ -1835,6 +1987,7 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
         target: request.target,
         caption: request.caption,
         number: None,
+        number_text: None,
         hash: None,
         cached: request.cached,
         selector: request.selector,
@@ -2106,6 +2259,7 @@ pub fn add_table_insert(package: &Path, request: InsertRequest, rows: &[Vec<Stri
         target: request.target.clone(),
         caption: caption.clone(),
         number: None,
+        number_text: None,
         hash: None,
         cached: format!("{}×{}", rows.len(), rows.iter().map(Vec::len).max().unwrap_or(0)),
         selector: request.selector.clone(),
@@ -2227,17 +2381,44 @@ pub fn renumber_insert_captions(package: &Path) -> Result<PackageInfo, String> {
         insert.caption = new_caption.clone();
         insert.cached = new_caption;
     }
-    // Перекрёстные ссылки — после того, как известны номера всех рисунков/таблиц.
+    // Номера формул (ADR-0018): документно-локальный отображаемый номер из rde:doc.
+    let mut formula_numbers: BTreeMap<String, String> = BTreeMap::new();
+    for insert in rde_doc.inserts.iter().filter(|insert| insert.kind == "formula") {
+        let Some(target) = parse_formula_target(&insert.target) else { continue };
+        let Some(number) = insert.number_text.clone().or_else(|| insert.number.map(|number| number.to_string())) else { continue };
+        // Первое вхождение формулы в документе — «основное»: ссылки указывают на него.
+        formula_numbers.entry(target.formula_id).or_insert_with(|| format!("({number})"));
+    }
+    // Перекрёстные ссылки — после того, как известны номера всех рисунков/таблиц и формул.
+    let mut missing_formula_refs: Vec<(String, String)> = Vec::new();
     let crossrefs: Vec<(String, String)> = rde_doc
         .inserts
         .iter()
         .filter(|insert| insert.kind == "crossref")
         .filter_map(|insert| {
-            let target_id = insert.target.strip_prefix("rde://insert/")?;
-            let text = numbering.get(target_id)?;
-            (insert.cached != *text).then(|| (insert.id.clone(), text.clone()))
+            let text = if let Some(target_id) = insert.target.strip_prefix("rde://insert/") {
+                numbering.get(target_id)?.clone()
+            } else if let Some(formula_id) = insert.target.strip_prefix("rde://formula/") {
+                let formula_id = formula_id.split('@').next().unwrap_or(formula_id);
+                match formula_numbers.get(formula_id) {
+                    Some(text) => text.clone(),
+                    // B3: удалённая/невставленная цель — placeholder и предупреждение, не тихая ошибка.
+                    None => {
+                        missing_formula_refs.push((insert.id.clone(), formula_id.to_owned()));
+                        "(?)".to_owned()
+                    }
+                }
+            } else {
+                return None;
+            };
+            (insert.cached != text).then(|| (insert.id.clone(), text))
         })
         .collect();
+    for (id, formula_id) in &missing_formula_refs {
+        eprintln!(
+            "rde-doc: перекрёстная ссылка {id} на формулу {formula_id}: формула не вставлена в документ — в тексте «(?)»"
+        );
+    }
     for (id, text) in crossrefs {
         if let Some(insert) = rde_doc.inserts.iter().find(|insert| insert.id == id).cloned() {
             if let Some(new_xml) = replace_sdt_text(&document_xml, &insert, &text) {
@@ -2381,6 +2562,7 @@ pub fn add_figure_insert(
         target,
         caption: caption.clone(),
         number: None,
+        number_text: None,
         hash: Some(out_hash),
         cached: caption,
         selector: String::new(),
@@ -2817,6 +2999,8 @@ pub struct DocumentUpdateFullReport {
     pub formula_conflicts: Vec<String>,
     /// Формульные вставки без цели: формула удалена/не найдена.
     pub formula_missing: Vec<String>,
+    /// Предупреждения нумерации формул (раздел без номера, формулы до раздела, нет заголовков).
+    pub formula_numbering_warnings: Vec<String>,
     pub diff: DocDiff,
     pub backup: Option<PathBuf>,
     pub txid: Option<String>,
@@ -2836,6 +3020,7 @@ pub fn update_document_transactional(
     images: &BTreeMap<String, (String, Vec<u8>)>,
     tables: &BTreeMap<String, Vec<Vec<String>>>,
     formulas: &BTreeMap<String, formula_insert::FormulaBody>,
+    formula_numbering: formula_numbering::FormulaNumbering,
     extra_roots: &BTreeMap<String, rde_hash::Hash>,
     payload_extra: Option<serde_json::Value>,
     store: &mut rde_store::Store,
@@ -2861,10 +3046,11 @@ pub fn update_document_transactional(
     // 4) Формульные вставки (ADR-0005 §3.3): пересобрать содержимое sdt из кэшей формулы,
     // перенумеровать документно-локальные номера; ручную правку не перезаписываем.
     if !formulas.is_empty() {
-        let updated = update_formula_inserts(package, formulas)?;
+        let updated = update_formula_inserts_with(package, formulas, formula_numbering)?;
         report.formula_updates = updated.updated;
         report.formula_conflicts = updated.conflicts;
         report.formula_missing = updated.missing;
+        report.formula_numbering_warnings = updated.warnings;
     }
     // 5) Перенумерация подписей/перекрёстных ссылок + refresh/сохранение пакета.
     renumber_insert_captions(package)?;

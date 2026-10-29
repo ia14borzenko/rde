@@ -24,6 +24,7 @@ use wordcraft_engine::doc::math::parse_linear;
 use wordcraft_engine::doc::math_latex::to_latex;
 use wordcraft_engine::doc::{InlineObject, StoryRef};
 
+use crate::formula_numbering::{FormulaNumbering, number_formulas};
 use crate::{InsertReport, RdeDoc, RdeInsert, DOCUMENT_XML, RDE_DOC_PART};
 
 /// Префикс тега sdt формульной вставки (`rde:formula:<insert-id>`).
@@ -65,6 +66,10 @@ pub struct FormulaInsertRequest {
     pub render_mode: String,
     /// Блок-якорь (0-based индекс блока тела); `None` — в конец документа.
     pub anchor_block: Option<usize>,
+    /// Схема нумерации документа (ADR-0018): сквозная (по умолчанию) или по разделам. Номер
+    /// назначается документно-локально и пересчитывается после вставки (см.
+    /// [`renumber_formula_numbers`]).
+    pub numbering: FormulaNumbering,
 }
 
 /// Разобранная ссылка на формулу: `rde://formula/<id>[@<act_key>]`.
@@ -147,6 +152,8 @@ pub struct FormulaBacklink {
     pub insert_id: String,
     pub render_mode: String,
     pub number: Option<u32>,
+    /// Отображаемый номер без скобок (`"2.1"`, `"А.1"`); `None` — отображается `number`.
+    pub number_text: Option<String>,
     pub stale: bool,
 }
 
@@ -156,6 +163,8 @@ pub struct FormulaUpdateReport {
     pub updated: Vec<String>,
     pub conflicts: Vec<String>,
     pub missing: Vec<String>,
+    /// Предупреждения нумерации (раздел без номера, формулы до первого раздела, нет заголовков).
+    pub warnings: Vec<String>,
 }
 
 /// Отчёт миграции формул документа.
@@ -206,6 +215,7 @@ pub fn add_formula_insert(package: &Path, request: FormulaInsertRequest) -> Resu
     let document_xml = entries.get(DOCUMENT_XML).map(|bytes| String::from_utf8_lossy(bytes).to_string()).unwrap_or_default();
     let id = super::next_insert_id(&rde_doc.inserts, &document_xml);
     let para_id = super::para_id_for(&format!("{}:formula:{id}", rde_doc.doc_id), rde_doc.inserts.len());
+    let numbering = request.numbering;
     let number = if body.display && body.numbered { next_formula_number(&rde_doc) } else { None };
     let mut insert = RdeInsert {
         id: id.clone(),
@@ -214,6 +224,7 @@ pub fn add_formula_insert(package: &Path, request: FormulaInsertRequest) -> Resu
         target: format!("rde://formula/{}@{}", body.formula_id, body.act_key),
         caption: String::new(),
         number,
+        number_text: None,
         hash: Some(body.act_key.clone()),
         cached: body.latex.clone(),
         selector: String::new(),
@@ -227,12 +238,13 @@ pub fn add_formula_insert(package: &Path, request: FormulaInsertRequest) -> Resu
     };
     let signature = if render_mode == "svg" { svg_signature(&body) } else { omml_signature(&body.omml)? };
     insert.body_hash = Some(signature);
+    let number_text_provisional = number.map(|number| number.to_string());
     let content = if body.display {
         let media = if render_mode == "svg" { Some(ensure_formula_media(&mut entries, &insert.id, &body)?) } else { None };
-        build_block_content(&insert, &body, number, &para_id, media)?
+        wrap_block_sdt(&insert.id, &block_content(&insert, &body, number_text_provisional.as_deref(), &para_id, media, &entries)?)
     } else {
         let media = if render_mode == "svg" { Some(ensure_formula_media(&mut entries, &insert.id, &body)?) } else { None };
-        build_inline_content(&insert, &body, &para_id, media)?
+        wrap_inline_sdt(&insert.id, &inline_content(&insert, &body, &para_id, media)?)
     };
     let document_xml = if body.display {
         super::insert_fragment(&document_xml, &content, request.anchor_block)
@@ -250,11 +262,35 @@ pub fn add_formula_insert(package: &Path, request: FormulaInsertRequest) -> Resu
     super::upsert_custom_props(&mut entries, &rde_doc);
     let info = super::info_from_entries(&entries);
     super::write_entries_atomic(&entries, package)?;
+    // Схемная нумерация (ADR-0018): после вставки пересчитываем номера всех формул документа и
+    // ссылки на них (схема «по разделам» переставляет номера у формул после места вставки).
+    let renumbered = renumber_formula_numbers(package, numbering)?;
+    let _ = &renumbered.warnings;
     Ok(InsertReport { insert, package: info })
 }
 
 fn normalize_render_mode(mode: &str) -> &'static str {
     if mode.eq_ignore_ascii_case("svg") { "svg" } else { "omml" }
+}
+
+/// Предварительный номер следующей формулы в документе (для диалога вставки, ADR-0018):
+/// формула ставится последней в порядке документа; возвращает текст без скобок (`"3"`, `"2.2"`,
+/// `"А.1"`) и предупреждения схемы. Ошибки чтения пакета — `None` (превью необязательно).
+pub fn next_formula_number_text(package: &Path, numbering: FormulaNumbering) -> Option<(String, Vec<String>)> {
+    let entries = super::read_package(package).ok()?.entries;
+    let rde_doc = super::load_rde_doc_from_entries(&entries).ok()?;
+    let document_xml = entries.get(DOCUMENT_XML).map(|bytes| String::from_utf8_lossy(bytes).to_string())?;
+    let styles_xml = entries.get("word/styles.xml").map(|bytes| String::from_utf8_lossy(bytes).to_string());
+    let mut ordered: Vec<(String, usize)> = rde_doc
+        .inserts
+        .iter()
+        .filter(|insert| insert.kind == "formula" && insert.number.is_some())
+        .map(|insert| (insert.id.clone(), formula_tag_position(&document_xml, &insert.id).unwrap_or(usize::MAX)))
+        .collect();
+    ordered.push(("__next__".to_owned(), usize::MAX));
+    let (values, warnings) = number_formulas(&document_xml, styles_xml.as_deref(), numbering, &ordered);
+    let text = values.into_iter().find(|value| value.id == "__next__")?.number;
+    Some((text, warnings))
 }
 
 /// Следующий документно-локальный номер формулы: максимальный занятый + 1.
@@ -263,54 +299,72 @@ fn next_formula_number(rde_doc: &RdeDoc) -> Option<u32> {
     Some(max + 1)
 }
 
-/// Содержимое block-sdt: `w:sdt` вокруг нумерованной таблицы 1×2 или центрированного абзаца.
-fn build_block_content(
+/// Содержимое block-sdt display-формулы.
+///
+/// Нумерованная формула — **как «Right-numbered» в Word**: один абзац с табуляциями (центр/право
+/// по ширине текста), display-формула по центру и номер `(n)` у правого поля; видимой таблицы нет
+/// (ADR-0018). Ненумерованная — центрированный абзац. `entries` нужны для ширины текста из
+/// `w:sectPr` (позиции табов).
+fn block_content(
     insert: &RdeInsert,
     body: &FormulaBody,
-    number: Option<u32>,
+    number_text: Option<&str>,
     para_id: &str,
     media: Option<(String, String)>,
+    entries: &BTreeMap<String, Vec<u8>>,
 ) -> Result<String, String> {
     let inner = if insert.render_mode == "svg" {
         let (png_rel, svg_rel) = media.ok_or("svg-режим: нет медиа-связей")?;
         let (cx, cy) = formula_extent_emu(body);
         let drawing = drawing_run_xml(&png_rel, &svg_rel, cx, cy, para_id);
-        match number {
-            Some(number) => numbered_table_xml(&paragraph_centered(para_id, &drawing), number),
+        match number_text {
+            Some(number) => numbered_tabs_paragraph(para_id, &drawing, number, entries),
             None => paragraph_centered(para_id, &drawing),
         }
     } else {
+        // Display-фрагмент: `m:oMathPara` (движок/Word считают его display-формулой — пределы
+        // сумм/интегралов сверху/снизу, как в Word); табы-соседи по абзацу — по ECMA-376
+        // math — run-level элемент (EG_RunLevelElts), поэтому абзац валиден.
         let omml = omml_fragment(&body.omml, body.display)?;
         let math = String::from_utf8_lossy(&omml);
-        match number {
-            Some(number) => numbered_table_xml(&paragraph_centered(para_id, &math), number),
+        match number_text {
+            Some(number) => numbered_tabs_paragraph(para_id, &math, number, entries),
             None => paragraph_centered(para_id, &math),
         }
     };
-    Ok(format!(
-        "<w:sdt><w:sdtPr><w:tag w:val=\"{FORMULA_TAG_PREFIX}{}\"/><w:alias w:val=\"формула\"/></w:sdtPr><w:sdtContent>{inner}</w:sdtContent></w:sdt>",
-        crate::escape_attr(&insert.id)
-    ))
+    Ok(inner)
 }
 
-/// Содержимое inline-формулы: inline-`w:sdt` с `m:oMath`/`w:drawing` (вставляется в абзац).
-fn build_inline_content(
+/// Обернуть блок-содержимое формулы в `w:sdt` с тегом реестра `rde:formula:<id>`.
+fn wrap_block_sdt(insert_id: &str, inner: &str) -> String {
+    format!(
+        "<w:sdt><w:sdtPr><w:tag w:val=\"{FORMULA_TAG_PREFIX}{}\"/><w:alias w:val=\"формула\"/></w:sdtPr><w:sdtContent>{inner}</w:sdtContent></w:sdt>",
+        crate::escape_attr(insert_id)
+    )
+}
+
+/// Inline-содержимое формулы: `m:oMath` для редактируемой или `w:drawing` (SVG+PNG).
+fn inline_content(
     insert: &RdeInsert,
     body: &FormulaBody,
     para_id: &str,
     media: Option<(String, String)>,
 ) -> Result<String, String> {
-    let inner = if insert.render_mode == "svg" {
+    if insert.render_mode == "svg" {
         let (png_rel, svg_rel) = media.ok_or("svg-режим: нет медиа-связей")?;
         let (cx, cy) = formula_extent_emu(body);
-        drawing_run_xml(&png_rel, &svg_rel, cx, cy, para_id)
+        Ok(drawing_run_xml(&png_rel, &svg_rel, cx, cy, para_id))
     } else {
-        String::from_utf8_lossy(&omml_fragment(&body.omml, false)?).to_string()
-    };
-    Ok(format!(
+        Ok(String::from_utf8_lossy(&omml_fragment(&body.omml, false)?).to_string())
+    }
+}
+
+/// Обернуть inline-содержимое формулы в inline-`w:sdt` (вставляется в абзац).
+fn wrap_inline_sdt(insert_id: &str, inner: &str) -> String {
+    format!(
         "<w:sdt><w:sdtPr><w:tag w:val=\"{FORMULA_TAG_PREFIX}{}\"/><w:alias w:val=\"формула\"/></w:sdtPr><w:sdtContent>{inner}</w:sdtContent></w:sdt>",
-        crate::escape_attr(&insert.id)
-    ))
+        crate::escape_attr(insert_id)
+    )
 }
 
 /// Абзац display-формулы: по центру, без отступов и интервалов, с содержимым (OMML/drawing).
@@ -372,22 +426,64 @@ fn nth_body_paragraph_start(xml: &str, index: usize) -> Option<usize> {
     None
 }
 
-/// Нумерованная таблица 1×2: формула в левой ячейке, `(n)` справа (§9.4).
-fn numbered_table_xml(left: &str, number: u32) -> String {
-    let nil = "<w:top w:val=\"nil\" w:sz=\"0\" w:space=\"0\" w:color=\"auto\"/><w:left w:val=\"nil\" w:sz=\"0\" w:space=\"0\" w:color=\"auto\"/>\
-               <w:bottom w:val=\"nil\" w:sz=\"0\" w:space=\"0\" w:color=\"auto\"/><w:right w:val=\"nil\" w:sz=\"0\" w:space=\"0\" w:color=\"auto\"/>\
-               <w:insideH w:val=\"nil\" w:sz=\"0\" w:space=\"0\" w:color=\"auto\"/><w:insideV w:val=\"nil\" w:sz=\"0\" w:space=\"0\" w:color=\"auto\"/>";
+/// Абзац «Right-numbered» формулы: таб-стопы центр/право по ширине текста, формула по центру,
+/// номер `(n)` у правого поля. Схема OOXML: табы + display-формула (`m:oMathPara`) в одном абзаце —
+/// `EG_RunLevelElts` разрешает math внутри `w:p`; Word и LibreOffice ставят формулу на таб-центр,
+/// а номер — на правый таб (LO-оракул в retest'ах). Видимой таблицы нет.
+fn numbered_tabs_paragraph(para_id: &str, content: &str, number: &str, entries: &BTreeMap<String, Vec<u8>>) -> String {
+    let (center, right) = tab_stops(entries);
     format!(
-        "<w:tbl><w:tblPr><w:tblW w:w=\"9355\" w:type=\"dxa\"/><w:tblBorders>{nil}</w:tblBorders>\
-         <w:tblLayout w:type=\"fixed\"/><w:tblCellMar><w:top w:w=\"0\" w:type=\"dxa\"/><w:left w:w=\"0\" w:type=\"dxa\"/>\
-         <w:bottom w:w=\"0\" w:type=\"dxa\"/><w:right w:w=\"0\" w:type=\"dxa\"/></w:tblCellMar>\
-         <w:tblLook w:val=\"04A0\" w:firstRow=\"1\" w:lastRow=\"0\" w:firstColumn=\"1\" w:lastColumn=\"0\" w:noHBand=\"0\" w:noVBand=\"1\"/></w:tblPr>\
-         <w:tblGrid><w:gridCol w:w=\"8505\"/><w:gridCol w:w=\"850\"/></w:tblGrid>\
-         <w:tr><w:tc><w:tcPr><w:tcW w:w=\"8505\" w:type=\"dxa\"/></w:tcPr>{left}</w:tc>\
-         <w:tc><w:tcPr><w:tcW w:w=\"850\" w:type=\"dxa\"/></w:tcPr><w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\"/>\
-         <w:ind w:left=\"0\" w:right=\"0\" w:firstLine=\"0\"/><w:jc w:val=\"right\"/></w:pPr>\
-         <w:r><w:t xml:space=\"preserve\">({number})</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+        "<w:p w14:paraId=\"{para_id}\"><w:pPr>\
+         <w:tabs><w:tab w:val=\"center\" w:pos=\"{center}\"/><w:tab w:val=\"right\" w:pos=\"{right}\"/></w:tabs>\
+         <w:spacing w:before=\"120\" w:after=\"120\"/>\
+         <w:ind w:left=\"0\" w:right=\"0\" w:firstLine=\"0\"/></w:pPr>\
+         <w:r><w:tab/></w:r>{content}<w:r><w:tab/></w:r>\
+         <w:r><w:t xml:space=\"preserve\">({number})</w:t></w:r></w:p>"
     )
+}
+
+/// Позиции таб-стопов (twips от левого поля) из `w:sectPr`: (центр, право) по ширине текста.
+/// Не удалось разобрать `pgSz`/`pgMar` — типовая A4 с полями ГОСТ (текст 9355 twips = 16.5 см).
+fn tab_stops(entries: &BTreeMap<String, Vec<u8>>) -> (i32, i32) {
+    const DEFAULT_TEXT_WIDTH: i32 = 9355;
+    let width = entries
+        .get(DOCUMENT_XML)
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .and_then(|xml| text_width_twips(&xml))
+        .unwrap_or(DEFAULT_TEXT_WIDTH);
+    let width = width.clamp(3000, 30_000);
+    (width / 2, width)
+}
+
+/// Ширина текстового поля страницы в twips из первого `w:sectPr` (pgSz − поля pgMar).
+fn text_width_twips(document_xml: &str) -> Option<i32> {
+    let attr = |xml: &str, name: &str| -> Option<i32> {
+        let marker = format!("{name}=\"");
+        let index = xml.find(&marker)? + marker.len();
+        let rest = &xml[index..];
+        let end = rest.find('"')?;
+        rest[..end].trim().parse::<i32>().ok()
+    };
+    let (page_start, page_end) = element_bounds(document_xml, "<w:pgSz", "</w:pgSz>")?;
+    let page = &document_xml[page_start..page_end];
+    let page_width = attr(page, "w:w")?;
+    let margin = element_bounds(document_xml, "<w:pgMar", "</w:pgMar>").map(|(start, end)| &document_xml[start..end]).unwrap_or("");
+    let left = attr(margin, "w:left").unwrap_or(0);
+    let right = attr(margin, "w:right").unwrap_or(0);
+    let width = page_width - left - right;
+    (width > 0).then_some(width)
+}
+
+/// Границы элемента по открывающему фрагменту и закрывающему тегу (для самозакрытых —
+/// `<w:pgSz .../>` без явного `</w:pgSz>`: границы до `>`).
+fn element_bounds(xml: &str, open: &str, close: &str) -> Option<(usize, usize)> {
+    let start = xml.find(open)?;
+    let open_end = xml[start..].find('>')? + start;
+    if xml[start..open_end].ends_with('/') {
+        return Some((start, open_end + 1));
+    }
+    let end = xml[open_end..].find(close)? + open_end + close.len();
+    Some((start, end))
 }
 
 /// `w:drawing` с PNG-preview и `asvg:svgBlip` (вектор) в `a:blip/a:extLst` + PNG-fallback.
@@ -588,28 +684,54 @@ fn extract_omml_from_content(content: &str) -> Option<String> {
 /// Пересобрать формульные вставки документа из кэшей formula-объектов: заменить содержимое sdt,
 /// обновить `hash`/`cached`/`number`/`body_hash` в `rde:doc`, перенумеровать документно-локальные
 /// номера. Тело, изменённое вручную (подпись ≠ `body_hash`), не перезаписывается — конфликт.
+/// Обновить формульные вставки документа (совместимость): схема нумерации — сквозная.
 pub fn update_formula_inserts(package: &Path, bodies: &BTreeMap<String, FormulaBody>) -> Result<FormulaUpdateReport, String> {
+    update_formula_inserts_with(package, bodies, FormulaNumbering::Continuous)
+}
+
+/// Обновить формульные вставки документа: пересобрать содержимое `w:sdt` из кэшей формулы и
+/// перенумеровать документно-локальные номера по схеме `numbering` (ADR-0005 §3.1, ADR-0018).
+pub fn update_formula_inserts_with(
+    package: &Path,
+    bodies: &BTreeMap<String, FormulaBody>,
+    numbering: FormulaNumbering,
+) -> Result<FormulaUpdateReport, String> {
     let mut entries = super::read_package(package)?.entries;
     let mut rde_doc = super::load_rde_doc_from_entries(&entries)?;
     let Some(document) = entries.get(DOCUMENT_XML) else { return Ok(FormulaUpdateReport::default()) };
     let mut document_xml = String::from_utf8_lossy(document).to_string();
+    let styles_xml = entries.get("word/styles.xml").map(|bytes| String::from_utf8_lossy(bytes).to_string());
     let mut report = FormulaUpdateReport::default();
     let mut formulas: Vec<RdeInsert> = rde_doc.inserts.iter().filter(|insert| insert.kind == "formula").cloned().collect();
     if formulas.is_empty() {
         return Ok(report);
     }
     formulas.sort_by_key(|insert| formula_tag_position(&document_xml, &insert.id).unwrap_or(usize::MAX));
-    // Документно-локальная нумерация (ADR-0005 §3.1): по порядку в документе.
-    let mut number = 0u32;
-    let mut numbers: BTreeMap<String, u32> = BTreeMap::new();
-    for insert in &formulas {
-        let body = parse_formula_target(&insert.target).and_then(|target| bodies.get(&target.formula_id));
-        let numbered = body.map(|body| body.display && body.numbered).unwrap_or(insert.number.is_some());
-        if numbered {
-            number += 1;
-            numbers.insert(insert.id.clone(), number);
-        }
-    }
+    // Документно-локальная нумерация (ADR-0005 §3.1) по схеме документа (ADR-0018): только
+    // display-формулы с политикой «нумеровать», в порядке следования в документе.
+    let numbered_ids: Vec<(String, usize)> = formulas
+        .iter()
+        .filter(|insert| {
+            let body = parse_formula_target(&insert.target).and_then(|target| bodies.get(&target.formula_id));
+            body.map(|body| body.display && body.numbered).unwrap_or(insert.number.is_some())
+        })
+        .filter_map(|insert| formula_tag_position(&document_xml, &insert.id).map(|position| (insert.id.clone(), position)))
+        .collect();
+    let (number_values, numbering_warnings) =
+        number_formulas(&document_xml, styles_xml.as_deref(), numbering, numbered_ids.as_slice());
+    report.warnings = numbering_warnings;
+    let numbers: BTreeMap<String, (u32, String)> = numbered_ids
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| {
+            let text = number_values
+                .iter()
+                .find(|value| &value.id == id)
+                .map(|value| value.number.clone())
+                .unwrap_or_else(|| (index + 1).to_string());
+            (id.clone(), ((index + 1) as u32, text))
+        })
+        .collect();
     let mut changed = false;
     for index in 0..rde_doc.inserts.len() {
         if rde_doc.inserts[index].kind != "formula" {
@@ -627,10 +749,14 @@ pub fn update_formula_inserts(package: &Path, bodies: &BTreeMap<String, FormulaB
             report.conflicts.push(insert_snapshot.id.clone());
             continue;
         }
-        let new_number = numbers.get(&insert_snapshot.id).copied();
+        let new_number = numbers.get(&insert_snapshot.id).map(|(number, _)| *number);
+        let new_number_text = numbers.get(&insert_snapshot.id).map(|(_, text)| text.clone());
         let expected_signature = if insert_snapshot.render_mode == "svg" { svg_signature(body) } else { omml_signature(&body.omml)? };
+        let expected_target = format!("rde://formula/{}@{}", body.formula_id, body.act_key);
         let unchanged = insert_snapshot.hash.as_deref() == Some(body.act_key.as_str())
+            && insert_snapshot.target == expected_target
             && insert_snapshot.number == new_number
+            && insert_snapshot.number_text == new_number_text
             && current_signature.as_deref() == Some(expected_signature.as_str());
         if unchanged {
             continue;
@@ -640,21 +766,35 @@ pub fn update_formula_inserts(package: &Path, bodies: &BTreeMap<String, FormulaB
             .clone()
             .unwrap_or_else(|| super::para_id_for(&format!("{}:formula:{}", rde_doc.doc_id, insert_snapshot.id), 0));
         let media = if insert_snapshot.render_mode == "svg" { Some(ensure_formula_media(&mut entries, &insert_snapshot.id, body)?) } else { None };
+        // ВАЖНО: заменяем содержимое существующего `w:sdt` (его inner), а не сам sdt — иначе
+        // формула оборачивалась бы в новый sdt при каждом обновлении (вложенные content-controls).
         let content = if is_block_sdt(&document_xml, &insert_snapshot.id) {
-            build_block_content(&insert_snapshot, body, new_number, &para_id, media)?
+            block_content(&insert_snapshot, body, new_number_text.as_deref(), &para_id, media, &entries)?
         } else {
-            build_inline_content(&insert_snapshot, body, &para_id, media)?
+            inline_content(&insert_snapshot, body, &para_id, media)?
         };
-        let Some(sdt) = find_formula_sdt(&document_xml, &insert_snapshot.id) else { continue };
-        let mut out = String::with_capacity(document_xml.len() + content.len());
-        out.push_str(&document_xml[..sdt.content_start]);
-        out.push_str(&content);
-        out.push_str(&document_xml[sdt.content_end..]);
+        let Some((block_start, block_end)) = find_formula_sdt_block(&document_xml, &insert_snapshot.id) else { continue };
+        // Заменяем блок `w:sdt` целиком: чинит исторические вложения sdt (после прежних версий
+        // обновления формула была обёрнута в новый sdt при каждом проходе — XML становился
+        // невалидным для LibreOffice/Word).
+        let block = if is_block_sdt(&document_xml, &insert_snapshot.id) {
+            wrap_block_sdt(&insert_snapshot.id, &content)
+        } else {
+            wrap_inline_sdt(&insert_snapshot.id, &content)
+        };
+        let mut out = String::with_capacity(document_xml.len() + block.len());
+        out.push_str(&document_xml[..block_start]);
+        out.push_str(&block);
+        out.push_str(&document_xml[block_end..]);
         document_xml = out;
         let insert = &mut rde_doc.inserts[index];
         insert.hash = Some(body.act_key.clone());
+        // Целевой URI несёт act_key: обновляем вместе с телом, иначе «где вставлено» показывает
+        // формулу устаревшей, хотя тело пересобрано из её текущего кэша.
+        insert.target = format!("rde://formula/{}@{}", body.formula_id, body.act_key);
         insert.cached = body.latex.clone();
         insert.number = new_number;
+        insert.number_text = new_number_text;
         insert.body_hash = Some(expected_signature);
         report.updated.push(insert_snapshot.id.clone());
         changed = true;
@@ -669,6 +809,135 @@ pub fn update_formula_inserts(package: &Path, bodies: &BTreeMap<String, FormulaB
     super::upsert_custom_props(&mut entries, &rde_doc);
     super::write_entries_atomic(&entries, package)?;
     Ok(report)
+}
+
+/// Отчёт пересчёта номеров формул и ссылок на них (ADR-0018).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FormulaRenumberReport {
+    /// Формулы с изменившимся отображаемым номером: (insert-id, новый номер без скобок).
+    pub formulas: Vec<(String, String)>,
+    /// Обновлённые перекрёстные ссылки: (insert-id ссылки, новый текст в документе).
+    pub crossrefs: Vec<(String, String)>,
+    /// Предупреждения (раздел без номера, цель ссылки отсутствует и т. п.).
+    pub warnings: Vec<String>,
+}
+
+/// Пересчитать номера формул и перекрёстные ссылки на них **без пересборки тел** (меняется только
+/// текст номера в `w:sdt`): один проход, документно-локально, по схеме `numbering` (ADR-0018).
+///
+/// Вызывается после вставки/удаления/перестановки формулы, чтобы номера и ссылки в тексте
+/// обновлялись автоматически (главное требование B3). Тело формулы не перезаписывается — правки
+/// `number_text` не входят в `body_hash`, поэтому ручные правки тела не конфликтуют (R-DOC-13).
+pub fn renumber_formula_numbers(package: &Path, numbering: FormulaNumbering) -> Result<FormulaRenumberReport, String> {
+    let mut entries = super::read_package(package)?.entries;
+    let mut rde_doc = super::load_rde_doc_from_entries(&entries)?;
+    let Some(document) = entries.get(DOCUMENT_XML) else { return Ok(FormulaRenumberReport::default()) };
+    let mut document_xml = String::from_utf8_lossy(document).to_string();
+    let styles_xml = entries.get("word/styles.xml").map(|bytes| String::from_utf8_lossy(bytes).to_string());
+    let mut report = FormulaRenumberReport::default();
+    let mut ordered: Vec<(String, usize)> = rde_doc
+        .inserts
+        .iter()
+        .filter(|insert| insert.kind == "formula" && insert.number.is_some())
+        .filter_map(|insert| formula_tag_position(&document_xml, &insert.id).map(|position| (insert.id.clone(), position)))
+        .collect();
+    ordered.sort_by_key(|(_, position)| *position);
+    if ordered.is_empty() {
+        return Ok(report);
+    }
+    let (values, warnings) = number_formulas(&document_xml, styles_xml.as_deref(), numbering, &ordered);
+    report.warnings = warnings;
+    let mut changed = false;
+    for (index, (id, _)) in ordered.iter().enumerate() {
+        let Some(value) = values.iter().find(|value| &value.id == id) else { continue };
+        let previous = rde_doc
+            .inserts
+            .iter()
+            .find(|insert| &insert.id == id)
+            .and_then(|insert| insert.number_text.clone().or_else(|| insert.number.map(|number| number.to_string())));
+        if previous.as_deref() != Some(value.number.as_str())
+            && let Some(updated) = replace_formula_number_text(&document_xml, id, &value.number)
+        {
+            document_xml = updated;
+            changed = true;
+            report.formulas.push((id.clone(), value.number.clone()));
+        }
+        if let Some(insert) = rde_doc.inserts.iter_mut().find(|insert| &insert.id == id) {
+            insert.number = Some((index + 1) as u32);
+            insert.number_text = Some(value.number.clone());
+        }
+    }
+    // Перекрёстные ссылки на формулы — после того, как известны все номера.
+    let mut formula_numbers: BTreeMap<String, String> = BTreeMap::new();
+    for insert in rde_doc.inserts.iter().filter(|insert| insert.kind == "formula") {
+        let Some(target) = parse_formula_target(&insert.target) else { continue };
+        let Some(number) = insert.number_text.clone().or_else(|| insert.number.map(|number| number.to_string())) else { continue };
+        // Первое вхождение формулы в документе — «основное»: ссылки указывают на него.
+        formula_numbers.entry(target.formula_id).or_insert_with(|| format!("({number})"));
+    }
+    let mut missing_targets = Vec::new();
+    let crossrefs: Vec<(String, String)> = rde_doc
+        .inserts
+        .iter()
+        .filter(|insert| insert.kind == "crossref")
+        .filter_map(|insert| {
+            let formula_id = insert.target.strip_prefix("rde://formula/")?;
+            let formula_id = formula_id.split('@').next().unwrap_or(formula_id);
+            let text = match formula_numbers.get(formula_id) {
+                Some(text) => text.clone(),
+                None => {
+                    missing_targets.push((insert.id.clone(), formula_id.to_owned()));
+                    "(?)".to_owned()
+                }
+            };
+            (insert.cached != text).then(|| (insert.id.clone(), text))
+        })
+        .collect();
+    for (id, formula_id) in &missing_targets {
+        report.warnings.push(format!(
+            "перекрёстная ссылка {id}: формула {formula_id} не вставлена в документ — в тексте placeholder «(?)»"
+        ));
+    }
+    for (id, text) in crossrefs {
+        if let Some(insert) = rde_doc.inserts.iter().find(|insert| insert.id == id).cloned() {
+            if let Some(updated) = super::replace_sdt_text(&document_xml, &insert, &text) {
+                document_xml = updated;
+                changed = true;
+                report.crossrefs.push((id.clone(), text.clone()));
+            }
+        }
+        if let Some(insert) = rde_doc.inserts.iter_mut().find(|insert| insert.id == id) {
+            insert.cached = text;
+        }
+    }
+    if !changed {
+        return Ok(report);
+    }
+    rde_doc.updated_unix = super::now_unix();
+    rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    entries.insert(RDE_DOC_PART.to_owned(), super::render_rde_doc(&rde_doc).into_bytes());
+    super::upsert_custom_props(&mut entries, &rde_doc);
+    super::write_entries_atomic(&entries, package)?;
+    Ok(report)
+}
+
+/// Заменить текст номера `(…)` в block-sdt формулы (последний `w:t` внутри sdtContent).
+fn replace_formula_number_text(document_xml: &str, insert_id: &str, number: &str) -> Option<String> {
+    let (start, end) = find_formula_sdt_block(document_xml, insert_id)?;
+    let block = &document_xml[start..end];
+    let text_open = block.rfind("<w:t")?;
+    let open_end = block[text_open..].find('>')? + text_open;
+    let close = block[open_end..].find("</w:t>")? + open_end;
+    let mut out = String::with_capacity(document_xml.len() + 16);
+    out.push_str(&document_xml[..start]);
+    out.push_str(&block[..open_end + 1]);
+    out.push('(');
+    out.push_str(&crate::escape_attr(number));
+    out.push(')');
+    out.push_str(&block[close..]);
+    out.push_str(&document_xml[end..]);
+    Some(out)
 }
 
 /// Статусы формульных вставок документа (R-DOC-13/19): доступность формулы задаёт вызывающий
@@ -737,6 +1006,7 @@ pub fn formula_backlinks(documents: &[(String, String, PathBuf)], formula_id: &s
                 insert_id: insert.id.clone(),
                 render_mode: insert.render_mode.clone(),
                 number: insert.number,
+                number_text: insert.number_text.clone(),
                 stale,
             });
         }
@@ -805,6 +1075,7 @@ pub fn migrate_formulas(package: &Path, plans: &[FormulaMigrationPlan]) -> Resul
             target: format!("rde://formula/{}@{}", plan.formula_id, plan.act_key),
             caption: String::new(),
             number: raw.number,
+            number_text: None,
             hash: Some(plan.act_key.clone()),
             cached: plan.latex.clone(),
             selector: String::new(),
@@ -816,11 +1087,13 @@ pub fn migrate_formulas(package: &Path, plans: &[FormulaMigrationPlan]) -> Resul
             render_mode: "omml".to_owned(),
             body_hash: Some(omml_signature(&plan.omml)?),
         };
+        let number_text = raw.number.map(|number| number.to_string());
+        insert.number_text = number_text.clone();
         let content = if raw.display {
             insert.para_id = Some(para_id.clone());
-            build_block_content(&insert, &body, raw.number, &para_id, None)?
+            wrap_block_sdt(&id, &block_content(&insert, &body, number_text.as_deref(), &para_id, None, &entries)?)
         } else {
-            build_inline_content(&insert, &body, &para_id, None)?
+            wrap_inline_sdt(&id, &inline_content(&insert, &body, &para_id, None)?)
         };
         if raw.display {
             if let Some((start, end, _)) = raw.numbered_table {
@@ -1043,6 +1316,64 @@ fn strip_between(text: &str, open: &str, close: &str) -> String {
 struct FormulaSdt {
     content_start: usize,
     content_end: usize,
+}
+
+/// Границы **целого** `w:sdt` формулы (внешнего, если исторические вложения): замена блока
+/// целиком лечит вложенные content-controls от прежних обновлений (они ломали XML-документ).
+fn find_formula_sdt_block(xml: &str, insert_id: &str) -> Option<(usize, usize)> {
+    let tag = format!("<w:tag w:val=\"{FORMULA_TAG_PREFIX}{insert_id}\"");
+    let tag_index = xml.find(&tag)?;
+    // Самый внешний `w:sdt` вокруг тега: идём по открывающим тегам до позиции тега.
+    let mut outer: Option<usize> = None;
+    let mut stack: Vec<usize> = Vec::new();
+    let mut pos = 0usize;
+    while pos < tag_index {
+        let Some(rel) = xml[pos..].find('<') else { break };
+        let start = pos + rel;
+        let Some(rel_end) = xml[start..].find('>') else { break };
+        let end = start + rel_end;
+        let body = &xml[start + 1..end];
+        let closing = body.starts_with('/');
+        let self_closing = body.ends_with('/');
+        let name = body.trim_start_matches('/').split([' ', '\t', '\n', '/']).next().unwrap_or("");
+        if name == "w:sdt" {
+            if closing {
+                stack.pop();
+            } else if !self_closing {
+                stack.push(start);
+            }
+        }
+        pos = end + 1;
+    }
+    outer = stack.first().copied().or(outer);
+    let start = outer?;
+    // Конец блока: балансировка `<w:sdt>`/`</w:sdt>` (точное имя, без sdtPr/sdtContent).
+    let mut depth = 0usize;
+    let mut pos = start;
+    while pos < xml.len() {
+        let Some(rel) = xml[pos..].find('<') else { break };
+        let at = pos + rel;
+        let Some(rel_end) = xml[at..].find('>') else { break };
+        let end = at + rel_end;
+        let body = &xml[at + 1..end];
+        let closing = body.starts_with('/');
+        let self_closing = body.ends_with('/');
+        let name = body.trim_start_matches('/').split([' ', '\t', '\n', '/']).next().unwrap_or("");
+        if name == "w:sdt" {
+            if closing {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((start, end + 1));
+                }
+            } else if !self_closing {
+                depth += 1;
+            } else if depth == 1 {
+                return Some((start, end + 1));
+            }
+        }
+        pos = end + 1;
+    }
+    None
 }
 
 /// Найти sdt формулы по тегу `rde:formula:<id>`.

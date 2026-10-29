@@ -42,6 +42,7 @@ fn rde_doc_xml_roundtrip_handles_unicode_and_escapes() {
             target: "rde://artifact/01ABC/out/plot.svg".into(),
             caption: "Рисунок 1 — График".into(),
             number: Some(1),
+            number_text: None,
             hash: Some("sha256:ff".into()),
             cached: "42.5".into(),
             selector: "#/stats/x1/mean".into(),

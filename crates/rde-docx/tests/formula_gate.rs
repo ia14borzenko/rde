@@ -54,12 +54,12 @@ fn formula_inserts_pass_fidelity_gate() {
     // Одна formula-вставка в режиме omml (с номером) и одна в svg (с номером) — оба режима в гейте.
     add_formula_insert(
         &package,
-        FormulaInsertRequest { body: body("\\sigma=\\frac{F}{A}", "act-omml", true), render_mode: "omml".to_owned(), anchor_block: None },
+        FormulaInsertRequest { body: body("\\sigma=\\frac{F}{A}", "act-omml", true), render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, },
     )
     .unwrap();
     add_formula_insert(
         &package,
-        FormulaInsertRequest { body: body("\\sigma=\\sqrt{\\frac{F}{A}}", "act-svg", true), render_mode: "svg".to_owned(), anchor_block: None },
+        FormulaInsertRequest { body: body("\\sigma=\\sqrt{\\frac{F}{A}}", "act-svg", true), render_mode: "svg".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, },
     )
     .unwrap();
     let clean = dir.join("with-formulas.docx");

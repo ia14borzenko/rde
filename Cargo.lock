@@ -4141,6 +4141,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wordcraft-engine",
+ "wordcraft-fonts",
  "zip",
 ]
 

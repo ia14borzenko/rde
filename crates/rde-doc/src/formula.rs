@@ -20,8 +20,9 @@ use wordcraft_engine::Session;
 pub const FORMULA_RENDERER_ID: &str = "wordcraft";
 /// Версия рендерера: WordCraft v0.10.0 (пин форка) + RDE-пайплайн SVG.
 /// `rde2` — кроп кэшей по ink-bbox PDF (скобки/линейки формул рисуются путями, а не текстом);
-/// ранее отрендеренные SVG/PNG невалидны для новой версии и пересобираются по `renderer`-хэшу.
-pub const FORMULA_RENDERER_VERSION: &str = "0.10.0+rde2";
+/// `rde3` — бандл math-шрифта STIX Two Math (Times-стиль, ADR-0018): все кэши формул (OMML/SVG/PNG)
+/// пересобираются с новым шрифтом по `renderer`-хэшу.
+pub const FORMULA_RENDERER_VERSION: &str = "0.10.0+rde3";
 
 /// Скомпилированные кэши формулы.
 #[derive(Clone, Debug, Default)]
@@ -56,6 +57,8 @@ pub fn compile_formula(effective_latex: &str, display: bool) -> Result<FormulaCa
     if effective_latex.trim().is_empty() {
         return Err("пустой LaTeX формулы".to_owned());
     }
+    // Math-шрифт формул (STIX Two Math, ADR-0018) — до первой вёрстки OMML/SVG/PNG.
+    crate::math_font::ensure_registered();
     let mut session = Session::new(Document::new());
     session
         .run("insert.equation", &json!({"latex": effective_latex, "display": display}))

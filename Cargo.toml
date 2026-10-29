@@ -72,6 +72,8 @@ rde-mcp = { path = "crates/rde-mcp" }
 rde-host = { path = "crates/rde-host" }
 rde-agent = { path = "crates/rde-agent" }
 wordcraft-engine = { path = "vendor/wordcraft/crates/engine" }
+# GUI-02/L-шрифт: регистрация бандл-шрифта формул в глобальном FontDb (ADR-0018).
+wordcraft-fonts = { path = "vendor/wordcraft/crates/fonts" }
 
 # WordCraft pins krilla itself in its own workspace; patches of a dependency's
 # workspace do not apply when it is built as a path dependency, so RDE mirrors it.

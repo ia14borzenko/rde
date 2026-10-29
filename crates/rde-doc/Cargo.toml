@@ -15,6 +15,8 @@ serde_json = { workspace = true }
 quick-xml = { workspace = true }
 zip = { workspace = true }
 wordcraft-engine = { workspace = true }
+# Бандл math-шрифта формул (STIX Two Math, OFL 1.1): регистрация в FontDb (ADR-0018).
+wordcraft-fonts = { workspace = true }
 # R-DOC-44: OLE Compound File (MathType `Equation Native` при импорте .docx).
 cfb = { workspace = true }
 # Кроп SVG-кэшей формул: растровый ink-bbox из PDF (скобки/линии рисуются путями, не текстом).

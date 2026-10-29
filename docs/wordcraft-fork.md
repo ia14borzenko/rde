@@ -16,6 +16,7 @@
 | 1 | 2026-10-24 | `crates/ui-egui` | `f85cb9c9ecaf6d4193a8b06d32eefe9671338733` (ветка `rde/main`) | S5: `WordApp::doc_view_ui()` — canvas документа без WordCraft titlebar/ribbon/panes/statusbar; feature `rde-docview` (выключен по умолчанию). RDE получает нативный редактор в своей панели | да, кандидат: выделение `DocView`-виджета в upstream | `cargo check` ui-egui с feature и без; `cargo build -p rde`; headless-скриншот `concept-v0.3.png`; полный тест-сьют upstream — feature off, поведение не меняется |
 | 2 | 2026-10-27 | `crates/doc`, `crates/docx` | `a33bb6ce3d8d4e3ee73a4712b3799b5921cf4b1c` (ветка `rde/main`) | **P2.5**: сохранение blip-extLst — `InlineObject::Image` получает `blip_ext: Option<Arc<Embedded>>`; на чтении `a:blip/a:extLst` (в т.ч. `asvg:svgBlip`) сохраняется тем же механизмом, что вложенные объекты/чарты (части: `word/media/*.svg`, их relationship и Content_Types — в `Document::passthrough`), на записи список целиком возвращается в `a:blip` с новыми `r:id`; namespace `asvg`/`a14` — канонические. Зачем: R-DOC-22 п.2 / ADR-0005 — векторная формула/рисунок в docx не должны терять SVG при пересохранении WordCraft | да, кандидат: blip-extLst в модели картинки + общий preserve-механизм (не спец-случай формулы) | форк: `cargo test -p wordcraft-docx` — вся crate, включая `tests/svg_blip.rs` (docx с `svgBlip` → open → save → `svgBlip` и SVG-часть сохранены; повторный save тоже), `cargo check --workspace --tests`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` — зелёные; семантика затронутых крейтов — `wordcraft-doc/docbin/formats/engine`: **1456 passed, 0 failed**. RDE: `rde-docx/tests/svg_blip_roundtrip.rs` (roundtrip через `wordcraft_engine::io`, SVG-часть + rels + Content_Types + LO-оракул) |
 | 3 | 2026-10-28 | `crates/metafile` | `d3a92ab729d04ebc075ae4417cde962448a76fff` (ветка `rde/main`) | **WMF/EMF-текст**: reader игнорировал текстовые записи, поэтому preview-картинки MathType-формул (чистый текст Times New Roman/Symbol/MT Extra) рендерились пустыми — в RDE импортированные формулы выглядели «пропусками». Добавлены `CreateFontIndirect`/`TextOut`/`ExtTextOut` (оба формата длины), `SetTextCharacterExtra`/`SetTextColor`/`SetBkColor`, `ETO_OPAQUE`/`ETO_CLIPPED`, `Rectangle`; имена шрифтов обрезаются по первому NUL (MathType добивает мусором); байты текста → Unicode по charset (CP1252/CP1251/CP1250) + полная таблица Adobe Symbol (включая куски скобок 0xE6–0xFE → U+239B–U+23AE), MT Extra `0x26` → U+02D9 (проверено оракулом LibreOffice). Зачем: fallback-видимость формул при импорте и корректный preview любых WMF/EMF с текстом | да, кандидат: текстовые записи WMF/EMF в metafile (не спец-случай MathType) | форк: `cargo test -p wordcraft-metafile` — **70 passed** (7 новых: текстовые записи/оба формата ExtTextOut, charset'ы, Symbol-куски, NUL-имена, ETO_OPAQUE, advances), `cargo clippy -p wordcraft-metafile --all-targets -- -D warnings`, `cargo fmt` — зелёные. Визуально: все 15 страниц с формулами реального `.docx` в preview-рендере WordCraft совпадают с LibreOffice (RDE-проба `metafile`); после конверсии MathType-preview заменяются нативными формулами (R-DOC-44) |
+| 4 | 2026-10-29 | `crates/layout` | `e90d2743f362c09c7436037b964118bc7438e406` (ветка `rde/main`) | **Right-numbered формула без таблицы (ADR-0018)**: display-формула в абзаце с таб-стопами (центр + право) и номером `(n)` в конце строки — Word-стиль; layout больше не уводит формулу на отдельную строку из-за табов перед ней и продолжает строку табом после неё. Зачем: номер `(N)` справа на той же строке, без невидимой таблицы 1×2 (R-DOC-21, B1) | да, кандидат: «numbered display equation with explicit tabs» (семантика Word для абзаца с текстом и display-формулой сохранена) | форк: `cargo test -p wordcraft-layout` (490 passed, новый `tests::a_display_equation_shares_a_line_with_its_right_number`), clippy `-D warnings`, fmt check. RDE: LO-оракул (номер bbox xMax≈552.9 pt при правом поле 552.5 pt), XML-тесты `formula_numbering`, headless-рендер страницы |
 
 ## Форк опубликован (2026-10-24)
 
@@ -60,7 +61,7 @@ relationship и Content_Types терялись при open/save (спайк B6: 
 | Компонент | Что | Статус |
 |---|---|---|
 | `crates/docx` (возможно) | API для добавления/чтения RDE-частей пакета, если внешней пост-обработки zip окажется недостаточно | исследуется в `rde-doc` |
-| `crates/docx` (формулы) | Нумерация уравнений `#`/`m:eqArr`: `resolve_numbers` добавляет `(n)`, но маркер `#` остаётся в `m:t` (`crates/docx/src/write/math.rs:96-99`) — Word/LibreOffice показывают `#` в формуле. Кандидат upstream: не писать маркер в `m:t`, а хранить номер как Word (no-op phantom/поле) или отдельный правый таб | зафиксировано 2026-10-26 (R-DOC-21/22, фаза 1); обход не делали — нумерация в RDE через таблицу 1×2 |
+| `crates/docx` (формулы) | Нумерация уравнений `#`/`m:eqArr`: `resolve_numbers` добавляет `(n)`, но маркер `#` остаётся в `m:t` — Word/LibreOffice показывают `#` в формуле; авто-номер Word не подходит для ГОСТ-схем | зафиксировано 2026-10-26 (R-DOC-21/22, фаза 1); **закрыто в ADR-0018 иначе**: нумерация RDE — таб-вёрстка (центр+право)+номер проекта, без `m:eqArr`; `#`-путь остаётся неиспользуемым |
 
 ## WMF/EMF-текст в metafile (2026-10-28, коммит `d3a92ab7`)
 
@@ -92,3 +93,31 @@ Roman/Symbol/MT Extra; 654 записи `EXTTEXTOUT` на 63 файла в ре�
 **Ограничения.** Поддержаны штатные текстовые записи WMF/EMF, встречающиеся в Office/MathType;
 экзотика (сложные `SetTextAlign`, повороты глифов, сложные ROP-эффекты) не реализована — рендер
 best-effort; шрифты подставляются системными (WordCraft font resolution), не встраиваются в пакет.
+
+## Right-numbered display-формула с табуляциями (2026-10-29, коммит `e90d2743`)
+
+**Что было.** `break_lines` (`crates/layout/src/para.rs`) принудительно уводил display-формулу
+(`m:oMathPara`) на отдельную строку, если перед ней в строке было что-либо, кроме невидимых
+маркеров (таб в том числе), и после формулы всегда начинал новую строку. Поэтому Word-вёрстка
+«формула по центру, номер `(N)` у правого поля в том же абзаце» (таб-стопы center + right) не
+раскладывалась: номер уезжал на следующую строку.
+
+**Что сделано (RDE-патч форка, ADR-0018 §3).**
+
+* табы (и маркеры) перед display-формулой больше не уводят её на свою строку; прочий текст —
+  по-прежнему уводит (семантика Word для абзаца «текст + display-формула» сохранена);
+* после display-формулы строка продолжается, если следующий элемент — таб, — правый таб прижимает
+  номер к правой границе текста;
+* тест `tests::a_display_equation_shares_a_line_with_its_right_number`: формула на центр-табе,
+  номер правым краем у правого поля, одна строка, display-статус сохранён.
+
+**Проверка.** `cargo test -p wordcraft-layout` — 490 passed, 0 failed; clippy `-D warnings` и
+`cargo fmt --check` чистые. RDE: экспорт `.docx` (табы + `m:oMathPara` + `(n)` в одном `w:p`)
+открывается LibreOffice — номер bbox `xMax≈552.9 pt` при правом поле `552.5 pt` (LO-оракул);
+WordCraft-рендер страницы (предпросмотр/PDF) ставит номер справа; XML-гейты RDE проверяют
+отсутствие `<w:tbl>` в формуле.
+
+**Ограничения.** Word на стенде нет: поведение Word для `m:oMathPara` в одном абзаце с табами —
+`unverified` (по ECMA-376 допустимо; LO и WordCraft рендерят корректно). Абзац с обычным текстом
+перед display-формулой сохранёт прежнее поведение WordCraft (формула на своей строке) — RDE так не
+вставляет.

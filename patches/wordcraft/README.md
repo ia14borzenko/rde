@@ -27,3 +27,16 @@ git -C vendor/wordcraft checkout v0.10.0
 git -C vendor/wordcraft apply ../../../patches/wordcraft/0001-rde-docview.patch
 git -C vendor/wordcraft apply ../../../patches/wordcraft/0002-wmf-text.patch
 ```
+
+## 0004-layout-right-numbered.patch
+`break_lines` (`crates/layout/src/para.rs`): display-формула делит строку с табами и номером —
+табы перед ней не уводят её на отдельную строку, после неё строка продолжается табом. Нужен RDE
+для Word-вёрстки right-numbered формул без таблицы (ADR-0018, R-DOC-21).
+
+Применение на чистом WordCraft v0.10.0 (после 0001/0002):
+```bash
+git -C vendor/wordcraft checkout v0.10.0
+git -C vendor/wordcraft apply ../../../patches/wordcraft/0001-rde-docview.patch
+git -C vendor/wordcraft apply ../../../patches/wordcraft/0002-wmf-text.patch
+git -C vendor/wordcraft apply ../../../patches/wordcraft/0004-layout-right-numbered.patch
+```

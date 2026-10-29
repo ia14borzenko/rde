@@ -301,6 +301,16 @@ pub struct DocumentManifest {
     pub template: String,
     /// Рабочий файл документа (в M3 — `.doc.rde`, пока `.docx`).
     pub file: String,
+    /// Схема нумерации формул документа (ADR-0018): `continuous` (сквозная, по умолчанию) или
+    /// `section` (по разделам, ГОСТ `(2.1)`; приложения `(А.1)`). Номер — документно-локальный
+    /// (ADR-0005 §3.1), назначается RDE, а не набирается руками.
+    #[serde(default = "continuous_numbering")]
+    pub formula_numbering: String,
+}
+
+/// Схема нумерации формул документа по умолчанию — сквозная (совместимость с документами без поля).
+pub fn continuous_numbering() -> String {
+    "continuous".to_owned()
 }
 
 fn default_formula_numbering() -> String {

@@ -117,6 +117,14 @@ fn main() {
         _ => {}
     }
 
+    // 8-й аргумент — режим области документа: docview | full | preview (для скриншотов).
+    if let Some(mode) = std::env::args().nth(8) {
+        state.demo_set_doc_mode(&mode);
+    }
+    // 9-й аргумент — вертикальный скролл предпросмотра страниц (например, 2-я страница).
+    if let Some(offset) = std::env::args().nth(9).and_then(|value| value.parse::<f32>().ok()) {
+        state.demo_set_preview_scroll(offset);
+    }
     // 6-й аргумент — тема оболочки: dark | light | system (GUI фаза 2).
     if let Some(theme) = std::env::args().nth(6) {
         state.demo_set_theme(&theme);
@@ -137,7 +145,8 @@ fn main() {
             state,
         );
     harness.input_mut().max_texture_side = Some(8192);
-    for _ in 0..12 {
+    let steps = std::env::var("RDE_SCREENSHOT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+    for _ in 0..steps {
         harness.step();
     }
 

@@ -874,10 +874,20 @@ pub struct RdeApp {
     picker_errors: Vec<(PathTarget, String)>,
     /// Куда вернуть фокус после выбора — кнопка «ОК» соответствующего диалога.
     picker_focus_ok: Vec<PathTarget>,
+    /// Демо/тест: вертикальный скролл предпросмотра страниц (скриншоты конкретной страницы).
+    demo_preview_scroll: f32,
     /// Демо/тест: подменённая история проектов (скриншоты, kittest) вместо файла конфига.
     demo_recent_projects: Option<Vec<rde_core::RecentProject>>,
     /// Файл истории проектов: `None` — не записывать (тесты); по умолчанию — из конфига RDE.
     recent_projects_file: Option<PathBuf>,
+}
+
+/// Подпись схемы нумерации формул документа (ADR-0018) для инспектора/журнала.
+fn formula_numbering_label(scheme: rde_doc::FormulaNumbering) -> &'static str {
+    match scheme {
+        rde_doc::FormulaNumbering::Continuous => "сквозная (1), (2)…",
+        rde_doc::FormulaNumbering::Section => "по разделам (2.1), (2.2)…",
+    }
 }
 
 /// Документ, открываемый при старте: самый свежий по mtime пакета (в проекте может быть несколько
@@ -898,6 +908,9 @@ fn initial_document_path(project: &rde_core::Project) -> Option<PathBuf> {
 
 impl RdeApp {
     pub fn new(project: Project) -> Self {
+        // Math-шрифт формул (STIX Two Math, ADR-0018) — до первой вёрстки/рендера WordCraft:
+        // предпросмотр страниц, DocView и редактор используют один глобальный FontDb.
+        rde_doc::ensure_math_font();
         let app_settings = rde_core::settings::load();
         let chat_allowed = app_settings.allow_builtin_agent;
         let lang = i18n::lang(&app_settings.language);
@@ -1002,6 +1015,7 @@ impl RdeApp {
             picked_paths: Vec::new(),
             picker_errors: Vec::new(),
             picker_focus_ok: Vec::new(),
+            demo_preview_scroll: 0.0,
             demo_recent_projects: None,
             // В unit-тестах история не пишется в конфиг пользователя (тесты создают много
             // временных проектов); тесты, проверяющие историю, задают путь явно.
@@ -1490,7 +1504,9 @@ impl RdeApp {
         let stem = package.file_stem().map(|stem| stem.to_string_lossy().to_string()).unwrap_or_else(|| "document".to_owned());
         let out = self.export_dir.join(format!("{stem}-word.docx"));
         let result = if rde_doc::is_rde_package(&package) {
-            rde_doc::extract_docx(&package, &out).map(|_| ())
+            // ADR-0018: экспорт для Word — пакет без RDE-частей + math-шрифт STIX Two Math
+            // (m:mathPr/m:mathFont, w:rFonts math-ранов); Word на стенде нет — по спецификации + LO.
+            rde_doc::export_docx(&package, &out).map(|_| ())
         } else {
             std::fs::copy(&package, &out).map(|_| ()).map_err(|e| e.to_string())
         };
@@ -1665,13 +1681,26 @@ impl RdeApp {
                     .and_then(|path| rde_doc::load_rde_doc(&path).ok())
                     .map(|doc| doc.inserts)
                     .unwrap_or_default();
-                let Some(insert) = inserts.iter().find(|insert| !insert.target.is_empty() && matches!(insert.kind.as_str(), "figure" | "table")) else {
-                    self.push_log(Level::Warn, "Перекрёстная ссылка: в документе нет рисунков/таблиц-вставок");
+                // Приоритет — формулы проекта (главный сценарий B3), если их нет — рисунки/таблицы.
+                let target = inserts
+                    .iter()
+                    .find(|insert| !insert.target.is_empty() && insert.kind == "formula")
+                    .or_else(|| inserts.iter().find(|insert| !insert.target.is_empty() && matches!(insert.kind.as_str(), "figure" | "table")));
+                let Some(insert) = target else {
+                    self.push_log(Level::Warn, "Перекрёстная ссылка: в документе нет формул/рисунков/таблиц-вставок");
                     return;
                 };
-                dialog.artifact_id = insert.id.clone();
+                let (option_id, caption) = if insert.kind == "formula" {
+                    match rde_doc::parse_formula_target(&insert.target) {
+                        Some(target) => (format!("formula:{}", target.formula_id), "см. формулу".to_owned()),
+                        None => (insert.id.clone(), "см. вставку".to_owned()),
+                    }
+                } else {
+                    (insert.id.clone(), "см. рисунок".to_owned())
+                };
+                dialog.artifact_id = option_id;
                 dialog.format = "raw".to_owned();
-                dialog.caption = "см. рисунок".to_owned();
+                dialog.caption = caption;
             }
             "citation" => {
                 let Some(source) = self.project.sources().next() else {
@@ -1813,13 +1842,20 @@ impl RdeApp {
                     })
                 }
                 "crossref" => {
-                    let uri = format!("rde://insert/{}", dialog.artifact_id);
+                    // B3 (ADR-0018): цель — формула проекта (`rde://formula/<id>`) или вставка.
+                    let (uri, cached) = match dialog.artifact_id.strip_prefix("formula:") {
+                        Some(formula_id) => {
+                            let number = self.formula_number_in_document(&package, formula_id);
+                            (format!("rde://formula/{formula_id}"), number.map(|number| format!("({number})")).unwrap_or_else(|| "(?)".to_owned()))
+                        }
+                        None => (format!("rde://insert/{}", dialog.artifact_id), "Рисунок 1".to_owned()),
+                    };
                     let request = rde_doc::InsertRequest {
                         kind: "crossref".to_owned(),
                         target: uri,
                         selector: String::new(),
                         value_kind: "text".to_owned(),
-                        cached: "Рисунок 1".to_owned(),
+                        cached,
                         caption: dialog.caption.clone(),
                         style: dialog.style.clone(),
                         format: "raw".to_owned(),
@@ -1922,6 +1958,59 @@ impl RdeApp {
         }
     }
 
+    /// Сменить схему нумерации формул документа (ADR-0018): запись `document.toml` + немедленная
+    /// перенумерация формул и перекрёстных ссылок в пакете. Возвращает число изменённых записей.
+    fn apply_document_formula_numbering(&mut self, object_dir: &Path, scheme: rde_doc::FormulaNumbering) -> Result<usize, String> {
+        let manifest_path = object_dir.join("document.toml");
+        rde_core::set_document_formula_numbering(&manifest_path, scheme.as_str())?;
+        let package = self
+            .project
+            .objects
+            .iter()
+            .find_map(|object| match &object.data {
+                ObjectData::Document(document) if object.dir == object_dir => Some(object.dir.join(&document.file)),
+                _ => None,
+            })
+            .or_else(|| self.project.document_path());
+        let changed = match package.filter(|package| rde_doc::is_rde_package(package)) {
+            Some(package) => {
+                let report = rde_doc::renumber_formula_numbers(&package, scheme)?;
+                for warning in &report.warnings {
+                    self.push_log(Level::Warn, format!("Нумерация формул: {warning}"));
+                }
+                report.formulas.len() + report.crossrefs.len()
+            }
+            None => 0,
+        };
+        self.doc = DocPreview::new(self.active_document_path());
+        self.structure_cache = None;
+        self.inserts_cache = None;
+        self.reload_project();
+        Ok(changed)
+    }
+
+    /// Отображаемый номер формулы в конкретном документе (без скобок): из `rde:doc` по
+    /// `rde://formula/<id>` (ADR-0018). `None` — формула в документ не вставлена.
+    fn formula_number_in_document(&self, package: &Path, formula_id: &str) -> Option<String> {
+        let rde_doc = rde_doc::load_rde_doc(package).ok()?;
+        rde_doc
+            .inserts
+            .iter()
+            .filter(|insert| insert.kind == "formula")
+            .find(|insert| rde_doc::parse_formula_target(&insert.target).map(|target| target.formula_id == formula_id).unwrap_or(false))
+            .and_then(|insert| insert.number_text.clone().or_else(|| insert.number.map(|number| number.to_string())))
+    }
+
+    /// Схема нумерации формул активного документа из `document.toml` (ADR-0018; по умолчанию
+    /// сквозная для документов без поля).
+    fn document_formula_numbering(&self) -> rde_doc::FormulaNumbering {
+        self.project
+            .document()
+            .map(|document| document.formula_numbering.as_str())
+            .and_then(rde_doc::FormulaNumbering::parse)
+            .unwrap_or_default()
+    }
+
     /// Вставка формулы (P3): кэш-бандл из formula-объекта (при устаревании — пересчёт), затем
     /// sdt-вставка с render_mode = omml|svg. Возвращает (отчёт, act_key).
     fn formula_insert_from_dialog(
@@ -1978,6 +2067,7 @@ impl RdeApp {
                 body,
                 render_mode: dialog.render_mode.clone(),
                 anchor_block: self.insert_anchor_block,
+                numbering: self.document_formula_numbering(),
             },
         )?;
         Ok((report, state.act_key.clone()))
@@ -2496,6 +2586,8 @@ impl RdeApp {
             payload["kind"] = serde_json::json!("document-formula-update");
             Some(payload)
         };
+        // Схему нумерации читаем до мутабельного займа store (`document.toml` активного документа).
+        let formula_numbering = self.document_formula_numbering();
         let Some(store) = self.store.as_mut() else { return };
         match rde_doc::update_document_transactional(
             &self.project.root,
@@ -2506,6 +2598,7 @@ impl RdeApp {
             &images,
             &tables,
             &formula_bodies,
+            formula_numbering,
             &formula_roots,
             formula_payload,
             store,
@@ -2514,6 +2607,9 @@ impl RdeApp {
                 // `[state]` пересчитанных формул — зеркало ledger в formula.toml (после tx).
                 for prepared in &prepared_formulas {
                     let _ = rde_dag::record_prepared_formula_state(&self.project, prepared);
+                }
+                for warning in &report.formula_numbering_warnings {
+                    self.push_log(Level::Warn, format!("Нумерация формул: {warning}"));
                 }
                 let formula_statuses = rde_doc::formula_insert_statuses(&package, &formula_availability).unwrap_or_default();
                 let stale_count = formula_statuses
@@ -3074,6 +3170,21 @@ impl RdeApp {
 
     /// Для демо/скриншотов: переключить центральную вкладку по имени
     /// (`document|structure|artifacts|source|code`).
+    /// Демо/тест: прокрутить предпросмотр страниц на `offset` (скриншот нужной страницы).
+    pub fn demo_set_preview_scroll(&mut self, offset: f32) {
+        self.demo_preview_scroll = offset.max(0.0);
+    }
+
+    /// Режим области документа («Document mode»): `docview` (редактор WordCraft), `full`
+    /// (полный WordCraft) или `preview` (растровые страницы) — для скриншотов/приёмки.
+    pub fn demo_set_doc_mode(&mut self, mode: &str) {
+        self.doc_mode = match mode {
+            "full" => DocMode::Full,
+            "preview" => DocMode::Preview,
+            _ => DocMode::DocView,
+        };
+    }
+
     pub fn demo_select_tab(&mut self, name: &str) {
         self.tab = match name {
             "structure" => Tab::Structure,
@@ -3107,7 +3218,15 @@ impl RdeApp {
                 Ok(()) => {
                     let path = dir.join("demo-report-edited.docx");
                     match wordcraft_engine::io::save_path(&path, &ed.app.session.doc) {
-                        Ok(()) => (Level::Ok, format!("Экспорт .docx (RDE): {} (шрифты/оформление — дальше с шаблонами)", path.display())),
+                        Ok(()) => {
+                            // ADR-0018: math-шрифт OMML в экспорте — STIX Two Math (best-effort).
+                            let patch = match rde_doc::patch_export_math_font(&path) {
+                                Ok(true) => format!(", math-шрифт: {}", rde_doc::MATH_FONT_FAMILY),
+                                Ok(false) => String::new(),
+                                Err(e) => format!(" (math-шрифт не пропатчен: {e})"),
+                            };
+                            (Level::Ok, format!("Экспорт .docx (RDE): {}{patch}", path.display()))
+                        }
                         Err(e) => (Level::Warn, format!("Не удалось сохранить документ: {e}")),
                     }
                 }
@@ -3122,6 +3241,8 @@ impl RdeApp {
         if self.editor.is_some() || self.editor_error.is_some() {
             return;
         }
+        // Формулы в редакторе вёрстаются бандл-шрифтом (ADR-0018): регистрация идемпотентна.
+        rde_doc::ensure_math_font();
         let Some(doc_path) = self.doc.path.clone() else {
             self.editor_error = Some("в проекте нет документа".to_owned());
             return;
@@ -4627,6 +4748,8 @@ impl RdeApp {
         let mut word_copy_clicked = false;
         let mut review_import_clicked = false;
         let mut migrate_formulas_clicked = false;
+        // ADR-0018: смена схемы нумерации формул документа из инспектора.
+        let mut numbering_change: Option<rde_doc::FormulaNumbering> = None;
         // GUI-02: свойства источника/репозитория и «Показать каталог» из инспектора.
         let mut edit_properties_clicked = false;
         let mut reveal_dir_clicked = false;
@@ -4831,7 +4954,12 @@ impl RdeApp {
                             }
                             for link in &panel.backlinks {
                                 let mode = if link.render_mode.is_empty() { "omml" } else { &link.render_mode };
-                                let number = link.number.map(|number| format!(" ({number})")).unwrap_or_default();
+                                let number = link
+                                    .number_text
+                                    .clone()
+                                    .or_else(|| link.number.map(|number| number.to_string()))
+                                    .map(|number| format!(" ({number})"))
+                                    .unwrap_or_default();
                                 let stale = if link.stale { " · устарела" } else { "" };
                                 ui.label(
                                     RichText::new(format!(
@@ -4909,6 +5037,30 @@ impl RdeApp {
                         ObjectData::Document(document) => {
                             field_row(ui, "файл", &document.file, false);
                             field_row(ui, "шаблон", if document.template.is_empty() { "—" } else { &document.template }, false);
+                            // ADR-0018: схема нумерации формул документа; смена сразу перенумеровывает
+                            // формулы и ссылки (без пересборки тел).
+                            let current_scheme = rde_doc::FormulaNumbering::parse(&document.formula_numbering).unwrap_or_default();
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("нумерация формул").small().color(pal.muted));
+                                let mut chosen = current_scheme;
+                                egui::ComboBox::from_id_salt("rde_formula_numbering_scheme")
+                                    .selected_text(formula_numbering_label(current_scheme))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut chosen,
+                                            rde_doc::FormulaNumbering::Continuous,
+                                            formula_numbering_label(rde_doc::FormulaNumbering::Continuous),
+                                        );
+                                        ui.selectable_value(
+                                            &mut chosen,
+                                            rde_doc::FormulaNumbering::Section,
+                                            formula_numbering_label(rde_doc::FormulaNumbering::Section),
+                                        );
+                                    });
+                                if chosen != current_scheme {
+                                    numbering_change = Some(chosen);
+                                }
+                            });
                             if rde_doc::is_rde_package(&object.dir.join(&document.file)) {
                                 let package = object.dir.join(&document.file);
                                 let comments_key = format!("{}:{}", package.display(), fs::metadata(&package).and_then(|m| m.modified()).map(|t| format!("{t:?}")).unwrap_or_default());
@@ -5003,6 +5155,20 @@ impl RdeApp {
             }
             if migrate_formulas_clicked {
                 self.migrate_document_formulas();
+            }
+            if let Some(scheme) = numbering_change {
+                match self.apply_document_formula_numbering(&object.dir, scheme) {
+                    Ok(changed) if changed > 0 => self.push_log(
+                        Level::Ok,
+                        format!(
+                            "Нумерация формул: схема «{}», перенумеровано {} формул(ы)",
+                            formula_numbering_label(scheme),
+                            changed
+                        ),
+                    ),
+                    Ok(_) => self.push_log(Level::Info, format!("Нумерация формул: схема «{}» (номеров менять не пришлось)", formula_numbering_label(scheme))),
+                    Err(error) => self.push_log(Level::Warn, format!("Нумерация формул: {error}")),
+                }
             }
             if edit_properties_clicked {
                 match object.data {
@@ -7336,6 +7502,15 @@ impl RdeApp {
                 .filter(|path| rde_doc::is_rde_package(path))
                 .and_then(|path| rde_doc::list_document_styles(&path).ok())
                 .unwrap_or_default();
+            // Превью документно-локального номера для диалога вставки формулы (ADR-0018).
+            let formula_number_preview: Option<String> = {
+                let numbering = self.document_formula_numbering();
+                self.project
+                    .document_path()
+                    .filter(|path| rde_doc::is_rde_package(path))
+                    .and_then(|path| rde_doc::next_formula_number_text(&path, numbering))
+                    .map(|(number, _warnings)| format!("({number})"))
+            };
             let formulas_list: Vec<rde_core::FormulaManifest> = self.project.formulas().cloned().collect();
             let mut confirm = false;
             let mut cancel = false;
@@ -7400,18 +7575,52 @@ impl RdeApp {
                             }
                         }
                         "crossref" => {
+                            // Список целей: рисунки/таблицы (текст «Рисунок N») и формулы проекта
+                            // с их документно-локальными номерами (ADR-0018): «формула (2.1)».
+                            let formula_target_id = |insert: &rde_doc::RdeInsert| {
+                                rde_doc::parse_formula_target(&insert.target).map(|target| target.formula_id)
+                            };
+                            let formula_option_id = |insert: &rde_doc::RdeInsert| formula_target_id(insert).map(|id| format!("formula:{id}"));
+                            let display_number = |insert: &rde_doc::RdeInsert| {
+                                insert
+                                    .number_text
+                                    .clone()
+                                    .or_else(|| insert.number.map(|number| number.to_string()))
+                                    .map(|number| format!("({number})"))
+                                    .unwrap_or_else(|| "(?)".to_owned())
+                            };
                             let current = doc_inserts
                                 .iter()
-                                .find(|insert| insert.id == dialog.artifact_id)
-                                .map(|insert| format!("{} · {} · {}", insert.id, insert.kind, insert.caption))
+                                .find(|insert| insert.id == dialog.artifact_id || formula_option_id(insert).as_deref() == Some(dialog.artifact_id.as_str()))
+                                .map(|insert| {
+                                    if insert.kind == "formula" {
+                                        format!("формула {} · {}", display_number(insert), insert.cached.chars().take(40).collect::<String>())
+                                    } else {
+                                        format!("{} · {} · {}", insert.id, insert.kind, insert.caption)
+                                    }
+                                })
                                 .unwrap_or_else(|| "— выбрать —".to_owned());
                             egui::ComboBox::from_label("на что ссылаться").selected_text(current).show_ui(ui, |ui| {
-                                for insert in doc_inserts.iter().filter(|insert| !insert.target.is_empty() && matches!(insert.kind.as_str(), "figure" | "table")) {
-                                    ui.selectable_value(
-                                        &mut dialog.artifact_id,
-                                        insert.id.clone(),
-                                        format!("{} · {} · {}", insert.id, insert.kind, insert.caption),
-                                    );
+                                for insert in doc_inserts.iter().filter(|insert| !insert.target.is_empty()) {
+                                    match insert.kind.as_str() {
+                                        "figure" | "table" => {
+                                            ui.selectable_value(
+                                                &mut dialog.artifact_id,
+                                                insert.id.clone(),
+                                                format!("{} · {} · {}", insert.id, insert.kind, insert.caption),
+                                            );
+                                        }
+                                        "formula" => {
+                                            if let Some(option) = formula_option_id(insert) {
+                                                ui.selectable_value(
+                                                    &mut dialog.artifact_id,
+                                                    option,
+                                                    format!("формула {} · {}", display_number(insert), insert.cached.chars().take(40).collect::<String>()),
+                                                );
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             });
                         }
@@ -7431,6 +7640,16 @@ impl RdeApp {
                             ui.label(RichText::new(format!("Будет вставлена дата: {}", today_iso_date())).small().color(pal.muted));
                         }
                         "formula" => {
+                            if let Some(number) = &formula_number_preview {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "номер в документе (предварительно): {number} · схема: {}",
+                                        formula_numbering_label(self.document_formula_numbering())
+                                    ))
+                                    .small()
+                                    .color(pal.muted),
+                                );
+                            }
                             let current = formulas_list
                                 .iter()
                                 .find(|formula| formula.id == dialog.formula_id)
@@ -7576,7 +7795,10 @@ impl RdeApp {
                     }
                     let uri = match dialog.kind.as_str() {
                         "constant" => format!("rde://constants/{}/{}", dialog.artifact_id, dialog.selector),
-                        "crossref" => format!("rde://insert/{}", dialog.artifact_id),
+                        "crossref" => match dialog.artifact_id.strip_prefix("formula:") {
+                            Some(formula_id) => format!("rde://formula/{formula_id}"),
+                            None => format!("rde://insert/{}", dialog.artifact_id),
+                        },
                         "citation" => format!("rde://source/{}", dialog.artifact_id),
                         "date" => "rde://date/iso".to_owned(),
                         "formula" => format!("rde://formula/{}@<act_key>", dialog.formula_id),
@@ -8102,7 +8324,11 @@ impl RdeApp {
                         });
                     }
                     DocState::Ready(doc) => {
-                        egui::ScrollArea::both().id_salt("rde_doc_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        egui::ScrollArea::both()
+                            .id_salt("rde_doc_scroll")
+                            .auto_shrink([false, false])
+                            .vertical_scroll_offset(self.demo_preview_scroll)
+                            .show(ui, |ui| {
                             ui.add_space(14.0);
                             ui.vertical_centered(|ui| {
                                 for (i, tex) in doc.pages.iter().enumerate() {
@@ -13127,6 +13353,115 @@ mod gui_path_tests {
         app.apply_tree_action(super::TreeAction::Open(note.clone()));
         assert!(app.tab == Tab::Source, "заметка открывается на вкладке «Источник»");
         assert_eq!(app.selected.as_deref(), Some(note.as_str()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── ADR-0018: нумерация формул и ссылки на формулы (B1–B3) ─────────────
+
+    /// Копия демо-проекта во временный каталог (без `.rde`: кэши формул уже в пакете).
+    fn numbering_demo_copy(name: &str) -> std::path::PathBuf {
+        fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for entry in std::fs::read_dir(src).unwrap().flatten() {
+                let name = entry.file_name();
+                if name == ".rde" {
+                    continue;
+                }
+                let path = entry.path();
+                let target = dst.join(&name);
+                if path.is_dir() {
+                    copy_tree(&path, &target);
+                } else {
+                    std::fs::copy(&path, &target).unwrap();
+                }
+            }
+        }
+        let root = std::env::temp_dir().join(format!("rde-ui-numbering-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        copy_tree(&rde_core::demo_project_dir(), &root);
+        root
+    }
+
+    /// Диалог перекрёстной ссылки по умолчанию предлагает формулу (B3), вставка создаёт
+    /// `rde://formula/<id>` с номером документа, а перенумерация обновляет текст ссылки.
+    #[test]
+    fn formula_crossref_dialog_inserts_and_updates_reference() {
+        let root = numbering_demo_copy("formula-crossref");
+        let project = rde_core::load_project(&root).unwrap();
+        let mut app = RdeApp::new(project);
+        app.open_insert_dialog("crossref");
+        let dialog = app.insert_dialog.as_ref().expect("диалог перекрёстной ссылки");
+        assert_eq!(dialog.kind, "crossref");
+        assert!(dialog.artifact_id.starts_with("formula:"), "по умолчанию — формула (B3): {}", dialog.artifact_id);
+        let formula_id = dialog.artifact_id.trim_start_matches("formula:").to_owned();
+        let dialog = app.insert_dialog.take().unwrap();
+        app.confirm_insert(dialog);
+        let package = app.project.document_path().unwrap();
+        let doc = rde_doc::load_rde_doc(&package).unwrap();
+        let reference = doc
+            .inserts
+            .iter()
+            .filter(|insert| insert.kind == "crossref")
+            .find(|insert| insert.target == format!("rde://formula/{formula_id}"))
+            .expect("ссылка на формулу rde://formula/<id>");
+        // Номер ссылки совпадает с номером формулы в документе (B3: «(N)», не руками).
+        let formula = doc
+            .inserts
+            .iter()
+            .filter(|insert| insert.kind == "formula")
+            .find(|insert| rde_doc::parse_formula_target(&insert.target).map(|target| target.formula_id == formula_id).unwrap_or(false))
+            .expect("формула вставлена");
+        let number = formula.number_text.clone().or_else(|| formula.number.map(|number| number.to_string())).unwrap();
+        assert_eq!(reference.cached, format!("({number})"), "текст ссылки — номер формулы: {reference:?}");
+        // Смена схемы «по разделам»: номер и текст ссылки обновляются одним проходом (B3).
+        let report = rde_doc::renumber_formula_numbers(&package, rde_doc::FormulaNumbering::Section).unwrap();
+        assert!(!report.formulas.is_empty(), "номера формул пересчитаны: {report:?}");
+        let doc = rde_doc::load_rde_doc(&package).unwrap();
+        let reference = doc.inserts.iter().find(|insert| insert.id == reference.id).unwrap();
+        let formula = doc
+            .inserts
+            .iter()
+            .filter(|insert| insert.kind == "formula")
+            .find(|insert| rde_doc::parse_formula_target(&insert.target).map(|target| target.formula_id == formula_id).unwrap_or(false))
+            .unwrap();
+        let number = formula.number_text.clone().or_else(|| formula.number.map(|number| number.to_string())).unwrap();
+        assert!(number.contains('.'), "схема по разделам: номер вида 2.1: {number}");
+        assert_eq!(reference.cached, format!("({number})"), "ссылка обновилась вместе с номером");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Смена схемы нумерации в инспекторе документа: `document.toml` + немедленная
+    /// перенумерация формул документа (сквозная ↔ по разделам), без пересборки тел.
+    #[test]
+    fn document_numbering_scheme_switch_renumbers_formulas() {
+        let root = numbering_demo_copy("formula-numbering");
+        let project = rde_core::load_project(&root).unwrap();
+        let object = project.document_object().cloned().unwrap();
+        let mut app = RdeApp::new(project);
+        let package = app.project.document_path().unwrap();
+        let changed = app.apply_document_formula_numbering(&object.dir, rde_doc::FormulaNumbering::Section).unwrap();
+        assert!(changed > 0, "номера изменились при переходе на схему по разделам");
+        let manifest = std::fs::read_to_string(object.dir.join("document.toml")).unwrap();
+        assert!(manifest.contains("formula_numbering = \"section\""), "схема записана в document.toml: {manifest}");
+        let doc = rde_doc::load_rde_doc(&package).unwrap();
+        let numbers: Vec<String> = doc
+            .inserts
+            .iter()
+            .filter(|insert| insert.kind == "formula")
+            .filter_map(|insert| insert.number_text.clone().or_else(|| insert.number.map(|number| number.to_string())))
+            .collect();
+        assert!(!numbers.is_empty(), "в демо есть формульные вставки");
+        assert!(numbers.iter().all(|number| number.contains('.')), "схема по разделам: {numbers:?}");
+        // Обратно — сквозная: (1), (2)…
+        app.apply_document_formula_numbering(&object.dir, rde_doc::FormulaNumbering::Continuous).unwrap();
+        let doc = rde_doc::load_rde_doc(&package).unwrap();
+        let numbers: Vec<String> = doc
+            .inserts
+            .iter()
+            .filter(|insert| insert.kind == "formula")
+            .filter_map(|insert| insert.number_text.clone().or_else(|| insert.number.map(|number| number.to_string())))
+            .collect();
+        assert_eq!(numbers, vec!["1".to_owned(), "2".to_owned()], "сквозная нумерация: {numbers:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
