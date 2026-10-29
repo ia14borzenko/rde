@@ -1,21 +1,23 @@
 {
-  "source": "/tmp/rde-docx-example-5/clean.docx",
+  "source": ".cache-tmp/p18/clean.docx",
   "source_parts": 14,
   "roundtrip_parts": 14,
   "missing": [],
   "extra": [],
   "changed": [
+    "[Content_Types].xml",
     "_rels/.rels",
+    "docProps/app.xml",
     "word/document.xml"
   ],
   "critical_missing": [],
   "media_preserved": true,
-  "paragraphs_source": 48,
-  "paragraphs_roundtrip": 48,
+  "paragraphs_source": 46,
+  "paragraphs_roundtrip": 46,
   "lo": {
     "available": true,
     "version": "LibreOffice 26.2.6.3 620(Build:3)",
-    "pdf_bytes": 190202,
+    "pdf_bytes": 188886,
     "pdf_is_valid": true,
     "error": null
   },
@@ -53,5 +55,5 @@
     "roundtrip_parts": 1,
     "errors": []
   },
-  "generated_unix": 1793082883
+  "generated_unix": 1793273785
 }
