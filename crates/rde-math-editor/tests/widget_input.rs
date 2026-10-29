@@ -172,3 +172,57 @@ fn caret_rect_exists_for_filled_matrix() {
     eprintln!("pos={:?} caret={:?} image={:?}", widget.state.pos, caret, render.size_px());
     assert!(caret.is_some(), "каретка должна рисоваться для текущей позиции {:?}", widget.state.pos);
 }
+
+/// Пробел в конце уже структурированной формулы не перестраивает её (баг владельца: σ-формула
+/// после пробела превращалась в `\left.\left(...`-вариант с «уехавшей» вёрсткой).
+#[test]
+fn space_at_end_does_not_restructure_formula() {
+    use rde_math_editor::edit::{MathEditorState, MathPos};
+    let source = r"\sigma = \sqrt{\frac{1}{N-1}\sum_{i=1}^{N}(x_i-\bar{x})^2}";
+    let mut state = MathEditorState::from_latex(source, true);
+    let before_model = state.model.clone();
+    let units = wordcraft_engine::doc::math_edit::units(&state.model);
+    state.set_caret(MathPos::new(Vec::new(), units), false);
+    state.type_text(" ");
+    let after = state.latex_source();
+    assert!(!after.contains(r"\left."), r"пробел не должен порождать скрытые \left.: {after}");
+    assert!(after.contains(r"\sqrt{"), "структура формулы сохранена: {after}");
+    assert!(after.contains(r"\bar{x}"), "акценты сохранены: {after}");
+    assert!(after.contains(r"\sum"), "сумма сохранена: {after}");
+    // Модель не перестроена: убрали добавленный пробельный Run(ы) — получили исходную модель.
+    let mut trimmed = state.model.clone();
+    while let Some(wordcraft_engine::doc::math::MNode::Run(run)) = trimmed.last() {
+        if run.text.trim().is_empty() {
+            trimmed.pop();
+        } else {
+            break;
+        }
+    }
+    assert_eq!(trimmed, before_model, "пробел в конце только добавляет пробел, но не меняет структуру");
+}
+
+/// Оператор (`+`) в конце формулы тоже не должен перезапускать build-up и перестраивать модель.
+#[test]
+fn operator_at_end_appends_without_restructuring() {
+    use rde_math_editor::edit::{MathEditorState, MathPos};
+    let source = r"\sigma = \sqrt{x^2 + y^2}";
+    let mut state = MathEditorState::from_latex(source, true);
+    let units = wordcraft_engine::doc::math_edit::units(&state.model);
+    state.set_caret(MathPos::new(Vec::new(), units), false);
+    state.type_text("+");
+    let after = state.latex_source();
+    assert!(!after.contains(r"\left."), r"оператор не перестраивает формулу: {after}");
+    assert!(after.contains(r"\sqrt{"), "корень сохранён: {after}");
+    assert!(after.ends_with('+'), "оператор добавлен в конец: {after}");
+}
+
+/// А линейный набор по-прежнему собирает структуры: `a/b` + пробел → дробь.
+#[test]
+fn linear_typing_still_builds_structures() {
+    use rde_math_editor::edit::MathEditorState;
+    let mut state = MathEditorState::empty(true);
+    state.type_text("a/b");
+    state.type_text(" ");
+    let latex = state.latex_source();
+    assert!(latex.contains(r"\frac"), "линейный набор a/b + пробел строит дробь: {latex}");
+}

@@ -14,7 +14,9 @@ use std::cmp::Ordering;
 use std::time::Instant;
 
 use wordcraft_engine::doc::math::MNode;
-use wordcraft_engine::doc::math_edit::{self as me, MathPos, TypeStyle};
+use wordcraft_engine::doc::math_edit::{self as me, TypeStyle};
+/// Позиция каретки в модели (аргумент `path` + смещение в units) — публичный тип API редактора.
+pub use wordcraft_engine::doc::math_edit::MathPos;
 
 use crate::source;
 
@@ -168,6 +170,22 @@ impl MathEditorState {
 
     /// Ввести текст (буквы/цифры/команды). Повторяет поведение `equation.type` WordCraft:
     /// авто-коррекция `\alpha` и build-up `a/b`/`x^2` на пробеле или знаке отношения.
+    /// Можно ли безопасно запускать WordCraft build-up на текущей позиции.
+    ///
+    /// `math_edit::build_up` перелинеаризует и заново парсит аргумент от последнего «форматного»
+    /// узла до каретки. Для линейно набираемого текста (один Run) это безопасно, но если в
+    /// аргументе уже есть готовые структуры (корень/сумма/дробь/скобки), их линейный образ не
+    /// гарантированно эквивалентен: «пробел» молча перестраивал открытую LaTeX-формулу
+    /// (`\sqrt{...}`/`ar{x}` превращались в скрытые `\left.\left(...`). Разрешаем build-up
+    /// только когда аргумент каретки целиком — текстовые Run (именно тот случай, ради которого
+    /// build-up и нужен: `a/b`→дробь, `x^2`→надстрочный).
+    fn can_build_up(&self) -> bool {
+        let Some(argument) = me::arg_at(&self.model, &self.pos.path) else {
+            return false;
+        };
+        argument.iter().all(|node| matches!(node, MNode::Run(_)))
+    }
+
     pub fn type_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -186,7 +204,11 @@ impl MathEditorState {
                 }
                 // build-up как в WordCraft Equation (UnicodeMath): `a/b`→дробь, `x^2`→надстрочный.
                 // LaTeX-команды вводятся строкой «LaTeX-команда» ниже панели (автодополнение).
-                if let Some(next) = me::build_up(&mut self.model, &pos, false) {
+                // Только для линейного набора: готовые структуры build-up не трогает (иначе
+                // пробел/оператор в конце формулы перестраивал её — см. can_build_up).
+                if self.can_build_up()
+                    && let Some(next) = me::build_up(&mut self.model, &pos, false)
+                {
                     pos = next;
                     changed = true;
                 }
