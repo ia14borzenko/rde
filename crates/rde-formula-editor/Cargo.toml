@@ -1,0 +1,17 @@
+[package]
+name = "rde-formula-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P6 (ADR-0022): окно визуального LaTeX-редактора формул RDE — MathLive (MIT, ассеты в бандле) в отдельном окне браузера + локальный JS-мост на 127.0.0.1"
+
+[dependencies]
+# Протокол JS↔Rust (JSON) и настройки окна (TOML).
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+# Криптостойкий токен моста (как у MCP streamable HTTP, ADR: rde-mcp).
+getrandom = { workspace = true }
+
+[dev-dependencies]
+# HTTP-клиент для тестов моста — только std (TcpStream), без новых зависимостей.

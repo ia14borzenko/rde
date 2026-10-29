@@ -34,7 +34,7 @@ fn main() {
     }
     // 5-й аргумент — действие для снимка: update | insert-value | insert-figure | insert-formula |
 // formula-tab-empty | formula-create-dialog | formula-editor | formula-editor-native |
-// formula-insert …
+// formula-insert | formula-insert-svg …
     match std::env::args().nth(5).as_deref() {
         Some("update") => state.request_update(None, true),
         Some("insert-value") => state.demo_open_insert_dialog("value"),
@@ -69,17 +69,23 @@ fn main() {
             state.demo_show_service_objects();
             state.demo_open_formula_editor("Формула");
         }
-        // Новая формула с дробью/корнем (структурный ввод в модели редактора).
+        // Новая формула с дробью (LaTeX-панель; визуальное редактирование — в окне, ADR-0022).
         Some("formula-editor-fraction") => {
-            state.demo_formula_editor_with_model("", Some("frac.stacked"), "12");
+            state.demo_open_formula_editor_create("Демонстрация дроби", r"\frac{1}{2}");
         }
-        // Матрица 2×2 из палитры структур (MathType-подобная вставка шаблона).
+        // Матрица 2×2 (LaTeX-панель; визуальное редактирование — в окне, ADR-0022).
         Some("formula-editor-matrix") => {
-            state.demo_formula_editor_with_model("", Some("mat.paren"), "1234");
+            state.demo_open_formula_editor_create("Демонстрация матрицы", r"\begin{pmatrix}1&2\\3&4\end{pmatrix}");
         }
-        // Палитра структур открыта на категории «Дроби» (пустая формула).
+        // Вкладка «Формула» без выбранной формулы (пустое состояние панели).
         Some("formula-editor-palette") => {
-            state.demo_formula_editor_with_model("", None, "");
+            state.demo_show_formula_tab();
+        }
+        // P6 (ADR-0022): вставка формулы в SVG-режиме с номером (правая нумерация документа).
+        Some("formula-insert-svg") => {
+            state.demo_show_service_objects();
+            state.demo_document_full_width();
+            state.demo_insert_formula_svg_with_number();
         }
         Some("formula-editor-native") => {
             state.demo_show_service_objects();

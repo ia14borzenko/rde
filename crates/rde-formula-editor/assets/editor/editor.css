@@ -1,0 +1,266 @@
+/* Окно визуального редактора формул RDE (P6, ADR-0022).
+   Палитра повторяет тему оболочки RDE (тёмная: BG #16171b …; светлая: #e9ecf1 …). */
+
+:root {
+  --rde-bg: #16171b;
+  --rde-panel: #1d1f24;
+  --rde-panel-hi: #252830;
+  --rde-border: #323640;
+  --rde-text: #d8dbe2;
+  --rde-muted: #9aa1af;
+  --rde-accent: #518cff;
+  --rde-accent-hover: #6a9cff;
+  --rde-green: #3f9a63;
+  --rde-red: #c4554a;
+  --rde-zoom: 1;
+  --rde-math-size: calc(34px * var(--rde-zoom));
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  --rde-bg: #e9ecf1;
+  --rde-panel: #f7f8fa;
+  --rde-panel-hi: #e2e6eb;
+  --rde-border: #c9cfd8;
+  --rde-text: #1b1f26;
+  --rde-muted: #59616e;
+  --rde-accent: #2b5ac7;
+  --rde-accent-hover: #2450b0;
+  --rde-green: #1b6e3e;
+  --rde-red: #b4342a;
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--rde-bg);
+  color: var(--rde-text);
+  font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', 'Noto Sans', sans-serif;
+  overflow: hidden;
+}
+
+/* ── шапка ─────────────────────────────────────────────────────────────── */
+.rde-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 14px;
+  background: var(--rde-panel);
+  border-bottom: 1px solid var(--rde-border);
+  flex: none;
+}
+
+.rde-heading { min-width: 0; flex: 1 1 auto; }
+.rde-caption { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--rde-muted); }
+.rde-title {
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rde-meta { font-size: 12px; color: var(--rde-muted); }
+.rde-meta .badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 6px;
+  border: 1px solid var(--rde-border);
+  border-radius: 5px;
+  font-size: 11px;
+}
+
+.rde-zoom { display: flex; align-items: center; gap: 2px; flex: none; }
+.rde-zoom button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+}
+.rde-zoom-label { min-width: 48px; text-align: center; font-variant-numeric: tabular-nums; color: var(--rde-muted); font-size: 12px; }
+
+.rde-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+
+/* ── кнопки ────────────────────────────────────────────────────────────── */
+button {
+  font: inherit;
+  font-size: 13px;
+  color: var(--rde-text);
+  background: var(--rde-panel-hi);
+  border: 1px solid var(--rde-border);
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease;
+}
+button:hover { border-color: var(--rde-accent); }
+button:active { background: var(--rde-border); }
+button:disabled { opacity: .5; cursor: default; }
+button.primary {
+  background: var(--rde-accent);
+  border-color: var(--rde-accent);
+  color: #fff;
+  font-weight: 600;
+}
+button.primary:hover { background: var(--rde-accent-hover); border-color: var(--rde-accent-hover); }
+button.secondary { background: transparent; }
+button.ghost { background: transparent; border-color: transparent; color: var(--rde-muted); padding: 4px 10px; }
+button.ghost:hover { color: var(--rde-text); border-color: var(--rde-border); }
+:root[data-theme='light'] button.primary { color: #fff; }
+
+/* ── рабочая область ───────────────────────────────────────────────────── */
+.rde-main {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 18px 24px 12px;
+  gap: 12px;
+}
+
+.rde-hint {
+  margin: 0;
+  color: var(--rde-muted);
+  font-size: 12.5px;
+  text-align: center;
+}
+.rde-hint code {
+  background: var(--rde-panel-hi);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 12px;
+}
+
+.rde-canvas {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+  background:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--rde-border) 60%, transparent) 1px, transparent 0) 0 0 / 22px 22px;
+  border-radius: 12px;
+}
+
+math-field {
+  font-size: var(--rde-math-size);
+  color: var(--rde-text);
+  background: var(--rde-panel);
+  border: 1px solid var(--rde-border);
+  border-radius: 10px;
+  padding: 18px 22px;
+  /* Ширина по формуле, но не шире полотна: длинные формулы MathLive прокручивает сам. */
+  min-width: min(640px, 100%);
+  max-width: 100%;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.25);
+  /* MathLive: цвет каретки/выделения и подсветки слотов под тему RDE. */
+  --caret-color: var(--rde-accent);
+  --selection-background-color: color-mix(in srgb, var(--rde-accent) 30%, transparent);
+  --selection-color: var(--rde-text);
+  --contains-highlight-background-color: color-mix(in srgb, var(--rde-accent) 16%, transparent);
+  --text-highlight-background-color: color-mix(in srgb, var(--rde-accent) 16%, transparent);
+  --smart-fence-color: var(--rde-accent);
+  --placeholder-color: var(--rde-muted);
+  --box-placeholder-color: var(--rde-muted);
+  --latex-color: var(--rde-text);
+}
+math-field::part(virtual-keyboard-toggle),
+math-field::part(menu-toggle) {
+  color: var(--rde-muted);
+}
+
+/* ── LaTeX-панель ──────────────────────────────────────────────────────── */
+.rde-latex {
+  flex: 0 1 auto;
+  min-height: 96px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--rde-panel);
+  border: 1px solid var(--rde-border);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+.rde-latex-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--rde-muted); }
+.rde-latex-head span { flex: 1 1 auto; }
+.rde-latex textarea {
+  flex: 1 1 auto;
+  min-height: 64px;
+  resize: vertical;
+  font: 13px/1.5 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  color: var(--rde-text);
+  background: var(--rde-bg);
+  border: 1px solid var(--rde-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.rde-latex textarea:focus { outline: 1px solid var(--rde-accent); }
+
+/* ── подвал ────────────────────────────────────────────────────────────── */
+.rde-footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--rde-border);
+  background: var(--rde-panel);
+  font-size: 12px;
+}
+.rde-status { color: var(--rde-muted); }
+.rde-status.ok { color: var(--rde-green); }
+.rde-status.error { color: var(--rde-red); }
+.rde-bridge { flex: 1 1 auto; color: var(--rde-muted); text-align: right; }
+.rde-bridge.offline { color: var(--rde-red); }
+
+/* ── виртуальная клавиатура MathLive: тёмная тема RDE ──────────────────── */
+:root[data-theme='dark'] .ML__keyboard,
+:root[data-theme='dark'] math-virtual-keyboard,
+:root[data-theme='dark'] .ML__keyboard-sink {
+  --keyboard-background: #202329;
+  --keyboard-border: #323640;
+  --keyboard-horizontal-rule: #323640;
+  --keyboard-toolbar-background: #1d1f24;
+  --keyboard-toolbar-background-hover: #2a2e37;
+  --keyboard-toolbar-background-selected: #323640;
+  --keyboard-toolbar-text: #d8dbe2;
+  --keyboard-toolbar-text-active: #518cff;
+  --keyboard-accent-color: #518cff;
+  --keycap-background: #2a2e37;
+  --keycap-background-hover: #343945;
+  --keycap-background-active: #3d4350;
+  --keycap-background-pressed: #46505f;
+  --keycap-primary-background: #2f3644;
+  --keycap-primary-background-hover: #3a4354;
+  --keycap-primary-text: #d8dbe2;
+  --keycap-secondary-background: #262a33;
+  --keycap-secondary-background-hover: #303542;
+  --keycap-secondary-text: #b9c0cc;
+  --keycap-text: #d8dbe2;
+  --keycap-text-hover: #ffffff;
+  --keycap-text-active: #ffffff;
+  --keycap-text-pressed: #ffffff;
+  --keycap-shift-text: #7f8794;
+  --keycap-shift-color: #3f9a63;
+  --tooltip-background-color: #2a2e37;
+  --tooltip-color: #d8dbe2;
+  --ui-menu-text: #d8dbe2;
+  color: var(--rde-text);
+}
+
+/* Светлая тема: клавиатура остаётся в своей светлой палитре (как в MathLive), рамка — под RDE. */
+:root[data-theme='light'] .ML__keyboard,
+:root[data-theme='light'] math-virtual-keyboard {
+  --keyboard-border: #c9cfd8;
+  --keyboard-accent-color: #2b5ac7;
+}

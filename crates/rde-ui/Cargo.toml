@@ -22,8 +22,8 @@ rde-store = { workspace = true }
 # M4.1: встроенный MCP-сервер (streamable HTTP) для внешних агентов.
 rde-mcp = { workspace = true }
 rde-host = { workspace = true }
-# P5 (ADR-0021): нативный WYSIWYG-редактор формул (модель/кодек/вёрстка/виджет).
-rde-math-editor = { workspace = true }
+# P6 (ADR-0022): окно визуального LaTeX-редактора формул (MathLive в отдельном окне браузера).
+rde-formula-editor = { workspace = true }
 # M4.3: встроенный ACP-агент (DSH) — нейтральный API/события (протокол только в rde-agent).
 rde-agent = { workspace = true }
 # M4.2: GUI-approvals — async-хук ждёт решения пользователя в blocking-пуле tokio.

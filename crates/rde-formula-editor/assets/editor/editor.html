@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Редактор формул RDE</title>
+<link rel="stylesheet" href="./mathlive/mathlive-static.css">
+<link rel="stylesheet" href="./mathlive/mathlive-fonts.css">
+<link rel="stylesheet" href="./editor/editor.css">
+</head>
+<body>
+<header class="rde-header">
+  <div class="rde-heading">
+    <div class="rde-caption">RDE · редактор формул</div>
+    <div id="formula-title" class="rde-title">Новая формула</div>
+    <div id="formula-meta" class="rde-meta"></div>
+  </div>
+  <div class="rde-zoom" role="group" aria-label="Масштаб">
+    <button id="zoom-out" type="button" title="Уменьшить масштаб">−</button>
+    <span id="zoom-label" class="rde-zoom-label">100 %</span>
+    <button id="zoom-in" type="button" title="Увеличить масштаб">+</button>
+  </div>
+  <div class="rde-actions">
+    <button id="latex-toggle" type="button" class="secondary" title="Показать/скрыть LaTeX-источник">LaTeX</button>
+    <button id="keyboard-toggle" type="button" class="secondary" title="Виртуальная клавиатура">⌨</button>
+    <button id="cancel" type="button" class="secondary" title="Отмена (Esc)">Отмена</button>
+    <button id="apply" type="button" class="primary" title="Применить (Ctrl+Enter)">Применить</button>
+  </div>
+</header>
+<main class="rde-main">
+  <p id="hint" class="rde-hint">
+    Визуальный ввод как в MathType: <code>/</code> — дробь, <code>^</code> — степень,
+    «_» — индекс, <code>\alpha</code> — символ, <code>Tab</code> — следующий слот.
+    Структуры, шаблоны и символы — на виртуальной клавиатуре ⌨ и в меню поля.
+  </p>
+  <div class="rde-canvas">
+    <math-field id="mf" default-mode="math" math-virtual-keyboard-policy="manual" aria-label="Формула"></math-field>
+  </div>
+  <section id="latex-panel" class="rde-latex" hidden>
+    <div class="rde-latex-head">
+      <span>LaTeX-источник (source of truth)</span>
+      <button id="latex-from-field" type="button" class="ghost">← Из редактора</button>
+      <button id="latex-to-field" type="button" class="ghost">В редактор →</button>
+    </div>
+    <textarea id="latex-text" spellcheck="false" autocomplete="off" aria-label="LaTeX формулы"></textarea>
+  </section>
+</main>
+<footer class="rde-footer">
+  <span id="status" class="rde-status">Загрузка…</span>
+  <span id="bridge-state" class="rde-bridge"></span>
+  <button id="clear" type="button" class="ghost">Очистить</button>
+</footer>
+<script src="./mathlive/mathlive.min.js"></script>
+<script src="./editor/editor.js"></script>
+</body>
+</html>

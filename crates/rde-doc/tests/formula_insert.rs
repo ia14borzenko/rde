@@ -226,6 +226,60 @@ fn svg_insert_keeps_media_rels_and_content_types() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// P6 (ADR-0022 §3.3): в SVG-вставке display-формулы номер `(N)` поднят на глубину формулы
+/// (`w:position`), чтобы базовая линия номера совпала с базовой линией формулы: низ картинки —
+/// inline-объект — Word/WordCraft ставят на базовую линию абзаца. У OMML-вставки подъёма нет
+/// (формула живёт на базовой линии сама).
+#[test]
+fn svg_numbered_insert_raises_number_to_math_baseline() {
+    if !poppler_available() {
+        return;
+    }
+    let root = tmp("svg-baseline");
+    write_project(&root);
+    let metrics = rde_doc::formula_metrics("\\sigma=\\frac{F}{A}", true).expect("метрики формулы");
+    let body_v1 = compiled_body("\\sigma=\\frac{F}{A}", true, "act-baseline", true);
+
+    // SVG + номер: подъём = descent + отступ кропа (half-points, как в w:position).
+    let package = new_package(&root);
+    add_formula_insert(
+        &package,
+        FormulaInsertRequest { body: body_v1.clone(), render_mode: "svg".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous },
+    )
+    .expect("svg-вставка");
+    let document = body(&package);
+    let expected = ((metrics.descent_pt + rde_doc::SVG_CROP_PAD_PT) * 2.0).round().max(1.0) as i64;
+    assert!(
+        document.contains(&format!("<w:position w:val=\"{expected}\"/>")),
+        "номер поднят на {expected} half-points (descent {:.2}pt): {document}",
+        metrics.descent_pt
+    );
+    // Низ картинки и номер — в одном абзаце: позиция стоит в run'е номера после второго таба.
+    assert!(document.contains(&format!("({})", 1)), "номер формулы на месте: {document}");
+
+    // SVG без номера: w:position не нужен.
+    let package_plain = new_package(&root);
+    let plain = FormulaBody { numbered: false, ..body_v1.clone() };
+    add_formula_insert(
+        &package_plain,
+        FormulaInsertRequest { body: plain, render_mode: "svg".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous },
+    )
+    .expect("svg-вставка без номера");
+    let document_plain = body(&package_plain);
+    assert!(!document_plain.contains("<w:position"), "без номера подъём не нужен: {document_plain}");
+
+    // OMML + номер: подъёма нет (номер и формула на одной базовой линии).
+    let package_omml = new_package(&root);
+    add_formula_insert(
+        &package_omml,
+        FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous },
+    )
+    .expect("omml-вставка");
+    let document_omml = body(&package_omml);
+    assert!(!document_omml.contains("<w:position"), "OMML — без подъёма номера: {document_omml}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn missing_target_and_manual_edit_are_noted_not_overwritten() {
     if !poppler_available() {

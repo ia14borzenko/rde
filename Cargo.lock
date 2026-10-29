@@ -4170,6 +4170,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rde-formula-editor"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "rde-hash"
 version = "0.1.0"
 dependencies = [
@@ -4195,17 +4205,6 @@ dependencies = [
  "serde_json",
  "toml",
  "ulid",
-]
-
-[[package]]
-name = "rde-math-editor"
-version = "0.1.0"
-dependencies = [
- "egui",
- "egui_kittest",
- "rde-doc",
- "toml",
- "wordcraft-engine",
 ]
 
 [[package]]
@@ -4285,9 +4284,9 @@ dependencies = [
  "rde-doc",
  "rde-docx",
  "rde-env",
+ "rde-formula-editor",
  "rde-hash",
  "rde-host",
- "rde-math-editor",
  "rde-mcp",
  "rde-run",
  "rde-sources",

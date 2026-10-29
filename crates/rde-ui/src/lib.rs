@@ -744,9 +744,15 @@ struct FormulaEditorState {
     /// Отдельный WordCraft-редактор: предпросмотр (`previews::math_texture`) и нативная правка.
     /// Не трогает документ проекта — правка источника не создаёт черновиков в тексте.
     native: Option<Box<NativeFormulaEditor>>,
-    /// P5 (ADR-0021): нативный WYSIWYG-редактор формулы (модель `MNode` + каретка + палитры).
-    /// LaTeX-поле ниже — источник истины; редактор синхронизирован с ним.
-    math_editor: Option<Box<rde_math_editor::widget::MathEditorUi>>,
+    /// P6 (ADR-0022): окно визуального LaTeX-редактора формул (MathLive в отдельном окне
+    /// браузера) и его мост. LaTeX-поле ниже — источник истины; «Применить» в окне возвращает
+    /// LaTeX сюда (`pending_window_apply`) и дальше — в `formula.toml`.
+    editor_window: Option<rde_formula_editor::EditorWindow>,
+    /// LaTeX из окна редактора, ожидающий применения в источнике (обрабатывается в следующем кадре
+    /// панели: валидация `check_formula_latex` + существующий конвейер `apply_formula_edit`).
+    pending_window_apply: Option<String>,
+    /// Кэш предпросмотра формулы из кэшей (PNG из CAS): (png_hash, текстура egui).
+    preview: Option<(String, egui::TextureHandle)>,
 }
 
 /// Отдельный (scratch) WordCraft-редактор для панели формулы (P4, спайк A): живёт только в панели,
@@ -890,6 +896,9 @@ pub struct RdeApp {
     /// Панель редактора формулы (P4): создание/правка источника, предпросмотр, нативный
     /// equation_tab, вставка с номером (ADR-0005 §5).
     formula_editor: Option<FormulaEditorState>,
+    /// P6 (ADR-0022): переопределение браузера окна редактора формул (`none` — не открывать;
+    /// для тестов/диагностики). В обычной работе RDE — `None` (автоопределение).
+    formula_editor_browser_override: Option<String>,
     /// Состояние git-репозитория проекта (P5, R-VCS-01).
     git_status: Option<rde_vcs::GitStatus>,
     /// Диалог коммита: текст сообщения.
@@ -1090,6 +1099,7 @@ impl RdeApp {
             insert_dialog: None,
             formula_migration_dialog: None,
             formula_editor: None,
+            formula_editor_browser_override: None,
             git_status: None,
             commit_dialog: None,
             history_dialog: None,
@@ -2303,12 +2313,15 @@ impl RdeApp {
             display: true,
             numbering_mode: "auto".to_owned(),
             numbering_label: String::new(),
-            render_mode: "omml".to_owned(),
+            // P6 (ADR-0022): основной режим вставки — SVG-вектор; OMML остаётся опцией.
+            render_mode: "svg".to_owned(),
             error: String::new(),
             info: String::new(),
             native_open: false,
             native: None,
-            math_editor: None,
+            editor_window: None,
+            pending_window_apply: None,
+            preview: None,
         });
     }
 
@@ -2353,13 +2366,145 @@ impl RdeApp {
             display,
             numbering_mode,
             numbering_label,
-            render_mode: "omml".to_owned(),
+            // P6 (ADR-0022): новую вставку делаем SVG-вектором; старые OMML-вставки не меняются.
+            render_mode: "svg".to_owned(),
             error: String::new(),
             info: String::new(),
             native_open: false,
             native: None,
-            math_editor: None,
+            editor_window: None,
+            pending_window_apply: None,
+            preview: None,
         });
+    }
+
+    /// P6 (ADR-0022): открыть окно визуального LaTeX-редактора для поля панели формулы.
+    ///
+    /// Окно — отдельный процесс браузера (Chrome app-mode), страница — встроенный MathLive;
+    /// LaTeX остаётся источником истины, поэтому окно получает `dialog.latex` как есть. Ошибки
+    /// (нет браузера/графической сессии) показываются в панели — панель остаётся рабочей.
+    fn open_formula_editor_window(&mut self, dialog: &mut FormulaEditorState) {
+        if let Some(mut window) = dialog.editor_window.take() {
+            window.close();
+        }
+        if dialog.latex.trim().is_empty() {
+            dialog.error = "Введите LaTeX (или создайте черновик формулы) — окно откроется на нём".to_owned();
+            return;
+        }
+        let title = if dialog.title.trim().is_empty() { "Новая формула".to_owned() } else { dialog.title.clone() };
+        let config = rde_formula_editor::EditorConfig {
+            title,
+            project: self.project.manifest.name.clone(),
+            latex: dialog.latex.clone(),
+            display: dialog.display,
+            theme: rde_formula_editor::EditorTheme::from_settings(&self.app_settings.theme),
+            zoom: None,
+            browser_override: self.formula_editor_browser_override.clone(),
+            prefs_path: None,
+            profile_dir: None,
+        };
+        match rde_formula_editor::EditorWindow::open(config) {
+            Ok(window) => {
+                dialog.error.clear();
+                dialog.info = "Окно редактора формул открыто: «Применить» в окне вернёт LaTeX в формулу".to_owned();
+                dialog.editor_window = Some(window);
+                self.push_log(Level::Info, format!("Редактор формул: открыто окно для «{}»", dialog.title));
+            }
+            Err(error) => {
+                dialog.error = format!("Визуальный редактор: {error}");
+                self.push_log(Level::Warn, format!("Визуальный редактор формул: {error}"));
+            }
+        }
+    }
+
+    /// P6 (ADR-0022): неблокирующий опрос окна редактора (каждый кадр): тема следует за RDE,
+    /// события «Применить»/«Отмена»/зум; закрытие окна пользователем — «Отмена».
+    fn poll_formula_editor_window(&mut self) {
+        let theme = rde_formula_editor::EditorTheme::from_settings(&self.app_settings.theme);
+        let Some(dialog) = self.formula_editor.as_mut() else { return };
+        let Some(mut window) = dialog.editor_window.take() else { return };
+        window.set_theme(theme);
+        let events = window.poll();
+        let mut pending = None;
+        let mut closed = false;
+        for event in events {
+            match event {
+                rde_formula_editor::EditorEvent::Applied { latex } => {
+                    pending = Some(latex);
+                    closed = true;
+                }
+                rde_formula_editor::EditorEvent::Cancelled => closed = true,
+                rde_formula_editor::EditorEvent::Zoom { .. } => {}
+            }
+        }
+        if closed {
+            window.close();
+        }
+        if let Some(latex) = pending {
+            dialog.pending_window_apply = Some(latex);
+            dialog.info = "LaTeX получен из окна редактора — применяю к источнику".to_owned();
+        }
+        if !closed {
+            dialog.editor_window = Some(window);
+        }
+    }
+
+    /// P6 (ADR-0022): предпросмотр формулы в панели — кэшированный PNG формулы из CAS
+    /// (ink-mask, тинт темы), т. е. ровно то, что попадёт в документ.
+    fn formula_preview_ui(&mut self, dialog: &mut FormulaEditorState, ui: &mut egui::Ui) {
+        let Some(formula_id) = dialog.formula_id.clone() else {
+            dialog.preview = None;
+            return;
+        };
+        let png_hash = self
+            .project
+            .formula_object(&formula_id)
+            .and_then(|object| match &object.data {
+                ObjectData::Formula(manifest) => Some(manifest.state.png_hash.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if png_hash.is_empty() {
+            dialog.preview = None;
+            return;
+        }
+        if dialog.preview.as_ref().is_none_or(|(hash, _)| hash != &png_hash)
+            && let Some(texture) = self.formula_preview_texture(ui.ctx(), &png_hash)
+        {
+            dialog.preview = Some((png_hash, texture));
+        }
+        let Some((_, texture)) = &dialog.preview else { return };
+        let pal = theme_colors(ui.ctx().theme());
+        let size = texture.size_vec2();
+        let scale = (ui.available_width().max(64.0) / size.x.max(1.0)).min(96.0 / size.y.max(1.0)).min(2.0);
+        ui.add(egui::Image::new(egui::load::SizedTexture::new(texture.id(), size * scale)).tint(pal.text));
+    }
+
+    /// Загрузить PNG-кэш формулы из CAS как egui-текстуру: чёрные «чернила» → белый ink-mask
+    /// (цвет задаёт тинт темы), чёткое масштабирование без внешних шрифтов.
+    fn formula_preview_texture(&self, ctx: &egui::Context, png_hash: &str) -> Option<egui::TextureHandle> {
+        let store = self.store.as_ref()?;
+        let hash = rde_hash::Hash::from_hex(png_hash).ok()?;
+        let bytes = store.get_blob(hash).ok().flatten()?;
+        let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let (width, height) = decoded.dimensions();
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for pixel in decoded.pixels() {
+            let [r, g, b, a] = pixel.0;
+            let luminance = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000;
+            let ink = 255u32.saturating_sub(luminance.min(255)) * u32::from(a) / 255;
+            rgba.extend_from_slice(&[255, 255, 255, u8::try_from(ink).unwrap_or(u8::MAX)]);
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+        Some(ctx.load_texture(format!("rde-formula-preview-{png_hash}"), image, egui::TextureOptions::LINEAR))
+    }
+
+    /// Тесты: открыть окно для текущей панели (то же, что кнопка «Открыть редактор формул…»).
+    #[cfg(test)]
+    fn open_formula_editor_window_for_test(&mut self) {
+        let Some(mut dialog) = self.formula_editor.take() else { return };
+        self.open_formula_editor_window(&mut dialog);
+        self.formula_editor = Some(dialog);
     }
 
     /// Отдельный WordCraft-редактор для панели формулы (спайк A): пустой scratch-документ, своя
@@ -2610,6 +2755,25 @@ impl RdeApp {
         let mut update_document = false;
         let mut open_document = false;
         let mut apply_blocked = false;
+        let mut open_editor_window = false;
+        let mut close_editor_window = false;
+        // P6 (ADR-0022): LaTeX, пришедший из окна визуального редактора, — явное действие
+        // «Применить»: валидируем кандидат и прогоняем существующим конвейером записи источника.
+        if let Some(latex) = dialog.pending_window_apply.take() {
+            match rde_doc::check_formula_latex(&dialog.latex, &latex) {
+                Ok(check) => {
+                    dialog.latex = latex;
+                    dialog.error.clear();
+                    if !check.warnings.is_empty() {
+                        dialog.info = check.warnings.join("; ");
+                    }
+                    apply = true;
+                }
+                Err(error) => {
+                    dialog.error = format!("Редактор формул: {error} — источник не изменён");
+                }
+            }
+        }
 
         // ── Одна колонка: WYSIWYG-редактор (он и есть предпросмотр) + LaTeX-источник + параметры ──
         let total_w = ui.available_width();
@@ -2665,33 +2829,31 @@ impl RdeApp {
                         );
                     });
                 });
-                // ── WYSIWYG-редактор формулы (P5, ADR-0021): структурный ввод 2D, каретка,
-                //    палитры, undo; рендер — тем же конвейером/шрифтом, что документ (STIX).
+                // ── P6 (ADR-0022): визуальный LaTeX-редактор (MathType-класс) — отдельное окно
+                //    браузера с MathLive; панель остаётся источником истины и местом применения.
                 ui.add_space(4.0);
-                ui.label(RichText::new("РЕДАКТОР ФОРМУЛЫ").size(FS_CAPTION).family(bold_family(ui.ctx())).color(pal.muted));
-                if dialog.math_editor.is_none() {
-                    dialog.math_editor = Some(Box::new(rde_math_editor::widget::MathEditorUi::new(&dialog.latex, dialog.display)));
-                    if let Some(editor) = dialog.math_editor.as_mut() {
-                        editor.request_focus();
+                ui.label(RichText::new("ВИЗУАЛЬНЫЙ РЕДАКТОР ФОРМУЛЫ").size(FS_CAPTION).family(bold_family(ui.ctx())).color(pal.muted));
+                ui.horizontal_wrapped(|ui| {
+                    let window_open = dialog.editor_window.as_ref().is_some_and(|window| window.is_open());
+                    if window_open {
+                        ui.label(RichText::new("● Окно редактора открыто").size(FS_BODY).color(pal.green));
+                        if btn(ui, Role::Secondary, Some(IC_CLOSE), "Закрыть окно").clicked() {
+                            close_editor_window = true;
+                        }
+                    } else if btn(ui, Role::Primary, Some(IC_CODE), "Открыть редактор формул…").clicked() {
+                        open_editor_window = true;
                     }
-                }
-                if let Some(editor) = dialog.math_editor.as_mut() {
-                    if editor.state.display != dialog.display {
-                        editor.state.display = dialog.display;
-                        editor.cache.clear();
-                    }
-                    let editor_response = editor.show(ui);
-                    // LaTeX-поле — витрина модели: синхронизируем после любого изменения модели
-                    // (ввод, палитра, вставка LaTeX), но не затираем его при непредставимой модели.
-                    let editor_latex = editor_response.latex.trim().to_owned();
-                    if editor_latex != dialog.latex.trim() && editor_response.roundtrip_error.is_none() {
-                        dialog.latex = editor_latex;
-                    } else if let Some(error) = &editor_response.roundtrip_error
-                        && dialog.error.is_empty()
-                    {
-                        dialog.error = rde_math_editor::widget::roundtrip_warning(error);
-                    }
-                }
+                    ui.label(
+                        RichText::new(
+                            "MathType-класс: структуры, палитры, виртуальная клавиатура, undo/redo; \
+                             «Применить» в окне возвращает LaTeX в источник",
+                        )
+                        .small()
+                        .color(pal.muted),
+                    );
+                });
+                // Предпросмотр из кэшей формулы (PNG из CAS, ink-mask тинтом темы): как в документе.
+                self.formula_preview_ui(&mut dialog, ui);
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("LaTeX-источник").size(FS_BODY).color(pal.muted));
@@ -2704,12 +2866,7 @@ impl RdeApp {
                         .desired_width(f32::INFINITY)
                         .hint_text(r"\sigma = \sqrt{\frac{1}{N-1}\sum_{i=1}^{N}(x_i-\bar{x})^2}"),
                 );
-                if latex_response.changed()
-                    && let Some(editor) = dialog.math_editor.as_mut()
-                {
-                    // Правку LaTeX-поля переносим в модель редактора (LaTeX — источник истины).
-                    editor.set_source(&dialog.latex, dialog.display);
-                }
+                let _ = &latex_response;
                 // Формат / нумерация / параметры вставки — одной строкой (панель компактная).
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Формат").size(FS_BODY).color(pal.muted));
@@ -2744,6 +2901,19 @@ impl RdeApp {
                     };
                     ui.label(RichText::new(number_text).small().color(pal.muted));
                 });
+                if !dialog.display && dialog.render_mode == "svg" {
+                    // P6 (ADR-0022): inline-картинка в Word/WordCraft садится низом на базовую линию
+                    // строки — нижние индексы формулы окажутся слегка приподнятыми. Для inline
+                    // надёжнее OMML (нативная математика), SVG — для display-формул.
+                    ui.label(
+                        RichText::new(
+                            "inline + SVG: картинка встаёт на базовую линию строки, нижние индексы \
+                             слегка приподняты — для inline надёжнее OMML (Word-объект)",
+                        )
+                        .small()
+                        .color(pal.amber),
+                    );
+                }
                 if dirty {
                     ui.label(
                         RichText::new("есть неприменённые правки — «Применить», чтобы записать source-of-truth и пересчитать кэши")
@@ -2822,6 +2992,15 @@ impl RdeApp {
                 .color(pal.muted),
         );
 
+        if close_editor_window {
+            if let Some(mut window) = dialog.editor_window.take() {
+                window.close();
+            }
+            dialog.info = "Окно редактора формул закрыто (без применения)".to_owned();
+        }
+        if open_editor_window {
+            self.open_formula_editor_window(&mut dialog);
+        }
         if close {
             self.formula_editor = None;
             return;
@@ -2854,17 +3033,21 @@ impl RdeApp {
             };
             dialog.error.clear();
         }
-        if apply {
-            // P5 (ADR-0021 §Решение 2): источник пишем из модели редактора — нормализуем
-            // непредставимые конструкции, затем проверяем roundtrip (LaTeX↔модель).
-            if let Some(editor) = dialog.math_editor.as_mut() {
-                match editor.prepare_source() {
-                    Ok(canonical) => dialog.latex = canonical,
-                    Err(error) => {
-                        dialog.error = format!("Формула не представима в LaTeX-источнике: {}", error.detail);
-                        dialog.info.clear();
-                        apply_blocked = true;
+        if apply && !apply_blocked {
+            // P6 (ADR-0022): источник — LaTeX (MathLive пишет строку как есть). Кандидат проходит
+            // общую проверку P5 (запрет плейсхолдеров/Unicode-заменителей линейного формата),
+            // дальше — существующий конвейер записи (нормализация/кэши/ledger).
+            let source = stored.as_ref().map(|(_, latex, ..)| latex.clone()).unwrap_or_default();
+            match rde_doc::check_formula_latex(&source, &dialog.latex) {
+                Ok(check) => {
+                    if !check.warnings.is_empty() {
+                        dialog.info = check.warnings.join("; ");
                     }
+                }
+                Err(error) => {
+                    dialog.error = format!("LaTeX формулы: {error}");
+                    dialog.info.clear();
+                    apply_blocked = true;
                 }
             }
         }
@@ -2891,9 +3074,6 @@ impl RdeApp {
                         dialog.numbering_label = manifest.numbering.label.clone();
                     }
                     dialog.error.clear();
-                    if let Some(editor) = dialog.math_editor.as_mut() {
-                        editor.sync_applied(&dialog.latex, dialog.display);
-                    }
                     dialog.info = if reused {
                         "Такая формула уже есть в проекте — используется существующая".to_owned()
                     } else if was_new {
@@ -4141,30 +4321,14 @@ impl RdeApp {
         }
     }
 
-    /// Демо/скриншоты (P5): панель формулы с WYSIWYG-редактором и готовой моделью.
-    /// `template` — id шаблона галереи, который сразу вставляется в модель (например, `mat.paren`);
-    /// `fill` — текст, набираемый после вставки (чтобы матрица была не пустой).
-    pub fn demo_formula_editor_with_model(&mut self, latex: &str, template: Option<&str>, fill: &str) {
+    /// Демо/скриншоты: панель формулы с заданным LaTeX (историческое имя P5 сохранено для
+    /// скриптов скриншотов; WYSIWYG-виджет P5 удалён — визуальное редактирование в окне, ADR-0022).
+    pub fn demo_formula_editor_with_model(&mut self, latex: &str, _template: Option<&str>, _fill: &str) {
         self.open_formula_editor_new();
-        let Some(mut dialog) = self.formula_editor.take() else { return };
-        dialog.title = "Демонстрация редактора формул".to_owned();
-        let mut editor = rde_math_editor::widget::MathEditorUi::new(latex, dialog.display);
-        // Скриншоты: каретка без мигания (детерминированный кадр) и фокус в редакторе.
-        editor.options.blink_caret = false;
-        editor.request_focus();
-        if let Some(template_id) = template {
-            editor.state.insert_template(template_id);
-            // Заполняем слоты по одному (Tab между вводами) — как пользователь палитрой.
-            for (index, ch) in fill.chars().enumerate() {
-                if index > 0 {
-                    editor.state.move_caret(rde_math_editor::edit::Move::NextSlot, false);
-                }
-                editor.state.type_text(&ch.to_string());
-            }
+        if let Some(dialog) = self.formula_editor.as_mut() {
+            dialog.title = "Демонстрация редактора формул".to_owned();
+            dialog.latex = latex.to_owned();
         }
-        dialog.latex = editor.state.latex_source();
-        dialog.math_editor = Some(Box::new(editor));
-        self.formula_editor = Some(dialog);
         self.show_formula_editor_context();
     }
 
@@ -4186,6 +4350,25 @@ impl RdeApp {
         let first = self.project.formulas().next().map(|formula| formula.id.clone());
         if let Some(id) = first {
             self.formula_quick_insert(&id, "omml");
+        }
+    }
+
+    /// Демо/скриншоты: скрыть инспектор и панель агента — документ на всю ширину (страница
+    /// целиком, видно номер формулы у правого поля).
+    pub fn demo_document_full_width(&mut self) {
+        self.show_inspector = false;
+        self.show_agent = false;
+    }
+
+    /// Демо/скриншоты (P6, ADR-0022): вставка формулы в SVG-режиме (вектор + PNG-fallback)
+    /// с номером по схеме документа — правая нумерация display-формулы.
+    pub fn demo_insert_formula_svg_with_number(&mut self) {
+        let first = self.project.formulas().next().map(|formula| formula.id.clone());
+        if let Some(id) = first {
+            // Скриншот: формула видна на первой странице — вставляем после первого блока.
+            self.insert_anchor_block = Some(0);
+            self.formula_quick_insert(&id, "svg");
+            self.insert_anchor_block = None;
         }
     }
 
@@ -4517,6 +4700,8 @@ impl RdeApp {
         self.poll_agent_events();
         // GUI-02: результаты фонового «Проводник…» раскладываем по полям диалогов (ADR-0017).
         self.poll_file_dialog();
+        // P6 (ADR-0022): окно визуального редактора формул — события и закрытие (неблокирующе).
+        self.poll_formula_editor_window();
         self.ui_frames += 1;
         if !self.fonts_installed {
             install_fonts(ui.ctx());
@@ -14519,107 +14704,12 @@ mod docview_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// P5 (ADR-0021 Phase 2): WYSIWYG-редактор формулы в панели вкладки «Формула» —
-    /// структурный ввод (дробь через палитру/модель), LaTeX синхронизируется с моделью,
-    /// «Создать» записывает канонический источник и пересчитывает кэши.
+    /// P6 (ADR-0022): панель «Формула» — LaTeX-источник, предпросмотр из кэшей и кнопка окна
+    /// визуального редактора (WYSIWYG-виджет P5 удалён из UI).
     #[test]
-    fn formula_editor_panel_owns_keyboard_focus() {
-        // Регресс (найдено владельцем на живой панели): при открытой панели «Формула» клавиатура
-        // должна принадлежать WYSIWYG-редактору, а не скрытому WordCraft-canvas документа — тот
-        // авто-запрашивал фокус и перехватывал стрелки/Tab (в итоге «активировались» кнопки).
-        let root = temp_demo_copy("formula-focus");
-        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
-        app.demo_formula_editor_with_model("", Some("frac.stacked"), "");
-        let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1600.0, 1000.0))
-            .with_max_steps(200_000)
-            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
-        for _ in 0..4 {
-            harness.step();
-        }
-        let editor = harness.state().formula_editor.as_ref().and_then(|dialog| dialog.math_editor.as_ref()).expect("редактор формулы");
-        assert!(editor.focused, "клавиатурный фокус в WYSIWYG-редакторе формулы, а не в canvas документа");
-        assert!(editor.last_caret.is_some(), "каретка имеет геометрию и рисуется в полотне");
-        let before = editor.state.pos.clone();
-        // Tab — следующий слот структуры (числитель → знаменатель), фокус не уходит в оболочку.
-        harness.event(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
-        harness.step();
-        let editor = harness.state().formula_editor.as_ref().and_then(|dialog| dialog.math_editor.as_ref()).expect("редактор формулы");
-        assert!(editor.focused, "редактор удерживает клавиатурный фокус после Tab");
-        assert!(editor.last_caret.is_some(), "каретка по-прежнему рисуется после клавиш");
-        assert_ne!(before, editor.state.pos, "Tab двигает каретку по слотам, а не переключает виджеты оболочки");
-    }
-
-    #[test]
-
-    fn formula_wysiwyg_editor_edits_model_and_creates_formula() {
+    fn formula_panel_offers_visual_editor_window_and_source_field() {
         use egui_kittest::kittest::Queryable;
-        let root = temp_demo_copy("formula-wysiwyg");
-        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
-        app.open_formula_editor_new();
-        let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1600.0, 1000.0))
-            .with_max_steps(200_000)
-            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
-        for _ in 0..3 {
-            harness.step();
-        }
-        assert!(harness.query_by_label_contains("РЕДАКТОР ФОРМУЛЫ").is_some(), "WYSIWYG-редактор в панели «Формула»");
-        // Структурный ввод через модель (палитры/клавиатуру дергает виджет; здесь — модель):
-        // дробь + числитель/знаменатель.
-        {
-            let editor = harness
-                .state_mut()
-                .formula_editor
-                .as_mut()
-                .and_then(|dialog| dialog.math_editor.as_mut())
-                .expect("WYSIWYG-редактор инициализирован");
-            editor.state.insert_template("frac.stacked");
-            editor.state.type_text("1");
-            editor.state.move_caret(rde_math_editor::edit::Move::NextSlot, false);
-            editor.state.type_text("2");
-        }
-        harness.step();
-        let dialog = harness.state().formula_editor.as_ref().expect("панель формулы");
-        assert!(dialog.latex.contains("\\frac"), "модель → LaTeX-источник: {}", dialog.latex);
-        // «Создать» пишет формулу с кэшами (OMML/SVG/PNG) — тот же конвейер ADR-0020.
-        if let Some(dialog) = harness.state_mut().formula_editor.as_mut() {
-            dialog.title = "Проверка WYSIWYG".to_owned();
-        }
-        harness.step();
-        let create = {
-            use egui_kittest::kittest::{NodeT, Queryable};
-            harness
-                .query_all_by_label_contains("Создать")
-                .find(|node| node.accesskit_node().role() == egui::accesskit::Role::Button)
-                .expect("кнопка «Создать»")
-        };
-        create.click();
-        for _ in 0..4 {
-            harness.step();
-        }
-        let dialog = harness.state().formula_editor.as_ref().expect("панель формулы после создания");
-        let formula_id = dialog.formula_id.clone().unwrap_or_else(|| {
-            panic!(
-                "формула создана: latex={:?}, error={:?}, info={:?}, log={:?}",
-                dialog.latex,
-                dialog.error,
-                dialog.info,
-                harness.state().project.log.iter().map(|line| &line.text).collect::<Vec<_>>()
-            )
-        });
-        let object = harness.state().project.formula_object(&formula_id).expect("объект формулы").clone();
-        let rde_core::ObjectData::Formula(manifest) = &object.data else { panic!("не формула") };
-        assert!(manifest.latex.contains("\\frac"), "источник записан: {}", manifest.latex);
-        assert!(object.dir.join("formula.toml").is_file());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// P5: правка модели в WYSIWYG-редакторе обновляет поле LaTeX-источника (LaTeX — витрина
-    /// модели), а источник остаётся представитьмым (roundtrip-валидация проходит).
-    #[test]
-    fn formula_wysiwyg_model_syncs_latex_field() {
-        let root = temp_demo_copy("formula-wysiwyg-sync");
+        let root = temp_demo_copy("formula-panel-p6");
         let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
         let formula_id = app.project.formulas().next().expect("формула демо").id.clone();
         app.open_formula_editor(&formula_id);
@@ -14627,25 +14717,130 @@ mod docview_tests {
             .with_size(egui::vec2(1600.0, 1000.0))
             .with_max_steps(200_000)
             .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..4 {
+            harness.step();
+        }
+        assert!(
+            harness.query_by_label_contains("Открыть редактор формул…").is_some(),
+            "кнопка открытия окна визуального редактора в панели"
+        );
+        assert!(harness.query_by_label_contains("ВИЗУАЛЬНЫЙ РЕДАКТОР ФОРМУЛЫ").is_some(), "секция редактора в панели");
+        assert!(harness.query_by_label_contains("LaTeX-источник").is_some(), "LaTeX-поле осталось в панели");
+        // Предпросмотр читает PNG из CAS: во временной копии демо-проекта `.rde` не копируется
+        // (кэши не вычислить без запуска конвейера) — здесь проверяем, что панель не падает и
+        // секция отрисована; предпросмотр с живыми кэшами — в скриншоте `gui-p23-formula-panel.png`.
+        let _ = harness.state().formula_editor.as_ref().and_then(|dialog| dialog.preview.as_ref());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P6 (ADR-0022): при inline+SVG панель предупреждает о baseline-ограничении OOXML
+    /// (низ inline-картинки = базовая линия строки) и предлагает OMML для inline.
+    #[test]
+    fn formula_panel_warns_about_inline_svg_baseline() {
+        use egui_kittest::kittest::Queryable;
+        let root = temp_demo_copy("formula-inline-svg-hint");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let formula_id = app.project.formulas().next().expect("формула демо").id.clone();
+        app.open_formula_editor(&formula_id);
+        if let Some(dialog) = app.formula_editor.as_mut() {
+            dialog.display = false;
+            dialog.render_mode = "svg".to_owned();
+        }
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..4 {
+            harness.step();
+        }
+        assert!(
+            harness.query_by_label_contains("inline + SVG").is_some(),
+            "подсказка о baseline для inline+SVG в панели"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P6 (ADR-0022): LaTeX из окна редактора применяется тем же конвейером, что и «Применить»
+    /// (валидация + запись в `formula.toml`); проверяем сквозь реальный loopback-мост окна.
+    #[cfg(unix)]
+    #[test]
+    fn formula_editor_window_apply_writes_source() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_demo_copy("formula-window-apply");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let formula_id = app.project.formulas().next().expect("формула демо").id.clone();
+        app.open_formula_editor(&formula_id);
+        // «Браузер» теста: скрипт живёт, пока RDE не закроет окно (страницу изображает тест).
+        let browser = root.join("fake-browser.sh");
+        std::fs::write(&browser, "#!/bin/sh\nsleep 60\n").expect("скрипт");
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        app.formula_editor_browser_override = Some(browser.display().to_string());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
         for _ in 0..3 {
             harness.step();
         }
-        let before = harness.state().formula_editor.as_ref().expect("панель").latex.clone();
-        {
-            let editor = harness
-                .state_mut()
-                .formula_editor
-                .as_mut()
-                .and_then(|dialog| dialog.math_editor.as_mut())
-                .expect("редактор");
-            // Вставка в конец существующей σ-формулы: модель меняется, LaTeX пересобирается.
-            editor.state.type_text("+x");
-            assert!(editor.prepare_source().is_ok(), "модель представима: {:?}", editor.state.validate().err());
+        harness.state_mut().open_formula_editor_window_for_test();
+        let (addr, token) = {
+            let dialog = harness.state().formula_editor.as_ref().expect("панель формулы");
+            let window = dialog.editor_window.as_ref().unwrap_or_else(|| panic!("окно не открылось: {:?}", dialog.error));
+            (window.bridge().addr(), window.bridge().token().to_owned())
+        };
+        // «Страница» шлёт LaTeX через мост (то же, что кнопка «Применить» в окне MathLive).
+        let latex = "\\int_0^1 x^2 \\, dx = \\frac{1}{3}";
+        let body = serde_json::json!({ "latex": latex }).to_string();
+        let mut stream = std::net::TcpStream::connect(addr).expect("мост окна");
+        let request = format!(
+            "POST /api/apply?t={token} HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).expect("запрос apply");
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).ok();
+        assert!(reply.contains("\"ok\":true"), "мост принял LaTeX: {reply}");
+        // Кадр RDE: опрос окна → pending apply → запись источника существующим конвейером.
+        for _ in 0..6 {
+            harness.step();
         }
-        harness.step();
-        let after = harness.state().formula_editor.as_ref().expect("панель").latex.clone();
-        assert_ne!(before, after, "LaTeX-поле обновилось из модели");
-        assert!(after.contains("+x"), "{after}");
+        let manifest = {
+            let object = harness.state().project.formula_object(&formula_id).expect("объект формулы").clone();
+            match &object.data {
+                rde_core::ObjectData::Formula(manifest) => manifest.clone(),
+                _ => panic!("не формула"),
+            }
+        };
+        assert!(manifest.latex.contains("\\int_0^1"), "источник записан из окна: {}", manifest.latex);
+        assert!(manifest.latex.contains("\\frac{1}{3}"), "LaTeX из окна сохранён целиком: {}", manifest.latex);
+        let dialog = harness.state().formula_editor.as_ref().expect("панель после применения");
+        assert!(dialog.editor_window.is_none(), "окно закрыто после «Применить»");
+        assert!(dialog.error.is_empty(), "ошибок нет: {}", dialog.error);
+        harness.state_mut().formula_editor = None;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P6 (ADR-0022): если браузера нет — окно не открывается, панель рабочая и объясняет причину.
+    #[cfg(unix)]
+    #[test]
+    fn formula_editor_window_reports_missing_browser() {
+        let root = temp_demo_copy("formula-window-nobrowser");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let formula_id = app.project.formulas().next().expect("формула демо").id.clone();
+        app.open_formula_editor(&formula_id);
+        app.formula_editor_browser_override = Some("off".to_owned());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..3 {
+            harness.step();
+        }
+        harness.state_mut().open_formula_editor_window_for_test();
+        let dialog = harness.state().formula_editor.as_ref().expect("панель формулы");
+        assert!(dialog.editor_window.is_none(), "окно не открыто без браузера");
+        assert!(dialog.error.contains("не найден браузер"), "причина показана: {}", dialog.error);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

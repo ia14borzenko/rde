@@ -357,8 +357,11 @@ fn block_content(
         let (png_rel, svg_rel) = media.ok_or("svg-режим: нет медиа-связей")?;
         let (cx, cy) = formula_extent_emu(body);
         let drawing = drawing_run_xml(&png_rel, &svg_rel, cx, cy, para_id);
+        // P6 (ADR-0022): низ картинки садится на базовую линию абзаца — номер `(N)` поднимается
+        // на глубину формулы + отступ кропа, чтобы его базовая линия совпала с формулой.
+        let raise_pt = number_raise_pt(body);
         match number_text {
-            Some(number) => numbered_tabs_paragraph(para_id, &drawing, number, suffix, entries),
+            Some(number) => numbered_tabs_paragraph(para_id, &drawing, number, suffix, entries, raise_pt),
             None => paragraph_centered(para_id, &drawing, suffix),
         }
     } else {
@@ -368,7 +371,8 @@ fn block_content(
         let omml = omml_fragment(&body.omml, body.display)?;
         let math = String::from_utf8_lossy(&omml);
         match number_text {
-            Some(number) => numbered_tabs_paragraph(para_id, &math, number, suffix, entries),
+            // OMML-формула живёт на базовой линии абзаца — номер выравнивается сам, подъём не нужен.
+            Some(number) => numbered_tabs_paragraph(para_id, &math, number, suffix, entries, 0.0),
             None => paragraph_centered(para_id, &math, suffix),
         }
     };
@@ -405,6 +409,19 @@ fn wrap_inline_sdt(insert_id: &str, inner: &str) -> String {
         "<w:sdt><w:sdtPr><w:tag w:val=\"{FORMULA_TAG_PREFIX}{}\"/><w:alias w:val=\"формула\"/></w:sdtPr><w:sdtContent>{inner}</w:sdtContent></w:sdt>",
         crate::escape_attr(insert_id)
     )
+}
+
+/// Подъём номера `(N)` в SVG-вставке, pt (P6, ADR-0022 §3.3).
+///
+/// `w:drawing` в WordprocessingML — inline-объект: его **низ** ставится на базовую линию строки
+/// (проверено LO-оракулом P6; WordCraft делает так же). Значит базовая линия формулы находится
+/// выше низа картинки на `descent + отступ кропа`; номер `(N)` — обычный текст на базовой линии
+/// абзаца, поэтому его надо поднять на эту величину (`w:position`, half-points), иначе номер
+/// визуально «висит» ниже формулы. Метрики — из той же вёрстки WordCraft, что рисует документ.
+fn number_raise_pt(body: &FormulaBody) -> f64 {
+    crate::formula::formula_metrics(&body.latex, body.display)
+        .map(|metrics| metrics.descent_pt + crate::formula::SVG_CROP_PAD_PT)
+        .unwrap_or(0.0)
 }
 
 /// Абзац display-формулы: по центру, без отступов и интервалов, с содержимым (OMML/drawing) и
@@ -480,16 +497,29 @@ fn nth_body_paragraph_start(xml: &str, index: usize) -> Option<usize> {
 /// номер `(n)` у правого поля. Схема OOXML: табы + display-формула (`m:oMathPara`) в одном абзаце —
 /// `EG_RunLevelElts` разрешает math внутри `w:p`; Word и LibreOffice ставят формулу на таб-центр,
 /// а номер — на правый таб (LO-оракул в retest'ах). Видимой таблицы нет.
-fn numbered_tabs_paragraph(para_id: &str, content: &str, number: &str, suffix: &str, entries: &BTreeMap<String, Vec<u8>>) -> String {
+fn numbered_tabs_paragraph(
+    para_id: &str,
+    content: &str,
+    number: &str,
+    suffix: &str,
+    entries: &BTreeMap<String, Vec<u8>>,
+    number_raise_pt: f64,
+) -> String {
     let (center, right) = tab_stops(entries);
+    // Подъём номера: `w:position` в half-points (0 — номер на базовой линии, как у OMML).
+    let number_run = if number_raise_pt > 0.05 {
+        let half_points = (number_raise_pt * 2.0).round().max(1.0) as i64;
+        format!("<w:r><w:rPr><w:position w:val=\"{half_points}\"/></w:rPr><w:t xml:space=\"preserve\">({number})</w:t></w:r>")
+    } else {
+        format!("<w:r><w:t xml:space=\"preserve\">({number})</w:t></w:r>")
+    };
     // Пунктуация — сразу после формулы (до таба к номеру): «α = λ/d, … (1)» (ADR-0019).
     format!(
         "<w:p w14:paraId=\"{para_id}\"><w:pPr>\
          <w:tabs><w:tab w:val=\"center\" w:pos=\"{center}\"/><w:tab w:val=\"right\" w:pos=\"{right}\"/></w:tabs>\
          <w:spacing w:before=\"120\" w:after=\"120\"/>\
          <w:ind w:left=\"0\" w:right=\"0\" w:firstLine=\"0\"/></w:pPr>\
-         <w:r><w:tab/></w:r>{content}{suffix_run}<w:r><w:tab/></w:r>\
-         <w:r><w:t xml:space=\"preserve\">({number})</w:t></w:r></w:p>",
+         <w:r><w:tab/></w:r>{content}{suffix_run}<w:r><w:tab/></w:r>{number_run}</w:p>",
         suffix_run = suffix_run(suffix)
     )
 }

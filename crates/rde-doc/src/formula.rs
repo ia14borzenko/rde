@@ -15,6 +15,68 @@ use serde_json::json;
 use wordcraft_engine::doc::Document;
 use wordcraft_engine::Session;
 
+/// Отступ кропа SVG/PNG вокруг «чернил» формулы, pt. Учитывается при выравнивании номера `(N)`:
+/// картинка в `w:drawing` садится **низом** на базовую линию абзаца, поэтому номер надо поднять
+/// на `descent + отступ`, чтобы его базовая линия совпала с базовой линией формулы.
+pub const SVG_CROP_PAD_PT: f64 = 2.0;
+
+/// Метрики вёрстки формулы (pt) относительно её базовой линии (ADR-0022 §3.1).
+///
+/// Нужны для корректной вставки SVG-формулы в поток документа: `w:drawing` — inline-объект,
+/// который Word/WordCraft сажают низом на базовую линию строки (проверено LO-оракулом в P6),
+/// поэтому display-номер `(N)` и inline-выравнивание считаются из `ascent`/`descent`, а не из
+/// габаритов картинки. Метрики даёт та же вёрстка WordCraft, что рисует документ (ADR-0018):
+/// ширина и глубина совпадают с PDF-рендером формулы.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FormulaMetrics {
+    /// Ширина формулы, pt.
+    pub width_pt: f64,
+    /// Высота над базовой линией, pt.
+    pub ascent_pt: f64,
+    /// Глубина под базовой линией, pt (дроби/индексы/суммы с пределами снизу).
+    pub descent_pt: f64,
+}
+
+/// Сверстать эффективный LaTeX и вернуть метрики (`width`/`ascent`/`descent`, pt).
+///
+/// Ошибки — невалидный LaTeX/движок не разложил формулу; вызывающий код деградирует
+/// (вставка без подъёма номера), а не падает.
+pub fn formula_metrics(effective_latex: &str, display: bool) -> Result<FormulaMetrics, String> {
+    if effective_latex.trim().is_empty() {
+        return Err("пустой LaTeX формулы".to_owned());
+    }
+    crate::math_font::ensure_registered();
+    let mut session = Session::new(Document::new());
+    session
+        .run("insert.equation", &json!({"latex": effective_latex, "display": display}))
+        .map_err(|e| format!("LaTeX не разобран движком: {e}"))?;
+    session.run("equation.exit", &json!({})).map_err(|e| e.to_string())?;
+    layout_metrics(&session.doc).ok_or_else(|| "движок не сверстал формулу (нет MathLayout)".to_owned())
+}
+
+/// Достать `MathLayout` единственной формулы scratch-документа и превратить в [`FormulaMetrics`].
+fn layout_metrics(document: &Document) -> Option<FormulaMetrics> {
+    use wordcraft_engine::layout::Placed;
+    let layout = wordcraft_engine::layout::layout(
+        document,
+        &mut wordcraft_engine::layout::LayoutCache::new(),
+        &Default::default(),
+    );
+    let page = layout.pages.first()?;
+    for placed in &page.items {
+        if let Placed::Lines { para, .. } = placed
+            && let Some((_, math_layout)) = para.maths.first()
+        {
+            return Some(FormulaMetrics {
+                width_pt: f64::from(math_layout.width.max(0.01)),
+                ascent_pt: f64::from(math_layout.ascent.max(0.01)),
+                descent_pt: f64::from(math_layout.descent.max(0.0)),
+            });
+        }
+    }
+    None
+}
+
 /// Идентификатор рендерера формул для `env_hash` (ADR-0005 §4.1): версия WordCraft/пайплайна.
 /// Менять при обновлении пина `vendor/wordcraft` — кэши формул инвалидируются осознанно.
 pub const FORMULA_RENDERER_ID: &str = "wordcraft";
@@ -141,7 +203,7 @@ fn pdf_to_formula_svg_png(pdf: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), Stri
         run_checked(Command::new("pdftocairo").arg("-svg").arg(&pdf_path).arg(&svg_path))?;
         let svg = std::fs::read(&svg_path).map_err(|e| format!("прочитать svg: {e}"))?;
         let svg_text = String::from_utf8_lossy(&svg).to_string();
-        let (x, y, w, h) = pdf_ink_bbox(&pdf_path, &dir, 2.0)?;
+        let (x, y, w, h) = pdf_ink_bbox(&pdf_path, &dir, SVG_CROP_PAD_PT)?;
         let cropped = crop_svg(&svg_text, x, y, w, h)?;
         let png = rasterize_svg(cropped.as_bytes()).ok();
         Ok((cropped.into_bytes(), png))
@@ -252,6 +314,60 @@ mod tests {
         assert_eq!(caches.omml_hash.len(), 64);
         assert_eq!(caches.svg_hash.as_deref().map(str::len), Some(64));
         assert_eq!(caches.png_hash.as_deref().map(str::len), Some(64));
+    }
+
+    /// Метрики вёрстки (ADR-0022): штрих σ=F/A имеет ширину/подъём и нулевую глубину
+    /// (дробь без нижних выносных), а формула с пределом снизу — ненулевую глубину.
+    /// Требует math-движок (без poppler): метрики считает вёрстка WordCraft.
+    #[test]
+    fn formula_metrics_match_layout() {
+        let sigma = formula_metrics("\\sigma=\\frac{F}{A}", true).expect("метрики σ-формулы");
+        assert!(sigma.width_pt > 10.0, "ширина σ-формулы: {sigma:?}");
+        assert!(sigma.ascent_pt > 4.0, "подъём σ-формулы: {sigma:?}");
+        assert!(sigma.descent_pt >= 0.0);
+        // Детерминизм: один и тот же LaTeX → те же метрики (кэши/перф-замеры опираются на это).
+        let again = formula_metrics("\\sigma=\\frac{F}{A}", true).expect("повтор");
+        assert_eq!(sigma, again, "метрики детерминированы");
+        // Пределы/дроби с глубиной: \sum_{i=1}^{n} — глубина под базовой линией ненулевая.
+        let sum = formula_metrics("\\sum_{i=1}^{n} i", true).expect("метрики суммы");
+        assert!(sum.descent_pt > 0.5, "глубина суммы: {sum:?}");
+        assert!(sum.ascent_pt > sigma.ascent_pt, "предел сверху выше: {sum:?} vs {sigma:?}");
+        // Невалидный/пустой LaTeX — понятная ошибка, без паники.
+        assert!(formula_metrics("   ", true).is_err());
+    }
+
+    /// PERF (P6, ADR-0022; не в обычном прогоне): полный рендер формулы `compile_formula`
+    /// (OMML+SVG+PNG, включая poppler) и метрики вёрстки. Запуск:
+    /// `cargo test -p rde-doc --release --lib formula::tests::perf -- --ignored --nocapture`
+    /// (на стенде release: рендер ≤50 мс — критерий ТЗ; фактические числа — в отчёте P6).
+    #[test]
+    #[ignore = "перф-замер: запускать вручную в release с --ignored --nocapture"]
+    fn perf_compile_formula_and_metrics() {
+        if !command_available("pdftocairo") {
+            eprintln!("PERF: poppler недоступен — замер пропущен");
+            return;
+        }
+        let corpus = [
+            ("простая", "x=Vt"),
+            ("демо σ", "\\sigma=\\sqrt{\\frac{1}{N-1}\\sum_{i=1}^{N}(x_i-\\bar{x})^2}"),
+            ("дробь/матрица", "\\begin{pmatrix}a&b\\\\c&d\\end{pmatrix}"),
+        ];
+        for (label, latex) in corpus {
+            // Прогрев (шрифт/кэши движка).
+            let _ = compile_formula(latex, true).expect("прогрев");
+            let iterations = 20u32;
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                let _ = compile_formula(latex, true).expect("компиляция");
+            }
+            let compile_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations);
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                let _ = formula_metrics(latex, true).expect("метрики");
+            }
+            let metrics_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations);
+            println!("PERF {label}: compile_formula {compile_ms:.3} мс, formula_metrics {metrics_ms:.3} мс");
+        }
     }
 
     fn command_available(name: &str) -> bool {
