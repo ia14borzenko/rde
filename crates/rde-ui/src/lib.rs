@@ -223,6 +223,8 @@ const AGENT_WIDTH_MIN: f32 = 180.0;
 const INSPECTOR_WIDTH: f32 = 340.0;
 const INSPECTOR_WIDTH_MIN: f32 = 280.0;
 const INSPECTOR_WIDTH_MAX: f32 = 480.0;
+/// Высота нативной области правки формулы (equation_tab + canvas WordCraft) в панели P4.
+const NATIVE_FORMULA_EDITOR_H: f32 = 300.0;
 
 // ── строка вкладок центра: ОДНА линия без переноса (ТЗ-03 §19-7) ────────────────────────
 /// Высота таба строки вкладок и сегмента переключателя режимов (равна `interact_size.y`
@@ -452,6 +454,10 @@ enum TreeAction {
     Inspect(String),
     /// GUI-02: свойства источника/репозитория (path/url/kind задаются в диалоге).
     Properties(String),
+    /// P4: панель редактора формулы (ADR-0020).
+    EditFormula(String),
+    /// P4: вставка project-level формулы в документ из дерева.
+    InsertFormula(String),
 }
 
 /// Состояние диалога создания объекта.
@@ -684,7 +690,48 @@ struct FormulaInspectorData {
     status: Option<rde_dag::FormulaLiveStatus>,
     act_key: Option<String>,
     backlinks: Vec<rde_doc::FormulaBacklink>,
+    /// Статусы формульных вставок (Fresh/Stale/BodyModified/MissingTarget, R-DOC-13/19):
+    /// сравнение `act_key` вставки с текущим — то, что пересоберёт «Обновить документ».
+    insert_states: Vec<rde_doc::FormulaInsertState>,
     unregistered: usize,
+}
+
+/// Панель редактора формулы (P4, ADR-0005 §5): LaTeX-источник, предпросмотр, нативный
+/// `equation_tab` WordCraft, применение в `formula.toml` и вставка в документ с номером.
+/// `formula_id = None` — режим создания (диалог «Создать формулу»).
+struct FormulaEditorState {
+    /// `None` — создание новой формулы, `Some(id)` — правка существующей.
+    formula_id: Option<String>,
+    title: String,
+    latex: String,
+    /// `true` — display (отдельная строка, нумеруется), `false` — inline.
+    display: bool,
+    /// Политика нумерации объекта: `auto` — нумеровать при вставке/обновлении, `none` — без номера.
+    numbering_mode: String,
+    /// Метка/группа нумерации (R-DOC-15; пусто — нет).
+    numbering_label: String,
+    /// Режим вставки в документ: `omml` (редактируемый Word-объект) | `svg` (вектор).
+    render_mode: String,
+    /// Ошибка последнего действия (валидация LaTeX, применение, вставка).
+    error: String,
+    /// Информационное сообщение (создана/применена/пересчитана/вставлена).
+    info: String,
+    /// Открыт нативный «профессиональный редактор» WordCraft (equation_tab + canvas).
+    native_open: bool,
+    /// Отдельный WordCraft-редактор: предпросмотр (`previews::math_texture`) и нативная правка.
+    /// Не трогает документ проекта — правка источника не создаёт черновиков в тексте.
+    native: Option<Box<NativeFormulaEditor>>,
+}
+
+/// Отдельный (scratch) WordCraft-редактор для панели формулы (P4, спайк A): живёт только в панели,
+/// нативная вкладка Equation и canvas рисуются в окне RDE без правок `vendor/wordcraft`.
+struct NativeFormulaEditor {
+    app: wordcraft_ui_egui::WordApp,
+    /// `theme::install_fonts` вызван; до следующего кадра `equation_tab::show` паникует
+    /// (`FontFamily::Name("semibold") is not bound to any fonts`) — первый кадр панели без него.
+    fonts_ready: bool,
+    /// Пропустить кадры после `set_fonts` (шрифты применяются со следующего кадра).
+    skip_frames: u8,
 }
 
 impl InsertDialogState {
@@ -801,6 +848,9 @@ pub struct RdeApp {
     insert_dialog: Option<InsertDialogState>,
     /// Диалог «Принять формулы как объекты» (ADR-0005 §7, ADR-0019): политика номеров.
     formula_migration_dialog: Option<FormulaMigrationDialogState>,
+    /// Панель редактора формулы (P4): создание/правка источника, предпросмотр, нативный
+    /// equation_tab, вставка с номером (ADR-0005 §5).
+    formula_editor: Option<FormulaEditorState>,
     /// Состояние git-репозитория проекта (P5, R-VCS-01).
     git_status: Option<rde_vcs::GitStatus>,
     /// Диалог коммита: текст сообщения.
@@ -991,6 +1041,7 @@ impl RdeApp {
             update_job: None,
             insert_dialog: None,
             formula_migration_dialog: None,
+            formula_editor: None,
             git_status: None,
             commit_dialog: None,
             history_dialog: None,
@@ -2041,10 +2092,12 @@ impl RdeApp {
             version: rde_doc::FORMULA_RENDERER_VERSION,
         };
         let formula_id = dialog.formula_id.clone();
-        let display = {
+        let (display, numbered) = {
             let object = self.project.formula_object(&formula_id).ok_or_else(|| format!("формула {formula_id} не найдена"))?;
             let ObjectData::Formula(formula) = &object.data else { return Err("объект не формула".to_owned()) };
-            formula.display
+            // Политика нумерации объекта (ADR-0005 §5.1): display + mode=auto → номер (N);
+            // inline и mode=none — без номера (R-DOC-15/ADR-0019 не регрессируют).
+            (formula.display, formula.display && formula.numbering.mode != "none")
         };
         {
             let project = &self.project;
@@ -2074,7 +2127,7 @@ impl RdeApp {
             act_key: state.act_key.clone(),
             latex: state.resolved_latex.clone(),
             display,
-            numbered: display,
+            numbered,
             omml: load(&state.omml_hash)?,
             svg: state.svg_hash.as_ref().map(|_| load(&state.svg_hash)).transpose()?,
             png: state.png_hash.as_ref().map(|_| load(&state.png_hash)).transpose()?,
@@ -2089,6 +2142,721 @@ impl RdeApp {
             },
         )?;
         Ok((report, state.act_key.clone()))
+    }
+
+    // ── P4: редактор формулы (ADR-0020) — создание/правка source-of-truth + кэши ─────
+
+    /// Проверить LaTeX формулы компиляцией (P4): ошибка движка показывается в панели/диалоге
+    /// **до** записи `formula.toml` (и до создания объекта).
+    fn validate_formula_latex(latex: &str, display: bool) -> Result<(), String> {
+        let latex = latex.trim();
+        if latex.is_empty() {
+            return Err("LaTeX-источник формулы не может быть пустым".to_owned());
+        }
+        rde_doc::compile_formula(latex, display).map(|_| ()).map_err(|error| format!("LaTeX не компилируется: {error}"))
+    }
+
+    /// Пересчитать кэши формулы и зафиксировать состояние (P4): `prepare` (OMML/SVG/PNG) →
+    /// транзакция ledger `formula-update` → зеркало `[state]` в `formula.toml` (ADR-0005 §3.3).
+    fn refresh_formula_caches(&mut self, formula_id: &str) -> Result<(), String> {
+        let renderer = rde_dag::FormulaRenderer {
+            id: rde_doc::FORMULA_RENDERER_ID,
+            version: rde_doc::FORMULA_RENDERER_VERSION,
+        };
+        let project = &self.project;
+        let store = self.store.as_mut().ok_or_else(|| "хранилище проекта не открыто".to_owned())?;
+        let prepared = rde_dag::prepare_formula_update(project, store, formula_id, &renderer, |latex, display| {
+            let caches = rde_doc::compile_formula(latex, display)?;
+            Ok(rde_dag::FormulaCompiled { omml: caches.omml, svg: caches.svg, png: caches.png })
+        })?;
+        rde_dag::commit_formula_update(store, &prepared.state, prepared.cache_tree, &format!("formula edit: {formula_id}"))?;
+        rde_dag::record_prepared_formula_state(project, &prepared)
+    }
+
+    /// Создать project-level формулу из GUI (P4, ADR-0020): валидация LaTeX компиляцией, дедуп по
+    /// `latex.trim()` (как миграция ADR-0019: та же формула — используем существующую), запись
+    /// `formula.toml` + кэши OMML/SVG/PNG + ledger. Возвращает `(id, reused)`.
+    fn create_formula_action(
+        &mut self,
+        title: &str,
+        latex: &str,
+        display: bool,
+        numbering_mode: &str,
+    ) -> Result<(String, bool), String> {
+        let title = title.trim();
+        let latex = latex.trim();
+        if title.is_empty() {
+            return Err("название формулы не может быть пустым".to_owned());
+        }
+        Self::validate_formula_latex(latex, display)?;
+        // Дедуп по источнику: та же формула (LaTeX) уже есть — не создаём дубль.
+        if let Some(existing) = self.project.formulas().find(|formula| formula.latex.trim() == latex) {
+            let id = existing.id.clone();
+            self.selected = Some(id.clone());
+            return Ok((id, true));
+        }
+        let dir = rde_core::create_formula_with_options(&self.project.root, title, latex, display, numbering_mode)?;
+        self.reload_project();
+        let Some(id) = self.project.objects.iter().find(|object| object.dir == dir).map(|object| object.id.clone()) else {
+            return Err("созданная формула не загрузилась в проект".to_owned());
+        };
+        self.selected = Some(id.clone());
+        if let Err(error) = self.refresh_formula_caches(&id) {
+            // Откат: не оставляем объект, формулу из которого не удалось вычислить.
+            let _ = std::fs::remove_dir_all(&dir);
+            self.reload_project();
+            return Err(format!("кэши формулы: {error}"));
+        }
+        self.reload_project();
+        self.selected = Some(id.clone());
+        Ok((id, false))
+    }
+
+    /// Применить правку источника формулы (P4): валидация LaTeX, запись шапки без потери
+    /// inputs/fragments/[state], пересчёт кэшей и `[state]`. Вставки становятся устаревшими
+    /// автоматически (их `act_key` сравнивается с текущим при статусах/R-DOC-19).
+    fn apply_formula_edit(
+        &mut self,
+        id: &str,
+        title: &str,
+        latex: &str,
+        display: bool,
+        numbering_mode: &str,
+        numbering_label: &str,
+    ) -> Result<(), String> {
+        Self::validate_formula_latex(latex, display)?;
+        let update = rde_core::FormulaSourceUpdate {
+            title: title.to_owned(),
+            latex: latex.to_owned(),
+            display,
+            numbering_mode: numbering_mode.to_owned(),
+            numbering_label: numbering_label.to_owned(),
+        };
+        rde_core::update_formula_source(&self.project.root, id, &update)?;
+        self.reload_project();
+        if let Err(error) = self.refresh_formula_caches(id) {
+            self.reload_project();
+            return Err(format!("кэши формулы: {error}"));
+        }
+        self.reload_project();
+        self.selected = Some(id.to_owned());
+        Ok(())
+    }
+
+    // ── P4: панель формулы (создание/правка/предпросмотр/нативная вкладка Equation) ──
+
+    /// Открыть панель создания формулы (P4): пустые поля, display, политика `auto`.
+    pub fn open_formula_editor_new(&mut self) {
+        self.formula_editor = Some(FormulaEditorState {
+            formula_id: None,
+            title: String::new(),
+            latex: String::new(),
+            display: true,
+            numbering_mode: "auto".to_owned(),
+            numbering_label: String::new(),
+            render_mode: "omml".to_owned(),
+            error: String::new(),
+            info: String::new(),
+            native_open: false,
+            native: None,
+        });
+    }
+
+    /// Открыть панель редактирования формулы, выбранной в дереве/инспекторе (P4).
+    pub fn open_selected_formula_editor(&mut self) {
+        let Some(object) = self.selected_object() else {
+            self.push_log(Level::Info, "Редактировать формулу: выберите формулу в дереве или инспекторе");
+            return;
+        };
+        if !matches!(object.data, ObjectData::Formula(_)) {
+            self.push_log(Level::Info, "Редактировать формулу: выбранный объект — не формула");
+            return;
+        }
+        let id = object.id.clone();
+        self.open_formula_editor(&id);
+    }
+
+    /// Открыть панель редактора формулы по id (P4); неизвестный id — запись в журнал.
+    pub fn open_formula_editor(&mut self, formula_id: &str) {
+        let Some(object) = self.project.formula_object(formula_id) else {
+            self.push_log(Level::Warn, format!("Редактор формулы: формула {formula_id} не найдена"));
+            return;
+        };
+        let ObjectData::Formula(formula) = &object.data else { return };
+        self.selected = Some(formula.id.clone());
+        self.formula_editor = Some(FormulaEditorState {
+            formula_id: Some(formula.id.clone()),
+            title: object.title.clone(),
+            latex: formula.latex.clone(),
+            display: formula.display,
+            numbering_mode: if formula.numbering.mode.is_empty() { "auto".to_owned() } else { formula.numbering.mode.clone() },
+            numbering_label: formula.numbering.label.clone(),
+            render_mode: "omml".to_owned(),
+            error: String::new(),
+            info: String::new(),
+            native_open: false,
+            native: None,
+        });
+    }
+
+    /// Отдельный WordCraft-редактор для панели формулы (спайк A): пустой scratch-документ, своя
+    /// `Session`. Документ пользователя не затрагивается — правка источника не создаёт черновиков.
+    fn new_native_formula_editor(&self) -> Box<NativeFormulaEditor> {
+        rde_doc::ensure_math_font();
+        let session = wordcraft_engine::Session::new(wordcraft_engine::doc::Document::default());
+        let mut app = wordcraft_ui_egui::WordApp::new(session, wordcraft_ui_egui::Services::default());
+        app.integrated_titlebar = false;
+        app.autosave = false;
+        app.ui.theme = appearance_of(&self.app_settings.theme);
+        Box::new(NativeFormulaEditor { app, fonts_ready: false, skip_frames: 1 })
+    }
+
+    /// Лениво создать scratch-редактор панели: он же даёт предпросмотр (`previews::math_texture`).
+    fn ensure_formula_native(&self, dialog: &mut FormulaEditorState) {
+        if dialog.native.is_none() {
+            dialog.native = Some(self.new_native_formula_editor());
+        }
+    }
+
+    /// Перезапустить нативную правку: свежий scratch-документ + уравнение из поля LaTeX.
+    fn restart_native_formula_editor(&self, dialog: &mut FormulaEditorState) {
+        dialog.native = Some(self.new_native_formula_editor());
+        let Some(native) = dialog.native.as_mut() else { return };
+        let request = serde_json::json!({ "latex": dialog.latex.trim(), "display": dialog.display });
+        if native.app.run("insert.equation", request).is_err() {
+            // Пустой/невалидный на момент открытия LaTeX — начинаем с пустой формулы.
+            let _ = native.app.run("insert.equation", serde_json::json!({ "display": dialog.display }));
+        }
+        let _ = native.app.run("equation.inputFormat", serde_json::json!({ "format": "latex" }));
+        native.app.canvas.want_focus = true;
+    }
+
+    /// Забрать LaTeX/display из нативного редактора (`equation.get`, спайк A) в поля панели.
+    fn sync_formula_from_native(dialog: &mut FormulaEditorState) {
+        let Some(native) = dialog.native.as_mut() else { return };
+        let Ok(info) = native.app.run("equation.get", serde_json::json!({})) else { return };
+        if let Some(latex) = info.get("latex").and_then(|value| value.as_str())
+            && !latex.trim().is_empty()
+        {
+            dialog.latex = latex.to_owned();
+        }
+        if let Some(display) = info.get("display").and_then(|value| value.as_bool()) {
+            dialog.display = display;
+        }
+    }
+
+    /// Вставить формулу из панели (P4): кэши из ledger (при устаревании — пересчёт) + sdt-вставка с
+    /// документно-локальным номером по схеме документа (ADR-0018/0019, right-numbered без таблицы).
+    fn formula_editor_insert(&mut self, dialog: &mut FormulaEditorState) {
+        let Some(formula_id) = dialog.formula_id.clone() else {
+            dialog.error = "Сначала создайте формулу («Создать»)".to_owned();
+            return;
+        };
+        let Some(package) = self.active_document_path() else {
+            dialog.error = "В проекте нет документа — вставка недоступна".to_owned();
+            return;
+        };
+        if !rde_doc::is_rde_package(&package) {
+            dialog.error = "Документ ещё не в .doc.rde — сначала «Сохранить проект»".to_owned();
+            return;
+        }
+        let style = self
+            .project
+            .document_path()
+            .filter(|path| rde_doc::is_rde_package(path))
+            .map(|path| rde_doc::default_paragraph_style(&path))
+            .unwrap_or_default();
+        let insert_dialog = InsertDialogState {
+            kind: "formula".to_owned(),
+            artifact_id: String::new(),
+            formula_id: formula_id.clone(),
+            render_mode: dialog.render_mode.clone(),
+            selector: String::new(),
+            pointer: String::new(),
+            caption: String::new(),
+            style,
+            format: "raw".to_owned(),
+            precision: 2,
+            error: String::new(),
+        };
+        let result = self.formula_insert_from_dialog(&insert_dialog, &package);
+        match &result {
+            Ok((report, _)) => {
+                let number = report
+                    .insert
+                    .number_text
+                    .clone()
+                    .or_else(|| report.insert.number.map(|number| number.to_string()))
+                    .map(|number| format!(" ({number})"))
+                    .unwrap_or_else(|| " (без номера)".to_owned());
+                dialog.error.clear();
+                dialog.info = format!("Формула вставлена в документ: {}{number}", report.insert.id);
+            }
+            Err(error) => dialog.error = format!("Вставка: {error}"),
+        }
+        self.finish_insert(&package, result);
+    }
+
+    /// Быстрая вставка формулы из дерева/инспектора (P4): OMML-режим, текущая позиция вставки,
+    /// нумерация — по схеме документа (ADR-0018/0019). Ошибки — в журнал.
+    fn formula_quick_insert(&mut self, formula_id: &str, render_mode: &str) {
+        let Some(package) = self.active_document_path() else {
+            self.push_log(Level::Warn, "Вставка формулы: в проекте нет документа");
+            return;
+        };
+        if !rde_doc::is_rde_package(&package) {
+            self.push_log(Level::Warn, "Вставка формулы: документ ещё не в .doc.rde — сначала «Сохранить проект»");
+            return;
+        }
+        let style = self
+            .project
+            .document_path()
+            .filter(|path| rde_doc::is_rde_package(path))
+            .map(|path| rde_doc::default_paragraph_style(&path))
+            .unwrap_or_default();
+        let dialog = InsertDialogState {
+            kind: "formula".to_owned(),
+            artifact_id: String::new(),
+            formula_id: formula_id.to_owned(),
+            render_mode: render_mode.to_owned(),
+            selector: String::new(),
+            pointer: String::new(),
+            caption: String::new(),
+            style,
+            format: "raw".to_owned(),
+            precision: 2,
+            error: String::new(),
+        };
+        let result = self.formula_insert_from_dialog(&dialog, &package);
+        match &result {
+            Ok((report, _)) => {
+                let number = report
+                    .insert
+                    .number_text
+                    .clone()
+                    .or_else(|| report.insert.number.map(|number| number.to_string()))
+                    .map(|number| format!(" (номер {number})"))
+                    .unwrap_or_default();
+                self.push_log(Level::Ok, format!("Вставка формулы: {}{number}", report.insert.id));
+            }
+            Err(error) => self.push_log(Level::Warn, format!("Вставка формулы: {error}")),
+        }
+        self.finish_insert(&package, result);
+    }
+
+    /// Панель/диалог формулы (P4): создание и правка source-of-truth, предпросмотр, нативный
+    /// `equation_tab`, «Применить» (манифест+кэши) и «Вставить в документ» (номер по схеме).
+    /// Возвращает `true`, если панель остаётся открытой.
+    fn formula_editor_window(&mut self, ctx: &egui::Context, dialog: &mut FormulaEditorState) -> bool {
+        let pal = theme_colors(ctx.theme());
+        self.ensure_formula_native(dialog);
+        // Статус/«где вставлено» существующей формулы (R-DOC-19) — до окна (заимствует store).
+        let inspector = dialog.formula_id.as_deref().map(|id| self.formula_inspector_data(id));
+        let stored = dialog.formula_id.as_deref().and_then(|id| {
+            self.project.formula_object(id).and_then(|object| match &object.data {
+                ObjectData::Formula(formula) => Some((
+                    object.title.clone(),
+                    formula.latex.clone(),
+                    formula.display,
+                    formula.numbering.mode.clone(),
+                    formula.numbering.label.clone(),
+                )),
+                _ => None,
+            })
+        });
+        let dirty = stored.as_ref().is_some_and(|(title, latex, display, mode, label)| {
+            dialog.title.trim() != title.trim()
+                || dialog.latex.trim() != latex.trim()
+                || dialog.display != *display
+                || dialog.numbering_mode != *mode
+                || dialog.numbering_label.trim() != label.trim()
+        });
+        // Подсказка «такая формула уже есть» для создания (дедуп по latex.trim(), ADR-0019).
+        let duplicate = (dialog.formula_id.is_none() && !dialog.latex.trim().is_empty())
+            .then(|| self.project.formulas().find(|formula| formula.latex.trim() == dialog.latex.trim()).map(|formula| formula.id.clone()))
+            .flatten();
+        let anchor_label = match self.insert_anchor_block {
+            Some(block) => format!("после блока {}", block + 1),
+            None => "в конец документа".to_owned(),
+        };
+        let number_preview: Option<String> = self
+            .active_document_path()
+            .filter(|path| rde_doc::is_rde_package(path))
+            .and_then(|path| rde_doc::next_formula_number_text(&path, self.document_formula_numbering()))
+            .map(|(number, _warnings)| number);
+        let mut close = false;
+        let mut apply = false;
+        let mut insert = false;
+        let mut toggle_native = false;
+        let mut sync_native = false;
+        let mut update_document = false;
+        let mut open_document = false;
+        let title = if dialog.formula_id.is_some() { "Формула" } else { "Новая формула" };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(900.0)
+            .default_height(700.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0))
+            .show(ctx, |ui| {
+                // Панель с нативным редактором выше окна: содержимое прокручивается, кнопки
+                // действий живут внутри scroll-области (иначе на 1000px-окне окно уезжает за верх).
+                let max_height = (ctx.content_rect().height() - 150.0).max(420.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("rde_formula_panel_scroll")
+                    .max_height(max_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                ui.set_min_width(760.0);
+                ui.set_max_width(1100.0);
+                // Статус существующей формулы.
+                if let Some(inspector) = &inspector {
+                    let (label, color) = match &inspector.status {
+                        Some(rde_dag::FormulaLiveStatus::Fresh) => ("актуальна", pal.green),
+                        Some(rde_dag::FormulaLiveStatus::Stale(_)) => ("устарела", pal.amber),
+                        Some(rde_dag::FormulaLiveStatus::NeverComputed) => ("не вычислена", pal.amber),
+                        Some(rde_dag::FormulaLiveStatus::NotComputable(_)) => ("ошибка", pal.red),
+                        None => ("статус неизвестен", pal.muted),
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("● {label}")).size(FS_BODY).color(color));
+                        if let Some(reason) = inspector.status.as_ref().and_then(|status| status.reason()) {
+                            ui.label(RichText::new(reason).small().color(pal.muted));
+                        }
+                        let stale = inspector
+                            .insert_states
+                            .iter()
+                            .filter(|state| **state != rde_doc::FormulaInsertState::Fresh)
+                            .count();
+                        ui.label(
+                            RichText::new(format!("вставок: {} · устаревших: {stale}", inspector.backlinks.len()))
+                                .small()
+                                .color(if stale > 0 { pal.amber } else { pal.muted }),
+                        );
+                        if let Some(id) = &dialog.formula_id {
+                            ui.label(RichText::new(format!("id {}", &id[..id.len().min(12)])).monospace().size(FS_CAPTION).color(pal.muted));
+                        }
+                    });
+                    if dirty {
+                        ui.label(
+                            RichText::new("есть неприменённые правки — «Применить», чтобы записать source-of-truth и пересчитать кэши")
+                                .small()
+                                .color(pal.amber),
+                        );
+                    }
+                    if !inspector.backlinks.is_empty() && btn(ui, Role::Ghost, Some(IC_OPEN), "Открыть документ на вставке").clicked() {
+                        open_document = true;
+                    }
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Заголовок").size(FS_BODY).color(pal.muted));
+                    ui.add(egui::TextEdit::singleline(&mut dialog.title).hint_text("например: Средняя квадратичная ошибка").desired_width(f32::INFINITY));
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("LaTeX-источник").size(FS_BODY).color(pal.muted));
+                    ui.label(RichText::new("источник истины формулы (formula.toml)").small().color(pal.muted));
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut dialog.latex)
+                        .code_editor()
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(r"\sigma = \sqrt{\frac{1}{N-1}\sum_{i=1}^{N}(x_i-\bar{x})^2}"),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Формат").size(FS_BODY).color(pal.muted));
+                    ui.radio_value(&mut dialog.display, true, "display (отдельная строка)");
+                    ui.radio_value(&mut dialog.display, false, "inline (в тексте)");
+                    ui.separator();
+                    ui.label(RichText::new("Нумерация").size(FS_BODY).color(pal.muted));
+                    egui::ComboBox::from_id_salt("rde_formula_policy")
+                        .selected_text(if dialog.numbering_mode == "none" { "без номера (none)" } else { "авто (auto)" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut dialog.numbering_mode, "auto".to_owned(), "авто (auto): номер (N) при вставке/обновлении");
+                            ui.selectable_value(&mut dialog.numbering_mode, "none".to_owned(), "без номера (none)");
+                        });
+                    if dialog.display && dialog.numbering_mode == "auto" {
+                        ui.label(RichText::new("номер (N) справа — канон ADR-0018").small().color(pal.muted));
+                    }
+                });
+                if let Some(duplicate) = &duplicate {
+                    ui.add_space(2.0);
+                    let duplicate_title = self.project.formula_object(duplicate).map(|object| object.title.clone()).unwrap_or_else(|| duplicate.clone());
+                    ui.label(
+                        RichText::new(format!("такая формула (по LaTeX) уже есть: «{duplicate_title}» — «Создать» использует существующую"))
+                            .small()
+                            .color(pal.amber),
+                    );
+                }
+                if !dialog.error.is_empty() {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(&dialog.error).small().color(pal.red));
+                }
+                if !dialog.info.is_empty() {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(&dialog.info).small().color(pal.green));
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let native_label = if dialog.native_open { "Скрыть профессиональный редактор" } else { "Профессиональный редактор (WordCraft)" };
+                    if btn(ui, Role::Secondary, Some(IC_CODE), native_label).clicked() {
+                        toggle_native = true;
+                    }
+                    if dialog.native_open && btn(ui, Role::Ghost, None, "← Забрать LaTeX из редактора").clicked() {
+                        sync_native = true;
+                    }
+                    ui.label(
+                        RichText::new("нативная вкладка Equation WordCraft на отдельном мини-документе — документ проекта не меняется")
+                            .small()
+                            .color(pal.muted),
+                    );
+                });
+                ui.add_space(4.0);
+                if dialog.native_open {
+                    ui.label(
+                        RichText::new(
+                            "Профессиональный редактор WordCraft открыт в отдельном окне — документ проекта не меняется; \
+                             «Забрать LaTeX из редактора» переносит правку в поле источника.",
+                        )
+                        .small()
+                        .color(pal.muted),
+                    );
+                } else {
+                    ui.label(RichText::new("ПРЕДПРОСМОТР (рендер вкладки Equation, шрифт формул STIX)").size(FS_CAPTION).family(bold_family(ui.ctx())).color(pal.muted));
+                    ui.add_space(2.0);
+                    let size = vec2(ui.available_width(), 84.0);
+                    let (rect, _resp) = ui.allocate_exact_size(size, Sense::hover());
+                    ui.painter().rect_filled(rect, CornerRadius::same(8), pal.panel_hi);
+                    ui.painter().rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                    if dialog.latex.trim().is_empty() {
+                        ui.painter().text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            "введите LaTeX — здесь появится формула",
+                            FontId::proportional(13.0),
+                            pal.muted,
+                        );
+                    } else if let Some(native) = dialog.native.as_mut() {
+                        let nodes = wordcraft_engine::doc::math_latex::parse_latex(dialog.latex.trim());
+                        let key = format!("rde-formula-preview:{}:{}", dialog.latex.trim(), dialog.display);
+                        match wordcraft_ui_egui::previews::math_texture(
+                            &mut native.app,
+                            ui.ctx(),
+                            &key,
+                            &nodes,
+                            dialog.display,
+                            15.0,
+                            vec2(rect.width() - 16.0, rect.height() - 12.0),
+                        ) {
+                            Some((tex, uv)) => {
+                                ui.painter().image(tex, rect.shrink(6.0), uv, pal.text);
+                            }
+                            None => {
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Вставка в документ:").size(FS_BODY).color(pal.muted));
+                    egui::ComboBox::from_id_salt("rde_formula_render_mode")
+                        .selected_text(if dialog.render_mode == "svg" { "SVG-вектор" } else { "Word-объект (OMML)" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut dialog.render_mode, "omml".to_owned(), "Word-объект (OMML, редактируемый)");
+                            ui.selectable_value(&mut dialog.render_mode, "svg".to_owned(), "SVG-вектор (+PNG fallback)");
+                        });
+                    ui.label(RichText::new(format!("позиция: {anchor_label}")).small().color(pal.muted));
+                    let number_text = if dialog.display && dialog.numbering_mode == "auto" {
+                        number_preview.as_ref().map(|number| format!("номер (N) при вставке: ({number})")).unwrap_or_else(|| "номер: по схеме документа".to_owned())
+                    } else if !dialog.display {
+                        "inline — без номера".to_owned()
+                    } else {
+                        "без номера (политика none)".to_owned()
+                    };
+                    ui.label(RichText::new(number_text).small().color(pal.muted));
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let apply_label = if dialog.formula_id.is_some() { "Применить" } else { "Создать" };
+                    if btn(ui, Role::Primary, Some(IC_SAVE), apply_label).clicked() {
+                        apply = true;
+                    }
+                    let can_insert = dialog.formula_id.is_some() && !dirty;
+                    let insert_resp = ui.add_enabled_ui(can_insert, |ui| btn(ui, Role::Secondary, Some(IC_CONST), "Вставить в документ")).inner;
+                    if insert_resp.clicked() {
+                        insert = true;
+                    }
+                    if dialog.formula_id.is_some() && dirty {
+                        insert_resp.on_disabled_hover_text("сначала «Применить» — вставка берёт кэши применённой формулы");
+                    } else if dialog.formula_id.is_none() {
+                        insert_resp.on_disabled_hover_text("сначала «Создать»");
+                    }
+                    if btn(ui, Role::Secondary, Some(IC_UPDATE), "Обновить документ").clicked() {
+                        update_document = true;
+                    }
+                    if btn(ui, Role::Ghost, None, "Закрыть").clicked() {
+                        close = true;
+                    }
+                });
+                    });
+            });
+        // Нативный «профессиональный редактор» — отдельное окно: WordCraft canvas рисует свою
+        // область сам, вложенный ScrollArea основного окна конфликтует с его clip (спайк A).
+        if dialog.native_open {
+            let mut take_from_editor = false;
+            let mut hide_editor = false;
+            egui::Window::new("Профессиональный редактор формулы")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(1000.0)
+                .default_pos(egui::pos2(380.0, 90.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(980.0);
+                    if let Some(native) = dialog.native.as_mut() {
+                        if !native.fonts_ready {
+                            // equation_tab использует семейства medium/semibold WordCraft: до первого
+                            // кадра панели их надо установить, иначе паника (спайк A); первый кадр — без show.
+                            wordcraft_ui_egui::theme::install_fonts(ui.ctx());
+                            native.fonts_ready = true;
+                            native.skip_frames = 1;
+                            ui.ctx().request_repaint();
+                        } else if native.skip_frames > 0 {
+                            native.skip_frames -= 1;
+                            ui.ctx().request_repaint();
+                        } else {
+                            wordcraft_ui_egui::equation_tab::show(&mut native.app, ui);
+                            ui.add_space(4.0);
+                            let size = vec2(ui.available_width(), NATIVE_FORMULA_EDITOR_H);
+                            let (rect, _resp) = ui.allocate_exact_size(size, Sense::hover());
+                            let mut child = ui.new_child(
+                                egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)),
+                            );
+                            child.set_clip_rect(rect);
+                            native.app.logic(ui.ctx());
+                            native.app.doc_view_ui(&mut child);
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if btn(ui, Role::Primary, Some(IC_SAVE), "← Забрать LaTeX из редактора").clicked() {
+                            take_from_editor = true;
+                        }
+                        if btn(ui, Role::Ghost, None, "Скрыть редактор").clicked() {
+                            hide_editor = true;
+                        }
+                        ui.label(
+                            RichText::new("нативный Equation WordCraft: структуры/символы/LaTeX-ввод на отдельном мини-документе")
+                                .small()
+                                .color(pal.muted),
+                        );
+                    });
+                });
+            if take_from_editor {
+                sync_native = true;
+            }
+            if hide_editor {
+                toggle_native = true;
+            }
+        }
+        if toggle_native {
+            if dialog.native_open {
+                // Забираем правку перед закрытием, чтобы не потерять ввод.
+                Self::sync_formula_from_native(dialog);
+                dialog.native_open = false;
+            } else {
+                Self::sync_formula_from_native(dialog);
+                self.restart_native_formula_editor(dialog);
+                dialog.native_open = true;
+                dialog.info = "Профессиональный редактор: ввод структур/символов и текста; «Забрать LaTeX из редактора» переносит источник в поле".to_owned();
+            }
+            ctx.request_repaint();
+        }
+        if sync_native {
+            let before = dialog.latex.clone();
+            Self::sync_formula_from_native(dialog);
+            dialog.info = if dialog.latex == before {
+                "Редактор: LaTeX не изменился".to_owned()
+            } else {
+                "LaTeX забран из профессионального редактора — «Применить», чтобы записать".to_owned()
+            };
+            dialog.error.clear();
+        }
+        if apply {
+            // Если открыт нативный редактор — берём актуальный LaTeX из него.
+            if dialog.native_open {
+                Self::sync_formula_from_native(dialog);
+            }
+            let was_new = dialog.formula_id.is_none();
+            let result = match &dialog.formula_id {
+                Some(id) => {
+                    let id = id.clone();
+                    self.apply_formula_edit(&id, &dialog.title, &dialog.latex, dialog.display, &dialog.numbering_mode, &dialog.numbering_label)
+                        .map(|()| (id, false))
+                }
+                None => self.create_formula_action(&dialog.title, &dialog.latex, dialog.display, &dialog.numbering_mode),
+            };
+            match result {
+                Ok((id, reused)) => {
+                    dialog.formula_id = Some(id.clone());
+                    if let Some(formula) = self.project.formula_object(&id)
+                        && let ObjectData::Formula(manifest) = &formula.data
+                    {
+                        dialog.title = formula.title.clone();
+                        dialog.latex = manifest.latex.clone();
+                        dialog.display = manifest.display;
+                        dialog.numbering_mode = manifest.numbering.mode.clone();
+                        dialog.numbering_label = manifest.numbering.label.clone();
+                    }
+                    dialog.error.clear();
+                    dialog.info = if reused {
+                        "Такая формула уже есть в проекте — используется существующая".to_owned()
+                    } else if was_new {
+                        "Формула создана; кэши OMML/SVG/PNG пересчитаны, объект выбран в дереве".to_owned()
+                    } else {
+                        "Источник применён; кэши пересчитаны, вставки помечены устаревшими — «Обновить документ»".to_owned()
+                    };
+                    if dialog.native_open {
+                        self.restart_native_formula_editor(dialog);
+                    }
+                    self.push_log(Level::Ok, format!("Формула {}: {} ({})", if was_new { "создана" } else { "обновлена" }, dialog.title, id));
+                }
+                Err(error) => {
+                    dialog.error = error.clone();
+                    self.push_log(Level::Warn, format!("Формула: {error}"));
+                }
+            }
+        }
+        if open_document
+            && let Some(backlink) = inspector.as_ref().and_then(|inspector| inspector.backlinks.first())
+        {
+            let document_id = backlink.document_id.clone();
+            if self.project.object(&document_id).is_some() {
+                self.selected = Some(document_id);
+                self.tab = Tab::Document;
+                self.show_inspector = true;
+                self.push_log(Level::Info, format!("Документ на вставке: {}", backlink.document_title));
+            }
+        }
+        if insert {
+            self.formula_editor_insert(dialog);
+        }
+        if update_document {
+            self.update_project_document();
+            dialog.info = "Документ обновлён: тела/номера/ссылки вставок пересобраны".to_owned();
+        }
+        if close {
+            self.formula_editor = None;
+            return false;
+        }
+        true
     }
 
     /// «Принять формулы как объекты» (P3, ADR-0005 §7): OMML вне реестра → project-level формулы +
@@ -2245,9 +3013,9 @@ impl RdeApp {
                 // Сразу после миграции: тела вставок из кэшей + текст перекрёстных ссылок.
                 let mut bodies: BTreeMap<String, rde_doc::FormulaBody> = BTreeMap::new();
                 if let Some(store) = self.store.as_ref() {
-                    for (formula_id, display, _numbered) in &states {
+                    for (formula_id, display, numbered) in &states {
                         if let Some((_, state)) = prepared_states.iter().find(|(id, _)| id == formula_id)
-                            && let Ok(body) = formula_body_from_state(store, formula_id, state, *display)
+                            && let Ok(body) = formula_body_from_state(store, formula_id, state, *display, *numbered)
                         {
                             bodies.insert(formula_id.clone(), body);
                         }
@@ -2342,10 +3110,24 @@ impl RdeApp {
             .and_then(|path| rde_doc::unregistered_formulas(&path).ok())
             .map(|equations| equations.len())
             .unwrap_or(0);
+        let act_key = status.as_ref().and_then(|(_, act_key)| act_key.clone());
+        // Статусы вставок: доступность формулы задаёт текущий act_key (R-DOC-19), тела
+        // сравниваются с подписью последней записи RDE (R-DOC-13).
+        let mut insert_states = Vec::new();
+        if let Some(act_key) = &act_key {
+            let mut availability: BTreeMap<String, rde_doc::FormulaAvailability> = BTreeMap::new();
+            availability.insert(formula_id.to_owned(), rde_doc::FormulaAvailability::Current(act_key.clone()));
+            for (_document_id, _title, path) in self.formula_documents() {
+                if let Ok(states) = rde_doc::formula_insert_statuses(&path, &availability) {
+                    insert_states.extend(states.into_iter().filter(|state| state.formula_id == formula_id).map(|state| state.state));
+                }
+            }
+        }
         FormulaInspectorData {
             status: status.as_ref().map(|(status, _)| status.clone()),
-            act_key: status.and_then(|(_, act_key)| act_key),
+            act_key,
             backlinks,
+            insert_states,
             unregistered,
         }
     }
@@ -2642,7 +3424,8 @@ impl RdeApp {
                                 _ => None,
                             })
                             .unwrap_or(true);
-                        match formula_body_from_state(store, formula_id, state, display) {
+                        let numbered = display && formula_numbering_enabled(project, formula_id);
+                        match formula_body_from_state(store, formula_id, state, display, numbered) {
                             Ok(body) => {
                                 formula_availability.insert(formula_id.clone(), rde_doc::FormulaAvailability::Current(state.act_key.clone()));
                                 formula_bodies.insert(formula_id.clone(), body);
@@ -2664,7 +3447,8 @@ impl RdeApp {
                                         _ => None,
                                     })
                                     .unwrap_or(true);
-                                match formula_body_from_state(store, formula_id, &prepared.state, display) {
+                                let numbered = display && formula_numbering_enabled(project, formula_id);
+                                match formula_body_from_state(store, formula_id, &prepared.state, display, numbered) {
                                     Ok(body) => {
                                         formula_availability
                                             .insert(formula_id.clone(), rde_doc::FormulaAvailability::Current(prepared.state.act_key.clone()));
@@ -3156,6 +3940,52 @@ impl RdeApp {
     /// Демо/скриншоты: диалог «Принять формулы как объекты» (ADR-0019).
     pub fn demo_open_formula_migration_dialog(&mut self) {
         self.open_formula_migration_dialog();
+    }
+
+    // ── P4 (ADR-0020): демо/скриншоты панели редактора формулы ──────────────
+
+    /// Демо/скриншоты: панель редактора формулы по id/вхождению названия (иначе — создание).
+    pub fn demo_open_formula_editor(&mut self, query: &str) {
+        let found = self
+            .project
+            .objects
+            .iter()
+            .find(|object| matches!(object.data, ObjectData::Formula(_)) && (object.id == query || object.title.contains(query)))
+            .map(|object| object.id.clone());
+        match found {
+            Some(id) => self.open_formula_editor(&id),
+            None => self.open_formula_editor_new(),
+        }
+    }
+
+    /// Демо/скриншоты: панель создания формулы с заполненными полями (LaTeX → предпросмотр).
+    pub fn demo_open_formula_editor_create(&mut self, title: &str, latex: &str) {
+        self.open_formula_editor_new();
+        if let Some(dialog) = self.formula_editor.as_mut() {
+            dialog.title = title.to_owned();
+            dialog.latex = latex.to_owned();
+        }
+    }
+
+    /// Демо/скриншоты: панель формулы с открытым нативным редактором WordCraft (equation_tab).
+    pub fn demo_open_formula_editor_native(&mut self) {
+        let first = self.project.formulas().next().map(|formula| formula.id.clone());
+        if let Some(id) = first {
+            self.open_formula_editor(&id);
+            let Some(mut dialog) = self.formula_editor.take() else { return };
+            dialog.native_open = true;
+            dialog.info = "Профессиональный редактор: ввод структур/символов и текста; «Забрать LaTeX из редактора» переносит источник в поле".to_owned();
+            self.restart_native_formula_editor(&mut dialog);
+            self.formula_editor = Some(dialog);
+        }
+    }
+
+    /// Демо/скриншоты: быстро вставить первую формулу проекта в документ (номер по схеме).
+    pub fn demo_insert_formula_with_number(&mut self) {
+        let first = self.project.formulas().next().map(|formula| formula.id.clone());
+        if let Some(id) = first {
+            self.formula_quick_insert(&id, "omml");
+        }
     }
 
     // ── GUI-02: демо/скриншоты диалогов путей и «Проводника…» (ADR-0017) ────
@@ -3772,6 +4602,9 @@ impl RdeApp {
             Cmd::InsertCitation => self.open_insert_dialog("citation"),
             Cmd::InsertDate => self.open_insert_dialog("date"),
             Cmd::InsertFormula => self.open_insert_dialog("formula"),
+            // P4 (ADR-0020): создание и правка source-of-truth формулы в GUI.
+            Cmd::NewFormula => self.open_formula_editor_new(),
+            Cmd::EditFormula => self.open_selected_formula_editor(),
             Cmd::MigrateFormulas => self.open_formula_migration_dialog(),
             Cmd::ApplyGost => self.update_document_package(true, true),
             Cmd::InsertBibliography => self.update_document_package(false, true),
@@ -3858,6 +4691,8 @@ impl RdeApp {
     fn cmd_enabled(&self, cmd: Cmd) -> bool {
         match cmd {
             Cmd::Undo => self.editor.as_ref().is_some_and(|editor| editor.app.session.can_undo()),
+            // P4: «Редактировать формулу» — только когда выбрана формула проекта.
+            Cmd::EditFormula => self.selected_object().is_some_and(|object| matches!(object.data, ObjectData::Formula(_))),
             Cmd::Redo => self.editor.as_ref().is_some_and(|editor| editor.app.session.can_redo()),
             // Команды, которым нужен документ проекта: в пустом проекте они недоступны с причиной
             // в тултипе, а не «тихим» предупреждением в журнале после клика.
@@ -3884,6 +4719,7 @@ impl RdeApp {
     fn cmd_disabled_reason(&self, cmd: Cmd) -> &'static str {
         match cmd {
             Cmd::Undo => "нечего отменять",
+            Cmd::EditFormula => "выберите формулу в дереве или инспекторе",
             Cmd::Redo => "нечего повторять",
             Cmd::ExportDocx
             | Cmd::OpenWordCopy
@@ -4309,6 +5145,7 @@ impl RdeApp {
         let mut clicked: Option<String> = None;
         let mut action: Option<TreeAction> = None;
         let mut new_object = false;
+        let mut new_formula = false;
         let mut hide_tree = false;
         let focus_filter = std::mem::take(&mut self.search_focus);
         egui::Panel::left("rde_tree")
@@ -4351,7 +5188,9 @@ impl RdeApp {
                             .filter_map(|&index| objects.get(index))
                             .filter(|object| filter.is_empty() || object.title.to_lowercase().contains(&filter))
                             .collect();
-                        if visible.is_empty() {
+                        // Группа «Формулы» (P4): показываем и пустой — с кнопкой «Создать формулу…».
+                        let formula_group = group.kind == ObjectKind::Formula;
+                        if visible.is_empty() && !(formula_group && show_service) {
                             continue;
                         }
                         let header = RichText::new(format!("{}  {}  · {}", kind_icon(group.kind), group.title, visible.len())).strong().size(12.5).color(pal.text);
@@ -4437,6 +5276,17 @@ impl RdeApp {
                                             action = Some(TreeAction::Properties(obj.id.clone()));
                                             ui.close();
                                         }
+                                        ObjectData::Formula(_) => {
+                                            // P4 (ADR-0020): правка источника/вставка с номером.
+                                            if ui.button("Редактировать формулу…").clicked() {
+                                                action = Some(TreeAction::EditFormula(obj.id.clone()));
+                                                ui.close();
+                                            }
+                                            if ui.button("Вставить в документ").clicked() {
+                                                action = Some(TreeAction::InsertFormula(obj.id.clone()));
+                                                ui.close();
+                                            }
+                                        }
                                         _ => {}
                                     }
                                     ui.separator();
@@ -4462,6 +5312,13 @@ impl RdeApp {
                                     clicked = Some(obj.id.clone());
                                 }
                             }
+                            // P4: пустое/непустое состояние группы «Формулы» — создание из GUI.
+                            if formula_group {
+                                ui.add_space(2.0);
+                                if ui.small_button("+ Создать формулу…").clicked() {
+                                    new_formula = true;
+                                }
+                            }
                         });
                     }
                     ui.add_space(6.0);
@@ -4485,6 +5342,9 @@ impl RdeApp {
         }
         if new_object {
             self.create_dialog = Some(CreateDialogState { kind: UiObjectKind::Core(NewObjectKind::ComputeArtifact), title: String::new() });
+        }
+        if new_formula {
+            self.open_formula_editor_new();
         }
         if let Some(id) = clicked {
             if let Some(object) = self.project.object(&id).cloned() {
@@ -4552,6 +5412,14 @@ impl RdeApp {
             TreeAction::WordCopy => self.export_word_copy(),
             TreeAction::ImportReview => self.import_review_from_exports(),
             TreeAction::Ocr(id) => self.ocr_source(&id),
+            TreeAction::EditFormula(id) => {
+                self.selected = Some(id.clone());
+                self.open_formula_editor(&id);
+            }
+            TreeAction::InsertFormula(id) => {
+                self.selected = Some(id.clone());
+                self.formula_quick_insert(&id, "omml");
+            }
             TreeAction::Reveal(path) => {
                 let path = PathBuf::from(path);
                 // Один путь «открыть в файловом менеджере» (headless — честная запись в журнал).
@@ -4858,6 +5726,9 @@ impl RdeApp {
         let mut word_copy_clicked = false;
         let mut review_import_clicked = false;
         let mut migrate_formulas_clicked = false;
+        // P4: панель редактора формулы / быстрая вставка с номером.
+        let mut edit_formula_clicked = false;
+        let mut insert_formula_clicked = false;
         // ADR-0018: смена схемы нумерации формул документа из инспектора.
         let mut numbering_change: Option<rde_doc::FormulaNumbering> = None;
         // GUI-02: свойства источника/репозитория и «Показать каталог» из инспектора.
@@ -5026,6 +5897,18 @@ impl RdeApp {
                             };
                             field_row(ui, "нумерация", &numbering, false);
                             field_row(ui, "latex", formula.latex.chars().take(80).collect::<String>().as_str(), true);
+                            // P4 (ADR-0020): правка источника и вставка с номером из инспектора.
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let w = grid_column_width(ui, 2);
+                                if btn_w(ui, Role::Primary, Some(IC_RENAME), "Редактировать", w).clicked() {
+                                    edit_formula_clicked = true;
+                                }
+                                if btn_w(ui, Role::Secondary, Some(IC_CONST), "Вставить", w).clicked() {
+                                    insert_formula_clicked = true;
+                                }
+                            });
+                            ui.add_space(4.0);
                             let hashed = formula.inputs.iter().filter(|input| input.mode == "hashed").count();
                             let refed = formula.inputs.len().saturating_sub(hashed);
                             field_row(ui, "входы", &format!("{hashed} hashed · {refed} ref"), false);
@@ -5272,6 +6155,12 @@ impl RdeApp {
             }
             if migrate_formulas_clicked {
                 self.open_formula_migration_dialog();
+            }
+            if edit_formula_clicked {
+                self.open_formula_editor(&object.id);
+            }
+            if insert_formula_clicked {
+                self.formula_quick_insert(&object.id, "omml");
             }
             if let Some(scheme) = numbering_change {
                 match self.apply_document_formula_numbering(&object.dir, scheme) {
@@ -8139,6 +9028,14 @@ impl RdeApp {
                 self.history_dialog = Some(entries);
             }
         }
+
+        // ── P4 (ADR-0020): панель редактора формулы ──────────────────────────
+        if let Some(mut dialog) = self.formula_editor.take() {
+            let keep = self.formula_editor_window(ctx, &mut dialog);
+            if keep {
+                self.formula_editor = Some(dialog);
+            }
+        }
     }
 
     /// M4.2/M4.2b: диалог подтверждения действия внешнего агента (разрешить/отклонить).
@@ -8471,7 +9368,11 @@ impl RdeApp {
         let pal = theme_colors(ui.ctx().theme());
         let mode = self.doc_mode;
         let mut caret_block: Option<usize> = None;
-        if mode != DocMode::Preview {
+        // P4: пока открыт нативный редактор формулы (свой canvas WordCraft в окне), живой
+        // canvas документа не рисуем — два canvas с общим egui-id в одном кадре конфликтуют;
+        // вместо него — растровый предпросмотр страниц (документ не меняется).
+        let formula_native_open = self.formula_editor.as_ref().is_some_and(|dialog| dialog.native_open);
+        if mode != DocMode::Preview && !formula_native_open {
             self.ensure_editor();
         }
         // Лента — только в режиме RDE (вкладка «Документ» + DocView): в WordCraft и предпросмотре её нет.
@@ -8491,7 +9392,18 @@ impl RdeApp {
         ui.separator();
         match mode {
             DocMode::DocView => {
-                if let Some(ed) = &mut self.editor {
+                if formula_native_open {
+                    ui.label(
+                        RichText::new(
+                            "Открыт профессиональный редактор формулы — документ показан как предпросмотр страниц \
+                             (после закрытия редактора вернётся живой canvas)",
+                        )
+                        .small()
+                        .color(pal.muted),
+                    );
+                    ui.add_space(2.0);
+                    self.doc_preview_pages(ui);
+                } else if let Some(ed) = &mut self.editor {
                     let ctx = ui.ctx().clone();
                     ed.app.logic(&ctx);
                     // Позиция каретки в DocView → блок-якорь вставки (P8-B1).
@@ -8526,47 +9438,54 @@ impl RdeApp {
                 }
             }
             DocMode::Preview => {
-                self.doc.ensure(ui.ctx());
                 self.preview_controls(ui);
-                let zoom = self.zoom;
-                match &self.doc.state {
-                    DocState::Pending => {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(60.0);
-                            ui.spinner();
-                            ui.label(RichText::new("Рендеринг документа движком WordCraft…").color(pal.muted));
-                        });
-                    }
-                    DocState::Failed(e) => {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(60.0);
-                            ui.label(RichText::new("Не удалось открыть документ").color(pal.red).strong());
-                            ui.label(RichText::new(e).color(pal.muted));
-                        });
-                    }
-                    DocState::Ready(doc) => {
-                        egui::ScrollArea::both()
-                            .id_salt("rde_doc_scroll")
-                            .auto_shrink([false, false])
-                            .vertical_scroll_offset(self.demo_preview_scroll)
-                            .show(ui, |ui| {
-                            ui.add_space(14.0);
-                            ui.vertical_centered(|ui| {
-                                for (i, tex) in doc.pages.iter().enumerate() {
-                                    let size = doc.page_pt * zoom;
-                                    ui.image((tex.id(), size));
-                                    ui.add_space(4.0);
-                                    ui.label(RichText::new(format!("Страница {} из {}", i + 1, doc.count)).small().color(pal.muted));
-                                    ui.add_space(12.0);
-                                }
-                            });
-                        });
-                    }
-                }
+                self.doc_preview_pages(ui);
             }
         }
         if let Some(block) = caret_block {
             self.insert_anchor_block = Some(block);
+        }
+    }
+
+    /// Растровый предпросмотр страниц документа (режим «Предпросмотр страниц»; P4 — пока
+    /// открыт нативный редактор формулы, чтобы не рисовать второй canvas WordCraft в кадре).
+    fn doc_preview_pages(&mut self, ui: &mut egui::Ui) {
+        let pal = theme_colors(ui.ctx().theme());
+        self.doc.ensure(ui.ctx());
+        let zoom = self.zoom;
+        match &self.doc.state {
+            DocState::Pending => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(60.0);
+                    ui.spinner();
+                    ui.label(RichText::new("Рендеринг документа движком WordCraft…").color(pal.muted));
+                });
+            }
+            DocState::Failed(e) => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(60.0);
+                    ui.label(RichText::new("Не удалось открыть документ").color(pal.red).strong());
+                    ui.label(RichText::new(e).color(pal.muted));
+                });
+            }
+            DocState::Ready(doc) => {
+                egui::ScrollArea::both()
+                    .id_salt("rde_doc_scroll")
+                    .auto_shrink([false, false])
+                    .vertical_scroll_offset(self.demo_preview_scroll)
+                    .show(ui, |ui| {
+                        ui.add_space(14.0);
+                        ui.vertical_centered(|ui| {
+                            for (i, tex) in doc.pages.iter().enumerate() {
+                                let size = doc.page_pt * zoom;
+                                ui.image((tex.id(), size));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(format!("Страница {} из {}", i + 1, doc.count)).small().color(pal.muted));
+                                ui.add_space(12.0);
+                            }
+                        });
+                    });
+            }
         }
     }
 
@@ -11019,12 +11938,25 @@ fn apply_app_theme(ctx: &egui::Context, theme: &str, ui_scale: f32) {
     });
 }
 
+/// Политика нумерации формулы объекта (ADR-0005 §5.1, R-DOC-15): `true`, если формула
+/// display и `numbering.mode = auto` (для display-вставок назначается номер `(N)`).
+fn formula_numbering_enabled(project: &rde_core::Project, formula_id: &str) -> bool {
+    project
+        .formula_object(formula_id)
+        .and_then(|object| match &object.data {
+            ObjectData::Formula(formula) => Some(formula.numbering.mode != "none"),
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
 /// Бандл кэшей формулы из ledger/CAS для вставки/обновления документа (ADR-0005 §2.4).
 fn formula_body_from_state(
     store: &rde_store::Store,
     formula_id: &str,
     state: &rde_dag::FormulaState,
     display: bool,
+    numbered: bool,
 ) -> Result<rde_doc::FormulaBody, String> {
     let load = |hash: &Option<String>| -> Result<Vec<u8>, String> {
         let hash = hash.as_deref().ok_or("нет кэша формулы")?;
@@ -11036,7 +11968,7 @@ fn formula_body_from_state(
         act_key: state.act_key.clone(),
         latex: state.resolved_latex.clone(),
         display,
-        numbered: display,
+        numbered,
         omml: load(&state.omml_hash)?,
         svg: state.svg_hash.as_ref().map(|_| load(&state.svg_hash)).transpose()?,
         png: state.png_hash.as_ref().map(|_| load(&state.png_hash)).transpose()?,
@@ -11992,6 +12924,227 @@ mod docview_tests {
         let after = doc.inserts.iter().filter(|insert| insert.kind == "formula").count();
         assert_eq!(after, before + 1, "формульная вставка добавлена");
         assert!(doc.inserts.iter().any(|insert| insert.kind == "formula" && insert.render_mode == "omml"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P4 (ADR-0020): создание/правка формулы в GUI, панель, вставка с номером ──
+
+    /// Компиляция формулы требует poppler (`pdftocairo`/`pdftotext`): без него — честный skip,
+    /// как у остальных CLI-зависимых тестов.
+    fn poppler_available() -> bool {
+        ["pdftocairo", "pdftotext"].iter().all(|tool| {
+            std::process::Command::new(tool).arg("-v").output().map(|output| output.status.success()).unwrap_or(false)
+        })
+    }
+
+    /// Сырой `word/document.xml` пакета `.doc.rde` (проверки вёрстки вставок: табы/таблица/OMML).
+    fn package_document_xml(package: &std::path::Path) -> String {
+        use std::io::Read;
+        let file = std::fs::File::open(package).expect("пакет .doc.rde");
+        let mut archive = zip::ZipArchive::new(file).expect("zip-пакет .doc.rde");
+        let mut entry = archive.by_name("word/document.xml").expect("word/document.xml");
+        let mut xml = String::new();
+        entry.read_to_string(&mut xml).expect("прочитать document.xml");
+        xml
+    }
+
+    /// P4: диалог/панель создания формулы — валидация LaTeX компиляцией, объект + кэши OMML/SVG/PNG
+    /// в CAS + `[state]` + статус Fresh; невалидный LaTeX и дедуп по источнику (ADR-0019) не создают
+    /// дубль; панель создания рендерится в headless-харнессе без паники.
+    #[test]
+    fn formula_editor_creates_formula_with_caches_and_validates_latex() {
+        if !poppler_available() {
+            eprintln!("poppler недоступен — тест пропущен");
+            return;
+        }
+        let root = temp_demo_copy("formula-create");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let before = app.project.formulas().count();
+        // Невалидный LaTeX: ошибка до создания объекта (панель показывает её, файлов нет).
+        let error = app.create_formula_action("Битая формула", "{{{{", true, "auto").expect_err("невалидный LaTeX отклонён");
+        assert!(error.contains("LaTeX"), "{error}");
+        assert_eq!(app.project.formulas().count(), before, "невалидный LaTeX не создаёт объект");
+        // Пустые поля — ошибки до записи.
+        assert!(app.create_formula_action("  ", "x^2", true, "auto").is_err());
+        assert!(app.create_formula_action("T", "  ", true, "auto").is_err());
+        // Валидная формула: объект + кэши (OMML/SVG/PNG) + ledger + зеркало [state].
+        let (id, reused) = app.create_formula_action("Новая формула из GUI", "a^2 + b^2 = c^2", true, "auto").expect("создать формулу");
+        assert!(!reused, "первое создание — не переиспользование");
+        assert_eq!(app.project.formulas().count(), before + 1);
+        assert_eq!(app.selected.as_deref(), Some(id.as_str()), "созданная формула выбрана в дереве");
+        let object = app.project.formula_object(&id).cloned().expect("объект формулы");
+        let rde_core::ObjectData::Formula(formula) = &object.data else { panic!("не формула") };
+        assert_eq!(formula.latex, "a^2 + b^2 = c^2");
+        assert_eq!(formula.numbering.mode, "auto");
+        assert_eq!(formula.state.act_key.len(), 64, "act_key записан в [state]: {:?}", formula.state);
+        assert!(!formula.state.omml_hash.is_empty() && !formula.state.svg_hash.is_empty(), "кэши OMML/SVG: {:?}", formula.state);
+        let text = std::fs::read_to_string(object.dir.join("formula.toml")).unwrap();
+        assert!(text.contains("[state]") && text.contains("omml_hash"), "{text}");
+        let renderer = rde_dag::FormulaRenderer { id: rde_doc::FORMULA_RENDERER_ID, version: rde_doc::FORMULA_RENDERER_VERSION };
+        let statuses = rde_dag::formula_statuses(&app.project, app.store.as_ref().unwrap(), &renderer).unwrap();
+        assert!(matches!(statuses[&id].status, rde_dag::FormulaLiveStatus::Fresh), "{:?}", statuses[&id].status);
+        // Дедуп по ЛаТЕХ-источнику: та же формула — используется существующая (как миграция ADR-0019).
+        let (same, reused) = app.create_formula_action("Дубль", "a^2 + b^2 = c^2", true, "auto").expect("дедуп");
+        assert!(reused, "дубль по LaTeX переиспользует формулу");
+        assert_eq!(same, id);
+        assert_eq!(app.project.formulas().count(), before + 1, "дубль не создан");
+        // Политика нумерации none сохраняется в манифесте.
+        let (inline_id, _) = app.create_formula_action("Инлайн без номера", "x_i", false, "none").expect("формула none");
+        let rde_core::ObjectData::Formula(inline) = &app.project.formula_object(&inline_id).unwrap().data else { panic!() };
+        assert!(!inline.display);
+        assert_eq!(inline.numbering.mode, "none");
+        // Панель создания рендерится (LaTeX + предпросмотр) без паники.
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        app.demo_open_formula_editor_create("Средняя ошибка", r"\sigma = \sqrt{\frac{1}{N-1}\sum_{i=1}^{N}(x_i-\bar{x})^2}");
+        assert!(app.formula_editor.is_some(), "панель создания открыта");
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1700.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..8 {
+            harness.step();
+        }
+        assert!(harness.state().formula_editor.is_some(), "панель создания формулы остаётся открытой после кадров");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P4: правка источника формулы — манифест обновлён (inputs/fragments/[state] не потеряны),
+    /// кэши/act_key пересчитаны, вставки становятся Stale; «Обновить документ» пересобирает тело,
+    /// сохраняя номер/пунктуацию/источник номера (ADR-0018/0019), без `<w:tbl>`.
+    #[test]
+    fn formula_editor_edit_stales_inserts_and_document_update_rebuilds() {
+        if !poppler_available() {
+            eprintln!("poppler недоступен — тест пропущен");
+            return;
+        }
+        let root = temp_demo_copy("formula-edit");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let formula_id = app.project.formulas().next().expect("формула демо").id.clone();
+        let package = app.project.document_path().expect("документ демо");
+        let before_doc = rde_doc::load_rde_doc(&package).unwrap();
+        let tables_before = package_document_xml(&package).matches("<w:tbl>").count();
+        let before_insert = before_doc
+            .inserts
+            .iter()
+            .find(|insert| insert.kind == "formula" && insert.number.is_some())
+            .expect("нумерованная вставка демо")
+            .clone();
+        // Первичный пересчёт кэшей базы (в тестовой копии нет .rde): статус Fresh.
+        app.refresh_formula_caches(&formula_id).expect("кэши формулы");
+        app.reload_project();
+        // Правка источника: LaTeX меняется, display/нумерация — прежние; файлы не теряются.
+        app.apply_formula_edit(&formula_id, "Формула σ (правка GUI)", r"\sigma = \frac{F}{A}", true, "auto", "").expect("правка формулы");
+        let object = app.project.formula_object(&formula_id).cloned().expect("формула после правки");
+        let rde_core::ObjectData::Formula(manifest) = &object.data else { panic!("не формула") };
+        assert_eq!(manifest.latex, r"\sigma = \frac{F}{A}");
+        assert_eq!(object.title, "Формула σ (правка GUI)");
+        let text = std::fs::read_to_string(object.dir.join("formula.toml")).unwrap();
+        assert!(text.contains("[state]"), "[state] записан после пересчёта:\n{text}");
+        // Живой статус формулы — актуальна; вставки — Stale (act_key вставки ≠ текущему).
+        let data = app.formula_inspector_data(&formula_id);
+        assert!(matches!(data.status, Some(rde_dag::FormulaLiveStatus::Fresh)), "{:?}", data.status);
+        assert!(
+            data.insert_states.contains(&rde_doc::FormulaInsertState::Stale),
+            "вставки должны стать Stale: {:?}",
+            data.insert_states
+        );
+        // «Обновить документ»: тела пересобраны, номера/пунктуация/источник номера сохранены.
+        app.update_project_document();
+        let after_doc = rde_doc::load_rde_doc(&package).unwrap();
+        let after_insert = after_doc.inserts.iter().find(|insert| insert.id == before_insert.id).expect("вставка после обновления");
+        assert_eq!(after_insert.number, before_insert.number, "номер сохранён (ADR-0018/0019)");
+        assert_eq!(after_insert.number_text, before_insert.number_text, "текст номера сохранён");
+        assert_eq!(after_insert.suffix, before_insert.suffix, "пунктуация после формулы сохранена");
+        assert_eq!(after_insert.number_source, before_insert.number_source, "источник номера сохранён");
+        assert_ne!(after_insert.hash, before_insert.hash, "act_key вставки обновлён на новый");
+        assert_eq!(after_insert.kind, "formula");
+        // Вёрстка: right-numbered табами (w:tabs), без таблицы; OMML формулы F/A в теле.
+        let xml = package_document_xml(&package);
+        assert_eq!(xml.matches("<w:tbl>").count(), tables_before, "display-формула не добавляет таблицу (ADR-0018)");
+        assert!(xml.contains("<w:tabs>"), "номер справа — табуляции");
+        assert!(xml.contains("m:oMath"), "OMML-тело формулы в документе");
+        assert!(xml.contains("rde:formula:"), "sdt-тег реестра вставок");
+        let statuses = rde_dag::formula_statuses(&app.project, app.store.as_ref().unwrap(), &rde_dag::FormulaRenderer {
+            id: rde_doc::FORMULA_RENDERER_ID,
+            version: rde_doc::FORMULA_RENDERER_VERSION,
+        })
+        .unwrap();
+        assert!(matches!(statuses[&formula_id].status, rde_dag::FormulaLiveStatus::Fresh));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P4: вставка формулы из панели/дерева — display-вставка с документно-локальным номером по
+    /// схеме, inline/`numbering=none` — без номера; смена схемы перенумеровывает (ADR-0018).
+    #[test]
+    fn formula_editor_inserts_numbered_formula_and_respects_numbering_policy() {
+        if !poppler_available() {
+            eprintln!("poppler недоступен — тест пропущен");
+            return;
+        }
+        let root = temp_demo_copy("formula-insert-panel");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let formula_id = app.project.formulas().next().expect("формула демо").id.clone();
+        let package = app.project.document_path().expect("документ демо");
+        let before = rde_doc::load_rde_doc(&package).unwrap().inserts.iter().filter(|insert| insert.kind == "formula").count();
+        let tables_before = package_document_xml(&package).matches("<w:tbl>").count();
+        app.formula_quick_insert(&formula_id, "omml");
+        let doc = rde_doc::load_rde_doc(&package).unwrap();
+        let inserted = doc.inserts.iter().rfind(|insert| insert.kind == "formula").expect("вставка добавлена");
+        assert_eq!(doc.inserts.iter().filter(|insert| insert.kind == "formula").count(), before + 1);
+        assert_eq!(inserted.target.split('@').next(), Some(format!("rde://formula/{formula_id}").as_str()), "ссылка на объект: {}", inserted.target);
+        assert!(inserted.number.is_some(), "display + auto — номер назначен: {inserted:?}");
+        assert_eq!(inserted.render_mode, "omml");
+        // Номер — right-numbered табами, без таблицы; нумерация идёт после существующих.
+        let xml = package_document_xml(&package);
+        assert!(xml.contains("<w:tabs>"));
+        assert_eq!(xml.matches("<w:tbl>").count(), tables_before, "номер справа — без новой таблицы (ADR-0018)");
+        // Смена схемы документа перенумеровывает формулы и сохраняет вёрстку.
+        let document_dir = app.active_document_object().expect("документ").dir.clone();
+        let changed = app
+            .apply_document_formula_numbering(&document_dir, rde_doc::FormulaNumbering::Section)
+            .expect("смена схемы");
+        assert!(changed > 0, "смена схемы пересчитала номера/ссылки");
+        // Формула с политикой `none` (не нумеруется и inline не создаёт номер).
+        let (no_number_id, _) = app.create_formula_action("Без номера", "x_i", true, "none").expect("формула none");
+        let before = rde_doc::load_rde_doc(&package).unwrap().inserts.iter().filter(|insert| insert.kind == "formula").count();
+        app.formula_quick_insert(&no_number_id, "omml");
+        let doc = rde_doc::load_rde_doc(&package).unwrap();
+        let inserted = doc.inserts.iter().rfind(|insert| insert.kind == "formula").expect("вставка none");
+        assert_eq!(doc.inserts.iter().filter(|insert| insert.kind == "formula").count(), before + 1);
+        assert!(inserted.number.is_none(), "политика none — без номера: {inserted:?}");
+        // Inline-формула — в тексте без номера (R-DOC-11/ADR-0019) и без правой нумерации.
+        let (inline_id, _) = app.create_formula_action("Inline-формула", "x_i", false, "auto").expect("inline-формула");
+        app.formula_quick_insert(&inline_id, "omml");
+        let doc = rde_doc::load_rde_doc(&package).unwrap();
+        let inserted = doc.inserts.iter().rfind(|insert| insert.kind == "formula").expect("inline-вставка");
+        assert!(inserted.number.is_none(), "inline — без номера: {inserted:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P4 (спайк A): нативная вкладка Equation WordCraft встраивается в отдельное окно панели на
+    /// scratch-документе — рендерится в headless-харнессе без паники, `equation.get` отдаёт LaTeX,
+    /// документ проекта не меняется.
+    #[test]
+    fn formula_editor_native_equation_tab_renders_and_does_not_touch_project_document() {
+        let root = temp_demo_copy("formula-native");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let package = app.project.document_path().expect("документ демо");
+        let before = std::fs::read(&package).unwrap();
+        app.demo_open_formula_editor_native();
+        assert!(app.formula_editor.as_ref().is_some_and(|dialog| dialog.native_open), "нативная вкладка открыта");
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1700.0, 1100.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..10 {
+            harness.step();
+        }
+        let state = harness.state_mut().formula_editor.as_mut().expect("панель формулы");
+        let native = state.native.as_mut().expect("scratch-редактор WordCraft");
+        let info = native.app.run("equation.get", serde_json::json!({})).expect("equation.get");
+        assert!(info.get("latex").and_then(|value| value.as_str()).is_some_and(|latex| !latex.trim().is_empty()), "{info:?}");
+        // Документ проекта не тронут: нативная правка идёт на отдельном мини-документе.
+        assert_eq!(std::fs::read(&package).unwrap(), before, "документ проекта не изменён нативным редактором");
         let _ = std::fs::remove_dir_all(&root);
     }
 

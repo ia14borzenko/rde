@@ -45,6 +45,10 @@ pub(crate) enum Cmd {
     InsertDate,
     InsertFormula,
     // Документ
+    /// P4: создать project-level формулу из GUI (диалог LaTeX + предпросмотр).
+    NewFormula,
+    /// P4: открыть панель редактора выбранной формулы проекта.
+    EditFormula,
     MigrateFormulas,
     ApplyGost,
     InsertBibliography,
@@ -113,6 +117,8 @@ impl Cmd {
         Cmd::InsertCitation,
         Cmd::InsertDate,
         Cmd::InsertFormula,
+        Cmd::NewFormula,
+        Cmd::EditFormula,
         Cmd::MigrateFormulas,
         Cmd::ApplyGost,
         Cmd::InsertBibliography,
@@ -391,7 +397,22 @@ pub(crate) fn ribbon_groups(tab: RibbonTab) -> &'static [Group] {
             Group {
                 title: "Формулы",
                 // P3: вставка формулы и явная миграция OMML вне реестра (ADR-0005 §7).
+                // P4: создание и редактирование source-of-truth формулы в GUI (ADR-0020).
                 slots: &[
+                    Slot::Button {
+                        cmd: Cmd::NewFormula,
+                        icon: IC_ADD,
+                        label: "Создать\nформулу…",
+                        tip: "Создать формулу проекта из GUI: LaTeX + предпросмотр, политика нумерации (P4)",
+                        primary: true,
+                    },
+                    Slot::Button {
+                        cmd: Cmd::EditFormula,
+                        icon: IC_RENAME,
+                        label: "Редактировать\nформулу…",
+                        tip: "Редактировать источник формулы (title/LaTeX/display/нумерация) и вставить в документ",
+                        primary: false,
+                    },
                     Slot::Button {
                         cmd: Cmd::InsertFormula,
                         icon: IC_CONST,

@@ -30,7 +30,8 @@ fn main() {
     if let Some(logs_tab) = std::env::args().nth(4).and_then(|value| value.parse::<usize>().ok()) {
         state.demo_set_logs_tab(logs_tab);
     }
-    // 5-й аргумент — действие для снимка: update | insert-value | insert-figure | insert-formula …
+    // 5-й аргумент — действие для снимка: update | insert-value | insert-figure | insert-formula |
+// formula-create-dialog | formula-editor | formula-editor-native | formula-insert …
     match std::env::args().nth(5).as_deref() {
         Some("update") => state.request_update(None, true),
         Some("insert-value") => state.demo_open_insert_dialog("value"),
@@ -47,6 +48,25 @@ fn main() {
             state.demo_show_service_objects();
             state.demo_select_object("Формула");
             state.demo_select_tab("document");
+        }
+        // P4 (ADR-0020): создание/правка формулы в GUI.
+        Some("formula-create-dialog") => {
+            state.demo_open_formula_editor_create(
+                "Средняя квадратичная ошибка",
+                r"\sigma = \sqrt{\frac{1}{N-1}\sum_{i=1}^{N}(x_i-\bar{x})^2}",
+            );
+        }
+        Some("formula-editor") => {
+            state.demo_show_service_objects();
+            state.demo_open_formula_editor("Формула");
+        }
+        Some("formula-editor-native") => {
+            state.demo_show_service_objects();
+            state.demo_open_formula_editor_native();
+        }
+        Some("formula-insert") => {
+            state.demo_show_service_objects();
+            state.demo_insert_formula_with_number();
         }
         Some("app-settings") => state.demo_open_app_settings(),
         // M4.2b: настройки с включёнными мастер-галочками (видны подгалочки run/git).
