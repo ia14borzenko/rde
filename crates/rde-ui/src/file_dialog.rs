@@ -370,10 +370,14 @@ pub fn detect_backend() -> Box<dyn PickerBackend> {
     }
 }
 
-/// Завершённый запрос backend'а: адрес поля + результат.
+/// Завершённый запрос backend'а: адрес поля + результат + токен поколения запроса.
+///
+/// Токен нужен, чтобы «поздний» выбор от запроса, чей диалог уже закрыт/пересоздан, не попал
+/// в поле нового диалога (см. [`FileDialogService::abandon`]).
 #[derive(Clone, Debug)]
 pub struct PickDone {
     pub target: PathTarget,
+    pub token: u64,
     pub result: Result<Option<PathBuf>, String>,
 }
 
@@ -382,7 +386,10 @@ pub struct FileDialogService {
     backend: std::sync::Arc<dyn PickerBackend>,
     tx: mpsc::Sender<PickDone>,
     rx: mpsc::Receiver<PickDone>,
-    in_flight: Option<PathTarget>,
+    /// Текущий запрос «в полёте»: адрес поля + токен поколения.
+    in_flight: Option<(PathTarget, u64)>,
+    /// Счётчик поколений запросов (для отбрасывания устаревших результатов).
+    next_token: u64,
 }
 
 impl FileDialogService {
@@ -394,7 +401,7 @@ impl FileDialogService {
     /// Сервис с явным backend'ом (DI: тесты, скриншоты, альтернативный редактор).
     pub fn with_backend(backend: std::sync::Arc<dyn PickerBackend>) -> Self {
         let (tx, rx) = mpsc::channel();
-        Self { backend, tx, rx, in_flight: None }
+        Self { backend, tx, rx, in_flight: None, next_token: 0 }
     }
 
     /// Подменить backend (тесты kittest: клик по кнопке должен вызвать фейк).
@@ -409,7 +416,17 @@ impl FileDialogService {
 
     /// Запрос в полёте (для индикатора на кнопке «Проводник…»).
     pub fn in_flight(&self) -> Option<&PathTarget> {
-        self.in_flight.as_ref()
+        self.in_flight.as_ref().map(|(target, _)| target)
+    }
+
+    /// Забыть запрос «в полёте» для адреса: его поздний результат будет отброшен по токену.
+    ///
+    /// Нужно при закрытии диалога во время выбора и при повторном открытии диалога: системное
+    /// окно могло остаться открытым, но его выбор уже не должен менять новое поле.
+    pub fn abandon(&mut self, target: &PathTarget) {
+        if self.in_flight.as_ref().is_some_and(|(current, _)| current == target) {
+            self.in_flight = None;
+        }
     }
 
     /// Запустить выбор в фоне. `false` — уже открыт другой диалог (одно окно за раз).
@@ -421,10 +438,12 @@ impl FileDialogService {
         let sender = self.tx.clone();
         let ctx = ctx.clone();
         let result_target = target.clone();
-        self.in_flight = Some(target);
+        self.next_token = self.next_token.wrapping_add(1);
+        let token = self.next_token;
+        self.in_flight = Some((target, token));
         std::thread::spawn(move || {
             let result = backend.pick(&request);
-            let _ = sender.send(PickDone { target: result_target, result });
+            let _ = sender.send(PickDone { target: result_target, token, result });
             // Разбудить UI: результат нужно разложить по полю в ближайшем кадре.
             ctx.request_repaint();
         });
@@ -435,9 +454,16 @@ impl FileDialogService {
     pub fn poll(&mut self) -> Vec<PickDone> {
         let mut done = Vec::new();
         while let Ok(item) = self.rx.try_recv() {
-            if self.in_flight.as_ref() == Some(&item.target) {
-                self.in_flight = None;
+            // Принимаем только результат текущего поколения: поздний ответ отменённого/переоткрытого
+            // диалога молча отбрасывается (иначе он подменил бы путь в новом диалоге).
+            let current = self
+                .in_flight
+                .as_ref()
+                .is_some_and(|(target, token)| target == &item.target && *token == item.token);
+            if !current {
+                continue;
             }
+            self.in_flight = None;
             done.push(item);
         }
         done
@@ -649,6 +675,35 @@ mod tests {
         let logged = picker.last_request().expect("backend получил запрос");
         assert_eq!(logged, req);
         assert_eq!(service.backend_name(), "fake");
+    }
+
+    /// Отменённый (закрытый диалог) запрос: поздний результат отбрасывается, новый запрос
+    /// можно открыть сразу (не «залипает» в in_flight) — регресс GUI-02.
+    #[test]
+    fn abandoned_request_drops_late_result_and_allows_new_spawn() {
+        use super::test_support::{FakePicker, ScriptedReply};
+        let ctx = egui::Context::default();
+        let picker = Arc::new(
+            FakePicker::new(vec![
+                ScriptedReply::Selected(PathBuf::from("/tmp/поздний.docx")),
+                ScriptedReply::Selected(PathBuf::from("/tmp/новый.docx")),
+            ])
+            .with_delay(std::time::Duration::from_millis(80)),
+        );
+        let mut service = FileDialogService::with_backend(Arc::clone(&picker) as Arc<dyn PickerBackend>);
+        assert!(service.spawn(&ctx, PathTarget::ImportDocx, request(PickKind::any_file())));
+        assert!(service.in_flight().is_some());
+        // Диалог закрыли, пока системное окно было открыто.
+        service.abandon(&PathTarget::ImportDocx);
+        assert!(service.in_flight().is_none(), "после abandon выбор не блокирует новый запрос");
+        // Дожидаемся позднего результата — он должен быть отброшен.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(service.poll().is_empty(), "поздний выбор отменённого диалога не применяется");
+        // Новый запрос работает и получает уже свой результат.
+        assert!(service.spawn(&ctx, PathTarget::ImportDocx, request(PickKind::any_file())));
+        let done = wait_for(&mut service);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].result.as_ref().unwrap(), &Some(PathBuf::from("/tmp/новый.docx")));
     }
 
     /// Без графической сессии backend честно деградирует (в headless-сессии это всегда так).

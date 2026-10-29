@@ -2883,6 +2883,7 @@ impl RdeApp {
 
     /// Для демо/скриншотов: открыть настройки приложения.
     pub fn demo_open_app_settings(&mut self) {
+        self.begin_pick_target(file_dialog::PathTarget::AgentProgram);
         self.app_settings_dialog = Some(self.app_settings.clone());
     }
 
@@ -2891,6 +2892,7 @@ impl RdeApp {
     pub fn demo_open_app_settings_agents(&mut self) {
         self.app_settings.allow_external_mcp = true;
         self.app_settings.allow_agent_mutations = true;
+        self.begin_pick_target(file_dialog::PathTarget::AgentProgram);
         self.app_settings_dialog = Some(self.app_settings.clone());
     }
 
@@ -2954,6 +2956,7 @@ impl RdeApp {
 
     /// Демо: «Открыть проект» с заданным путём (по умолчанию — текущий проект).
     pub fn demo_open_open_project_dialog(&mut self) {
+        self.begin_pick_target(file_dialog::PathTarget::OpenProject);
         self.open_project_dialog = Some(OpenProjectDialog {
             path: self.project.root.display().to_string(),
             error: String::new(),
@@ -2968,6 +2971,7 @@ impl RdeApp {
 
     /// Демо: «Импорт .docx» с заданным путём (для скриншота валидации — можно битый).
     pub fn demo_open_import_docx_dialog(&mut self, path: &str) {
+        self.begin_pick_target(file_dialog::PathTarget::ImportDocx);
         self.import_docx_dialog = Some(ImportDocxDialog {
             path: path.to_owned(),
             title: String::new(),
@@ -2978,6 +2982,7 @@ impl RdeApp {
 
     /// Демо: «Новый проект» с заданным каталогом.
     pub fn demo_open_new_project_dialog(&mut self, path: &str) {
+        self.begin_pick_target(file_dialog::PathTarget::NewProjectDir);
         self.new_project_dialog = Some(NewProjectDialog {
             path: path.to_owned(),
             name: String::new(),
@@ -2988,6 +2993,7 @@ impl RdeApp {
 
     /// Демо: «Импорт цитат» с заданным файлом.
     pub fn demo_open_import_citations_dialog(&mut self, path: &str) {
+        self.begin_pick_target(file_dialog::PathTarget::ImportCitations);
         self.import_citations_dialog = Some(ImportCitationsDialog {
             path: path.to_owned(),
             error: String::new(),
@@ -2997,6 +3003,7 @@ impl RdeApp {
 
     /// Демо: «Импорт ревью из Word» с заданным путём (пусто — свежий из exports/).
     pub fn demo_open_import_review_dialog(&mut self, path: &str) {
+        self.begin_pick_target(file_dialog::PathTarget::ImportReview);
         self.import_review_dialog = Some(ImportReviewDialog {
             path: path.to_owned(),
             error: String::new(),
@@ -3340,9 +3347,40 @@ impl RdeApp {
         }
     }
 
+    /// Открыт ли сейчас диалог, которому адресован результат выбора («Проводник…»).
+    /// Результаты для закрытых диалогов не раскладываются по полям (см. `poll_file_dialog`).
+    fn picker_target_active(&self, target: &PathTarget) -> bool {
+        match target {
+            PathTarget::OpenProject => self.open_project_dialog.is_some(),
+            PathTarget::ImportDocx => self.import_docx_dialog.is_some(),
+            PathTarget::ImportReview => self.import_review_dialog.is_some(),
+            PathTarget::ImportCitations => self.import_citations_dialog.is_some(),
+            PathTarget::NewProjectDir => self.new_project_dialog.is_some(),
+            PathTarget::AgentProgram => self.app_settings_dialog.is_some(),
+            PathTarget::SourceFile(id) => self.source_edit_dialog.as_ref().is_some_and(|dialog| &dialog.id == id),
+            PathTarget::RepositoryPath(id) => self.repo_edit_dialog.as_ref().is_some_and(|dialog| &dialog.id == id),
+            // Копирование файлов в `inputs/…` артефакта — следующий шаг (docs/gui-coverage §11):
+            // адрес зарезервирован, диалога пока нет.
+            PathTarget::ArtifactInputFile => false,
+        }
+    }
+
+    /// Начать диалог с полем пути: забыть возможный «поздний» выбор прошлого экземпляра диалога.
+    fn begin_pick_target(&mut self, target: PathTarget) {
+        self.file_dialog.abandon(&target);
+        self.picked_paths.retain(|(stored, _)| stored != &target);
+        self.picker_errors.retain(|(stored, _)| stored != &target);
+        self.picker_focus_ok.retain(|stored| stored != &target);
+    }
+
     /// Разложить результаты фонового выбора и записать ошибки деградации в журнал.
     pub fn poll_file_dialog(&mut self) {
         for done in self.file_dialog.poll() {
+            // Выбор мог завершиться после закрытия диалога: не подменять поле при следующем
+            // открытии (иначе «поздний» путь/ошибка попадут в новый диалог).
+            if !self.picker_target_active(&done.target) {
+                continue;
+            }
             match done.result {
                 Ok(Some(path)) => {
                     self.picker_errors.retain(|(target, _)| target != &done.target);
@@ -3442,6 +3480,7 @@ impl RdeApp {
         match cmd {
             Cmd::NewProject => {
                 let base = self.project.root.parent().map(|parent| parent.to_path_buf()).unwrap_or_else(|| self.project.root.clone());
+                self.begin_pick_target(file_dialog::PathTarget::NewProjectDir);
                 self.new_project_dialog = Some(NewProjectDialog {
                     path: base.join("rde-project").display().to_string(),
                     name: "Новый проект RDE".to_owned(),
@@ -3450,6 +3489,7 @@ impl RdeApp {
                 });
             }
             Cmd::OpenProject => {
+                self.begin_pick_target(file_dialog::PathTarget::OpenProject);
                 self.open_project_dialog = Some(OpenProjectDialog {
                     path: self.project.root.display().to_string(),
                     error: String::new(),
@@ -3464,10 +3504,19 @@ impl RdeApp {
             Cmd::OpenWordCopy => self.export_word_copy(),
             Cmd::ExportProject => self.export_project_archive(),
             // «Импорт ревью»: диалог с выбором .docx (пусто — самый свежий из exports/).
-            Cmd::ImportReview => self.import_review_dialog = Some(ImportReviewDialog::default()),
-            Cmd::ImportDocx => self.import_docx_dialog = Some(ImportDocxDialog::default()),
+            Cmd::ImportReview => {
+                self.begin_pick_target(file_dialog::PathTarget::ImportReview);
+                self.import_review_dialog = Some(ImportReviewDialog::default());
+            }
+            Cmd::ImportDocx => {
+                self.begin_pick_target(file_dialog::PathTarget::ImportDocx);
+                self.import_docx_dialog = Some(ImportDocxDialog::default());
+            }
             // «Импорт цитат»: BibTeX/RIS/CSL-JSON → объекты-источники (rde-sources).
-            Cmd::ImportCitations => self.import_citations_dialog = Some(ImportCitationsDialog::default()),
+            Cmd::ImportCitations => {
+                self.begin_pick_target(file_dialog::PathTarget::ImportCitations);
+                self.import_citations_dialog = Some(ImportCitationsDialog::default());
+            }
             Cmd::Undo => self.undo_document(false),
             Cmd::Redo => self.undo_document(true),
             Cmd::Find => {
@@ -3515,7 +3564,10 @@ impl RdeApp {
                     new_author_email: String::new(),
                 });
             }
-            Cmd::AppSettings => self.app_settings_dialog = Some(self.app_settings.clone()),
+            Cmd::AppSettings => {
+                self.begin_pick_target(file_dialog::PathTarget::AgentProgram);
+                self.app_settings_dialog = Some(self.app_settings.clone());
+            }
             Cmd::ExportDiagnostics => {
                 self.export_diagnostics();
             }
@@ -5165,6 +5217,7 @@ impl RdeApp {
             self.push_log(Level::Warn, "«Свойства источника» доступны только для источников");
             return;
         };
+        self.begin_pick_target(file_dialog::PathTarget::SourceFile(id.to_owned()));
         self.source_edit_dialog = Some(SourceEditDialog {
             id: id.to_owned(),
             kind: if source.kind.is_empty() { "file".to_owned() } else { source.kind.clone() },
@@ -5186,6 +5239,7 @@ impl RdeApp {
             self.push_log(Level::Warn, "«Свойства репозитория» доступны только для репозиториев");
             return;
         };
+        self.begin_pick_target(file_dialog::PathTarget::RepositoryPath(id.to_owned()));
         self.repo_edit_dialog = Some(RepositoryEditDialog {
             id: id.to_owned(),
             kind: if repo.kind.is_empty() { "internal".to_owned() } else { repo.kind.clone() },
@@ -12802,6 +12856,49 @@ mod gui_path_tests {
         let dialog = harness.state().import_docx_dialog.as_ref().expect("диалог не закрылся");
         assert!(dialog.path.is_empty(), "поле не меняется при ошибке backend'а");
         // Поле остаётся рабочим: ручной ввод пути + импорт (покрыто отдельным тестом ниже).
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Регресс GUI-02: если закрыть диалог (Esc), пока системный выбор ещё открыт, поздний выбор
+    /// не должен подменять путь при следующем открытии диалога (генерация запроса + abandon).
+    #[test]
+    fn late_pick_after_closed_dialog_is_not_applied_to_next_dialog() {
+        let (mut app, root) = picker_app("late-pick");
+        let fake = Arc::new(
+            FakePicker::new(vec![ScriptedReply::Selected(PathBuf::from("/tmp/поздний-выбор.docx"))])
+                .with_delay(std::time::Duration::from_millis(150)),
+        );
+        app.set_file_dialog_backend(Arc::clone(&fake) as Arc<dyn PickerBackend>);
+        app.run_cmd(Cmd::ImportDocx);
+        let mut harness = render(app);
+        click_label(&harness, "Проводник");
+        harness.run_steps(4);
+        assert_eq!(fake.requests().len(), 1, "выбор запущен фоновым потоком");
+        // Закрыть диалог Esc, пока выбор ещё «в полёте».
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run_steps(2);
+        assert!(harness.state().import_docx_dialog.is_none(), "диалог закрыт");
+        // Дождаться позднего результата и открыть диалог заново.
+        for _ in 0..40 {
+            harness.run_steps(1);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        harness.run_steps(2);
+        harness.state_mut().run_cmd(Cmd::ImportDocx);
+        harness.run_steps(4);
+        let dialog = harness.state().import_docx_dialog.as_ref().expect("диалог открыт снова");
+        assert!(dialog.path.is_empty(), "поздний выбор закрытого диалога не попал в поле: {:?}", dialog.path);
+        assert!(
+            !logs(harness.state()).contains("поздний-выбор"),
+            "устаревший выбор не попал и в журнал: {}",
+            logs(harness.state())
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
