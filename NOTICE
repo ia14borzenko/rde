@@ -42,6 +42,15 @@ Third-party components referenced or used as dependencies (attribution):
   (editor/preview/SVG/PNG caches) and referenced in exported `.docx` (`m:mathPr/m:mathFont`,
   `w:rFonts` of math runs, best-effort; see ADR-0018). Times-compatible design with a `MATH` table;
   embedded at build time, no runtime downloads.
+- **MathLive 0.111.1** (`crates/rde-formula-editor/assets/mathlive/`, JS+CSS+страница редактора —
+  встроены в бинарник `include_bytes!`, ~1,09 МиБ) — MIT, Copyright (c) 2017 – present Arno Gourdol
+  (https://mathlive.io/): визуальный LaTeX-редактор формул уровня MathType в отдельном окне RDE
+  (P6, ADR-0022). Текст лицензии — `crates/rde-formula-editor/assets/licenses/LICENSE-mathlive.txt`;
+  рантайм офлайновый (без CDN/сети), шрифты — ниже.
+- **Шрифты KaTeX** (20 × `KaTeX_*.woff2` в `crates/rde-formula-editor/assets/mathlive/fonts/`,
+  259 792 B) — MIT, Copyright (c) 2013-2020 Khan Academy and other contributors; поставляются
+  вместе с MathLive и побайтово совпадают с `katex@0.19.1/dist/fonts`; текст лицензии —
+  `crates/rde-formula-editor/assets/licenses/LICENSE-katex-fonts.txt`.
 - Times New Roman — proprietary (Monotype, delivered with Microsoft software); NOT distributed with
   this project. RDE only references it as the document's text font when the user's system has it.
 - ГОСТ standards texts are NOT distributed with this project; formatting rules are implemented

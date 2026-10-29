@@ -439,3 +439,28 @@ RDE_PROJECT=demo-project /srv/yocto/rde-target/debug/examples/screenshot \
 **Следующая очередь (P1):** матричный тулбар «+строка/+столбец» в UI (примитивы `math_edit` уже
 есть), подсветка выделения через границы структур, MathML/OMML-копипаст, полная таблица
 MathType-шорткатов, цвета/фон. Бэклог перфа — [`perf-backlog.md`](perf-backlog.md).
+
+---
+
+## 14. Обновление P6 (`latex-editor-window`, 2026-10-31): визуальный LaTeX-редактор в окне + SVG
+
+| Возможность | Статус | Точка входа в GUI | Тест/доказательство |
+|---|---|---|---|
+| **Окно визуального LaTeX-редактора (MathType-класс)**: структуры/палитры, виртуальная клавиатура, undo/redo, LaTeX-копипаст | ✅🧪 | панель «Формула» → **«Открыть редактор формул…»** (отдельное окно Chrome/Chromium/Edge в режиме приложения; MathLive 0.111.1, офлайн) | `rde-formula-editor` (24 теста), `formula_editor_window_apply_writes_source`, `formula_editor_window_reports_missing_browser`; headless e2e `scripts/verify-formula-editor.sh`; `gui-p23-editor-window-*.png` |
+| «Применить»/«Отмена» в окне → LaTeX-источник | ✅🧪 | кнопки окна / Ctrl+Enter / Esc | `formula_editor_window_apply_writes_source` (мост → запись `formula.toml`), `formula_panel_offers_visual_editor_window_and_source_field` |
+| Тема RDE и зум 100–200 % в окне (с сохранением) | ✅🧪 | тема — «Настройки → тема»; зум — «−/+» в окне | `zoom_pref_updates_state_and_emits_event`, `rde_can_push_theme_and_content_to_open_page`, `gui-p23-editor-window-light.png` |
+| Предпросмотр формулы из кэшей в панели (SVG→PNG из CAS) | ✅🧪 | панель «Формула» под кнопкой окна | `formula_panel_offers_visual_editor_window_and_source_field`, `gui-p23-formula-panel.png` |
+| **SVG-вставка display-формулы с номером `(N)` справа** | ✅🧪 | панель «Формула» → «Вставить в документ» (режим «SVG-вектор» по умолчанию) | `svg_numbered_insert_raises_number_to_math_baseline` (номер поднят по метрикам), `svg_insert_keeps_media_rels_and_content_types`, `gui-p23-formula-svg-document.png` |
+| OMML-режим вставки сохранён (Word-объект) | ✅🧪 | панель «Формула» → «Вставка: Word-объект (OMML)» | прежние formula/import/numbering тесты, `omml_insert_updates_and_roundtrips_through_engine` |
+| WYSIWYG-виджет P5 / «проф. редактор» P4 | ❌ удалён из UI | — | ADR-0022; `rde-math-editor` удалён из workspace |
+
+**Ограничения P6:** inline+SVG — baseline-ограничение WordprocessingML (низ inline-картинки = базовая
+линия строки; LO-оракул/спайк §4) → inline по умолчанию OMML, SVG — основной режим display; Word на
+стенде нет (SVG/номер — LO-оракул, `unverified` для Word); Windows/Wayland-ручная проверка — не
+проведена (нет стендов); стиль окна — KaTeX-типографика MathLive (MathType-класс), документ —
+прежний STIX/WordCraft; рендер SVG-формулы 84–88 мс (два подпроцесса poppler, кэшируется по LaTeX) —
+PERF-2 в [`perf-backlog.md`](perf-backlog.md). Следующая итерация — **PERF-1** (оптимизация RDE).
+
+**Историческая пометка:** разделы §12–§13 (P5) описывают удалённый WYSIWYG-редактор `rde-math-editor`
+и его тесты — заменены P6 (ADR-0022); safety `check_formula_latex`, in-place reload и перф-quick-win
+P5 остаются действующими (используются панелью P6).

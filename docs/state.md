@@ -2303,3 +2303,121 @@ cd /home/admin-pc/proj/rde-dev/rde && source ~/.cargo/env
 RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=120 \
   /srv/yocto/rde-target/release/examples/screenshot /tmp/p22.png document "" 0 formula-editor-v2 dark
 ```
+
+---
+
+## Обновление 2026-10-31 (P6 «latex-editor-window»: настоящий визуальный LaTeX-редактор формул в отдельном окне + SVG-вставки)
+
+Итерация **`latex-editor-window`** (P6). Вход: HEAD `e71c5e4` (тег `import-number-restore`),
+workspace **629 passed**; выход: **632 passed / 0 failed**, release-бинарь
+`/srv/yocto/rde-target/release/rde` (130 680 440 B), документы — [ADR-0022](adr/0022-latex-editor-window.md)
+(+[ADR-0021](adr/0021-latex-math-editor.md) — superseded в части редактора, ADR-0005 §5.1 webview-запрет
+снят решением владельца), спайк [`docs/spikes/latex-editor-window.md`](spikes/latex-editor-window.md),
+отчёт [`fidelity/p23-formula-editor-window.md`](fidelity/p23-formula-editor-window.md), замеры
+[`fidelity/p23-perf.md`](fidelity/p23-perf.md).
+
+### Что сделано
+
+1. **Research Gate:** проверено ограничение стенда — рантайм WebKitGTK есть, но **dev-заголовков нет**
+   (`pkg-config webkit2gtk-4.1` → not found) и `sudo` запрещён → встроенный `wry`-webview невозможен;
+   Chrome 155 установлен, владелец разрешил webview и отдельное окно. Матрица кандидатов: MathLive
+   (MIT) в окне браузера — победитель; отвергнуты: встроенный wry (нет сборки), локальный sysroot из
+   `.deb`, план-B egui-MathType (fallback), MathJax/KaTeX (рендереры, не редакторы), latex-rust/
+   mathtex (P5-спайк), GPL-редакторы (не бандл). POC: headless Chrome + CDP — рендер MathLive,
+   виртуальная клавиатура, LaTeX из/в, JS→Rust POST, офлайн (все запросы loopback), 0 CSP-нарушений;
+   лицензии MIT (MathLive, шрифты KaTeX) с доказательствами; LO-оракул baseline: **низ inline-рисунка
+   = базовая линия** (0,28 pt), `<w:position>` не двигает drawing.
+2. **Новый crate `crates/rde-formula-editor`** (24 теста): встроенные ассеты MathLive 0.111.1 (MIT,
+   **1,09 МиБ** в бинарнике, офлайн), запуск Chrome/Chromium/Brave/Edge в режиме приложения
+   (`--app=`, изолированный профиль, запрет фоновой сети), fallback браузер по умолчанию, ошибка без
+   браузера; собственный HTTP/1.0-мост на `std` (loopback-only, токен CSPRNG constant-time,
+   anti-DNS-rebinding `Host`, CSP, лимиты, таймауты); настройки зума между открытиями.
+3. **Окно MathType-класса:** визуальные структуры/палитры, встроенная виртуальная клавиатура, undo/
+   redo, LaTeX-копипаст, `Tab`/Esc, тёмная/светлая тема RDE, зум 100–200 %, LaTeX-панель источника,
+   «Применить»/«Отмена» и горячие клавиши; «Применить» → `check_formula_latex` → прежний конвейер
+   (`formula.toml`, кэши OMML/SVG/PNG, ledger, статусы), «Отмена»/крестик — без изменений.
+4. **Панель «Формула»:** кнопка «Открыть редактор формул…», предпросмотр из кэшей (PNG из CAS →
+   ink-mask с тинтом темы), LaTeX-поле — источник истины; WYSIWYG-виджет P5 и crate `rde-math-editor`
+   удалены из UI/workspace (23 теста ушли); скриншот-действия/демо обновлены.
+5. **SVG-вставки:** режим по умолчанию — `svg` (OMML — опция; старые проекты не ломаются);
+   `rde_doc::formula_metrics` (width/ascent/descent из `MathLayout`) + подъём номера `(N)`
+   `<w:position>` на `descent + SVG_CROP_PAD_PT` → номер на базовой линии формулы (проверено рендером
+   документа); inline по умолчанию OMML (baseline-ограничение OOXML, подсказка в панели);
+   кэш-схема/`FORMULA_RENDERER_VERSION` не менялись.
+6. **Документы/лицензии:** ADR-0022 + спайк + fidelity p23/p23-perf; ADR-0021 → superseded, ADR-0005
+   §5.1 уточнён; `NOTICE` (+MathLive MIT, KaTeX-шрифты MIT), CHANGELOG/README/state/tz-03/
+   gui-coverage; `perf-backlog` — PERF-2 (poppler из горячего пути SVG-рендера).
+
+### Тесты/доказательства
+
+- `./scripts/build.sh test --workspace` — **632 passed / 0 failed**;
+  новые: `rde-formula-editor` 24 (protocol/assets/host/server + реальный TCP-мост: страница/CSP/
+  ассеты, токен/Host, apply/cancel, зум, лимиты; lifecycle с фейковым браузером), `rde-ui` +3
+  (панель с кнопкой/предпросмотром; **сквозь мост** POST `/api/apply` → запись `formula.toml`;
+  ошибка без браузера), `rde-doc` +3 (метрики вёрстки, подъём номера SVG-вставки, release-perf
+  ignored). Удалено: P5-крейт `rde-math-editor` (23 теста) и 3 P5-UI-теста (заменены).
+- Скриншоты: [`gui-p23-editor-window-dark.png`](fidelity/gui-p23-editor-window-dark.png) (+light,
+  +matrix), [`gui-p23-formula-panel.png`](fidelity/gui-p23-formula-panel.png) (+light),
+  [`gui-p23-formula-svg-document.png`](fidelity/gui-p23-formula-svg-document.png) (SVG-формула с
+  номером `(1)` на базовой линии).
+- Headless-проверка окна: `scripts/verify-formula-editor.sh` — реальный мост + headless Chrome/CDP:
+  READY, тема, виртуальная клавиатура, зум, скриншот, `APPLY_MS≈2`, 0 JS-ошибок/0 CSP-нарушений,
+  сквозной «Применить» → Rust-событие.
+- Замеры: страница окна **0,93–1,02 с** холодно / **0,77–0,80 с** тепло; apply POST **2 мс**;
+  `formula_metrics` **0,15–0,22 мс**; `compile_formula` **84–88 мс** (poppler-подпроцессы — PERF-2);
+  release-бинарь +0,88 МиБ.
+
+### Ограничения (честно)
+
+1. **Word не проверен** (нет на стенде): SVG/`svgBlip`/номер — LO-оракул + WordCraft-рендер,
+   Word — `unverified`.
+2. **Windows/Wayland** — пути запуска браузера заложены, ручной проверки нет (нет графической
+   сессии/стендов): `unverified`.
+3. **Inline+SVG** — фундаментальное ограничение OOXML (низ inline-рисунка = базовая линия): inline
+   по умолчанию OMML; SVG inline даёт приподнятые нижние индексы (подсказка в UI).
+4. **Стиль окна** — KaTeX-типографика MathLive (MathType-класс), документ — прежний STIX/WordCraft
+   (официальной подмены math-шрифта MathLive нет).
+5. **Без браузера** окно не открывается (fallback — браузер по умолчанию или ошибка при рабочей
+   панели); внешний процесс браузера — зависимость UX.
+6. **Рендер SVG 84–88 мс** — гейт «≤50 мс» не выполнен (наследие poppler-CLI P0); кэш по `act_key`
+   делает практическую цену нулевой для неизменённых формул; задача — PERF-2 в
+   [`perf-backlog.md`](perf-backlog.md).
+
+### Следующий шаг
+
+**PERF-1** — большая оптимизация RDE по [`perf-backlog.md`](perf-backlog.md) (владелец просил
+напомнить после формул). Отложено по формулам: P2-кастомизация MathType-палитр под ГОСТ/матричный
+тулбар, Word-проверка, Windows/Wayland-ручная проверка, PERF-2.
+
+### Как запустить (актуально на этой итерации)
+
+```bash
+cd /home/admin-pc/proj/rde-dev/rde
+source ~/.cargo/env
+
+# 1) приложение — release-бинарь уже собран (target на внешнем ext4 /srv/yocto/rde-target)
+/srv/yocto/rde-target/release/rde
+./scripts/run.sh                                  # последний проект
+RDE_PROJECT=demo-project ./scripts/run.sh         # демо-проект
+
+# в GUI: вкладка «Формула» → «Открыть редактор формул…» → отдельное окно MathLive
+#        «Применить» в окне → LaTeX в formula.toml → «Обновить документ» → SVG-формула с номером
+
+# 2) тесты
+./scripts/build.sh test --workspace               # 632 passed / 0 failed
+./scripts/build.sh test -p rde-formula-editor     # 21 тест окна/моста
+
+# 3) headless-скриншоты: окно редактора (Chrome+CDP, без X11) и панель/документ (egui_kittest)
+OUT_DIR=/tmp ./scripts/verify-formula-editor.sh   # скриншот окна + e2e «Применить»; SKIP без Chrome/node
+RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=120   /srv/yocto/rde-target/release/examples/screenshot /tmp/p23-panel.png document "" 0 formula-editor-v2 dark
+RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=150   /srv/yocto/rde-target/release/examples/screenshot /tmp/p23-svg.png document "" 0 formula-insert-svg dark
+git checkout -- demo-project && git clean -fdq demo-project   # восстановить фикстуры
+
+# 4) ручные проверки: окно из панели; визуальный ввод/Tab/⌨/undo; «Отмена» не меняет источник;
+#    «Применить» → LaTeX обновился; SVG-вставка с номером; OMML-режим; тема/зум; ошибка LaTeX.
+
+# 5) пересборка
+./scripts/build.sh build -p rde                   # debug
+./scripts/build.sh build -p rde --release         # release
+./scripts/clean-build.sh                          # полная очистка target
+```

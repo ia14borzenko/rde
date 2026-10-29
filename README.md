@@ -5,22 +5,46 @@
 проект — каталог с TOML-манифестами, документ — `.doc.rde` (OOXML + `rde:doc`), артефакты —
 скрипты (Python в демо) с хешами/транзакциями, источники — PDF/OCR/ревью.
 
-![RDE, P4: панель редактора формулы — LaTeX-источник, предпросмотр, вставка с номером](docs/fidelity/gui-p20-formula-editor.png)
+![RDE, P6: визуальный LaTeX-редактор формул уровня MathType — отдельное окно (MathLive, виртуальная клавиатура), LaTeX остаётся источником истины](docs/fidelity/gui-p23-editor-window-dark.png)
 
-*P4 «Редактор формул в GUI» (2026-10-29, [ADR-0020](docs/adr/0020-formula-editor-ui.md)): панель
-«Формула» — LaTeX-источник (source-of-truth `formula.toml`), предпросмотр тем же рендером, что вкладка
-Equation WordCraft, display/inline и политика нумерации, «Применить» (кэши OMML/SVG/PNG + ledger),
-«Вставить в документ» с номером по схеме. Ещё:
-[вкладка «Формула» — редактор на верхней панели](docs/fidelity/gui-p21-formula-tab.png),
-[пустое состояние вкладки](docs/fidelity/gui-p21-formula-tab-empty.png),
-[нативная вкладка Equation](docs/fidelity/gui-p21-formula-tab-native.png),
-[инспектор](docs/fidelity/gui-p20-formula-inspector.png),
-[вставка с номером `(2)`](docs/fidelity/gui-p20-formula-insert-numbered.png),
-[скролл предпросмотра колесом](docs/fidelity/gui-p21-preview-scroll.png).*
+*P6 «Окно редактора формул» (2026-10-31, [ADR-0022](docs/adr/0022-latex-editor-window.md)): на смену
+собственному WYSIWYG-редактору P5 пришёл **настоящий открытый визуальный LaTeX-редактор** —
+[MathLive](https://mathlive.io/) (MIT) в **отдельном окне** (Chrome/Chromium/Edge в режиме
+приложения; webview разрешён владельцем), полностью офлайн (ассеты в бандле, JS↔Rust мост на
+loopback); визуальные структуры/палитры/виртуальная клавиатура/undo, LaTeX — данные, «Применить»
+пишет `formula.toml` и пересчитывает кэши. SVG-вставки — основной режим display-формул (номер `(N)`
+выровнен по базовой линии по метрикам вёрстки), OMML-режим сохранён. Ещё:
+[окно в светлой теме](docs/fidelity/gui-p23-editor-window-light.png),
+[матрица в редакторе](docs/fidelity/gui-p23-editor-window-dark-matrix.png),
+[панель «Формула» с предпросмотром и кнопкой окна](docs/fidelity/gui-p23-formula-panel.png),
+[SVG-формула в документе с номером `(1)`](docs/fidelity/gui-p23-formula-svg-document.png).*
 
 ## Состояние
 
-Текущая итерация — **P5 «math-editor»: нативный LaTeX-редактор формул уровня MathType**
+Текущая итерация — **P6 «latex-editor-window»: настоящий визуальный LaTeX-редактор формул
+(MathType-класс) в отдельном окне + SVG-вставки** (2026-10-31,
+[ADR-0022](docs/adr/0022-latex-editor-window.md),
+[спайк Research Gate](docs/spikes/latex-editor-window.md), отчёт
+[`docs/fidelity/p23-formula-editor-window.md`](docs/fidelity/p23-formula-editor-window.md)):
+по решению владельца собственный WYSIWYG-редактор P5 заменён **настоящим открытым визуальным
+LaTeX-редактором уровня MathType** — [MathLive](https://mathlive.io/) **0.111.1** (MIT) в
+**отдельном окне** браузера в режиме приложения (Chrome/Chromium/Brave/Edge; на стенде встроенный
+`wry`/WebKitGTK невозможен — нет dev-заголовков и `sudo`): визуальные структуры/палитры, встроенная
+виртуальная клавиатура (числа/символы/латиница/греческий), undo/redo, LaTeX-копипаст, тема RDE и
+зум 100–200 %. Ассеты (JS/CSS/20 шрифтов KaTeX, **1,09 МиБ**) упакованы в бинарник — рантайм
+**полностью офлайновый**; окно общается с RDE по loopback-HTTP мосту (токен, CSP, только
+apply/cancel/state). **LaTeX остаётся источником истины**: «Применить» → валидация
+`check_formula_latex` → прежний конвейер (`formula.toml`, кэши OMML/SVG/PNG, ledger, статусы);
+P5-крейт `rde-math-editor` удалён, панель «Формула» — LaTeX-поле, предпросмотр из кэшей и кнопка
+«Открыть редактор формул…». **SVG-вставки** — основной режим display-формул: номер `(N)` справа
+поднимается `<w:position>` по метрикам вёрстки (`formula_metrics`: descent+отступ кропа), чтобы его
+базовая линия совпала с формулой; inline по умолчанию OMML (фундаментальное ограничение OOXML:
+низ inline-картинки = базовая линия строки — LO-оракул). Доказательства — **632
+тестов** workspace, скриншоты [`gui-p23-*`](docs/fidelity/gui-p23-formula-panel.png), замеры
+[`docs/fidelity/p23-perf.md`](docs/fidelity/p23-perf.md) (страница окна 0,93/0,80 с холодно/тепло,
+apply 2 мс; рендер SVG-формулы 84–88 мс — poppler-подпроцессы, PERF-2 в бэклоге).
+
+Предыдущая итерация — **P5 «math-editor»: нативный LaTeX-редактор формул уровня MathType**
 (2026-10-29, [ADR-0021](docs/adr/0021-latex-math-editor.md),
 [спайк Research Gate](docs/spikes/latex-editor.md), отчёт
 [`docs/fidelity/p22-formula-editor.md`](docs/fidelity/p22-formula-editor.md)):

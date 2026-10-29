@@ -12,6 +12,44 @@
 
 ### Добавлено
 
+- **P6 `latex-editor-window` — визуальный LaTeX-редактор формул уровня MathType в отдельном окне
+  (MathLive) + SVG-вставки (2026-10-31, [ADR-0022](docs/adr/0022-latex-editor-window.md), спайк
+  [`docs/spikes/latex-editor-window.md`](docs/spikes/latex-editor-window.md), отчёт
+  [`docs/fidelity/p23-formula-editor-window.md`](docs/fidelity/p23-formula-editor-window.md))**:
+  - **Новый crate [`crates/rde-formula-editor`](crates/rde-formula-editor)** (без новых внешних
+    зависимостей): встроенные офлайн-ассеты MathLive 0.111.1 (MIT) + шрифты KaTeX (MIT) +
+    страница редактора (**1,09 МиБ** в бинарнике); запуск отдельного окна
+    Chrome/Chromium/Brave/Edge в режиме приложения (`--app=`, изолированный профиль, запрет
+    фоновой сети), fallback — браузер по умолчанию, понятная деградация без браузера; свой
+    HTTP/1.0-мост на `std` (loopback-only, одноразовый токен, anti-DNS-rebinding `Host`,
+    CSP `default-src 'self'`, лимиты/таймауты, события `Applied/Cancelled/Zoom`); настройки
+    (зум 100–200 %) — `~/.config/rde/formula-editor.toml`; тесты: 21 (unit+integration, включая
+    реальный TCP-мост и lifecycle с фейковым браузером).
+  - **Окно MathType-класса:** визуальные структуры/палитры, виртуальная клавиатура (числа/символы/
+    латиница/греческий), undo/redo, LaTeX-копипаст, `Tab` между слотами, авто-дроби/степени/индексы,
+    LaTeX-панель источника с двусторонней синхронизацией, тёмная/светлая тема RDE, зум, «Применить»
+    (Ctrl+Enter)/«Отмена» (Esc)/горячие клавиши; «Применить» → валидация
+    `rde_doc::check_formula_latex` → существующий конвейер `apply_formula_edit`/
+    `create_formula_action` (нормализация, кэши OMML/SVG/PNG, ledger, Fresh/Stale) → окно закрыто;
+    «Отмена»/крестик — источники не меняются.
+  - **Панель «Формула»:** кнопка **«Открыть редактор формул…»** (при открытом окне — «Закрыть окно»),
+    предпросмотр формулы из кэшей (PNG из CAS → ink-mask с тинтом темы), LaTeX-поле — источник
+    истины; старый WYSIWYG-виджет P5 удалён, crate `rde-math-editor` удалён из workspace и
+    репозитория; скриншот-действия/демо-хелперы обновлены (`formula-insert-svg`).
+  - **SVG-вставки:** режим вставки по умолчанию — `svg` (OMML — опция, существующие проекты не
+    ломаются); `rde_doc::formula_metrics(latex, display)` — метрики вёрстки `width/ascent/descent`
+    из `MathLayout`; для display+SVG номер `(N)` поднимается `<w:position w:val="…"/>` на
+    `descent + SVG_CROP_PAD_PT` — базовая линия номера совпадает с формулой (LO-оракул: низ
+    inline-рисунка = базовая линия; `<w:position>` не двигает рисунок); inline по умолчанию OMML
+    (baseline нативный, ограничение OOXML — подсказка в панели); кэш-схема/`FORMULA_RENDERER_VERSION`
+    не менялись.
+  - **Документы:** ADR-0022 (ADR-0021 — superseded по редактору; ADR-0005 §5.1 webview-запрет снят
+    решением владельца), спайк Research Gate, fidelity p23 (+перф p23-perf), state/tz-03/
+    gui-coverage/README/`NOTICE` (+MIT-атрибуция MathLive/KaTeX-шрифтов), `docs/perf-backlog.md`
+    (PERF-2: убрать poppler из горячего пути SVG-рендера). Тесты: **632**
+    (release-бинарь собран, скриншоты `gui-p23-*`, headless-проверка окна
+    `scripts/verify-formula-editor.sh`).
+
 - **P5 `math-editor` Phase 2 — нативный WYSIWYG-редактор формул MathType-класса (2026-10-29,
   [ADR-0021](docs/adr/0021-latex-math-editor.md), отчёт
   [`docs/fidelity/p22-formula-editor.md`](docs/fidelity/p22-formula-editor.md))**:
