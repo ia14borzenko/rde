@@ -6546,6 +6546,35 @@ impl RdeApp {
     /// Исходник только читается; создаётся `objects/documents/<id>/report.doc.rde` (WordCraft →
     /// OOXML + `rde:doc` + paraId) и `import.json` с происхождением. Заголовок помечается
     /// `[IMPORTED]` (R-DOC-39), предупреждения о неподдерживаемых конструкциях — в журнал.
+    /// После импорта `.docx`: если в документе есть display-формулы вне реестра (MathType/OMML от
+    /// Word), сразу открыть диалог «Принять формулы как объекты» — восстановление right-numbered
+    /// вёрстки и Word-номеров (`(1)…(N)`) по ADR-0019. Импорт сам документ не перестраивает:
+    /// пользователь подтверждает применение одной кнопкой; в журнале — что и сколько найдено.
+    fn offer_formula_number_restore_after_import(&mut self, package: &Path) {
+        let equations = match rde_doc::unregistered_formulas(package) {
+            Ok(equations) => equations,
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Восстановление номеров формул: {error}"));
+                return;
+            }
+        };
+        let display = equations.iter().filter(|equation| equation.display).count();
+        if display == 0 {
+            return;
+        }
+        let numbered = equations.iter().filter(|equation| equation.display && equation.number_text.is_some()).count();
+        let numbers_hint = if numbered > 0 {
+            format!(", у {numbered} найдены номера Word — они будут сохранены")
+        } else {
+            String::new()
+        };
+        self.push_log(
+            Level::Info,
+            format!("Импорт .docx: display-формул вне реестра {display}{numbers_hint}; восстановление номеров — «Принять формулы как объекты»"),
+        );
+        self.open_formula_migration_dialog();
+    }
+
     fn import_docx_action(&mut self, source: &Path) -> Result<(), String> {
         self.import_docx_action_with_title(source, None)
     }
@@ -6617,6 +6646,9 @@ impl RdeApp {
                         report.source_sha256.chars().take(12).collect::<String>()
                     ),
                 );
+                // ADR-0019: восстановление right-numbered вёрстки/номеров Word — сразу после
+                // импорта, но с явным подтверждением пользователя (без молчаливых мутаций).
+                self.offer_formula_number_restore_after_import(&package);
                 Ok(())
             }
             Err(error) => {
@@ -13371,6 +13403,53 @@ mod docview_tests {
         })
     }
 
+    /// Синтетический `.docx` с одной display-формулой и её номером Word `(1)` — для проверки
+    /// автопредложения восстановления right-numbered вёрстки/номеров сразу после импорта (ADR-0019).
+    fn numbered_formula_docx(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::io::{Read, Write};
+        let clean = dir.join("numbered-formula.docx");
+        let document = wordcraft_engine::doc::Document::new();
+        wordcraft_engine::io::save_path(&clean, &document).expect("чистый .docx");
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&clean).expect("zip .docx")).expect("zip");
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).expect("часть zip");
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).expect("прочитать часть zip");
+            entries.push((entry.name().to_owned(), data));
+        }
+        drop(archive);
+        // Абзац как в Word «right-numbered»: display-формула + таб + номер (1) в одном w:p.
+        let paragraph = "<w:p><m:oMathPara><m:oMath><m:r><m:t>x^2</m:t></m:r></m:oMath></m:oMathPara>\
+                        <w:r><w:tab/></w:r><w:r><w:t>(1)</w:t></w:r></w:p>";
+        let mut patched = false;
+        for (name, data) in entries.iter_mut() {
+            if name == "word/document.xml" {
+                let mut xml = String::from_utf8(data.clone()).expect("utf-8 document.xml");
+                if !xml.contains("xmlns:m=") {
+                    xml = xml.replacen(
+                        "<w:document ",
+                        "<w:document xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\" ",
+                        1,
+                    );
+                }
+                xml = xml.replacen("<w:body>", &format!("<w:body>{paragraph}"), 1);
+                *data = xml.into_bytes();
+                patched = true;
+            }
+        }
+        assert!(patched, "word/document.xml пропатчен");
+        let out = std::fs::File::create(&clean).expect("перезаписать .docx");
+        let mut zip = zip::ZipWriter::new(out);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, data) in &entries {
+            zip.start_file(name.as_str(), options).expect("zip start");
+            zip.write_all(data).expect("zip write");
+        }
+        zip.finish().expect("zip finish");
+        clean
+    }
+
     /// Сырой `word/document.xml` пакета `.doc.rde` (проверки вёрстки вставок: табы/таблица/OMML).
     fn package_document_xml(package: &std::path::Path) -> String {
         use std::io::Read;
@@ -14042,6 +14121,48 @@ mod docview_tests {
         app.tab = super::Tab::Document;
         app.ensure_editor();
         assert!(app.editor.is_some(), "редактор открывает импортированный документ: {:?}", app.editor_error);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ADR-0019 (UX по замечанию владельца): сразу после «Импорт .docx…» с пронумерованными
+    /// display-формулами открывается диалог восстановления right-numbered вёрстки/номеров Word —
+    /// одной кнопкой, без ручного поиска команды; применение сохраняет номер `(1)` из Word.
+    #[test]
+    fn import_docx_with_numbered_display_offers_number_restore() {
+        if !poppler_available() {
+            return;
+        }
+        let root = temp_demo_copy("import-restore-numbers");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let source = numbered_formula_docx(&root);
+        app.import_docx_action(&source).expect("импорт .docx");
+        let dialog = app.formula_migration_dialog.as_ref().expect("диалог восстановления номеров открыт после импорта");
+        assert_eq!(dialog.display, 1, "одна display-формула");
+        assert_eq!(dialog.found_numbers, 1, "номер Word (1) найден");
+        assert!(dialog.preserve_numbers, "номера Word сохраняются по умолчанию");
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("display-формул вне реестра 1")),
+            "журнал: подсказка о восстановлении номеров"
+        );
+        let options = rde_doc::FormulaMigrationOptions {
+            numbering: dialog.scheme,
+            preserve_word_numbers: dialog.preserve_numbers,
+            number_display: dialog.number_display,
+        };
+        let package = app.active_document_path().expect("активный документ");
+        app.apply_formula_migration(options);
+        assert!(app.formula_migration_dialog.is_none(), "диалог закрыт после применения");
+        let package = if package.is_file() { package } else { app.active_document_path().expect("документ") };
+        let xml = package_document_xml(&package);
+        assert!(xml.contains("<w:sdt>"), "display-формула стала block-вставкой");
+        assert!(xml.contains("<w:tabs>"), "right-numbered таб-вёрстка");
+        assert!(xml.contains("(1)"), "номер Word сохранён");
+        let rde_doc = rde_doc::load_rde_doc(&package).expect("rde:doc");
+        assert!(
+            rde_doc.inserts.iter().any(|insert| insert.kind == "formula" && insert.number_source == rde_doc::NUMBER_SOURCE_WORD),
+            "номер помечен как сохранённый из Word: {:?}",
+            rde_doc.inserts.iter().map(|i| (&i.kind, &i.number_source)).collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
