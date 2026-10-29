@@ -44,6 +44,10 @@ pub use equation::*;
 pub mod formula;
 pub use formula::*;
 
+/// P5 (ADR-0021): валидация LaTeX-источника формулы — защита от мусора нативного редактора.
+pub mod formula_latex;
+pub use formula_latex::{LatexCheck, check_formula_latex, forbidden_char, is_linear_latex, structure_summary};
+
 mod formula_insert;
 pub use formula_insert::*;
 

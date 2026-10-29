@@ -64,6 +64,23 @@ fn main() {
             state.demo_show_service_objects();
             state.demo_open_formula_editor("Формула");
         }
+        // P5 (ADR-0021, Phase 2): WYSIWYG-редактор формулы MathType-класса.
+        Some("formula-editor-v2") => {
+            state.demo_show_service_objects();
+            state.demo_open_formula_editor("Формула");
+        }
+        // Новая формула с дробью/корнем (структурный ввод в модели редактора).
+        Some("formula-editor-fraction") => {
+            state.demo_formula_editor_with_model("", Some("frac.stacked"), "12");
+        }
+        // Матрица 2×2 из палитры структур (MathType-подобная вставка шаблона).
+        Some("formula-editor-matrix") => {
+            state.demo_formula_editor_with_model("", Some("mat.paren"), "1234");
+        }
+        // Палитра структур открыта на категории «Дроби» (пустая формула).
+        Some("formula-editor-palette") => {
+            state.demo_formula_editor_with_model("", None, "");
+        }
         Some("formula-editor-native") => {
             state.demo_show_service_objects();
             state.demo_open_formula_editor_native();

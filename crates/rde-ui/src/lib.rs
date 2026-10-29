@@ -225,6 +225,11 @@ const INSPECTOR_WIDTH_MIN: f32 = 280.0;
 const INSPECTOR_WIDTH_MAX: f32 = 480.0;
 /// Высота нативной области правки формулы (equation_tab + canvas WordCraft) в панели P4.
 const NATIVE_FORMULA_EDITOR_H: f32 = 300.0;
+/// P5 (ADR-0021): нативный «проф. редактор» (клон MS Equations) **выведен из UI** — он портил
+/// формулы (мусор `equation.get` писался в источник) и не отвечал требованиям MathType; заменяется
+/// редактором MathType-класса (Phase 2). Код оставлен за флагом (тесты валидации/отладка): при
+/// `true` возвращает старое окно и автосинк; в продукте — `false`.
+const FORMULA_NATIVE_UI: bool = false;
 
 // ── строка вкладок центра: ОДНА линия без переноса (ТЗ-03 §19-7) ────────────────────────
 /// Высота таба строки вкладок и сегмента переключателя режимов (равна `interact_size.y`
@@ -305,6 +310,14 @@ impl DocPreview {
         Self { path, state }
     }
 
+    /// Пометить предпросмотр устаревшим: страницы будут перерисованы из текущего пакета при
+    /// следующем `ensure`, сам `DocPreview` не пересоздаётся (P5: позиция/скролл не теряются).
+    fn invalidate(&mut self) {
+        if self.path.is_some() {
+            self.state = DocState::Pending;
+        }
+    }
+
     fn ensure(&mut self, ctx: &egui::Context) {
         if !matches!(self.state, DocState::Pending) {
             return;
@@ -318,6 +331,16 @@ impl DocPreview {
             Err(e) => self.state = DocState::Failed(e),
         }
     }
+}
+
+/// Снимок позиции документа для восстановления после пересборки пакета (P5, ADR-0021 §Решение 3):
+/// каретка/выделение редактора, page_hint и offset предпросмотра. Если путь документа сменился —
+/// позиция прежнего документа не переносится (осознанный сброс).
+struct DocumentViewState {
+    path: Option<std::path::PathBuf>,
+    selection: Option<wordcraft_engine::Selection>,
+    page_hint: usize,
+    preview_offset: f32,
 }
 
 /// Открыть `.docx`, разметить и растеризовать первые страницы через WordCraft.
@@ -721,6 +744,9 @@ struct FormulaEditorState {
     /// Отдельный WordCraft-редактор: предпросмотр (`previews::math_texture`) и нативная правка.
     /// Не трогает документ проекта — правка источника не создаёт черновиков в тексте.
     native: Option<Box<NativeFormulaEditor>>,
+    /// P5 (ADR-0021): нативный WYSIWYG-редактор формулы (модель `MNode` + каретка + палитры).
+    /// LaTeX-поле ниже — источник истины; редактор синхронизирован с ним.
+    math_editor: Option<Box<rde_math_editor::widget::MathEditorUi>>,
 }
 
 /// Отдельный (scratch) WordCraft-редактор для панели формулы (P4, спайк A): живёт только в панели,
@@ -818,6 +844,19 @@ pub struct RdeApp {
     comments_cache: Option<(String, usize)>,
     /// Кэш вставок rde:doc для вкладки «Структура» (ключ — путь пакета).
     inserts_cache: Option<(String, Vec<rde_doc::RdeInsert>)>,
+    /// P5 (quick-win §5.2): кэш «сколько вставок в пакете» для ленты — по (путь, mtime, размер),
+    /// чтобы не читать и не распаковывать `.doc.rde` каждый кадр в режиме RDE.
+    inserts_count_cache: Option<(String, u64, u64, usize)>,
+    /// P5 (quick-win §5.2): кэш инспектора формулы (`formula_inspector_data` считался каждый кадр:
+    /// ledger + backlinks + статусы вставок — до 52 мс на кадр в debug). Ключ — (эпоха данных, id).
+    formula_inspector_cache: Option<(u64, String, FormulaInspectorData)>,
+    /// Эпоха данных проекта/документа/ledger: увеличивается при `reload_project` (после любых
+    /// изменений) — инвалидирует производные кэши (инспектор формулы).
+    data_epoch: u64,
+    /// P5 (quick-win §5.2): превью следующего номера формулы — `next_formula_number_text` читает
+    /// `.doc.rde` (распаковка zip) и вызывался каждый кадр панели формулы; кэш по (путь, mtime,
+    /// размер, схема нумерации).
+    formula_number_preview_cache: Option<(String, Option<String>)>,
     /// Фокус на поиске объектов (кнопка «Поиск», меню «Найти», Ctrl+F).
     search_focus: bool,
     /// Диалог «Открыть проект…» (путь + ошибка; «Проводник…», недавние проекты).
@@ -945,6 +984,9 @@ pub struct RdeApp {
     demo_preview_scroll: f32,
     /// Текущий offset скролла области предпросмотра (тест: колесо/ползунок прокручивают).
     preview_scroll_offset: f32,
+    /// Одноразовый restore offset предпросмотра после пересборки пакета (P5, ADR-0021 §Решение 3):
+    /// применяется к `ScrollArea` один раз, когда страницы снова готовы (колесо не ломается).
+    preview_restore_offset: Option<f32>,
     /// Демо/тест: подменённая история проектов (скриншоты, kittest) вместо файла конфига.
     demo_recent_projects: Option<Vec<rde_core::RecentProject>>,
     /// Файл истории проектов: `None` — не записывать (тесты); по умолчанию — из конфига RDE.
@@ -1026,6 +1068,10 @@ impl RdeApp {
             pdf_cache: None,
             comments_cache: None,
             inserts_cache: None,
+            inserts_count_cache: None,
+            formula_inspector_cache: None,
+            data_epoch: 0,
+            formula_number_preview_cache: None,
             search_focus: false,
             open_project_dialog: None,
             import_docx_dialog: None,
@@ -1088,6 +1134,7 @@ impl RdeApp {
             picker_focus_ok: Vec::new(),
             demo_preview_scroll: 0.0,
             preview_scroll_offset: 0.0,
+            preview_restore_offset: None,
             demo_recent_projects: None,
             // В unit-тестах история не пишется в конфиг пользователя (тесты создают много
             // временных проектов); тесты, проверяющие историю, задают путь явно.
@@ -1544,10 +1591,7 @@ impl RdeApp {
                 }
                 let manifest_path = document_object.dir.join("document.toml");
                 let _ = set_manifest_string(&manifest_path, "template", &template_id);
-                self.editor = None;
-                self.doc = DocPreview::new(self.active_document_path());
-                self.structure_cache = None;
-                self.reload_project();
+                self.reload_document_view_preserving();
                 self.push_log(
                     Level::Ok,
                     format!(
@@ -2010,11 +2054,7 @@ impl RdeApp {
                         self.push_log(Level::Warn, format!("Вставка: версия документа не зафиксирована: {error}"));
                     }
                 }
-                self.editor = None;
-                self.doc = DocPreview::new(self.active_document_path());
-                self.structure_cache = None;
-                self.inserts_cache = None;
-                self.reload_project();
+                self.reload_document_view_preserving();
                 self.push_log(
                     Level::Ok,
                     format!(
@@ -2054,10 +2094,7 @@ impl RdeApp {
             }
             None => 0,
         };
-        self.doc = DocPreview::new(self.active_document_path());
-        self.structure_cache = None;
-        self.inserts_cache = None;
-        self.reload_project();
+        self.reload_document_view_preserving();
         Ok(changed)
     }
 
@@ -2271,6 +2308,7 @@ impl RdeApp {
             info: String::new(),
             native_open: false,
             native: None,
+            math_editor: None,
         });
     }
 
@@ -2320,6 +2358,7 @@ impl RdeApp {
             info: String::new(),
             native_open: false,
             native: None,
+            math_editor: None,
         });
     }
 
@@ -2333,13 +2372,6 @@ impl RdeApp {
         app.autosave = false;
         app.ui.theme = appearance_of(&self.app_settings.theme);
         Box::new(NativeFormulaEditor { app, fonts_ready: false, skip_frames: 1 })
-    }
-
-    /// Лениво создать scratch-редактор панели: он же даёт предпросмотр (`previews::math_texture`).
-    fn ensure_formula_native(&self, dialog: &mut FormulaEditorState) {
-        if dialog.native.is_none() {
-            dialog.native = Some(self.new_native_formula_editor());
-        }
     }
 
     /// Перезапустить нативную правку: свежий scratch-документ + уравнение из поля LaTeX.
@@ -2356,13 +2388,37 @@ impl RdeApp {
     }
 
     /// Забрать LaTeX/display из нативного редактора (`equation.get`, спайк A) в поля панели.
+    ///
+    /// P5 (ADR-0021 §Решение 2): полученный LaTeX **валидируется** — мусор линейного формата
+    /// (`√`, `▒`, `█`) и не-LaTeX не попадает в источник; при отказе `dialog.latex` не меняется,
+    /// ошибка показывается в панели. Явная правка структуры разрешена (это действие пользователя),
+    /// но сопровождается предупреждением о диффе структуры.
     fn sync_formula_from_native(dialog: &mut FormulaEditorState) {
         let Some(native) = dialog.native.as_mut() else { return };
         let Ok(info) = native.app.run("equation.get", serde_json::json!({})) else { return };
-        if let Some(latex) = info.get("latex").and_then(|value| value.as_str())
-            && !latex.trim().is_empty()
-        {
-            dialog.latex = latex.to_owned();
+        if let Some(latex) = info.get("latex").and_then(|value| value.as_str()) {
+            match rde_doc::check_formula_latex(&dialog.latex, latex) {
+                // Нативный редактор — «зеркало» источника, а не второй редактор: любое изменение
+                // структуры (конвертация в linear даёт `\backslash`/`√`/`▒`) — это порча,
+                // источник не трогаем (инцидент A, ADR-0021 §Решение 2).
+                Ok(check) if !check.equivalent => {
+                    let diff = if check.warnings.is_empty() { String::new() } else { format!(": {}", check.warnings.join("; ")) };
+                    dialog.error = format!(
+                        "LaTeX из нативного редактора меняет структуру формулы и отклонён (источник не изменён){diff}"
+                    );
+                    dialog.info.clear();
+                }
+                Ok(_) => {
+                    dialog.latex = latex.trim().to_owned();
+                    dialog.error.clear();
+                    dialog.info = "LaTeX из нативного редактора совпадает с источником — источник нормализован".to_owned();
+                }
+                Err(error) => {
+                    // Источник не трогаем: лучше отказ, чем запись не-LaTeX (инцидент A).
+                    dialog.error = format!("LaTeX из нативного редактора отклонён (источник не изменён): {error}");
+                    dialog.info.clear();
+                }
+            }
         }
         if let Some(display) = info.get("display").and_then(|value| value.as_bool()) {
             dialog.display = display;
@@ -2513,7 +2569,8 @@ impl RdeApp {
             }
             return;
         };
-        self.ensure_formula_native(&mut dialog);
+        // P5 (ADR-0021): WYSIWYG-редактор, без второго WordApp: scratch-редактор панели больше не
+        // создаётся (нативный проф. редактор выведен, растровый предпросмотр заменён редактором).
         // Статус/«где вставлено» существующей формулы (R-DOC-19) — до отрисовки (заимствует store).
         let inspector = dialog.formula_id.as_deref().map(|id| self.formula_inspector_data(id));
         let stored = dialog.formula_id.as_deref().and_then(|id| {
@@ -2543,11 +2600,7 @@ impl RdeApp {
             Some(block) => format!("после блока {}", block + 1),
             None => "в конец документа".to_owned(),
         };
-        let number_preview: Option<String> = self
-            .active_document_path()
-            .filter(|path| rde_doc::is_rde_package(path))
-            .and_then(|path| rde_doc::next_formula_number_text(&path, self.document_formula_numbering()))
-            .map(|(number, _warnings)| number);
+        let number_preview: Option<String> = self.next_formula_number_preview();
         let mut close = false;
         let mut new_formula = false;
         let mut apply = false;
@@ -2556,14 +2609,13 @@ impl RdeApp {
         let mut sync_native = false;
         let mut update_document = false;
         let mut open_document = false;
+        let mut apply_blocked = false;
 
-        // ── Две колонки: редактор источника + предпросмотр (адаптивно к ширине центра) ──
+        // ── Одна колонка: WYSIWYG-редактор (он и есть предпросмотр) + LaTeX-источник + параметры ──
         let total_w = ui.available_width();
-        let preview_w = (total_w * 0.28).clamp(180.0, 340.0);
         ui.horizontal_top(|ui| {
-            let left_w = (total_w - preview_w - 12.0).max(240.0);
             ui.vertical(|ui| {
-                ui.set_width(left_w);
+                ui.set_width(total_w);
                 // Статус (переносится по строкам — колонка не шире отведённой).
                 ui.horizontal_wrapped(|ui| {
                     if let Some(inspector) = &inspector {
@@ -2613,17 +2665,51 @@ impl RdeApp {
                         );
                     });
                 });
+                // ── WYSIWYG-редактор формулы (P5, ADR-0021): структурный ввод 2D, каретка,
+                //    палитры, undo; рендер — тем же конвейером/шрифтом, что документ (STIX).
+                ui.add_space(4.0);
+                ui.label(RichText::new("РЕДАКТОР ФОРМУЛЫ").size(FS_CAPTION).family(bold_family(ui.ctx())).color(pal.muted));
+                if dialog.math_editor.is_none() {
+                    dialog.math_editor = Some(Box::new(rde_math_editor::widget::MathEditorUi::new(&dialog.latex, dialog.display)));
+                    if let Some(editor) = dialog.math_editor.as_mut() {
+                        editor.request_focus();
+                    }
+                }
+                if let Some(editor) = dialog.math_editor.as_mut() {
+                    if editor.state.display != dialog.display {
+                        editor.state.display = dialog.display;
+                        editor.cache.clear();
+                    }
+                    let editor_response = editor.show(ui);
+                    // LaTeX-поле — витрина модели: синхронизируем после любого изменения модели
+                    // (ввод, палитра, вставка LaTeX), но не затираем его при непредставимой модели.
+                    let editor_latex = editor_response.latex.trim().to_owned();
+                    if editor_latex != dialog.latex.trim() && editor_response.roundtrip_error.is_none() {
+                        dialog.latex = editor_latex;
+                    } else if let Some(error) = &editor_response.roundtrip_error
+                        && dialog.error.is_empty()
+                    {
+                        dialog.error = rde_math_editor::widget::roundtrip_warning(error);
+                    }
+                }
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("LaTeX-источник").size(FS_BODY).color(pal.muted));
-                    ui.label(RichText::new("— source-of-truth формулы (formula.toml)").small().color(pal.muted));
+                    ui.label(RichText::new("— source-of-truth формулы (formula.toml); синхронизирован с редактором").small().color(pal.muted));
                 });
-                ui.add(
+                let latex_response = ui.add(
                     egui::TextEdit::multiline(&mut dialog.latex)
                         .code_editor()
                         .desired_rows(3)
                         .desired_width(f32::INFINITY)
                         .hint_text(r"\sigma = \sqrt{\frac{1}{N-1}\sum_{i=1}^{N}(x_i-\bar{x})^2}"),
                 );
+                if latex_response.changed()
+                    && let Some(editor) = dialog.math_editor.as_mut()
+                {
+                    // Правку LaTeX-поля переносим в модель редактора (LaTeX — источник истины).
+                    editor.set_source(&dialog.latex, dialog.display);
+                }
                 // Формат / нумерация / параметры вставки — одной строкой (панель компактная).
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Формат").size(FS_BODY).color(pal.muted));
@@ -2680,53 +2766,6 @@ impl RdeApp {
                     ui.label(RichText::new(&dialog.info).small().color(pal.green));
                 }
             });
-            ui.add_space(8.0);
-            // Правая колонка — предпросмотр тем же рендером, что вкладка Equation WordCraft.
-            ui.vertical(|ui| {
-                ui.set_width(preview_w);
-                ui.label(RichText::new("ПРЕДПРОСМОТР").size(FS_CAPTION).family(bold_family(ui.ctx())).color(pal.muted));
-                let size = vec2(ui.available_width(), 104.0);
-                let (rect, _resp) = ui.allocate_exact_size(size, Sense::hover());
-                ui.painter().rect_filled(rect, CornerRadius::same(8), pal.panel_hi);
-                ui.painter().rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
-                if dialog.latex.trim().is_empty() {
-                    ui.painter().text(
-                        rect.center(),
-                        Align2::CENTER_CENTER,
-                        "введите LaTeX — здесь появится формула",
-                        FontId::proportional(13.0),
-                        pal.muted,
-                    );
-                } else if let Some(native) = dialog.native.as_mut() {
-                    let nodes = wordcraft_engine::doc::math_latex::parse_latex(dialog.latex.trim());
-                    let key = format!("rde-formula-preview:{}:{}", dialog.latex.trim(), dialog.display);
-                    match wordcraft_ui_egui::previews::math_texture(
-                        &mut native.app,
-                        ui.ctx(),
-                        &key,
-                        &nodes,
-                        dialog.display,
-                        15.0,
-                        vec2(rect.width() - 16.0, rect.height() - 12.0),
-                    ) {
-                        Some((tex, uv)) => {
-                            ui.painter().image(tex, rect.shrink(6.0), uv, pal.text);
-                        }
-                        None => {
-                            ui.ctx().request_repaint();
-                        }
-                    }
-                }
-                ui.label(
-                    RichText::new(if dialog.native_open {
-                        "нативный редактор Equation открыт в отдельном окне"
-                    } else {
-                        "рендер вкладки Equation WordCraft; шрифт формул STIX (ADR-0018)"
-                    })
-                    .small()
-                    .color(pal.muted),
-                );
-            });
         });
         // ── Действия: две строки кнопок фиксированной ширины (панель не шире центра; подписи
         //    обрезаются с полной в подсказке — `btn_w`).
@@ -2755,21 +2794,22 @@ impl RdeApp {
                 update_document = true;
             }
         });
-        let row_b_w = ((total_w - 3.0 * 8.0) / 4.0).clamp(110.0, 200.0);
+        let row_b_columns = if FORMULA_NATIVE_UI { 4.0 } else { 2.0 };
+        let row_b_w = ((total_w - (row_b_columns - 1.0) * 8.0) / row_b_columns).clamp(110.0, 220.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            let native_label = if dialog.native_open { "Скрыть проф. редактор" } else { "Проф. редактор…" };
-            if btn_w(ui, Role::Secondary, Some(IC_CODE), native_label, row_b_w).clicked() {
-                toggle_native = true;
-            }
-            if dialog.native_open {
-                if btn_w(ui, Role::Ghost, None, "← Из редактора", row_b_w).clicked() {
+            // P5 (ADR-0021): кнопка нативного «проф. редактора» (клон MS Equations) убрана из UI —
+            // он портил формулы и не отвечал требованиям MathType; статус редактора — Phase 2.
+            if FORMULA_NATIVE_UI {
+                let native_label = if dialog.native_open { "Скрыть проф. редактор" } else { "Проф. редактор…" };
+                if btn_w(ui, Role::Secondary, Some(IC_CODE), native_label, row_b_w).clicked() {
+                    toggle_native = true;
+                }
+                if dialog.native_open && btn_w(ui, Role::Ghost, None, "← Из редактора", row_b_w).clicked() {
                     sync_native = true;
                 }
-            } else if btn_w(ui, Role::Ghost, Some(IC_ADD), "Новая формула", row_b_w).clicked() {
-                new_formula = true;
             }
-            if dialog.native_open && btn_w(ui, Role::Ghost, Some(IC_ADD), "Новая формула", row_b_w).clicked() {
+            if btn_w(ui, Role::Ghost, Some(IC_ADD), "Новая формула", row_b_w).clicked() {
                 new_formula = true;
             }
             if btn_w(ui, Role::Ghost, None, "Закрыть", row_b_w).clicked() {
@@ -2791,7 +2831,7 @@ impl RdeApp {
             self.open_formula_editor_new();
             return;
         }
-        if toggle_native {
+        if FORMULA_NATIVE_UI && toggle_native {
             if dialog.native_open {
                 // Забираем правку перед закрытием, чтобы не потерять ввод.
                 Self::sync_formula_from_native(&mut dialog);
@@ -2804,7 +2844,7 @@ impl RdeApp {
             }
             ui.ctx().request_repaint();
         }
-        if sync_native {
+        if FORMULA_NATIVE_UI && sync_native {
             let before = dialog.latex.clone();
             Self::sync_formula_from_native(&mut dialog);
             dialog.info = if dialog.latex == before {
@@ -2815,10 +2855,20 @@ impl RdeApp {
             dialog.error.clear();
         }
         if apply {
-            // Если открыт нативный редактор — берём актуальный LaTeX из него.
-            if dialog.native_open {
-                Self::sync_formula_from_native(&mut dialog);
+            // P5 (ADR-0021 §Решение 2): источник пишем из модели редактора — нормализуем
+            // непредставимые конструкции, затем проверяем roundtrip (LaTeX↔модель).
+            if let Some(editor) = dialog.math_editor.as_mut() {
+                match editor.prepare_source() {
+                    Ok(canonical) => dialog.latex = canonical,
+                    Err(error) => {
+                        dialog.error = format!("Формула не представима в LaTeX-источнике: {}", error.detail);
+                        dialog.info.clear();
+                        apply_blocked = true;
+                    }
+                }
             }
+        }
+        if apply && !apply_blocked {
             let was_new = dialog.formula_id.is_none();
             let result = match &dialog.formula_id {
                 Some(id) => {
@@ -2841,6 +2891,9 @@ impl RdeApp {
                         dialog.numbering_label = manifest.numbering.label.clone();
                     }
                     dialog.error.clear();
+                    if let Some(editor) = dialog.math_editor.as_mut() {
+                        editor.sync_applied(&dialog.latex, dialog.display);
+                    }
                     dialog.info = if reused {
                         "Такая формула уже есть в проекте — используется существующая".to_owned()
                     } else if was_new {
@@ -2885,6 +2938,10 @@ impl RdeApp {
     /// уживается с живым canvas документа в одном кадре (фиксированный egui-id/слои, ADR-0020 §3);
     /// пока оно открыто, документ в DocView показывается растровым предпросмотром.
     fn formula_native_window(&mut self, ctx: &egui::Context) {
+        // P5 (ADR-0021): окно проф. редактора выведено из UI вместе с порчей формул.
+        if !FORMULA_NATIVE_UI {
+            return;
+        }
         let Some(mut dialog) = self.formula_editor.take() else { return };
         if !dialog.native_open {
             self.formula_editor = Some(dialog);
@@ -3138,10 +3195,7 @@ impl RdeApp {
                 if let (Some(store), Some(doc_id)) = (self.store.as_mut(), doc_id) {
                     let _ = rde_doc::commit_document(&self.project.root, &package, &doc_id, store, "formula migrate");
                 }
-                self.doc = DocPreview::new(self.active_document_path());
-                self.structure_cache = None;
-                self.inserts_cache = None;
-                self.reload_project();
+                self.reload_document_view_preserving();
                 self.push_log(
                     Level::Ok,
                     format!(
@@ -3193,7 +3247,22 @@ impl RdeApp {
     }
 
     /// Данные панели инспектора формулы: живой статус, обратные ссылки, «формулы вне реестра».
-    fn formula_inspector_data(&self, formula_id: &str) -> FormulaInspectorData {
+    fn formula_inspector_data(&mut self, formula_id: &str) -> FormulaInspectorData {
+        // P5 (quick-win §5.2): без кэша функция вызывалась каждый кадр и стоила до 52 мс (debug);
+        // данные меняются только при изменении проекта/документа/ledger → эпоха + id.
+        if let Some((epoch, cached_id, cached)) = &self.formula_inspector_cache
+            && *epoch == self.data_epoch
+            && cached_id == formula_id
+        {
+            return cached.clone();
+        }
+        let data = self.compute_formula_inspector_data(formula_id);
+        self.formula_inspector_cache = Some((self.data_epoch, formula_id.to_owned(), data.clone()));
+        data
+    }
+
+    /// Расчёт данных инспектора формулы (дорогой путь: ledger + документы) — под кэшем выше.
+    fn compute_formula_inspector_data(&self, formula_id: &str) -> FormulaInspectorData {
         let store = self.store.as_ref();
         let renderer = rde_dag::FormulaRenderer { id: rde_doc::FORMULA_RENDERER_ID, version: rde_doc::FORMULA_RENDERER_VERSION };
         let status = store
@@ -3258,10 +3327,7 @@ impl RdeApp {
         match store.rollback(&candidate.txid) {
             Ok(_) => match rde_doc::restore_document_from_store(&self.project.root, &package, &doc_id, store) {
                 Ok(Some(_)) => {
-                    self.editor = None;
-                    self.doc = DocPreview::new(self.active_document_path());
-                    self.structure_cache = None;
-                    self.reload_project();
+                    self.reload_document_view_preserving();
                     self.push_log(Level::Ok, format!("Документ откачен к предыдущей версии (транзакция {})", candidate.txid.chars().take(10).collect::<String>()));
                 }
                 Ok(None) => self.push_log(Level::Warn, "Откат документа: в корнях нет версии документа"),
@@ -3332,8 +3398,7 @@ impl RdeApp {
                         outcome.restored.len()
                     ),
                 );
-                self.reload_project();
-                self.doc = DocPreview::new(self.active_document_path());
+                self.reload_document_view_preserving();
             }
             Ok(None) => self.push_log(Level::Info, "Откат артефактов: нет транзакций обновления"),
             Err(error) => self.push_log(Level::Warn, format!("Откат артефактов: {error}")),
@@ -3602,10 +3667,7 @@ impl RdeApp {
                     .iter()
                     .filter(|status| status.state == rde_doc::FormulaInsertState::Stale)
                     .count();
-                self.editor = None;
-                self.doc = DocPreview::new(self.active_document_path());
-                self.structure_cache = None;
-                self.reload_project();
+                self.reload_document_view_preserving();
                 self.push_log(
                     Level::Ok,
                     format!(
@@ -3728,6 +3790,9 @@ impl RdeApp {
         self.doc = DocPreview::new(Some(path));
         self.editor = None;
         self.editor_error = None;
+        // P5 (ADR-0021 §Решение 3): смена документа — осознанный сброс позиции предпросмотра.
+        self.preview_scroll_offset = 0.0;
+        self.preview_restore_offset = None;
         self.structure_cache = None;
         self.inserts_cache = None;
         self.comments_cache = None;
@@ -3744,6 +3809,9 @@ impl RdeApp {
     fn reload_project(&mut self) {
         match rde_core::load_project(&self.project.root) {
             Ok(project) => {
+                // P5: любые изменения проекта/документа/ledger проходят через reload_project —
+                // новая эпоха инвалидирует производные кэши (инспектор формулы, счётчики).
+                self.data_epoch = self.data_epoch.wrapping_add(1);
                 // Активный документ сохраняем, если он ещё существует (multi-doc); иначе — первый.
                 let active_exists = self
                     .doc
@@ -3771,6 +3839,9 @@ impl RdeApp {
                     self.editor_error = None;
                     self.inserts_cache = None;
                     self.comments_cache = None;
+                    // P5 (ADR-0021 §Решение 3): другой документ — позицию прежнего не переносим.
+                    self.preview_scroll_offset = 0.0;
+                    self.preview_restore_offset = None;
                 }
                 self.refresh_dag_statuses();
                 self.refresh_git_status();
@@ -4070,6 +4141,30 @@ impl RdeApp {
         }
     }
 
+    /// Демо/скриншоты (P5): панель формулы с WYSIWYG-редактором и готовой моделью.
+    /// `template` — id шаблона галереи, который сразу вставляется в модель (например, `mat.paren`);
+    /// `fill` — текст, набираемый после вставки (чтобы матрица была не пустой).
+    pub fn demo_formula_editor_with_model(&mut self, latex: &str, template: Option<&str>, fill: &str) {
+        self.open_formula_editor_new();
+        let Some(mut dialog) = self.formula_editor.take() else { return };
+        dialog.title = "Демонстрация редактора формул".to_owned();
+        let mut editor = rde_math_editor::widget::MathEditorUi::new(latex, dialog.display);
+        if let Some(template_id) = template {
+            editor.state.insert_template(template_id);
+            // Заполняем слоты по одному (Tab между вводами) — как пользователь палитрой.
+            for (index, ch) in fill.chars().enumerate() {
+                if index > 0 {
+                    editor.state.move_caret(rde_math_editor::edit::Move::NextSlot, false);
+                }
+                editor.state.type_text(&ch.to_string());
+            }
+        }
+        dialog.latex = editor.state.latex_source();
+        dialog.math_editor = Some(Box::new(editor));
+        self.formula_editor = Some(dialog);
+        self.show_formula_editor_context();
+    }
+
     /// Демо/скриншоты: панель формулы с открытым нативным редактором WordCraft (equation_tab).
     pub fn demo_open_formula_editor_native(&mut self) {
         let first = self.project.formulas().next().map(|formula| formula.id.clone());
@@ -4277,6 +4372,87 @@ impl RdeApp {
             }
         };
         self.push_log(msg.0, msg.1);
+    }
+
+    /// Снимок позиции документа (каретка, page_hint, offset предпросмотра) — перед пересборкой.
+    fn capture_document_view(&self) -> DocumentViewState {
+        let (selection, page_hint) = match self.editor.as_ref() {
+            Some(editor) => (Some(editor.app.session.sel.clone()), editor.app.session.page_hint),
+            None => (None, 0),
+        };
+        DocumentViewState { path: self.doc.path.clone(), selection, page_hint, preview_offset: self.preview_scroll_offset }
+    }
+
+    /// Восстановить позицию после пересборки пакета (P5, ADR-0021 §Решение 3).
+    ///
+    /// Редактор перезагружается **на месте** (`WordApp` не пересоздаётся): каретка/выделение и
+    /// страница остаются на месте, камера скролла — в том же `CanvasState`. Предпросмотр получает
+    /// одноразовый restore offset, чтобы не прыгать на первую страницу. Смена документа/проекта
+    /// позицию не переносит (осознанный сброс).
+    fn restore_document_view(&mut self, state: DocumentViewState) {
+        let same_path = state.path.is_some() && state.path == self.doc.path;
+        self.doc.invalidate();
+        if !same_path {
+            self.editor = None;
+            self.editor_error = None;
+            self.preview_restore_offset = None;
+            return;
+        }
+        if state.preview_offset > 0.0 {
+            self.preview_restore_offset = Some(state.preview_offset);
+        }
+        if let Some(selection) = state.selection
+            && self.editor.is_some()
+            && let Err(error) = self.reload_editor_in_place(selection, state.page_hint)
+        {
+            self.push_log(Level::Warn, format!("Документ пересобран: позиция редактора не сохранена ({error})"));
+            self.editor = None;
+            self.editor_error = None;
+        }
+    }
+
+    /// Перезагрузить документ в уже открытом редакторе «на месте», сохранив выбор и страницу
+    /// (P5, ADR-0021 §Решение 3): вместо `editor = None` + нового `WordApp` — замена документа в
+    /// существующей сессии (`set_document`), затем восстановление каретки/страницы и скролл к ней.
+    /// Undo-история при этом сбрасывается — документ пересобран из пакета (допустимо, ADR-0021).
+    fn reload_editor_in_place(&mut self, selection: wordcraft_engine::Selection, page_hint: usize) -> Result<(), String> {
+        let Some(doc_path) = self.doc.path.clone() else {
+            return Err("в проекте нет документа".to_owned());
+        };
+        let Some(editor) = self.editor.as_mut() else { return Ok(()) };
+        // Работаем на той же временной копии `.docx` (по её пути WordCraft разрешает связи OOXML).
+        let copy = editor.app.session.path.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("rde-embedded-doc-{}-0.docx", std::process::id()))
+        });
+        if rde_doc::is_rde_package(&doc_path) {
+            rde_doc::extract_docx(&doc_path, &copy)?;
+        } else {
+            let bytes = std::fs::read(&doc_path).map_err(|error| format!("чтение {}: {error}", doc_path.display()))?;
+            std::fs::write(&copy, bytes).map_err(|error| format!("запись {}: {error}", copy.display()))?;
+        }
+        let region = wordcraft_engine::Region::from_tag("ru-RU");
+        let (doc, _encrypted) = wordcraft_engine::io::open_path_in(&copy, None, &region)?;
+        let session = &mut editor.app.session;
+        session.set_document(doc);
+        session.path = Some(copy);
+        session.sel = selection;
+        session.page_hint = page_hint;
+        session.clamp_selection();
+        editor.pages = session.layout().pages.len();
+        // Камера скролла живёт в том же `CanvasState` и сохраняется; каретку при перепагинации
+        // прокручиваем в видимую область, чтобы вставка/обновление не «роняли» вид на первую.
+        editor.app.canvas.scroll_to_caret = true;
+        Ok(())
+    }
+
+    /// Пересобрать вид документа после изменения пакета «на месте» (вставка, «Обновить документ»,
+    /// «Обновить всё», rollback, миграция, оформление), сохранив каретку/страницу/скролл.
+    fn reload_document_view_preserving(&mut self) {
+        let state = self.capture_document_view();
+        self.structure_cache = None;
+        self.inserts_cache = None;
+        self.reload_project();
+        self.restore_document_view(state);
     }
 
     /// Лениво создать встроенный редактор WordCraft с тем же документом, что и предпросмотр.
@@ -6695,6 +6871,8 @@ impl RdeApp {
                 self.doc = DocPreview::new(self.active_document_path());
                 self.editor = None;
                 self.editor_error = None;
+                self.preview_scroll_offset = 0.0;
+                self.preview_restore_offset = None;
                 self.structure_cache = None;
                 self.pdf_cache = None;
                 self.comments_cache = None;
@@ -7213,11 +7391,7 @@ impl RdeApp {
                 match rde_core::restore_project(&self.project.root, &archive) {
                     Ok(count) => {
                         self.push_log(Level::Ok, format!("Проект восстановлен из {}: файлов {}", archive.display(), count));
-                        self.editor = None;
-                        self.doc = DocPreview::new(self.active_document_path());
-                        self.structure_cache = None;
-                        self.inserts_cache = None;
-                        self.reload_project();
+                        self.reload_document_view_preserving();
                     }
                     Err(error) => self.push_log(Level::Warn, format!("Восстановление проекта: {error}")),
                 }
@@ -9489,13 +9663,9 @@ impl RdeApp {
         }
         // Лента — только в режиме RDE (вкладка «Документ» + DocView): в WordCraft и предпросмотре её нет.
         if mode == DocMode::DocView {
-            let inserts_count = self
-                .project
-                .document_path()
-                .filter(|path| rde_doc::is_rde_package(path))
-                .and_then(|path| rde_doc::load_rde_doc(&path).ok())
-                .map(|doc| doc.inserts.len())
-                .unwrap_or(0);
+            // P5 (quick-win §5.2): счётчик вставок для ленты — из кэша по (путь, mtime, размер),
+            // а не `load_rde_doc` (распаковка .doc.rde) каждый кадр.
+            let inserts_count = self.document_inserts_count();
             if let Some(cmd) = self.ribbon_ui(ui, inserts_count) {
                 self.run_cmd(cmd);
             }
@@ -9643,10 +9813,15 @@ impl RdeApp {
             }
             DocState::Ready(doc) => {
                 let mut scroll = egui::ScrollArea::both().id_salt("rde_doc_scroll").auto_shrink([false, false]);
-                // Демо/скриншоты могут задать стартовый offset; в интерактивном режиме его НЕ
-                // форсируем каждый кадр — иначе ScrollArea сбрасывает колесо/перетаскивание
-                // ползунка обратно на `demo_preview_scroll` (по умолчанию 0) и скролл «не работает».
-                if self.demo_preview_scroll > 0.0 {
+                // P5 (ADR-0021 §Решение 3): после пересборки пакета возвращаем прежний offset ОДИН
+                // раз; иначе страницы на кадр исчезают, ScrollArea теряет позицию и документ
+                // «прыгает» на первую страницу (баг владельца B).
+                if let Some(offset) = self.preview_restore_offset.take() {
+                    scroll = scroll.vertical_scroll_offset(offset);
+                } else if self.demo_preview_scroll > 0.0 {
+                    // Демо/скриншоты могут задать стартовый offset; в интерактивном режиме его НЕ
+                    // форсируем каждый кадр — иначе ScrollArea сбрасывает колесо/перетаскивание
+                    // ползунка обратно на `demo_preview_scroll` (по умолчанию 0) и скролл «не работает».
                     scroll = scroll.vertical_scroll_offset(self.demo_preview_scroll);
                 }
                 let scroll_output = scroll.show(ui, |ui| {
@@ -9664,6 +9839,65 @@ impl RdeApp {
                 self.preview_scroll_offset = scroll_output.state.offset.y;
             }
         }
+    }
+
+    /// Число вставок активного документа с per-frame кэшем по (путь, mtime, размер пакета):
+    /// лента RDE спрашивает его каждый кадр, а `load_rde_doc` распаковывает zip (дорого).
+    fn document_inserts_count(&mut self) -> usize {
+        let Some(path) = self.project.document_path().filter(|path| rde_doc::is_rde_package(path)) else {
+            return 0;
+        };
+        let (mtime, len) = match fs::metadata(&path) {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos() as u64)
+                    .unwrap_or(0);
+                (mtime, meta.len())
+            }
+            Err(_) => (0, 0),
+        };
+        let key = path.display().to_string();
+        if let Some((cached_path, cached_mtime, cached_len, count)) = &self.inserts_count_cache
+            && cached_path == &key
+            && *cached_mtime == mtime
+            && *cached_len == len
+        {
+            return *count;
+        }
+        let count = rde_doc::load_rde_doc(&path).map(|doc| doc.inserts.len()).unwrap_or(0);
+        self.inserts_count_cache = Some((key, mtime, len, count));
+        count
+    }
+
+    /// Превью следующего номера формулы (ADR-0018) с кэшем по (путь, mtime, размер, схема):
+    /// `next_formula_number_text` распаковывает `.doc.rde`, а панель спрашивает номер каждый кадр.
+    fn next_formula_number_preview(&mut self) -> Option<String> {
+        let path = self.active_document_path().filter(|path| rde_doc::is_rde_package(path))?;
+        let scheme = self.document_formula_numbering();
+        let (mtime, len) = match fs::metadata(&path) {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos() as u64)
+                    .unwrap_or(0);
+                (mtime, meta.len())
+            }
+            Err(_) => (0, 0),
+        };
+        let key = format!("{}|{mtime}|{len}|{}", path.display(), scheme.as_str());
+        if let Some((cached_key, value)) = &self.formula_number_preview_cache
+            && cached_key == &key
+        {
+            return value.clone();
+        }
+        let value = rde_doc::next_formula_number_text(&path, scheme).map(|(number, _warnings)| number);
+        self.formula_number_preview_cache = Some((key, value.clone()));
+        value
     }
 
     /// Сообщение, если встроенный редактор не удалось открыть.
@@ -13900,6 +14134,351 @@ mod docview_tests {
             Some(&imported_pkg),
             "при старте открыт импортированный (свежий) документ"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Записать длинный `.docx` (n абзацев) движком WordCraft — для регресс-теста позиции (B, P5).
+    fn write_long_docx(path: &std::path::Path, paragraphs: usize) {
+        use wordcraft_engine::doc::{Block, CharProps, Document, Paragraph, StoryRef};
+        let mut doc = Document::default();
+        for index in 0..paragraphs {
+            let mut paragraph = Paragraph::new();
+            paragraph
+                .insert_text(
+                    0,
+                    &format!("Абзац {} — строка длинного документа для проверки пагинации и позиции каретки.", index + 1),
+                    &CharProps::default(),
+                )
+                .expect("текст абзаца");
+            doc.insert_block(StoryRef::Body, &wordcraft_engine::doc::Path::top(index), Block::Para(paragraph))
+                .expect("абзац в документ");
+        }
+        wordcraft_engine::io::save_path(path, &doc).expect("сохранить длинный .docx");
+    }
+
+    /// P5 (баг владельца B, ADR-0021 §Решение 3): «Обновить документ» на длинном документе
+    /// (≈250 страниц) НЕ сбрасывает каретку/страницу на первую — редактор перезагружается на месте.
+    #[test]
+    fn document_update_preserves_caret_on_long_document() {
+        let root = temp_demo_copy("scroll-preserve");
+        // Демо-документ заменяем длинным .docx; при сохранении он станет .doc.rde.
+        let project = rde_core::load_project(&root).unwrap();
+        let document = project.document_object().expect("документ демо").clone();
+        let dir = document.dir.clone();
+        write_long_docx(&dir.join("long.docx"), 4000);
+        let manifest = dir.join("document.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(&manifest, text.replace("file = \"report.doc.rde\"", "file = \"long.docx\"")).unwrap();
+        // Первый запуск: открыть длинный .docx и сохранить его силами RDE как .doc.rde.
+        {
+            let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+            app.ensure_editor();
+            assert!(app.editor.is_some(), "редактор длинного документа: {:?}", app.editor_error);
+            let pages = app.editor.as_ref().unwrap().pages;
+            assert!(pages >= 200, "длинный документ должен быть 200+ страниц, а не {pages}");
+            app.save_project_document();
+        }
+        // Второй запуск: активный документ — .doc.rde; каретка на 250-й странице, «Обновить документ».
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        assert_eq!(
+            app.doc.path.as_deref().and_then(|path| path.extension()).and_then(|ext| ext.to_str()),
+            Some("rde"),
+            "активный документ — .doc.rde: {:?}",
+            app.doc.path
+        );
+        app.ensure_editor();
+        assert!(app.editor.is_some(), "редактор пакета: {:?}", app.editor_error);
+        let pages = app.editor.as_ref().unwrap().pages;
+        assert!(pages >= 200, "пакет длинного документа: страниц {pages}");
+        let story = wordcraft_engine::doc::StoryRef::Body;
+        let paths: Vec<_> = app.editor.as_ref().unwrap().app.session.doc.para_paths(story);
+        assert!(paths.len() >= 4000, "абзацев в длинном документе: {}", paths.len());
+        // Каретка — в конце документа (страница ≈ 250) и page_hint «250».
+        let deep_path = paths[paths.len() - 20].clone();
+        // 10 — граница UTF-8 символа в кириллическом «Абзац …» (5 → попал бы внутрь char).
+        let deep = wordcraft_engine::doc::Pos::new(story, deep_path.clone(), 10);
+        {
+            let editor = app.editor.as_mut().expect("редактор");
+            editor.app.session.sel = wordcraft_engine::Selection::caret(deep.clone());
+            editor.app.session.page_hint = 250;
+        }
+        let before = app.capture_document_view();
+        assert_eq!(before.selection.as_ref().map(|selection| selection.focus.off), Some(10));
+        app.update_project_document();
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Документ обновлён")),
+            "Обновить документ не выполнилось: {:?}",
+            app.project.log.iter().map(|line| &line.text).collect::<Vec<_>>()
+        );
+        let after = app.capture_document_view();
+        let persisted = after.selection.expect("каретка сохранена после обновления");
+        assert_eq!(persisted.focus.story, deep.story);
+        assert_eq!(persisted.focus.path, deep.path, "каретка осталась в том же абзаце (не на первой странице)");
+        assert_eq!(persisted.focus.off, 10, "offset в абзаце сохранён");
+        assert!(persisted.focus.path.0.first().copied().unwrap_or(0) > 0, "каретка не в первом блоке документа");
+        let editor = app.editor.as_ref().expect("редактор не пересоздан с нуля");
+        assert_eq!(editor.pages, pages, "пагинация не изменилась");
+        assert_eq!(editor.app.session.page_hint, 250, "страница/камера сохранены");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P5 (баг владельца B, предпросмотр): «Обновить документ» в режиме «Предпросмотр страниц» не
+    /// сбрасывает прокрутку на первую страницу — restore-offset применяется один раз (ADR-0021).
+    #[test]
+    fn preview_keeps_scroll_offset_after_document_update() {
+        let root = temp_demo_copy("preview-preserve");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        app.tab = super::Tab::Document;
+        app.demo_set_doc_mode("preview");
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(20_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..6 {
+            harness.step();
+        }
+        harness.event(egui::Event::PointerMoved(egui::pos2(760.0, 520.0)));
+        harness.step();
+        for _ in 0..4 {
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -140.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        for _ in 0..4 {
+            harness.step();
+        }
+        let before = harness.state().preview_scroll_offset;
+        assert!(before > 1.0, "колесо прокрутило предпросмотр (offset {before})");
+        harness.state_mut().update_project_document();
+        for _ in 0..12 {
+            harness.step();
+        }
+        let after = harness.state().preview_scroll_offset;
+        assert!(
+            after > before * 0.5,
+            "прокрутка предпросмотра сохранена после обновления: было {before}, стало {after}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P5 (ADR-0021 §Решение 2, регресс инцидента A): мусор из `equation.get` нативного редактора
+    /// (после конвертации в линейный формат — `√`, `▒`) не записывается в источник формулы.
+    #[test]
+    fn corrupted_native_latex_is_rejected_by_panel_sync() {
+        let root = temp_demo_copy("formula-native-corruption");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        app.demo_open_formula_editor_native();
+        let source = app.formula_editor.as_ref().expect("панель формулы").latex.clone();
+        assert!(!source.trim().is_empty(), "исходный LaTeX демо-формулы");
+        {
+            let dialog = app.formula_editor.as_mut().expect("панель формулы");
+            let native = dialog.native.as_mut().expect("scratch-редактор");
+            // Ровно то, что ломало источник: Equation › Convert → Linear (мусор `√(…)▒…`).
+            native.app.run("equation.convert", serde_json::json!({ "to": "linear" })).expect("convert linear");
+        }
+        let dialog = app.formula_editor.as_mut().expect("панель формулы");
+        super::RdeApp::sync_formula_from_native(dialog);
+        let dialog = app.formula_editor.as_ref().expect("панель формулы");
+        assert_eq!(dialog.latex, source, "испорченный LaTeX не попал в источник истины");
+        assert!(dialog.error.contains("отклонён"), "ошибка валидации видна в панели: {:?}", dialog.error);
+        assert!(rde_doc::forbidden_char(&source).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P5 (ADR-0021, инцидент D): нативный «проф. редактор» (клон Microsoft Equations) убран из UI —
+    /// на вкладке «Формула» остаётся только LaTeX-редактор и его действия.
+    #[test]
+    fn formula_panel_hides_removed_native_professional_editor() {
+        use egui_kittest::kittest::Queryable;
+        let root = temp_demo_copy("formula-no-native");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        app.open_formula_editor_new();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..3 {
+            harness.step();
+        }
+        assert!(harness.query_by_label_contains("LaTeX-источник").is_some(), "LaTeX-поле редактора");
+        assert!(harness.query_by_label_contains("Проф. редактор").is_none(), "нативный «проф. редактор» выведен из UI");
+        assert!(harness.query_by_label_contains("Забрать LaTeX").is_none(), "автосинк нативного редактора выведен");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P5 (quick-win перф, §5.2 ТЗ): замер per-frame стоимостей UI на реальных данных.
+    /// Ручной запуск: `cargo test -p rde-ui --lib perf_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore = "замеры перфа: ручной запуск -- --ignored --nocapture"]
+    fn perf_smoke_measure_frame_costs() {
+        use std::time::Instant;
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let root = temp_demo_copy("perf-smoke");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        app.tab = super::Tab::Document;
+        app.doc_mode = super::DocMode::DocView;
+        app.ensure_editor();
+        assert!(app.editor.is_some(), "{:?}", app.editor_error);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(20_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..6 {
+            harness.step();
+        }
+        let n = 60u32;
+        let t = Instant::now();
+        for _ in 0..n {
+            harness.step();
+        }
+        println!("PERF docview frame ({}): {:?}/кадр", profile, t.elapsed() / n);
+        // Панель формулы открыта — formula_inspector_data/предпросмотр каждый кадр.
+        harness.state_mut().open_formula_editor_new();
+        for _ in 0..4 {
+            harness.step();
+        }
+        let t = Instant::now();
+        for _ in 0..n {
+            harness.step();
+        }
+        println!("PERF formula-panel frame ({}): {:?}/кадр", profile, t.elapsed() / n);
+        // Стоимость чистых вызовов «тяжёлых» функций.
+        let formula_id = harness.state().project.formulas().next().map(|formula| formula.id.clone()).expect("формула демо");
+        let t = Instant::now();
+        let calls = 20u32;
+        for _ in 0..calls {
+            let _ = harness.state_mut().formula_inspector_data(&formula_id);
+        }
+        println!("PERF formula_inspector_data (демо): {:?}/вызов", t.elapsed() / calls);
+        let package = harness.state().project.document_path().expect("документ");
+        let t = Instant::now();
+        for _ in 0..calls {
+            let _ = rde_doc::load_rde_doc(&package).expect("пакет");
+        }
+        println!("PERF load_rde_doc (демо): {:?}/вызов", t.elapsed() / calls);
+        // Реальный проект: 62 MathType-формулы, 24+ страниц.
+        let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache-tmp/import-v0003/final-e2e");
+        if let Ok(project) = rde_core::load_project(&real) {
+            let mut real_app = RdeApp::new(project);
+            real_app.ensure_editor();
+            let formula_id = real_app.project.formulas().next().map(|formula| formula.id.clone()).expect("формула реального проекта");
+            let t = Instant::now();
+            for _ in 0..calls {
+                let _ = real_app.formula_inspector_data(&formula_id);
+            }
+            println!("PERF formula_inspector_data (final-e2e, 62 формулы): {:?}/вызов", t.elapsed() / calls);
+            let package = real_app.project.document_path().expect("документ final-e2e");
+            let t = Instant::now();
+            for _ in 0..calls {
+                let _ = rde_doc::load_rde_doc(&package).expect("пакет final-e2e");
+            }
+            println!("PERF load_rde_doc (final-e2e): {:?}/вызов", t.elapsed() / calls);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P5 (ADR-0021 Phase 2): WYSIWYG-редактор формулы в панели вкладки «Формула» —
+    /// структурный ввод (дробь через палитру/модель), LaTeX синхронизируется с моделью,
+    /// «Создать» записывает канонический источник и пересчитывает кэши.
+    #[test]
+    fn formula_wysiwyg_editor_edits_model_and_creates_formula() {
+        use egui_kittest::kittest::Queryable;
+        let root = temp_demo_copy("formula-wysiwyg");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        app.open_formula_editor_new();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..3 {
+            harness.step();
+        }
+        assert!(harness.query_by_label_contains("РЕДАКТОР ФОРМУЛЫ").is_some(), "WYSIWYG-редактор в панели «Формула»");
+        // Структурный ввод через модель (палитры/клавиатуру дергает виджет; здесь — модель):
+        // дробь + числитель/знаменатель.
+        {
+            let editor = harness
+                .state_mut()
+                .formula_editor
+                .as_mut()
+                .and_then(|dialog| dialog.math_editor.as_mut())
+                .expect("WYSIWYG-редактор инициализирован");
+            editor.state.insert_template("frac.stacked");
+            editor.state.type_text("1");
+            editor.state.move_caret(rde_math_editor::edit::Move::NextSlot, false);
+            editor.state.type_text("2");
+        }
+        harness.step();
+        let dialog = harness.state().formula_editor.as_ref().expect("панель формулы");
+        assert!(dialog.latex.contains("\\frac"), "модель → LaTeX-источник: {}", dialog.latex);
+        // «Создать» пишет формулу с кэшами (OMML/SVG/PNG) — тот же конвейер ADR-0020.
+        if let Some(dialog) = harness.state_mut().formula_editor.as_mut() {
+            dialog.title = "Проверка WYSIWYG".to_owned();
+        }
+        harness.step();
+        let create = {
+            use egui_kittest::kittest::{NodeT, Queryable};
+            harness
+                .query_all_by_label_contains("Создать")
+                .find(|node| node.accesskit_node().role() == egui::accesskit::Role::Button)
+                .expect("кнопка «Создать»")
+        };
+        create.click();
+        for _ in 0..4 {
+            harness.step();
+        }
+        let dialog = harness.state().formula_editor.as_ref().expect("панель формулы после создания");
+        let formula_id = dialog.formula_id.clone().unwrap_or_else(|| {
+            panic!(
+                "формула создана: latex={:?}, error={:?}, info={:?}, log={:?}",
+                dialog.latex,
+                dialog.error,
+                dialog.info,
+                harness.state().project.log.iter().map(|line| &line.text).collect::<Vec<_>>()
+            )
+        });
+        let object = harness.state().project.formula_object(&formula_id).expect("объект формулы").clone();
+        let rde_core::ObjectData::Formula(manifest) = &object.data else { panic!("не формула") };
+        assert!(manifest.latex.contains("\\frac"), "источник записан: {}", manifest.latex);
+        assert!(object.dir.join("formula.toml").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P5: правка модели в WYSIWYG-редакторе обновляет поле LaTeX-источника (LaTeX — витрина
+    /// модели), а источник остаётся представитьмым (roundtrip-валидация проходит).
+    #[test]
+    fn formula_wysiwyg_model_syncs_latex_field() {
+        let root = temp_demo_copy("formula-wysiwyg-sync");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let formula_id = app.project.formulas().next().expect("формула демо").id.clone();
+        app.open_formula_editor(&formula_id);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..3 {
+            harness.step();
+        }
+        let before = harness.state().formula_editor.as_ref().expect("панель").latex.clone();
+        {
+            let editor = harness
+                .state_mut()
+                .formula_editor
+                .as_mut()
+                .and_then(|dialog| dialog.math_editor.as_mut())
+                .expect("редактор");
+            // Вставка в конец существующей σ-формулы: модель меняется, LaTeX пересобирается.
+            editor.state.type_text("+x");
+            assert!(editor.prepare_source().is_ok(), "модель представима: {:?}", editor.state.validate().err());
+        }
+        harness.step();
+        let after = harness.state().formula_editor.as_ref().expect("панель").latex.clone();
+        assert_ne!(before, after, "LaTeX-поле обновилось из модели");
+        assert!(after.contains("+x"), "{after}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

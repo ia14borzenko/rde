@@ -1,0 +1,16 @@
+[package]
+name = "rde-math-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P5 (ADR-0021): нативный WYSIWYG-редактор формул RDE — модель/кодек LaTeX/вёрстка/виджет (WordCraft math engine + MathType-подобный UI)"
+
+[dependencies]
+egui = { workspace = true }
+wordcraft-engine = { workspace = true }
+# Регистрация math-шрифта STIX (ADR-0018) для собственных тестов/рендера.
+rde-doc = { workspace = true }
+
+[dev-dependencies]
+# Корпус формул проекта (формулы MathType-импорта) для roundtrip-тестов — только чтение путей.
+toml = { workspace = true }

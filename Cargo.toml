@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/rde", "crates/rde-agent", "crates/rde-core", "crates/rde-dag", "crates/rde-doc", "crates/rde-docx", "crates/rde-env", "crates/rde-hash", "crates/rde-host", "crates/rde-mcp", "crates/rde-run", "crates/rde-sources", "crates/rde-store", "crates/rde-templates", "crates/rde-ui", "crates/rde-vcs", "xtask"]
+members = ["apps/rde", "crates/rde-agent", "crates/rde-core", "crates/rde-dag", "crates/rde-doc", "crates/rde-docx", "crates/rde-env", "crates/rde-hash", "crates/rde-host", "crates/rde-math-editor", "crates/rde-mcp", "crates/rde-run", "crates/rde-sources", "crates/rde-store", "crates/rde-templates", "crates/rde-ui", "crates/rde-vcs", "xtask"]
 # WordCraft vendored as a submodule keeps its own Cargo workspace (workspace-inherited
 # dependencies like `chrono = { workspace = true }`); the outer workspace must not
 # claim it, or those fields would inherit from RDE's manifest.
@@ -59,6 +59,7 @@ eframe = { version = "0.36.2", default-features = false, features = [
 rde-core = { path = "crates/rde-core" }
 rde-dag = { path = "crates/rde-dag" }
 rde-doc = { path = "crates/rde-doc" }
+rde-math-editor = { path = "crates/rde-math-editor" }
 rde-docx = { path = "crates/rde-docx" }
 rde-templates = { path = "crates/rde-templates" }
 rde-vcs = { path = "crates/rde-vcs" }
