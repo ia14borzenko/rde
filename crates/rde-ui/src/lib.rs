@@ -697,6 +697,21 @@ impl InsertDialogState {
     }
 }
 
+/// Диалог «Принять формулы как объекты» (ADR-0019): счётчики display/inline/номеров и политика
+/// нумерации (схема документа, сохранять ли номера Word, нумеровать ли display-формулы).
+#[derive(Clone, Debug)]
+struct FormulaMigrationDialogState {
+    equations: Vec<rde_doc::UnregisteredFormula>,
+    display: usize,
+    inline: usize,
+    found_numbers: usize,
+    mixed: usize,
+    scheme: rde_doc::FormulaNumbering,
+    preserve_numbers: bool,
+    number_display: bool,
+    error: String,
+}
+
 /// Результат фонового обновления (возвращается из потока вместе с хранилищем).
 struct UpdateJobResult {
     store: Option<Store>,
@@ -784,6 +799,8 @@ pub struct RdeApp {
     update_job: Option<UpdateJob>,
     /// Диалог вставки значения/рисунка из артефакта.
     insert_dialog: Option<InsertDialogState>,
+    /// Диалог «Принять формулы как объекты» (ADR-0005 §7, ADR-0019): политика номеров.
+    formula_migration_dialog: Option<FormulaMigrationDialogState>,
     /// Состояние git-репозитория проекта (P5, R-VCS-01).
     git_status: Option<rde_vcs::GitStatus>,
     /// Диалог коммита: текст сообщения.
@@ -973,6 +990,7 @@ impl RdeApp {
             trust_dialog: None,
             update_job: None,
             insert_dialog: None,
+            formula_migration_dialog: None,
             git_status: None,
             commit_dialog: None,
             history_dialog: None,
@@ -2075,7 +2093,10 @@ impl RdeApp {
 
     /// «Принять формулы как объекты» (P3, ADR-0005 §7): OMML вне реестра → project-level формулы +
     /// вставки-ссылки. Явная команда; при открытии документа ничего не меняется. Идемпотентна.
-    pub fn migrate_document_formulas(&mut self) {
+    ///
+    /// Открывает диалог со счётчиками display/inline/найденных номеров и политикой нумерации
+    /// (ADR-0019): сохранение номеров Word или перенумерация по схеме документа.
+    pub fn open_formula_migration_dialog(&mut self) {
         let Some(package) = self.active_document_path() else {
             self.push_log(Level::Warn, "Миграция формул: в проекте нет документа");
             return;
@@ -2099,9 +2120,59 @@ impl RdeApp {
             self.push_log(Level::Info, "Миграция формул: формул вне реестра нет");
             return;
         }
+        let display = equations.iter().filter(|equation| equation.display).count();
+        let inline = equations.len().saturating_sub(display);
+        let found_numbers = equations.iter().filter(|equation| equation.display && equation.number_text.is_some()).count();
+        let mixed = equations.iter().filter(|equation| equation.display && equation.mixed).count();
+        // «Сохранять номера Word» по умолчанию — только если они есть у всех display-формул и
+        // нет смешанных абзацев (частичное сохранение потеряло бы номера остальных).
+        let preserve_numbers = display > 0 && found_numbers == display && mixed == 0;
+        let scheme = self.document_formula_numbering();
+        self.formula_migration_dialog = Some(FormulaMigrationDialogState {
+            equations,
+            display,
+            inline,
+            found_numbers,
+            mixed,
+            scheme,
+            preserve_numbers,
+            number_display: true,
+            error: String::new(),
+        });
+    }
+
+    /// Применить миграцию формул с политикой номеров (из диалога/теста). После миграции сразу
+    /// пересобирает тела вставок и перекрёстные ссылки — отдельное «Обновить документ» не нужно.
+    fn apply_formula_migration(&mut self, options: rde_doc::FormulaMigrationOptions) {
+        let Some(package) = self.active_document_path() else {
+            self.push_log(Level::Warn, "Миграция формул: в проекте нет документа");
+            return;
+        };
+        if !rde_doc::is_rde_package(&package) {
+            self.push_log(Level::Warn, "Миграция формул: документ ещё не в .doc.rde");
+            return;
+        }
+        if self.store.is_none() {
+            self.push_log(Level::Warn, "Миграция формул: хранилище проекта не открыто");
+            return;
+        }
+        let equations = self
+            .formula_migration_dialog
+            .as_ref()
+            .map(|dialog| dialog.equations.clone())
+            .unwrap_or_default();
+        // Диалог закрывается по факту применения (в т.ч. при ошибке ниже).
+        self.formula_migration_dialog = None;
+        if equations.is_empty() {
+            self.push_log(Level::Info, "Миграция формул: формул вне реестра нет");
+            return;
+        }
         let renderer = rde_dag::FormulaRenderer { id: rde_doc::FORMULA_RENDERER_ID, version: rde_doc::FORMULA_RENDERER_VERSION };
         let mut plans: Vec<rde_doc::FormulaMigrationPlan> = Vec::new();
         let mut created = 0usize;
+        // (formula_id, display, numbered) в порядке планов — для сборки тел после миграции.
+        let mut states: Vec<(String, bool, bool)> = Vec::new();
+        let mut prepared_states: Vec<(String, rde_dag::FormulaState)> = Vec::new();
         for equation in &equations {
             // Та же формула (по LaTeX) уже может быть объектом проекта — не дублируем.
             let existing = self
@@ -2113,7 +2184,9 @@ impl RdeApp {
                 Some(id) => id,
                 None => {
                     let title: String = equation.latex.chars().take(40).collect();
-                    match rde_core::create_formula(&self.project.root, &title, &equation.latex) {
+                    // display-флаг формулы — из фактического вхождения (ADR-0019): inline-формулы
+                    // проекта не должны по умолчанию считаться display.
+                    match rde_core::create_formula_with_display(&self.project.root, &title, &equation.latex, equation.display) {
                         Ok(dir) => {
                             created += 1;
                             self.reload_project();
@@ -2141,13 +2214,12 @@ impl RdeApp {
                 }
             };
             // Кэши и состояние формулы — отдельной транзакцией (формула нужна вставке как цель).
-            if let Some(store) = self.store.as_mut() {
-                if let Err(error) =
+            if let Some(store) = self.store.as_mut()
+                && let Err(error) =
                     rde_dag::commit_formula_update(store, &prepared.state, prepared.cache_tree, &format!("formula migrate: {formula_id}"))
-                {
-                    self.push_log(Level::Warn, format!("Миграция формул: {error}"));
-                    return;
-                }
+            {
+                self.push_log(Level::Warn, format!("Миграция формул: {error}"));
+                return;
             }
             let _ = rde_dag::record_prepared_formula_state(&self.project, &prepared);
             let omml = {
@@ -2158,6 +2230,9 @@ impl RdeApp {
                     .and_then(|hash| store.get_blob(hash).ok().flatten())
                     .unwrap_or_default()
             };
+            // Номер получит только block-формула (display без текста вокруг), а не смешанная.
+            states.push((formula_id.clone(), equation.display, equation.display && !equation.mixed));
+            prepared_states.push((formula_id.clone(), prepared.state.clone()));
             plans.push(rde_doc::FormulaMigrationPlan {
                 formula_id,
                 act_key: prepared.state.act_key.clone(),
@@ -2165,8 +2240,32 @@ impl RdeApp {
                 omml,
             });
         }
-        match rde_doc::migrate_formulas(&package, &plans) {
+        match rde_doc::migrate_formulas_with(&package, &plans, options) {
             Ok(report) => {
+                // Сразу после миграции: тела вставок из кэшей + текст перекрёстных ссылок.
+                let mut bodies: BTreeMap<String, rde_doc::FormulaBody> = BTreeMap::new();
+                if let Some(store) = self.store.as_ref() {
+                    for (formula_id, display, _numbered) in &states {
+                        if let Some((_, state)) = prepared_states.iter().find(|(id, _)| id == formula_id)
+                            && let Ok(body) = formula_body_from_state(store, formula_id, state, *display)
+                        {
+                            bodies.insert(formula_id.clone(), body);
+                        }
+                    }
+                }
+                match rde_doc::update_formula_inserts_with(&package, &bodies, options.numbering) {
+                    Ok(update) => {
+                        for warning in &update.warnings {
+                            self.push_log(Level::Warn, format!("Нумерация формул: {warning}"));
+                        }
+                    }
+                    Err(error) => self.push_log(Level::Warn, format!("Обновление формул после миграции: {error}")),
+                }
+                if let Ok(refresh) = rde_doc::refresh_formula_crossrefs(&package) {
+                    for warning in &refresh.warnings {
+                        self.push_log(Level::Warn, format!("Ссылки на формулы: {warning}"));
+                    }
+                }
                 let doc_id = self.active_document_object().and_then(|object| match &object.data {
                     ObjectData::Document(manifest) => Some(manifest.id.clone()),
                     _ => None,
@@ -2181,13 +2280,19 @@ impl RdeApp {
                 self.push_log(
                     Level::Ok,
                     format!(
-                        "Миграция формул: объектов создано {created}, вставок {} (таблиц {} · абзацев {} · inline {}); запустите «Обновить документ» для проверки статусов",
+                        "Принято формул {} (display {}, inline {}): объектов создано {}, номеров сохранено из Word {}, назначено {}, схема «{}»; пунктуация после формул сохранена",
                         report.insert_ids.len(),
-                        report.replaced_tables,
-                        report.replaced_blocks,
-                        report.replaced_inline
+                        report.display,
+                        report.inline,
+                        created,
+                        report.numbers_preserved,
+                        report.numbers_assigned,
+                        formula_numbering_label(report.numbering)
                     ),
                 );
+                for warning in &report.warnings {
+                    self.push_log(Level::Warn, format!("Миграция формул: {warning}"));
+                }
             }
             Err(error) => self.push_log(Level::Warn, format!("Миграция формул: {error}")),
         }
@@ -3048,6 +3153,11 @@ impl RdeApp {
         self.open_insert_dialog(kind);
     }
 
+    /// Демо/скриншоты: диалог «Принять формулы как объекты» (ADR-0019).
+    pub fn demo_open_formula_migration_dialog(&mut self) {
+        self.open_formula_migration_dialog();
+    }
+
     // ── GUI-02: демо/скриншоты диалогов путей и «Проводника…» (ADR-0017) ────
 
     /// Демо: «Открыть проект» с заданным путём (по умолчанию — текущий проект).
@@ -3662,7 +3772,7 @@ impl RdeApp {
             Cmd::InsertCitation => self.open_insert_dialog("citation"),
             Cmd::InsertDate => self.open_insert_dialog("date"),
             Cmd::InsertFormula => self.open_insert_dialog("formula"),
-            Cmd::MigrateFormulas => self.migrate_document_formulas(),
+            Cmd::MigrateFormulas => self.open_formula_migration_dialog(),
             Cmd::ApplyGost => self.update_document_package(true, true),
             Cmd::InsertBibliography => self.update_document_package(false, true),
             Cmd::Zoom100 => self.run_editor_action("view.zoom100"),
@@ -4961,10 +5071,17 @@ impl RdeApp {
                                     .map(|number| format!(" ({number})"))
                                     .unwrap_or_default();
                                 let stale = if link.stale { " · устарела" } else { "" };
+                                // ADR-0019: источник номера — из Word / вручную / не нумеруется.
+                                let source = match link.number_source.as_str() {
+                                    "word" => " · номер из Word",
+                                    "manual" => " · номер вручную",
+                                    "off" => " · не нумеруется",
+                                    _ => "",
+                                };
                                 ui.label(
                                     RichText::new(format!(
-                                        "{} · {}{} · {}{}",
-                                        link.document_title, link.insert_id, number, mode, stale
+                                        "{} · {}{} · {}{}{}",
+                                        link.document_title, link.insert_id, number, mode, source, stale
                                     ))
                                     .small()
                                     .color(if link.stale { pal.amber } else { pal.text }),
@@ -5154,7 +5271,7 @@ impl RdeApp {
                 self.import_review_from_exports();
             }
             if migrate_formulas_clicked {
-                self.migrate_document_formulas();
+                self.open_formula_migration_dialog();
             }
             if let Some(scheme) = numbering_change {
                 match self.apply_document_formula_numbering(&object.dir, scheme) {
@@ -6363,6 +6480,110 @@ impl RdeApp {
             }
             if !closed {
                 self.import_docx_dialog = Some(dialog);
+            }
+        }
+
+        // ── «Принять формулы как объекты»: счётчики и политика номеров (ADR-0019) ────
+        if let Some(mut dialog) = self.formula_migration_dialog.take() {
+            let mut apply = false;
+            let mut cancel = false;
+            let mut closed = false;
+            let mut scheme_choice: Option<rde_doc::FormulaNumbering> = None;
+            egui::Window::new("Принять формулы как объекты")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.set_width(640.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Формул вне реестра: {} (display {} · inline {})",
+                            dialog.equations.len(),
+                            dialog.display,
+                            dialog.inline
+                        ))
+                        .color(pal.text),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "Номеров, найденных в Word: {} из {} display-формул",
+                            dialog.found_numbers, dialog.display
+                        ))
+                        .small()
+                        .color(if dialog.display > 0 && dialog.found_numbers == dialog.display { pal.green } else { pal.muted }),
+                    );
+                    if dialog.mixed > 0 {
+                        ui.label(
+                            RichText::new(format!(
+                                "display-формул в смешанных абзацах/таблицах: {} — останутся inline, номер не назначается",
+                                dialog.mixed
+                            ))
+                            .small()
+                            .color(pal.amber),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Схема нумерации").small().color(pal.muted));
+                        egui::ComboBox::from_id_salt("rde_formula_migration_scheme")
+                            .selected_text(formula_numbering_label(dialog.scheme))
+                            .show_ui(ui, |ui| {
+                                for scheme in [rde_doc::FormulaNumbering::Continuous, rde_doc::FormulaNumbering::Section] {
+                                    if ui.selectable_label(dialog.scheme == scheme, formula_numbering_label(scheme)).clicked() {
+                                        scheme_choice = Some(scheme);
+                                    }
+                                }
+                            });
+                    });
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut dialog.preserve_numbers, "Сохранять существующие номера из Word");
+                    if dialog.found_numbers == 0 {
+                        ui.label(
+                            RichText::new("номеров в Word не найдено — будут назначены по схеме документа")
+                                .small()
+                                .color(pal.muted),
+                        );
+                    }
+                    ui.checkbox(&mut dialog.number_display, "Нумеровать display-формулы (номер справа)");
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Формулы станут объектами проекта, display — block-абзацами с номером справа; inline-формулы не тронуты. Пунктуация после формул сохраняется.",
+                        )
+                        .small()
+                        .color(pal.muted),
+                    );
+                    if !dialog.error.is_empty() {
+                        ui.label(RichText::new(&dialog.error).small().color(pal.red));
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("Принять").min_size(vec2(96.0, 24.0))).clicked() {
+                            apply = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    ui.label(RichText::new("Enter — принять · Esc — отмена").small().color(pal.muted));
+                });
+            if let Some(scheme) = scheme_choice {
+                dialog.scheme = scheme;
+            }
+            if cancel || dialog_escape_pressed(ctx) {
+                closed = true;
+            } else if apply || dialog_confirm_pressed(ctx) {
+                let options = rde_doc::FormulaMigrationOptions {
+                    numbering: dialog.scheme,
+                    preserve_word_numbers: dialog.preserve_numbers,
+                    number_display: dialog.number_display,
+                };
+                self.formula_migration_dialog = Some(dialog.clone());
+                self.apply_formula_migration(options);
+                closed = true;
+            }
+            if !closed {
+                self.formula_migration_dialog = Some(dialog);
             }
         }
 
@@ -13462,6 +13683,89 @@ mod gui_path_tests {
             .filter_map(|insert| insert.number_text.clone().or_else(|| insert.number.map(|number| number.to_string())))
             .collect();
         assert_eq!(numbers, vec!["1".to_owned(), "2".to_owned()], "сквозная нумерация: {numbers:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── ADR-0019: миграция MathType-формул — диалог и немедленная нумерация ─────
+
+    /// Диалог «Принять формулы как объекты»: счётчики display/inline/найденных номеров, схема,
+    /// опции сохранения; в демо-проект добавляем формулу вне реестра (legacy таблица 1×2, номер (1)).
+    #[test]
+    fn formula_migration_dialog_shows_counts_and_renders() {
+        use egui_kittest::kittest::Queryable;
+        let root = numbering_demo_copy("formula-migration-dialog");
+        let package = rde_core::load_project(&root).unwrap().document_path().unwrap();
+        rde_doc::insert_equation(&package, "\\sigma=\\frac{F}{A}", Some(1)).unwrap();
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        app.set_recent_projects_file(None);
+        app.open_formula_migration_dialog();
+        let dialog = app.formula_migration_dialog.as_ref().expect("диалог миграции формул");
+        assert_eq!(dialog.display, 1, "одна display-формула вне реестра");
+        assert_eq!(dialog.inline, 0);
+        assert_eq!(dialog.found_numbers, 1, "номер (1) из legacy-таблицы распознан");
+        assert!(dialog.preserve_numbers, "номер найден — по умолчанию сохраняем");
+        assert_eq!(dialog.scheme, rde_doc::FormulaNumbering::Continuous);
+        // Диалог рисуется (egui_kittest): счётчики, схема и опции доступны в дереве.
+        let harness = render(app);
+        assert!(
+            harness.query_all_by_label_contains("Принять формулы как объекты").next().is_some(),
+            "заголовок диалога миграции"
+        );
+        assert!(
+            harness.query_all_by_label_contains("Формул вне реестра: 1").next().is_some(),
+            "счётчики формул в диалоге"
+        );
+        assert!(
+            harness.query_all_by_label_contains("Сохранять существующие номера").next().is_some(),
+            "опция сохранения номеров из Word"
+        );
+        assert!(
+            harness.query_all_by_label_contains("Нумеровать display-формулы").next().is_some(),
+            "опция нумерации display-формул"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// «Принять формулы как объекты»: миграция сразу ставит номер (не требуя отдельного
+    /// «Обновить документ»), display-формула становится block-вставкой, номер из Word сохранён.
+    #[test]
+    fn formula_migration_applies_numbered_display_block() {
+        let root = numbering_demo_copy("formula-migration-apply");
+        let package = rde_core::load_project(&root).unwrap().document_path().unwrap();
+        rde_doc::insert_equation(&package, "\\sigma=\\frac{F}{A}", Some(1)).unwrap();
+        let before = std::fs::read(&package).unwrap();
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        app.set_recent_projects_file(None);
+        app.open_formula_migration_dialog();
+        let dialog = app.formula_migration_dialog.take().expect("диалог миграции");
+        let options = rde_doc::FormulaMigrationOptions {
+            numbering: dialog.scheme,
+            preserve_word_numbers: dialog.preserve_numbers,
+            number_display: dialog.number_display,
+        };
+        app.formula_migration_dialog = Some(dialog);
+        app.apply_formula_migration(options);
+        let text = logs(&app);
+        assert!(text.contains("Принято формул 1"), "журнал миграции: {text}");
+        assert!(
+            text.contains("номеров сохранено из Word 1"),
+            "журнал: номер сохранён из Word: {text}"
+        );
+        assert_ne!(before, std::fs::read(&package).unwrap(), "документ изменён миграцией");
+        let doc = rde_doc::load_rde_doc(&package).unwrap();
+        let migrated: Vec<_> = doc
+            .inserts
+            .iter()
+            .filter(|insert| insert.kind == "formula" && insert.number_source == rde_doc::NUMBER_SOURCE_WORD)
+            .collect();
+        assert_eq!(migrated.len(), 1, "мигрированная вставка с номером из Word: {:?}", doc.inserts);
+        assert_eq!(migrated[0].number_text.as_deref(), Some("1"), "номер сохранён из Word");
+        let target = rde_doc::parse_formula_target(&migrated[0].target).expect("цель вставки — формула");
+        assert!(!target.formula_id.is_empty(), "target ссылается на формулу проекта");
+        assert!(target.act_key.is_some(), "target несёт act_key");
+        // Повторное открытие диалога: формул вне реестра уже нет (идемпотентность).
+        app.open_formula_migration_dialog();
+        assert!(app.formula_migration_dialog.is_none(), "после миграции формул вне реестра нет; журнал: {}", logs(&app));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -39,6 +39,8 @@ fn main() {
         Some("insert-constant") => state.demo_open_insert_dialog("constant"),
         Some("insert-crossref") => state.demo_open_insert_dialog("crossref"),
         Some("insert-formula") => state.demo_open_insert_dialog("formula"),
+        // ADR-0019: диалог «Принять формулы как объекты» (счётчики/схема/политика номеров).
+        Some("formula-migration-dialog") => state.demo_open_formula_migration_dialog(),
         Some("formula-inspector") => {
             // P3: служебные объекты включены в дереве, выбран объект формулы — инспектор с
             // живым статусом и «где вставлено» (R-DOC-19); центр — вкладка «Документ».
