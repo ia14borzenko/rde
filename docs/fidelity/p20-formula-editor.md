@@ -9,6 +9,12 @@
 | Тесты | workspace **590 passed / 0 failed** (было 582; +8); новые `formula_editor_*` (4) + `rde-core` `formula_write_tests` (4) |
 | Скриншоты | `gui-p20-formula-create.png`, `gui-p20-formula-editor.png`, `gui-p20-formula-native.png`, `gui-p20-formula-inspector.png`, `gui-p20-formula-insert-numbered.png` |
 
+> **Уточнение (2026-10-29, итерация `formula-tab`):** по итогам приёмки панель редактора переехала
+> с плавающего окна на **вкладку ленты «Формула»**, клик по формуле в тексте открывает её
+> автоматически, и починен скролл предпросмотра страниц. Скриншоты этой страницы показывают первую
+> (оконную) версию панели; актуальные — в отчёте
+> [`p21-formula-tab.md`](p21-formula-tab.md) (`docs/fidelity/gui-p21-*.png`).
+
 ## 1. Что проверялось
 
 Acceptance (ADR-0020/промпт итерации):

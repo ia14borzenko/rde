@@ -2141,3 +2141,99 @@ RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=80 \
 ./scripts/build.sh build -p rde --release            # release
 ./scripts/clean-build.sh                             # полная очистка /srv/yocto/rde-target
 ```
+
+## Обновление 2026-10-29 (вкладка «Формула», клик по формуле в тексте, скролл предпросмотра; итерация `formula-tab`)
+
+### Что сделано
+
+- **Редактор формулы переехал на верхнюю панель:** на ленте появилась вкладка **«Формула»** (порядок:
+  Файл, Правка, Главная, **Формула**, Вставка, Документ, …). Она заменяет группы ленты панелью
+  редактора на всю ширину: статус (актуальна/устарела, вставки/устаревшие), заголовок,
+  **LaTeX-источник**, display/inline, политика нумерации, параметры вставки (OMML/SVG, позиция,
+  превью номера), предпросмотр тем же рендером, что вкладка Equation (шрифт STIX), и две строки
+  действий: «Применить» / «Вставить в документ» / «Обновить документ»; «Проф. редактор…» /
+  «← Из редактора» / «Новая формула» / «Закрыть». Пустое состояние — «Выбрать формулу проекта…»,
+  «+ Создать формулу», подсказка про клик в тексте. Панель адаптивна: две колонки и две строки
+  кнопок фиксированной ширины (длинные подписи обрезаются, полные — в подсказке), ничего не вылезает
+  за ширину центра при открытых боковых панелях.
+- **Клик по формуле в тексте открывает редактор** (DocView): WordCraft на клик в уравнение входит в
+  `equation.edit`; RDE вызывает `equation.get`, сопоставляет LaTeX с project-level формулой (строгая
+  нормализация пробелов; `resolved_latex` из ledger — для формул с входами/фрагментами), выходит из
+  инлайн-правки (`equation.exit`, документ не меняется) и переключает вкладку «Формула» на этот
+  объект (центр — «Документ», режим RDE). Формулы вне реестра остаются в нативном режиме — их
+  принимают командой «Принять формулы как объекты» (ADR-0019); SVG-вставки кликом не открываются
+  (это картинка, не OMML-тело).
+- **Починен скролл в режиме «Предпросмотр страниц»:** `demo_preview_scroll` применялся как
+  `vertical_scroll_offset` каждый кадр и отбрасывал прокрутку на 0 — колесо мыши и ползунок не
+  работали. Теперь демо-offset применяется только когда задан (скриншоты), в интерактивном режиме
+  прокруткой владеет `ScrollArea`. В screenshot-пример добавлен `RDE_SCREENSHOT_WHEEL=<delta>` для
+  проверки колесом в headless.
+- Нативная вкладка Equation WordCraft осталась **отдельным окном** («Проф. редактор…»): canvas
+  WordCraft и живой canvas документа в одном кадре конфликтуют по фиксированному egui-id/слоям
+  (ADR-0020 §3); пока окно открыто, документ показан растровым предпросмотром страниц.
+
+### Проверка
+
+- `cargo test --workspace` — **592 passed / 0 failed** (было 590; +2 регресс-теста итерации:
+  - `preview_scrolls_with_mouse_wheel` — в «Предпросмотре страниц» при `demo_preview_scroll = 0`
+    колесо над страницами даёт `preview_scroll_offset > 0` (раньше сбрасывался на 0 каждый кадр);
+  - `formula_ribbon_tab_opens_editor_from_formula_click_in_text` — вкладка «Формула» есть на ленте
+    и показывает пустое состояние; каретка на объекте-уравнении демо-документа открывает редактор
+    именно формулы σ, центр → «Документ», режим → RDE, вкладка → «Формула», поле LaTeX на панели.
+  - `every_ribbon_tab_has_groups_and_slots` обновлён: вкладок **десять**.
+- Скриншоты (headless `egui_kittest`; скролл — колесом через `RDE_SCREENSHOT_WHEEL`):
+  `docs/fidelity/gui-p21-formula-tab.png`, `gui-p21-formula-tab-empty.png`,
+  `gui-p21-formula-tab-create.png`, `gui-p21-formula-tab-native.png`, `gui-p21-preview-scroll.png`
+  (страница 2/3 при нулевом демо-offset — колесо работает); отчёт —
+  [`fidelity/p21-formula-tab.md`](fidelity/p21-formula-tab.md).
+- Изменённые участки `rde-ui` — без новых clippy-предупреждений; `vendor/wordcraft` не менялся.
+
+### Ограничения и следующий шаг
+
+- Правка OMML-тела вставки «прямо в тексте» (поверх `equation.edit`) не делается: клик открывает
+  редактор источника, RDE выходит из инлайн-правки — иначе правка обходила бы ledger/`body_hash`
+  (R-DOC-13). Следующий шаг — навигация по `RdeInsert.para_id` с записью в объект (ADR-0020 §6).
+- Клик открывает только формулы реестра (`rde://formula/…`); формулы вне реестра — миграция ADR-0019;
+  SVG-вставки формул кликом не открываются (картинка, не OMML).
+- Остальные ограничения P4 без изменений: `inputs`/`fragments`/`numbering.label` в GUI не
+  редактируются (сохраняются), удаление используемой формулы — generic `delete_object`, Word —
+  `unverified` (LO-оракул).
+
+### Как запустить (актуально на этой итерации)
+
+```bash
+cd /home/admin-pc/proj/rde-dev/rde
+
+# 1) приложение — бинарь уже собран (target на внешнем ext4 /srv/yocto/rde-target)
+/srv/yocto/rde-target/debug/rde
+./scripts/run.sh                                     # или так (последний проект/демо)
+RDE_PROJECT=demo-project ./scripts/run.sh
+
+# 2) тесты
+./scripts/build.sh test --workspace                  # 592 passed / 0 failed
+
+# 3) headless-скриншоты (egui_kittest): вкладка «Формула», пустое состояние, нативный редактор
+RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=60 \
+  /srv/yocto/rde-target/debug/examples/screenshot /tmp/formula-tab.png \
+  document "" 0 formula-editor dark
+RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=45 \
+  /srv/yocto/rde-target/debug/examples/screenshot /tmp/formula-tab-empty.png \
+  document "" 0 formula-tab-empty light
+RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=80 \
+  /srv/yocto/rde-target/debug/examples/screenshot /tmp/formula-tab-native.png \
+  document "" 0 formula-editor-native dark tall
+# скролл предпросмотра колесом (delta<0 — вниз; демо-offset не задаётся)
+RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=40 RDE_SCREENSHOT_WHEEL=-320 \
+  /srv/yocto/rde-target/debug/examples/screenshot /tmp/preview-scroll.png \
+  document "" 0 "" light "" preview
+
+# 4) ручные проверки: открыть документ в режиме RDE → клик по формуле в тексте → открылась
+#    вкладка «Формула» с этой формулой (LaTeX + предпросмотр); «Применить»/«Обновить документ»;
+#    «Проф. редактор…» — нативная вкладка Equation; режим «Предпросмотр страниц» — колесо и
+#    ползунок прокручивают; смена схемы нумерации в инспекторе документа.
+
+# 5) пересборка debug/release и полная очистка
+./scripts/build.sh build -p rde                      # debug
+./scripts/build.sh build -p rde --release            # release
+./scripts/clean-build.sh                             # очистка /srv/yocto/rde-target
+```

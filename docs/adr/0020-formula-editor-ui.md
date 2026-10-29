@@ -13,7 +13,8 @@
   [ADR-0018](0018-formula-math-font-and-right-numbered.md),
   [ADR-0019](0019-import-numbered-formulas.md), [docs/state.md](../state.md).
 - **База:** HEAD `61255fe` (тег `import-numbered-formulas`), рабочее дерево чистое; на входе
-  `cargo test --workspace` — **582 passed / 0 failed**; на выходе — **590 passed / 0 failed** (см. §7).
+  `cargo test --workspace` — **582 passed / 0 failed**; на выходе (после итерации `formula-tab`) —
+  **592 passed / 0 failed** (см. §7).
 - **Vendor:** `vendor/wordcraft` **не менялся** (пин `33213040` прежний). Спайк A подтвердил: P4
   достижим через публичные `equation_tab`/`WordApp`; ADR-0001 §4 не задействован.
 
@@ -68,6 +69,10 @@ right-numbered + схемы нумерации + перекрёстные ссы
 отклоняется без замены и без tmp-хвостов.
 
 ## Решение 2 — панель редактора формулы (`rde-ui`)
+
+> **Уточнение (2026-10-29, итерация `formula-tab`):** по итогам приёмки панель переехала с
+> плавающего окна на **вкладку ленты «Формула»**, а клик по формуле в тексте открывает её
+> автоматически — см. §5.2 ниже.
 
 Состояние — `FormulaEditorState` (`formula_id: Option<String>`; `None` = режим создания):
 `title`, `latex`, `display`, `numbering_mode`, `numbering_label`, `render_mode` (omml|svg для
@@ -158,6 +163,42 @@ RDE и canvas панели) конфликтуют по слоям (`debug_asser
 - `number_source = word|manual|off` (ADR-0019) у существующих вставок не регрессирует: обновление
   уважает фиксацию, явная смена схемы её снимает (`renumber_formula_numbers`).
 
+### 5.2. Уточнение 2026-10-29 (итерация `formula-tab`): вкладка «Формула» и клик по формуле
+
+По итогам приёмки P4 доработано (тот же ADR, состав P4 не менялся):
+
+1. **Редактор — вкладка ленты «Формула»** (порядок: Файл, Правка, Главная, **Формула**, Вставка,
+   Документ, …), а не отдельное окно: вкладка заменяет группы ленты панелью редактора на всю
+   ширину — статус, заголовок, LaTeX-источник, display/inline, политика нумерации, параметры
+   вставки (OMML/SVG, позиция, превью номера), предпросмотр тем же рендером (STIX) и две строки
+   действий («Применить» / «Вставить в документ» / «Обновить документ»; «Проф. редактор…» /
+   «← Из редактора» / «Новая формула» / «Закрыть»). Расположение — в верхней панели RDE рядом с
+   «Файл/Правка/Главная»; доступна в режиме RDE (DocView) на вкладке центра «Документ». Пустое
+   состояние вкладки: «Выбрать формулу проекта…», «+ Создать формулу», подсказка про клик в тексте.
+   Панель адаптивна к ширине центра (две колонки + две строки кнопок фиксированной ширины, подписи
+   обрезаются с полной в подсказке) — при открытых боковых панелях ничего не вылезает за край.
+2. **Клик по формуле в тексте открывает редактор.** WordCraft на клик в уравнение ставит каретку и
+   входит в `equation.edit`; RDE на `primary_clicked` в canvas вызывает `equation.get`,
+   сопоставляет LaTeX с project-level формулой (нормализация пробелов, затем `resolved_latex` из
+   ledger — для формул с входами/фрагментами), выходит из инлайн-правки (`equation.exit`, документ
+   не меняется) и открывает вкладку «Формула» на этом объекте (центр — «Документ», режим RDE).
+   Формулы вне реестра остаются в нативном режиме — их принимают командой миграции (ADR-0019).
+   Реализация: `open_formula_editor_from_canvas_click` + `formula_for_latex`, регресс-тест
+   `formula_ribbon_tab_opens_editor_from_formula_click_in_text` (каретка ставится на объект-уравнение
+   демо-документа, проверяются открытый объект/вкладка/режим и поля LaTeX на верхней панели).
+3. **Нативная вкладка Equation WordCraft** осталась отдельным окном (кнопка «Проф. редактор…»):
+   причина прежняя — canvas WordCraft и живой canvas документа в одном кадре конфликтуют по
+   фиксированному egui-id/слоям (§3).
+4. **Скролл предпросмотра страниц починен:** демо-хук `demo_preview_scroll` применялся как
+   `vertical_scroll_offset` **каждый кадр**, из-за чего колесо мыши и перетаскивание ползунка
+   сбрасывались на 0. Теперь offset задаётся, только если он явно нужен скриншоту, а в
+   интерактивном режиме прокруткой владеет `ScrollArea`. Регресс-тест
+   `preview_scrolls_with_mouse_wheel`: колесо над страницами даёт offset > 0; скриншот
+   `docs/fidelity/gui-p21-preview-scroll.png` (страница 2/3 при нулевом демо-offset).
+5. Тесты: +2 к P4 (всего **592 passed / 0 failed**; `rde-ui` 143). Скриншоты итерации —
+   `docs/fidelity/gui-p21-formula-tab*.png`, `gui-p21-preview-scroll.png`;
+   отчёт — [`docs/fidelity/p21-formula-tab.md`](../fidelity/p21-formula-tab.md).
+
 ## Рассмотренные альтернативы
 
 | Вариант | Почему отклонён |
@@ -191,21 +232,32 @@ RDE и canvas панели) конфликтуют по слоям (`debug_asser
 
 ## Проверка (сводка)
 
-- **Тесты workspace:** 582 → **590 passed / 0 failed** (+8: `rde-ui` kittest/интеграционные
-  `formula_editor_*`: создание+валидация+предпросмотр/панель, правка→Stale→«Обновить документ»,
-  вставка с номером/политика `none`, нативная вкладка на scratch-документе без правки документа);
-  и `rde-core` `formula_write_tests` (+4; lib-тесты `rde-core` 39 → 43) входят в общий счёт.
+- **Тесты workspace:** 582 → **592 passed / 0 failed** (+10): `rde-core` `formula_write_tests` (4;
+  lib-тесты `rde-core` 39 → 43), `rde-ui` `formula_editor_*` (4: создание+валидация+панель,
+  правка→Stale→«Обновить документ», вставка с номером/политика `none`/inline, нативная вкладка без
+  правки документа) и 2 регресс-теста итерации `formula-tab`
+  (`preview_scrolls_with_mouse_wheel`, `formula_ribbon_tab_opens_editor_from_formula_click_in_text`);
+  `rde-ui` всего 143.
 - **Проверки acceptance:** валидный LaTeX → объект+кэши OMML/SVG/PNG в CAS+`[state]`+статус Fresh;
   невалидный LaTeX/пустые поля → ошибка, файлов нет; дедуп по LaTeX; правка LaTeX → вставки Stale →
   «Обновить документ» → тела/номера/пунктуация/`number_source` сохранены, `<w:tbl>` не добавлен,
   `<w:tabs>`/OMML на месте; display+auto → номер `(N)` по схеме, display+none/inline → без номера;
-  нативная вкладка рендерится и `equation.get` возвращает LaTeX, `.doc.rde` не изменён.
+  нативная вкладка рендерится и `equation.get` возвращает LaTeX, `.doc.rde` не изменён; клик по
+  формуле в тексте открывает редактор на вкладке «Формула» с объектом σ; колесо мыши прокручивает
+  предпросмотр страниц.
 - **Headless-скриншоты (`docs/fidelity/`):** [`gui-p20-formula-create.png`](../fidelity/gui-p20-formula-create.png)
   (диалог создания), [`gui-p20-formula-editor.png`](../fidelity/gui-p20-formula-editor.png) (панель:
   LaTeX + предпросмотр + статус + вставка), [`gui-p20-formula-native.png`](../fidelity/gui-p20-formula-native.png)
   (нативная вкладка Equation + canvas), [`gui-p20-formula-inspector.png`](../fidelity/gui-p20-formula-inspector.png)
   (инспектор с кнопками), [`gui-p20-formula-insert-numbered.png`](../fidelity/gui-p20-formula-insert-numbered.png)
-  (вставка с номером `(2)` в документе). Отчёт — [`docs/fidelity/p20-formula-editor.md`](../fidelity/p20-formula-editor.md).
+  (вставка с номером `(2)` в документе); итерация `formula-tab` —
+  [`gui-p21-formula-tab.png`](../fidelity/gui-p21-formula-tab.png),
+  [`gui-p21-formula-tab-empty.png`](../fidelity/gui-p21-formula-tab-empty.png),
+  [`gui-p21-formula-tab-create.png`](../fidelity/gui-p21-formula-tab-create.png),
+  [`gui-p21-formula-tab-native.png`](../fidelity/gui-p21-formula-tab-native.png),
+  [`gui-p21-preview-scroll.png`](../fidelity/gui-p21-preview-scroll.png). Отчёты —
+  [`docs/fidelity/p20-formula-editor.md`](../fidelity/p20-formula-editor.md),
+  [`docs/fidelity/p21-formula-tab.md`](../fidelity/p21-formula-tab.md).
 - **Clippy:** новые/изменённые участки `rde-core`/`rde-ui` без предупреждений (остальные
   clippy-1.99 предупреждения — существовавшие ранее, не трогались).
 - **Форк WordCraft:** не менялся; пин прежний.

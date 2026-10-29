@@ -11,16 +11,20 @@
 «Формула» — LaTeX-источник (source-of-truth `formula.toml`), предпросмотр тем же рендером, что вкладка
 Equation WordCraft, display/inline и политика нумерации, «Применить» (кэши OMML/SVG/PNG + ledger),
 «Вставить в документ» с номером по схеме. Ещё:
-[создание формулы](docs/fidelity/gui-p20-formula-create.png),
-[нативная вкладка Equation](docs/fidelity/gui-p20-formula-native.png),
+[вкладка «Формула» — редактор на верхней панели](docs/fidelity/gui-p21-formula-tab.png),
+[пустое состояние вкладки](docs/fidelity/gui-p21-formula-tab-empty.png),
+[нативная вкладка Equation](docs/fidelity/gui-p21-formula-tab-native.png),
 [инспектор](docs/fidelity/gui-p20-formula-inspector.png),
-[вставка с номером `(2)`](docs/fidelity/gui-p20-formula-insert-numbered.png).*
+[вставка с номером `(2)`](docs/fidelity/gui-p20-formula-insert-numbered.png),
+[скролл предпросмотра колесом](docs/fidelity/gui-p21-preview-scroll.png).*
 
 ## Состояние
 
 Текущая итерация — **редактор формул в GUI (P4)** (2026-10-29,
 [ADR-0020](docs/adr/0020-formula-editor-ui.md)): формулу теперь можно **создать и отредактировать
-из интерфейса** — диалог/панель «Формула» с **LaTeX-источником** (source-of-truth `formula.toml`),
+из интерфейса** — редактор на **вкладке ленты «Формула»** (рядом с «Файл/Правка/Главная»;
+клик по формуле в тексте документа открывает её автоматически — WordCraft `equation.get` →
+сопоставление LaTeX с объектом проекта): **LaTeX-источник** (source-of-truth `formula.toml`),
 **предпросмотром** тем же рендером, что вкладка Equation WordCraft (шрифт формул STIX), переключателем
 display/inline и **политикой нумерации** `auto|none`; «Применить» валидирует LaTeX компиляцией,
 пересчитывает кэши OMML/SVG/PNG, ledger `act_key` и `[state]` в манифесте (входы/фрагменты/состояние
@@ -30,9 +34,11 @@ OMML или SVG-вектор, display+auto → right-numbered `(N)` справа
 display+none/inline — без номера; нативная вкладка **Equation WordCraft** встроена как
 «профессиональный редактор» на отдельном мини-документе — документ пользователя не меняется
 (спайк A, без правок `vendor/wordcraft`); точки входа — лента «Документ → Формулы», дерево (группа
-«Формулы», «+ Создать формулу…»), инспектор. Доказательства — **590 тестов**, headless-скриншоты
-[`docs/fidelity/p20-formula-editor.md`](docs/fidelity/p20-formula-editor.md), LO-оракул номера
-`(2)` у правого поля (`xMax=552.9 pt` при поле 555.3 pt).
+«Формулы», «+ Создать формулу…»), инспектор. Доказательства — **592 теста**, headless-скриншоты
+[`docs/fidelity/p20-formula-editor.md`](docs/fidelity/p20-formula-editor.md) и
+[`docs/fidelity/p21-formula-tab.md`](docs/fidelity/p21-formula-tab.md) (вкладка «Формула», клик по
+формуле, скролл предпросмотра), LO-оракул номера `(2)` у правого поля (`xMax=552.9 pt` при поле
+555.3 pt).
 Предыдущая итерация — **импорт MathType-документов с нумерацией формул** (2026-10-29,
 [ADR-0019](docs/adr/0019-import-numbered-formulas.md)): display-формулы MathType при миграции
 становятся **block-вставками с номером справа** (каноническая Word-вёрстка right-numbered: формула
@@ -135,7 +141,7 @@ suggested edits/ревизии), **M2**
 Прототип **v0.1** закрыт по [`docs/exit-v0.1.md`](docs/exit-v0.1.md) (P5, теги `p5-gates` /
 `v0.1-prototype`) и отполирован в P6–P8.
 
-- **590 тестов** (`#[test]`/`#[tokio::test]`) в 16 пакетах, 18 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
+- **592 теста** (`#[test]`/`#[tokio::test]`) в 16 пакетах, 18 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
 - Демо-проект [`demo-project/`](demo-project): 12 объектов (вкл. project-level формулу σ, P3),
   документ с 11 живыми вставками; формула σ — режимы **OMML** (номер `(1)` справа в таб-абзаце без
   таблицы, [`docs/fidelity/p18-formula-stix.png`](docs/fidelity/p18-formula-stix.png) — рендер RDE,
