@@ -14,3 +14,5 @@ rde-doc = { workspace = true }
 [dev-dependencies]
 # Корпус формул проекта (формулы MathType-импорта) для roundtrip-тестов — только чтение путей.
 toml = { workspace = true }
+# Регресс-тесты ввода виджета: клик/каретка/фокус стрелок (headless egui-харнесс).
+egui_kittest = { version = "0.36" }

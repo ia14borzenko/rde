@@ -26,11 +26,13 @@ pub struct FormulaEditorOptions {
     pub show_palette: bool,
     /// Минимальная высота области формулы, px.
     pub min_height: f32,
+    /// Мигать кареткой (в тестах/скриншотах лучше выключить — детерминированный кадр).
+    pub blink_caret: bool,
 }
 
 impl Default for FormulaEditorOptions {
     fn default() -> Self {
-        Self { pt: 18.0, zoom: 1.0, show_palette: true, min_height: 96.0 }
+        Self { pt: 18.0, zoom: 1.0, show_palette: true, min_height: 96.0, blink_caret: true }
     }
 }
 
@@ -63,6 +65,10 @@ pub struct MathEditorUi {
     command_input: String,
     /// Последний отрисованный кадр — для диагностики/тестов.
     pub last_rendered: Option<Rect>,
+    /// Было ли полотно в фокусе клавиатуры в последнем кадре (диагностика/тесты).
+    pub focused: bool,
+    /// Где рисовалась каретка в последнем кадре (диагностика/тесты), в точках экрана.
+    pub last_caret: Option<Rect>,
 }
 
 impl MathEditorUi {
@@ -80,6 +86,8 @@ impl MathEditorUi {
             palette_symbol_set: 0,
             command_input: String::new(),
             last_rendered: None,
+            focused: false,
+            last_caret: None,
         }
     }
 
@@ -143,13 +151,29 @@ impl MathEditorUi {
         let id = canvas_response.id;
         if self.want_focus {
             self.want_focus = false;
-            ui.memory_mut(|memory| memory.request_focus(id));
+            canvas_response.request_focus();
         }
         if canvas_response.clicked() || canvas_response.drag_started() {
-            ui.memory_mut(|memory| memory.request_focus(id));
+            // Клик по полотну забирает клавиатурный фокус (иначе ввод уходит в оболочку).
+            canvas_response.request_focus();
             self.want_focus = false;
         }
+        if canvas_response.hovered() {
+            ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::Text);
+        }
         let focused = ui.memory(|memory| memory.has_focus(id));
+        self.focused = focused;
+        // КРИТИЧНО: по умолчанию egui использует стрелки/Tab/Esc для навигации ФОКУСА между
+        // виджетами — «стрелки уводят активный элемент в другие кнопки». Освобождаем эти клавиши
+        // для редактора (то же делает TextEdit своим focus-lock-фильтром).
+        if focused {
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    id,
+                    egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true },
+                );
+            });
+        }
         let painter = ui.painter_at(canvas_rect);
 
         // Полотно: лёгкий фон и рамка, как у поля ввода.
@@ -172,16 +196,19 @@ impl MathEditorUi {
                     painter.rect_filled(scaled, 1.0, accent.gamma_multiply(0.35));
                 }
             }
-            // Каретка (мигает; в скриншотах/тестах видна всегда).
-            let blink = (ui.input(|input| input.time) * 1.7).fract() < 0.55;
-            if (focused || ui.input(|input| input.time) < 0.05)
+            // Каретка: видна, когда редактор в фокусе (опционально мигает).
+            let blink = !self.options.blink_caret || (ui.input(|input| input.time) * 1.7).fract() < 0.6;
+            self.last_caret = None;
+            if focused
                 && let Some(caret) = render.caret_rect(&self.state.pos)
             {
                 let ppp = ui.ctx().pixels_per_point();
                 let min = origin + caret.min.to_vec2() / ppp;
                 let max = origin + caret.max.to_vec2() / ppp;
+                let caret_ui = Rect::from_min_max(min, max);
+                self.last_caret = Some(caret_ui);
                 if blink {
-                    painter.rect_filled(Rect::from_min_max(min, max), 0.5, accent);
+                    painter.rect_filled(caret_ui, 0.5, accent);
                 }
             }
         } else {
@@ -190,35 +217,35 @@ impl MathEditorUi {
         self.last_rendered = Some(formula_rect);
 
         // ── Мышь: клик/протяжка ставят каретку (hit-test по слотам MathLayout) ────────────────
-        if let Some(render) = &render {
-            let local_from_pointer = |pointer: egui::Pos2| -> Option<egui::Pos2> {
-                if !formula_rect.contains(pointer) {
-                    return None;
+        // Точка указателя переводится в координаты картинки как `(pointer - origin) * ppp`
+        // (никакого прибавления экранного origin — иначе каретка всегда прыгала в конец строки),
+        // а клик вне картинки клампится к ближайшему краю (справа/снизу — конец формулы).
+        if canvas_response.clicked() || canvas_response.dragged() {
+            let pointer = canvas_response
+                .interact_pointer_pos()
+                .or_else(|| ui.input(|input| input.pointer.interact_pos()));
+            if let Some(pointer) = pointer {
+                let offset = pointer - formula_rect.min;
+                let ppp = ui.ctx().pixels_per_point().max(f32::EPSILON);
+                match &render {
+                    Some(render) => {
+                        if let Some(pos) = render.hit_ui(offset, ppp) {
+                            let extend = ui.input(|input| input.modifiers.shift) || canvas_response.dragged();
+                            self.state.set_caret(pos, extend);
+                        }
+                    }
+                    // Пустая формула: клик по полотну ставит каретку в начало.
+                    None => self.state.set_caret(Default::default(), false),
                 }
-                let ppp = ui.ctx().pixels_per_point();
-                Some(formula_rect.min + (pointer - formula_rect.min) * ppp)
-            };
-            let extend = ui.input(|input| input.modifiers.shift);
-            if canvas_response.clicked()
-                && let Some(pointer) = canvas_response.interact_pointer_pos().or_else(|| ui.input(|input| input.pointer.interact_pos()))
-                && let Some(local) = local_from_pointer(pointer)
-                && let Some(pos) = render.hit(local)
-            {
-                self.state.set_caret(pos, extend);
-            }
-            if canvas_response.dragged()
-                && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
-                && let Some(local) = local_from_pointer(pointer)
-                && let Some(pos) = render.hit(local)
-            {
-                self.state.set_caret(pos, true);
             }
         }
 
         // ── Клавиатура ──────────────────────────────────────────────────────────────────────
         if focused {
-            let events: Vec<egui::Event> = ui.input_mut(|input| std::mem::take(&mut input.events));
-            let mut had_command = false;
+            // События читаем, не забирая: чужие (колесо и т.п.) не ломаем, а повторного ввода
+            // нет — события существуют только в кадре, когда пришли.
+            let events: Vec<egui::Event> = ui.input(|input| input.events.clone());
+            let mut handled_nav = false;
             for event in events {
                 match event {
                     egui::Event::Text(text) => {
@@ -227,21 +254,21 @@ impl MathEditorUi {
                             changed = true;
                         }
                     }
-                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                        if self.handle_key(key, modifiers) {
-                            changed = true;
-                            had_command = true;
-                        }
+                    egui::Event::Key { key, pressed: true, modifiers, .. } if self.handle_key(key, modifiers) => {
+                        changed = true;
+                        handled_nav = matches!(
+                            key,
+                            egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::Tab | egui::Key::Escape
+                        );
                     }
-                    other => {
-                        // Возвращаем прочие события (wheel и т.п.) — они не наши.
-                        ui.input_mut(|input| input.events.push(other));
-                    }
+                    _ => {}
                 }
             }
-            if had_command {
-                // Ввод команды/структуры — фокус остаётся в редакторе.
-                ui.memory_mut(|memory| memory.request_focus(id));
+            if handled_nav {
+                // egui уже мог поставить навигацию фокуса по стрелке/Tab в начале кадра
+                // (фильтр применяется только со следующего кадра) — отменяем её, чтобы
+                // «активным элементом» не становились кнопки оболочки.
+                ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
             }
         }
 
@@ -329,6 +356,7 @@ impl MathEditorUi {
                     if ui.small_button(suggestion.name.to_string()).on_hover_text(&suggestion.hint).clicked() {
                         self.insert_command(suggestion.name);
                         changed_now(changed);
+                        self.want_focus = true;
                     }
                 }
             }
@@ -338,6 +366,7 @@ impl MathEditorUi {
                     self.insert_command(&command);
                     self.command_input.clear();
                     changed_now(changed);
+                    self.want_focus = true;
                 }
             }
         });
@@ -395,9 +424,8 @@ impl MathEditorUi {
                     let response = response.on_hover_text(label);
                     if response.clicked() {
                         self.state.insert_template(id);
-                        self.state.set_caret(self.state.pos.clone(), false);
                         changed_now(changed);
-                        ui.memory_mut(|memory| memory.request_focus(ui.id()));
+                        self.want_focus = true;
                     }
                 }
             });
@@ -427,6 +455,7 @@ impl MathEditorUi {
                     if button.clicked() {
                         self.state.insert_symbol(&ch.to_string());
                         changed_now(changed);
+                        self.want_focus = true;
                     }
                 }
             });
@@ -445,6 +474,7 @@ impl MathEditorUi {
                     if ui.small_button(label_localized(action, label)).clicked() {
                         self.state.apply_structure_action(level, action);
                         changed_now(changed);
+                        self.want_focus = true;
                     }
                 }
             });

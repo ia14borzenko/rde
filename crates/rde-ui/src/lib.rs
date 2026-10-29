@@ -4149,6 +4149,9 @@ impl RdeApp {
         let Some(mut dialog) = self.formula_editor.take() else { return };
         dialog.title = "Демонстрация редактора формул".to_owned();
         let mut editor = rde_math_editor::widget::MathEditorUi::new(latex, dialog.display);
+        // Скриншоты: каретка без мигания (детерминированный кадр) и фокус в редакторе.
+        editor.options.blink_caret = false;
+        editor.request_focus();
         if let Some(template_id) = template {
             editor.state.insert_template(template_id);
             // Заполняем слоты по одному (Tab между вводами) — как пользователь палитрой.
@@ -9658,6 +9661,11 @@ impl RdeApp {
         // canvas документа не рисуем — два canvas с общим egui-id в одном кадре конфликтуют;
         // вместо него — растровый предпросмотр страниц (документ не меняется).
         let formula_native_open = self.formula_editor.as_ref().is_some_and(|dialog| dialog.native_open);
+        // P5: панель «Формула» открыта на ленте — она занимает почти всё место, центр — документ.
+        // Живой WordCraft-canvas документа в этом состоянии не нужен (панель его перекрывает), но
+        // он продолжает авто-запрашивать фокус ввода и перехватывал стрелки/Tab у редактора
+        // формулы. Показываем вместо него подсказку; после закрытия панели canvas вернётся.
+        let formula_panel_open = self.ribbon_tab == RibbonTab::Formula && self.formula_editor.is_some();
         if mode != DocMode::Preview && !formula_native_open {
             self.ensure_editor();
         }
@@ -9685,6 +9693,15 @@ impl RdeApp {
                     );
                     ui.add_space(2.0);
                     self.doc_preview_pages(ui);
+                } else if formula_panel_open {
+                    ui.label(
+                        RichText::new(
+                            "Открыт редактор формулы (вкладка «Формула») — живой canvas документа приостановлен, \
+                             чтобы клавиатура принадлежала редактору формулы; после «Закрыть» документ вернётся",
+                        )
+                        .small()
+                        .color(pal.muted),
+                    );
                 } else if let Some(ed) = &mut self.editor {
                     let ctx = ui.ctx().clone();
                     ed.app.logic(&ctx);
@@ -14385,6 +14402,35 @@ mod docview_tests {
     /// структурный ввод (дробь через палитру/модель), LaTeX синхронизируется с моделью,
     /// «Создать» записывает канонический источник и пересчитывает кэши.
     #[test]
+    fn formula_editor_panel_owns_keyboard_focus() {
+        // Регресс (найдено владельцем на живой панели): при открытой панели «Формула» клавиатура
+        // должна принадлежать WYSIWYG-редактору, а не скрытому WordCraft-canvas документа — тот
+        // авто-запрашивал фокус и перехватывал стрелки/Tab (в итоге «активировались» кнопки).
+        let root = temp_demo_copy("formula-focus");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        app.demo_formula_editor_with_model("", Some("frac.stacked"), "");
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_max_steps(200_000)
+            .build_ui_state(|ui, app: &mut RdeApp| app.ui(ui), app);
+        for _ in 0..4 {
+            harness.step();
+        }
+        let editor = harness.state().formula_editor.as_ref().and_then(|dialog| dialog.math_editor.as_ref()).expect("редактор формулы");
+        assert!(editor.focused, "клавиатурный фокус в WYSIWYG-редакторе формулы, а не в canvas документа");
+        assert!(editor.last_caret.is_some(), "каретка имеет геометрию и рисуется в полотне");
+        let before = editor.state.pos.clone();
+        // Tab — следующий слот структуры (числитель → знаменатель), фокус не уходит в оболочку.
+        harness.event(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+        harness.step();
+        let editor = harness.state().formula_editor.as_ref().and_then(|dialog| dialog.math_editor.as_ref()).expect("редактор формулы");
+        assert!(editor.focused, "редактор удерживает клавиатурный фокус после Tab");
+        assert!(editor.last_caret.is_some(), "каретка по-прежнему рисуется после клавиш");
+        assert_ne!(before, editor.state.pos, "Tab двигает каретку по слотам, а не переключает виджеты оболочки");
+    }
+
+    #[test]
+
     fn formula_wysiwyg_editor_edits_model_and_creates_formula() {
         use egui_kittest::kittest::Queryable;
         let root = temp_demo_copy("formula-wysiwyg");

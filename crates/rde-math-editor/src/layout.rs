@@ -35,6 +35,9 @@ pub struct FormulaRender {
     /// Масштаб растра: пикселей на pt по X/Y (может чуть отличаться из-за округления).
     pub scale_x: f32,
     pub scale_y: f32,
+    /// Поля вокруг формулы в растре, pt (по 1 pt с каждой стороны): нужны для точной
+    /// привязки каретки/кликов к картинке.
+    pub pad_pt: f32,
 }
 
 impl FormulaRender {
@@ -44,19 +47,26 @@ impl FormulaRender {
         Vec2::new(self.image.width() as f32, self.image.height() as f32)
     }
 
+    /// Расстояние от верхнего края картинки до базовой линии формулы, pt (с учётом поля).
+    #[must_use]
+    pub fn baseline_from_top_pt(&self) -> f32 {
+        self.ascent_pt + self.pad_pt
+    }
+
     /// Прямоугольник каретки в локальных пикселях картинки.
     #[must_use]
     pub fn caret_rect(&self, pos: &MathPos) -> Option<Rect> {
         let slot = self.layout.slot(&pos.path, pos.off)?;
-        let x = slot.x * self.scale_x;
+        let baseline = self.baseline_from_top_pt();
+        let x = (slot.x + self.pad_pt) * self.scale_x;
         // Толщина каретки 1.5 px, но не меньше 1.
         let width = (self.scale_x * 1.2).max(1.0);
-        let top_px = (self.ascent_pt - slot.y - slot.a) * self.scale_y;
-        let bottom_px = (self.ascent_pt - slot.y + slot.d) * self.scale_y;
+        let top_px = (baseline - slot.y - slot.a) * self.scale_y;
+        let bottom_px = (baseline - slot.y + slot.d) * self.scale_y;
         // Пустой слот бывает нулевой высоты — рисуем «строчную» высоту, чтобы каретка была видна.
         let line_px = self.scale_y * 11.0;
         let (top_px, bottom_px) = if (bottom_px - top_px).abs() < line_px {
-            let base = (self.ascent_pt - slot.y) * self.scale_y;
+            let base = (baseline - slot.y) * self.scale_y;
             (base - line_px * 0.75, base + line_px * 0.25)
         } else {
             (top_px, bottom_px)
@@ -64,13 +74,24 @@ impl FormulaRender {
         Some(Rect::from_min_max(Pos2::new(x, top_px), Pos2::new(x + width, bottom_px)))
     }
 
-    /// Хит-тест: точка в локальных пикселях → ближайшая позиция каретки.
+    /// Хит-тест: точка в локальных пикселях картинки → ближайшая позиция каретки.
     #[must_use]
     pub fn hit(&self, local: Pos2) -> Option<MathPos> {
-        let x_pt = local.x / self.scale_x.max(f32::EPSILON);
-        let y_pt = self.ascent_pt - local.y / self.scale_y.max(f32::EPSILON);
+        let x_pt = local.x / self.scale_x.max(f32::EPSILON) - self.pad_pt;
+        let y_pt = self.baseline_from_top_pt() - local.y / self.scale_y.max(f32::EPSILON);
         let slot = self.layout.hit(x_pt, y_pt)?;
         Some(MathPos::new(slot.path.clone(), slot.off))
+    }
+
+    /// Хит-тест по смещению указателя от левого верхнего угла картинки в UI-точках.
+    /// Клик за пределами картинки клампится к её краю: клик справа/снизу — в конец формулы,
+    /// слева/сверху — в начало (как в текстовом поле), это ожидаемое поведение мыши.
+    #[must_use]
+    pub fn hit_ui(&self, offset_points: egui::Vec2, pixels_per_point: f32) -> Option<MathPos> {
+        let ppp = pixels_per_point.max(f32::EPSILON);
+        let size = self.size_px();
+        let local = offset_points * ppp;
+        self.hit(Pos2::new(local.x.clamp(0.0, size.x), local.y.clamp(0.0, size.y)))
     }
 
     /// Прямоугольники подсветки выделения (для selection в одном аргументе).
@@ -95,20 +116,22 @@ impl FormulaRender {
             }
             let top_pt = left.y + left.a;
             let bottom_pt = left.y - left.d;
-            let x0 = left.x * self.scale_x;
-            let x1 = right.x * self.scale_x;
-            let y0 = (self.ascent_pt - top_pt) * self.scale_y;
-            let y1 = (self.ascent_pt - bottom_pt) * self.scale_y;
+            let baseline = self.baseline_from_top_pt();
+            let x0 = (left.x + self.pad_pt) * self.scale_x;
+            let x1 = (right.x + self.pad_pt) * self.scale_x;
+            let y0 = (baseline - top_pt) * self.scale_y;
+            let y1 = (baseline - bottom_pt) * self.scale_y;
             rects.push(Rect::from_min_max(Pos2::new(x0, y0.min(y1)), Pos2::new(x1, y0.max(y1))));
         }
         // Полное выделение пустого аргумента (lo == hi) или одного слота: тонкая плашка у каретки.
         if rects.is_empty()
             && let Some(slot) = self.layout.slot(&anchor.path, lo)
         {
-            let x0 = slot.x * self.scale_x;
+            let baseline = self.baseline_from_top_pt();
+            let x0 = (slot.x + self.pad_pt) * self.scale_x;
             let width = (self.scale_x * 6.0).max(3.0);
-            let y0 = (self.ascent_pt - slot.y - slot.a) * self.scale_y;
-            let y1 = (self.ascent_pt - slot.y + slot.d) * self.scale_y;
+            let y0 = (baseline - slot.y - slot.a) * self.scale_y;
+            let y1 = (baseline - slot.y + slot.d) * self.scale_y;
             rects.push(Rect::from_min_max(Pos2::new(x0, y0.min(y1)), Pos2::new(x0 + width, y0.max(y1))));
         }
         rects
@@ -119,9 +142,10 @@ impl FormulaRender {
     pub fn argument_extent(&self, pos: &MathPos) -> Option<Rect> {
         let extent = self.layout.arg_extent(&pos.path)?;
         let (x0, x1, up, down) = extent;
-        let top = (self.ascent_pt - up) * self.scale_y;
-        let bottom = (self.ascent_pt + down) * self.scale_y;
-        Some(Rect::from_min_max(Pos2::new(x0 * self.scale_x, top), Pos2::new(x1 * self.scale_x, bottom)))
+        let baseline = self.baseline_from_top_pt();
+        let top = (baseline - up) * self.scale_y;
+        let bottom = (baseline + down) * self.scale_y;
+        Some(Rect::from_min_max(Pos2::new((x0 + self.pad_pt) * self.scale_x, top), Pos2::new((x1 + self.pad_pt) * self.scale_x, bottom)))
     }
 }
 
@@ -142,7 +166,7 @@ pub fn render_formula(model: &Arg, display: bool, pt: f32, ppp: f32) -> Option<F
     let height_pt = ascent_pt + descent_pt;
     // Растр: рисуем ровно габарит формулы (чуть больше по высоте — чтобы не срезать выносные).
     let pad_pt = 1.0;
-    let area_x = 0.0;
+    let area_x = -pad_pt;
     let area_top = -ascent_pt - pad_pt;
     let area_w = width_pt + pad_pt * 2.0;
     let area_h = height_pt + pad_pt * 2.0;
@@ -157,6 +181,7 @@ pub fn render_formula(model: &Arg, display: bool, pt: f32, ppp: f32) -> Option<F
         ascent_pt,
         scale_x: width / area_w,
         scale_y: height / area_h,
+        pad_pt,
     })
 }
 

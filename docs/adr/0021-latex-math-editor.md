@@ -184,7 +184,8 @@ WYSIWYG-ввод, палитры, клавиатура, undo/redo, LaTeX как 
     сериализатор** `to_latex` + `check_roundtrip` + `normalize`/`unrepresentable`/`validate_source_latex`.
     Покрытие: `rac` (вкл. `inom`-паттерн), `\sqrt[n]`, скрипты (sub/sup/subsuppre), `\sum/\int/
     \prod` с пределами и `\limits/
-olimits`, `\left…\middle…ight`, матрицы/`array`, `cases`/
+olimits`, `\left…\middle…
+ight`, матрицы/`array`, `cases`/
     `aligned` (EqArr), акценты/черты/`\overbrace`, `oxed`/`\phantom`, функции `\sin…` и с пределами
     (`\lim_{}`, `\max_{}`), `\mathbb/\mathcal/\mathfrak/\mathsf/\mathtt/\mathbf/oldsymbol/\mathrm`,
     пробелы (`\ `), текст (`\text{…}`). Корпусный тест `tests/roundtrip.rs`: **316 случаев**
@@ -217,6 +218,17 @@ olimits`, `\left…\middle…ight`, матрицы/`array`, `cases`/
   LaTeX-поле), `gui-p22-formula-fraction.png`, `gui-p22-formula-matrix.png` (матрица из палитры +
   плейсхолдеры пустых слотов), `gui-p22-formula-palette.png`. Отчёт —
   [`docs/fidelity/p22-formula-editor.md`](../fidelity/p22-formula-editor.md).
+
+### Уточнение по вводу (после первой проверки владельцем, 2026-10-30)
+
+Клик по полотну и клавиатура в редакторе используют штатный egui-фокус с **focus-lock-фильтром**
+(как `TextEdit`): стрелки/Tab/Esc принадлежат редактору и не переключают виджеты оболочки;
+клик переводится в координаты картинки как `(pointer - origin) * ppp` с клампом к краям
+(справа/снизу — конец формулы, слева/сверху — начало), каретка/выделение учитывают поля растра.
+Регресс-тесты — `crates/rde-math-editor/tests/widget_input.rs` (5 kittest-тестов). Дополнительно
+при открытой панели «Формула» скрытый живой canvas документа не создаётся (он авто-запрашивал
+клавиатурный фокус и перехватывал стрелки/Tab): клавиатура принадлежит редактору формулы, после
+«Закрыть» документ возвращается — тест `formula_editor_panel_owns_keyboard_focus` в `rde-ui`.
 
 ### Ограничения MVP (честно; P1 → следующая очередь)
 

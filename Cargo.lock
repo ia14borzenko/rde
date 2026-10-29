@@ -4202,6 +4202,7 @@ name = "rde-math-editor"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "egui_kittest",
  "rde-doc",
  "toml",
  "wordcraft-engine",
