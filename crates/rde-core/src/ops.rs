@@ -633,6 +633,13 @@ pub fn create_document_stub(root: &Path, title: &str) -> Result<PathBuf, String>
 /// Создать project-level объект формулы (ADR-0005 P2): `objects/formulas/<id>/formula.toml`
 /// с LaTeX-источником (display, политика нумерации по умолчанию — auto).
 pub fn create_formula(root: &Path, title: &str, latex: &str) -> Result<PathBuf, String> {
+    create_formula_with_display(root, title, latex, true)
+}
+
+/// Создать формулу проекта с явным `display` (ADR-0019): display-формула нумеруется и вставляется
+/// block-абзацем, inline — вставляется в текст и не нумеруется. Импорт/миграция MathType-формул
+/// передаёт фактический режим вхождения (иначе inline-формулы проекта всегда были бы `display`).
+pub fn create_formula_with_display(root: &Path, title: &str, latex: &str, display: bool) -> Result<PathBuf, String> {
     let title = title.trim();
     if title.is_empty() {
         return Err("название формулы не может быть пустым".to_owned());
@@ -645,7 +652,7 @@ pub fn create_formula(root: &Path, title: &str, latex: &str) -> Result<PathBuf, 
     let dir = root.join("objects/formulas").join(&id);
     fs::create_dir_all(&dir).map_err(|e| format!("создать каталог формулы: {e}"))?;
     let manifest = format!(
-        "schema = \"{}\"\nid = \"{id}\"\ntitle = {}\nlatex = {}\ndisplay = true\n\n[numbering]\nmode = \"auto\"\nlabel = \"\"\n",
+        "schema = \"{}\"\nid = \"{id}\"\ntitle = {}\nlatex = {}\ndisplay = {display}\n\n[numbering]\nmode = \"auto\"\nlabel = \"\"\n",
         crate::manifest::SCHEMA_FORMULA,
         toml_string(title),
         toml_string(latex)

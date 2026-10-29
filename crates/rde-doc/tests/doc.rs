@@ -43,6 +43,8 @@ fn rde_doc_xml_roundtrip_handles_unicode_and_escapes() {
             caption: "Рисунок 1 — График".into(),
             number: Some(1),
             number_text: None,
+            suffix: String::new(),
+            number_source: String::new(),
             hash: Some("sha256:ff".into()),
             cached: "42.5".into(),
             selector: "#/stats/x1/mean".into(),

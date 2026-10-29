@@ -25,10 +25,23 @@ use wordcraft_engine::doc::math_latex::to_latex;
 use wordcraft_engine::doc::{InlineObject, StoryRef};
 
 use crate::formula_numbering::{FormulaNumbering, number_formulas};
+use crate::xml_fields::{is_punctuation_only, literal_text, mteqn_cached_number, paragraph_bounds, visible_text};
 use crate::{InsertReport, RdeDoc, RdeInsert, DOCUMENT_XML, RDE_DOC_PART};
 
 /// Префикс тега sdt формульной вставки (`rde:formula:<insert-id>`).
 pub const FORMULA_TAG_PREFIX: &str = "rde:formula:";
+/// Источник номера вставки (ADR-0019): номер сохранён из Word при миграции — «Обновить документ»
+/// его не перенумеровывает (перенумеровка — явная смена схемы в `renumber_formula_numbers`).
+pub const NUMBER_SOURCE_WORD: &str = "word";
+/// Источник номера вставки: номер задан вручную (резерв для UI; тоже не перенумеровывается).
+pub const NUMBER_SOURCE_MANUAL: &str = "manual";
+/// Источник номера вставки: формула сознательно не нумеруется (нумерация display отключена).
+pub const NUMBER_SOURCE_OFF: &str = "off";
+
+/// Номер вставки зафиксирован внешним источником и не пересчитывается автоматически.
+fn number_locked(insert: &RdeInsert) -> bool {
+    matches!(insert.number_source.as_str(), NUMBER_SOURCE_WORD | NUMBER_SOURCE_MANUAL)
+}
 /// `a:ext` URI для `asvg:svgBlip` (MS-ODRAWXML §2.3.1) — векторный источник картинки Word 2016+.
 pub const SVG_BLIP_EXT: &str = "{96DAC541-7B7A-43D3-8B79-37D633B846F1}";
 /// Пространство имён Office 2016 SVG (`asvg`).
@@ -154,6 +167,9 @@ pub struct FormulaBacklink {
     pub number: Option<u32>,
     /// Отображаемый номер без скобок (`"2.1"`, `"А.1"`); `None` — отображается `number`.
     pub number_text: Option<String>,
+    /// Источник номера (ADR-0019): пусто — схема документа, `word` — сохранён из Word,
+    /// `manual` — задан вручную, `off` — формула не нумеруется.
+    pub number_source: String,
     pub stale: bool,
 }
 
@@ -174,14 +190,35 @@ pub struct FormulaMigrationReport {
     pub replaced_tables: usize,
     pub replaced_blocks: usize,
     pub replaced_inline: usize,
+    /// display/inline среди принятых формул.
+    pub display: usize,
+    pub inline: usize,
+    /// display-формулы в смешанных абзацах/таблицах — оставлены inline, номер не назначался.
+    pub mixed: usize,
+    /// Сколько номеров сохранено из Word и сколько назначено по схеме документа.
+    pub numbers_preserved: usize,
+    pub numbers_assigned: usize,
+    /// Схема, по которой назначались номера (когда сохранять было нечего).
+    pub numbering: FormulaNumbering,
+    /// Предупреждения: смешанные абзацы, автономера Word, частичные номера, схема.
+    pub warnings: Vec<String>,
 }
 
-/// Формула документа вне реестра (для явной миграции/подсказки «формул вне реестра: N»).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnregisteredFormula {
-    pub block: String,
-    pub latex: String,
-    pub display: bool,
+/// Политика миграции формул (ADR-0019): что делать с display-формулами и их номерами.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormulaMigrationOptions {
+    /// Схема нумерации для назначаемых номеров (`document.toml: formula_numbering`).
+    pub numbering: FormulaNumbering,
+    /// Сохранять номера, найденные в Word (если найдены у всех display-формул).
+    pub preserve_word_numbers: bool,
+    /// Назначать номера display-формулам по схеме документа (когда сохранять нечего).
+    pub number_display: bool,
+}
+
+impl Default for FormulaMigrationOptions {
+    fn default() -> Self {
+        Self { numbering: FormulaNumbering::Continuous, preserve_word_numbers: true, number_display: true }
+    }
 }
 
 /// План миграции одной формулы документа в project-level объект.
@@ -225,6 +262,8 @@ pub fn add_formula_insert(package: &Path, request: FormulaInsertRequest) -> Resu
         caption: String::new(),
         number,
         number_text: None,
+        suffix: String::new(),
+        number_source: String::new(),
         hash: Some(body.act_key.clone()),
         cached: body.latex.clone(),
         selector: String::new(),
@@ -241,7 +280,7 @@ pub fn add_formula_insert(package: &Path, request: FormulaInsertRequest) -> Resu
     let number_text_provisional = number.map(|number| number.to_string());
     let content = if body.display {
         let media = if render_mode == "svg" { Some(ensure_formula_media(&mut entries, &insert.id, &body)?) } else { None };
-        wrap_block_sdt(&insert.id, &block_content(&insert, &body, number_text_provisional.as_deref(), &para_id, media, &entries)?)
+        wrap_block_sdt(&insert.id, &block_content(&insert, &body, number_text_provisional.as_deref(), &insert.suffix, &para_id, media, &entries)?)
     } else {
         let media = if render_mode == "svg" { Some(ensure_formula_media(&mut entries, &insert.id, &body)?) } else { None };
         wrap_inline_sdt(&insert.id, &inline_content(&insert, &body, &para_id, media)?)
@@ -309,6 +348,7 @@ fn block_content(
     insert: &RdeInsert,
     body: &FormulaBody,
     number_text: Option<&str>,
+    suffix: &str,
     para_id: &str,
     media: Option<(String, String)>,
     entries: &BTreeMap<String, Vec<u8>>,
@@ -318,8 +358,8 @@ fn block_content(
         let (cx, cy) = formula_extent_emu(body);
         let drawing = drawing_run_xml(&png_rel, &svg_rel, cx, cy, para_id);
         match number_text {
-            Some(number) => numbered_tabs_paragraph(para_id, &drawing, number, entries),
-            None => paragraph_centered(para_id, &drawing),
+            Some(number) => numbered_tabs_paragraph(para_id, &drawing, number, suffix, entries),
+            None => paragraph_centered(para_id, &drawing, suffix),
         }
     } else {
         // Display-фрагмент: `m:oMathPara` (движок/Word считают его display-формулой — пределы
@@ -328,8 +368,8 @@ fn block_content(
         let omml = omml_fragment(&body.omml, body.display)?;
         let math = String::from_utf8_lossy(&omml);
         match number_text {
-            Some(number) => numbered_tabs_paragraph(para_id, &math, number, entries),
-            None => paragraph_centered(para_id, &math),
+            Some(number) => numbered_tabs_paragraph(para_id, &math, number, suffix, entries),
+            None => paragraph_centered(para_id, &math, suffix),
         }
     };
     Ok(inner)
@@ -367,11 +407,21 @@ fn wrap_inline_sdt(insert_id: &str, inner: &str) -> String {
     )
 }
 
-/// Абзац display-формулы: по центру, без отступов и интервалов, с содержимым (OMML/drawing).
-fn paragraph_centered(para_id: &str, content: &str) -> String {
+/// Абзац display-формулы: по центру, без отступов и интервалов, с содержимым (OMML/drawing) и
+/// пунктуацией после формулы (`suffix` — `,`/`.`; ADR-0019: не теряется при миграции/обновлении).
+fn paragraph_centered(para_id: &str, content: &str, suffix: &str) -> String {
     format!(
-        "<w:p w14:paraId=\"{para_id}\"><w:pPr><w:spacing w:before=\"120\" w:after=\"120\"/><w:ind w:left=\"0\" w:right=\"0\" w:firstLine=\"0\"/><w:jc w:val=\"center\"/></w:pPr>{content}</w:p>"
+        "<w:p w14:paraId=\"{para_id}\"><w:pPr><w:spacing w:before=\"120\" w:after=\"120\"/><w:ind w:left=\"0\" w:right=\"0\" w:firstLine=\"0\"/><w:jc w:val=\"center\"/></w:pPr>{content}{}</w:p>",
+        suffix_run(suffix)
     )
+}
+
+/// Run с пунктуацией после формулы (пустой `suffix` — без run'а); текст экранируется.
+fn suffix_run(suffix: &str) -> String {
+    if suffix.is_empty() {
+        return String::new();
+    }
+    format!("<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r>", crate::escape_attr(suffix))
 }
 
 /// Абзац для inline-формулы, когда у вставки нет абзаца-якоря.
@@ -430,15 +480,17 @@ fn nth_body_paragraph_start(xml: &str, index: usize) -> Option<usize> {
 /// номер `(n)` у правого поля. Схема OOXML: табы + display-формула (`m:oMathPara`) в одном абзаце —
 /// `EG_RunLevelElts` разрешает math внутри `w:p`; Word и LibreOffice ставят формулу на таб-центр,
 /// а номер — на правый таб (LO-оракул в retest'ах). Видимой таблицы нет.
-fn numbered_tabs_paragraph(para_id: &str, content: &str, number: &str, entries: &BTreeMap<String, Vec<u8>>) -> String {
+fn numbered_tabs_paragraph(para_id: &str, content: &str, number: &str, suffix: &str, entries: &BTreeMap<String, Vec<u8>>) -> String {
     let (center, right) = tab_stops(entries);
+    // Пунктуация — сразу после формулы (до таба к номеру): «α = λ/d, … (1)» (ADR-0019).
     format!(
         "<w:p w14:paraId=\"{para_id}\"><w:pPr>\
          <w:tabs><w:tab w:val=\"center\" w:pos=\"{center}\"/><w:tab w:val=\"right\" w:pos=\"{right}\"/></w:tabs>\
          <w:spacing w:before=\"120\" w:after=\"120\"/>\
          <w:ind w:left=\"0\" w:right=\"0\" w:firstLine=\"0\"/></w:pPr>\
-         <w:r><w:tab/></w:r>{content}<w:r><w:tab/></w:r>\
-         <w:r><w:t xml:space=\"preserve\">({number})</w:t></w:r></w:p>"
+         <w:r><w:tab/></w:r>{content}{suffix_run}<w:r><w:tab/></w:r>\
+         <w:r><w:t xml:space=\"preserve\">({number})</w:t></w:r></w:p>",
+        suffix_run = suffix_run(suffix)
     )
 }
 
@@ -619,9 +671,25 @@ fn omml_fragment(omml: &[u8], display: bool) -> Result<Vec<u8>, String> {
     }
     if display && !trimmed.starts_with("<m:oMathPara") && trimmed.starts_with("<m:oMath") {
         Ok(format!("<m:oMathPara>{trimmed}</m:oMathPara>").into_bytes())
+    } else if !display && trimmed.starts_with("<m:oMathPara") {
+        // Display-кэш внутри inline-вставки (смешанный абзац): `m:oMathPara` — block-level элемент
+        // внутри `w:p`, в inline-`w:sdt` он невалиден; снимаем обёртку до `m:oMath`.
+        Ok(unwrap_math_para(trimmed).into_bytes())
     } else {
         Ok(trimmed.as_bytes().to_vec())
     }
+}
+
+/// Снять обёртку `m:oMathPara` (и `m:oMathParaPr`): содержимое для inline-вставки.
+fn unwrap_math_para(omml: &str) -> String {
+    let Some(open) = omml.find("<m:oMathPara") else { return omml.to_owned() };
+    let Some(open_end) = omml[open..].find('>').map(|offset| open + offset + 1) else { return omml.to_owned() };
+    let Some(close) = omml.rfind("</m:oMathPara>") else { return omml.to_owned() };
+    let inner = omml[open_end..close].trim();
+    let Some(start) = inner.find("<m:oMathParaPr") else { return inner.to_owned() };
+    let Some(end) = inner[start..].find("</m:oMathParaPr>").map(|offset| start + offset) else { return inner.to_owned() };
+    let after = end + "</m:oMathParaPr>".len();
+    format!("{}{}", &inner[..start], &inner[after..]).trim().to_owned()
 }
 
 /// Подпись текущего тела вставки в пакете: OMML-фрагмент (omml) или пара PNG+SVG (svg).
@@ -707,10 +775,15 @@ pub fn update_formula_inserts_with(
         return Ok(report);
     }
     formulas.sort_by_key(|insert| formula_tag_position(&document_xml, &insert.id).unwrap_or(usize::MAX));
-    // Документно-локальная нумерация (ADR-0005 §3.1) по схеме документа (ADR-0018): только
-    // display-формулы с политикой «нумеровать», в порядке следования в документе.
+    // Документно-локальная нумерация (ADR-0005 §3.1) по схеме документа (ADR-0018): нумеруются
+    // только block-вставки display-формул с политикой «нумеровать», в порядке документа. Номера,
+    // сохранённые из Word (`number_source = word/manual`), не пересчитываются (ADR-0019);
+    // `number_source = off` — формула сознательно не нумеруется.
+    let locked = formulas.iter().filter(|insert| number_locked(insert)).count();
     let numbered_ids: Vec<(String, usize)> = formulas
         .iter()
+        .filter(|insert| !number_locked(insert) && insert.number_source != NUMBER_SOURCE_OFF)
+        .filter(|insert| is_block_sdt(&document_xml, &insert.id))
         .filter(|insert| {
             let body = parse_formula_target(&insert.target).and_then(|target| bodies.get(&target.formula_id));
             body.map(|body| body.display && body.numbered).unwrap_or(insert.number.is_some())
@@ -720,6 +793,11 @@ pub fn update_formula_inserts_with(
     let (number_values, numbering_warnings) =
         number_formulas(&document_xml, styles_xml.as_deref(), numbering, numbered_ids.as_slice());
     report.warnings = numbering_warnings;
+    if locked > 0 && !numbered_ids.is_empty() {
+        report.warnings.push(format!(
+            "часть номеров сохранена из Word ({locked}), новые/прочие формулы нумеруются по схеме — номера могут повторяться"
+        ));
+    }
     let numbers: BTreeMap<String, (u32, String)> = numbered_ids
         .iter()
         .enumerate()
@@ -749,9 +827,26 @@ pub fn update_formula_inserts_with(
             report.conflicts.push(insert_snapshot.id.clone());
             continue;
         }
-        let new_number = numbers.get(&insert_snapshot.id).map(|(number, _)| *number);
-        let new_number_text = numbers.get(&insert_snapshot.id).map(|(_, text)| text.clone());
-        let expected_signature = if insert_snapshot.render_mode == "svg" { svg_signature(body) } else { omml_signature(&body.omml)? };
+        let (new_number, new_number_text) = if number_locked(&insert_snapshot) {
+            // Номер из Word/вручную: сохраняем как есть (ADR-0019).
+            (insert_snapshot.number, insert_snapshot.number_text.clone())
+        } else if insert_snapshot.number_source == NUMBER_SOURCE_OFF {
+            (None, None)
+        } else {
+            (
+                numbers.get(&insert_snapshot.id).map(|(number, _)| *number),
+                numbers.get(&insert_snapshot.id).map(|(_, text)| text.clone()),
+            )
+        };
+        // Подпись тела — по фактической вёрстке: display-кэш в inline-вставке (смешанный абзац)
+        // хранится без обёртки `m:oMathPara`, иначе «Обновить документ» видел бы ложную ручную
+        // правку (R-DOC-13).
+        let is_block = is_block_sdt(&document_xml, &insert_snapshot.id);
+        let expected_signature = if insert_snapshot.render_mode == "svg" {
+            svg_signature(body)
+        } else {
+            omml_signature(&omml_fragment(&body.omml, is_block)?)?
+        };
         let expected_target = format!("rde://formula/{}@{}", body.formula_id, body.act_key);
         let unchanged = insert_snapshot.hash.as_deref() == Some(body.act_key.as_str())
             && insert_snapshot.target == expected_target
@@ -768,8 +863,8 @@ pub fn update_formula_inserts_with(
         let media = if insert_snapshot.render_mode == "svg" { Some(ensure_formula_media(&mut entries, &insert_snapshot.id, body)?) } else { None };
         // ВАЖНО: заменяем содержимое существующего `w:sdt` (его inner), а не сам sdt — иначе
         // формула оборачивалась бы в новый sdt при каждом обновлении (вложенные content-controls).
-        let content = if is_block_sdt(&document_xml, &insert_snapshot.id) {
-            block_content(&insert_snapshot, body, new_number_text.as_deref(), &para_id, media, &entries)?
+        let content = if is_block {
+            block_content(&insert_snapshot, body, new_number_text.as_deref(), &insert_snapshot.suffix, &para_id, media, &entries)?
         } else {
             inline_content(&insert_snapshot, body, &para_id, media)?
         };
@@ -777,7 +872,7 @@ pub fn update_formula_inserts_with(
         // Заменяем блок `w:sdt` целиком: чинит исторические вложения sdt (после прежних версий
         // обновления формула была обёрнута в новый sdt при каждом проходе — XML становился
         // невалидным для LibreOffice/Word).
-        let block = if is_block_sdt(&document_xml, &insert_snapshot.id) {
+        let block = if is_block {
             wrap_block_sdt(&insert_snapshot.id, &content)
         } else {
             wrap_inline_sdt(&insert_snapshot.id, &content)
@@ -865,9 +960,48 @@ pub fn renumber_formula_numbers(package: &Path, numbering: FormulaNumbering) -> 
         if let Some(insert) = rde_doc.inserts.iter_mut().find(|insert| &insert.id == id) {
             insert.number = Some((index + 1) as u32);
             insert.number_text = Some(value.number.clone());
+            // Явный пересчёт схемы снимает фиксацию «номер из Word» (ADR-0019).
+            insert.number_source = String::new();
         }
     }
     // Перекрёстные ссылки на формулы — после того, как известны все номера.
+    changed |= refresh_crossrefs(&mut document_xml, &mut rde_doc, &mut report);
+    if !changed {
+        return Ok(report);
+    }
+    rde_doc.updated_unix = super::now_unix();
+    rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    entries.insert(RDE_DOC_PART.to_owned(), super::render_rde_doc(&rde_doc).into_bytes());
+    super::upsert_custom_props(&mut entries, &rde_doc);
+    super::write_entries_atomic(&entries, package)?;
+    Ok(report)
+}
+
+/// Обновить текст перекрёстных ссылок `rde://formula/<id>` по **текущим** номерам формул документа,
+/// не трогая сами номера (ADR-0019: вызывается после миграции, когда номера уже назначены или
+/// сохранены из Word, и явный пересчёт схемы не нужен).
+pub fn refresh_formula_crossrefs(package: &Path) -> Result<FormulaRenumberReport, String> {
+    let mut entries = super::read_package(package)?.entries;
+    let mut rde_doc = super::load_rde_doc_from_entries(&entries)?;
+    let Some(document) = entries.get(DOCUMENT_XML) else { return Ok(FormulaRenumberReport::default()) };
+    let mut document_xml = String::from_utf8_lossy(document).to_string();
+    let mut report = FormulaRenumberReport::default();
+    if !refresh_crossrefs(&mut document_xml, &mut rde_doc, &mut report) {
+        return Ok(report);
+    }
+    rde_doc.updated_unix = super::now_unix();
+    rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
+    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
+    entries.insert(RDE_DOC_PART.to_owned(), super::render_rde_doc(&rde_doc).into_bytes());
+    super::upsert_custom_props(&mut entries, &rde_doc);
+    super::write_entries_atomic(&entries, package)?;
+    Ok(report)
+}
+
+/// Синхронизировать текст перекрёстных ссылок на формулы с номерами вставок в `rde:doc`.
+/// Возвращает `true`, если документ изменился; обновлённые ссылки/предупреждения — в `report`.
+fn refresh_crossrefs(document_xml: &mut String, rde_doc: &mut RdeDoc, report: &mut FormulaRenumberReport) -> bool {
     let mut formula_numbers: BTreeMap<String, String> = BTreeMap::new();
     for insert in rde_doc.inserts.iter().filter(|insert| insert.kind == "formula") {
         let Some(target) = parse_formula_target(&insert.target) else { continue };
@@ -898,28 +1032,20 @@ pub fn renumber_formula_numbers(package: &Path, numbering: FormulaNumbering) -> 
             "перекрёстная ссылка {id}: формула {formula_id} не вставлена в документ — в тексте placeholder «(?)»"
         ));
     }
+    let mut changed = false;
     for (id, text) in crossrefs {
-        if let Some(insert) = rde_doc.inserts.iter().find(|insert| insert.id == id).cloned() {
-            if let Some(updated) = super::replace_sdt_text(&document_xml, &insert, &text) {
-                document_xml = updated;
-                changed = true;
-                report.crossrefs.push((id.clone(), text.clone()));
-            }
+        if let Some(insert) = rde_doc.inserts.iter().find(|insert| insert.id == id).cloned()
+            && let Some(updated) = super::replace_sdt_text(document_xml, &insert, &text)
+        {
+            *document_xml = updated;
+            changed = true;
+            report.crossrefs.push((id.clone(), text.clone()));
         }
         if let Some(insert) = rde_doc.inserts.iter_mut().find(|insert| insert.id == id) {
             insert.cached = text;
         }
     }
-    if !changed {
-        return Ok(report);
-    }
-    rde_doc.updated_unix = super::now_unix();
-    rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
-    entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
-    entries.insert(RDE_DOC_PART.to_owned(), super::render_rde_doc(&rde_doc).into_bytes());
-    super::upsert_custom_props(&mut entries, &rde_doc);
-    super::write_entries_atomic(&entries, package)?;
-    Ok(report)
+    changed
 }
 
 /// Заменить текст номера `(…)` в block-sdt формулы (последний `w:t` внутри sdtContent).
@@ -1007,6 +1133,7 @@ pub fn formula_backlinks(documents: &[(String, String, PathBuf)], formula_id: &s
                 render_mode: insert.render_mode.clone(),
                 number: insert.number,
                 number_text: insert.number_text.clone(),
+                number_source: insert.number_source.clone(),
                 stale,
             });
         }
@@ -1016,8 +1143,36 @@ pub fn formula_backlinks(documents: &[(String, String, PathBuf)], formula_id: &s
 
 // ── миграция существующего OMML вне реестра (явная команда) ──────────────────
 
+/// Формула документа вне реестра (для явной миграции/подсказки «формул вне реестра: N»).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnregisteredFormula {
+    pub block: String,
+    pub latex: String,
+    pub display: bool,
+    /// Номер, найденный в Word (`"3"`, `"2.1"`, `"А.1"`): поле `SEQ MTEqn`, таб-абзац или
+    /// legacy-таблица 1×2. `None` — номера нет (ADR-0019).
+    pub number_text: Option<String>,
+    /// display-формула в смешанном абзаце/таблице — останется inline, номер не назначается.
+    pub mixed: bool,
+    /// Автономер Word (`#`/`eqArr`) без литерального значения: восстановить нельзя.
+    pub auto_number: bool,
+    /// Пунктуация сразу после формулы (`,`, `.`), переносится в канонический абзац.
+    pub suffix: String,
+}
+
+impl UnregisteredFormula {
+    /// Короткая метка номера для журнала/диалога: `(3)`, `(2.1)`, `(А.1)` или `—`.
+    pub fn number_label(&self) -> String {
+        match &self.number_text {
+            Some(number) => format!("({number})"),
+            None => "—".to_owned(),
+        }
+    }
+}
+
 /// Формулы документа вне реестра (`m:oMath`/`m:oMathPara` не внутри `rde:formula:*` sdt), в
-/// порядке документа: LaTeX из модели WordCraft (автоизменений при открытии нет).
+/// порядке документа: LaTeX из модели WordCraft + контекст абзаца (номер/пунктуация/смешанность).
+/// Автоизменений при открытии нет.
 pub fn unregistered_formulas(package: &Path) -> Result<Vec<UnregisteredFormula>, String> {
     let equations = model_equations(package)?;
     let Some(document) = super::read_package(package)?.entries.get(DOCUMENT_XML).cloned() else {
@@ -1032,18 +1187,40 @@ pub fn unregistered_formulas(package: &Path) -> Result<Vec<UnregisteredFormula>,
         .iter()
         .zip(equations)
         .filter(|(raw, _)| !raw.registered)
-        .map(|(_, equation)| UnregisteredFormula { block: equation.block, latex: equation.latex, display: equation.display })
+        .map(|(raw, equation)| UnregisteredFormula {
+            block: equation.block,
+            latex: equation.latex,
+            display: equation.display,
+            number_text: raw.number_text.clone(),
+            mixed: raw.mixed_display(),
+            auto_number: raw.auto_number,
+            suffix: if raw.mixed_display() { String::new() } else { raw.suffix.clone() },
+        })
         .collect())
 }
 
-/// Явная миграция (ADR-0005 §7): заменить OMML вне реестра вставками-ссылками на formula-объекты.
-/// Идемпотентна по построению: переносит только формулы, ещё не обёрнутые в `rde:formula:*`.
-/// Нумерованная таблица 1×2 заменяется канонической формульной таблицей с тем же номером.
+/// Явная миграция (ADR-0005 §7, ADR-0019): заменить OMML вне реестра вставками-ссылками на
+/// formula-объекты с сохранением/назначением номеров и пунктуации.
+///
+/// Политика по умолчанию — «сохранить номера Word, если они найдены у **всех** display-формул,
+/// иначе назначить по схеме документа (сквозная)»; display-формулы становятся block-вставками,
+/// inline остаются inline. Идемпотентна: переносит только формулы, ещё не обёрнутые в
+/// `rde:formula:*`.
 pub fn migrate_formulas(package: &Path, plans: &[FormulaMigrationPlan]) -> Result<FormulaMigrationReport, String> {
+    migrate_formulas_with(package, plans, FormulaMigrationOptions::default())
+}
+
+/// Миграция формул с явной политикой номеров (ADR-0019): см. [`FormulaMigrationOptions`].
+pub fn migrate_formulas_with(
+    package: &Path,
+    plans: &[FormulaMigrationPlan],
+    options: FormulaMigrationOptions,
+) -> Result<FormulaMigrationReport, String> {
     let mut entries = super::read_package(package)?.entries;
     let mut rde_doc = super::load_rde_doc_from_entries(&entries)?;
     let document = entries.get(DOCUMENT_XML).cloned().ok_or("в пакете нет word/document.xml")?;
     let xml = String::from_utf8_lossy(&document).to_string();
+    let styles_xml = entries.get("word/styles.xml").map(|bytes| String::from_utf8_lossy(bytes).to_string());
     let equations = model_equations(package)?;
     let raw = raw_equations(&xml);
     if raw.len() != equations.len() {
@@ -1053,17 +1230,117 @@ pub fn migrate_formulas(package: &Path, plans: &[FormulaMigrationPlan]) -> Resul
     if candidates.len() != plans.len() {
         return Err(format!("миграция: формул вне реестра {}, планов {}", candidates.len(), plans.len()));
     }
-    let mut report = FormulaMigrationReport::default();
+    let mut report = FormulaMigrationReport { numbering: options.numbering, ..FormulaMigrationReport::default() };
+    if candidates.is_empty() {
+        return Ok(report);
+    }
+
+    // ── Шаг 1. Классификация и политика номеров (ADR-0019 §3) ────────────────────────────────
+    let display_indices: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, (raw, _))| raw.display)
+        .map(|(index, _)| index)
+        .collect();
+    let block_indices: Vec<usize> = display_indices
+        .iter()
+        .copied()
+        .filter(|index| candidates[*index].0.block_formula())
+        .collect();
+    let mixed_indices: Vec<usize> = display_indices.iter().copied().filter(|index| !block_indices.contains(index)).collect();
+    report.display = display_indices.len();
+    report.inline = candidates.iter().filter(|(raw, _)| !raw.display).count();
+    report.mixed = mixed_indices.len();
+    let found = block_indices.iter().filter(|index| candidates[**index].0.number_text.is_some()).count();
+    // Сохранять номера Word можно только если они есть у всех display-формул и согласованы:
+    // разрывы/повторы/нелитеральные автономера делают сохранение нечестным.
+    let preserved_all = options.preserve_word_numbers
+        && !block_indices.is_empty()
+        && mixed_indices.is_empty()
+        && found == block_indices.len()
+        && numbers_are_consistent(&block_indices, &candidates);
+    let mut number_texts: Vec<Option<String>> = vec![None; candidates.len()];
+    let mut number_indices: Vec<Option<u32>> = vec![None; candidates.len()];
+    if preserved_all {
+        for (order, index) in block_indices.iter().enumerate() {
+            number_texts[*index] = candidates[*index].0.number_text.clone();
+            number_indices[*index] = u32::try_from(order + 1).ok();
+        }
+        report.numbers_preserved = block_indices.len();
+    } else if options.number_display && !block_indices.is_empty() {
+        // Позициями для схемы «по разделам» служат исходные смещения абзацев: заголовки заменой
+        // формульных абзацев не двигаются, принадлежность разделу сохраняется.
+        let ordered: Vec<(String, usize)> = block_indices
+            .iter()
+            .enumerate()
+            .map(|(order, index)| (format!("candidate-{order}"), candidates[*index].0.paragraph_start.unwrap_or(usize::MAX)))
+            .collect();
+        let (values, warnings) = number_formulas(&xml, styles_xml.as_deref(), options.numbering, &ordered);
+        report.warnings.extend(warnings);
+        for (order, index) in block_indices.iter().enumerate() {
+            if let Some(value) = values.get(order) {
+                number_texts[*index] = Some(value.number.clone());
+            }
+            number_indices[*index] = u32::try_from(order + 1).ok();
+        }
+        report.numbers_assigned = block_indices.len();
+        if found > 0 {
+            let reason = if options.preserve_word_numbers {
+                "номера найдены не у всех display-формул/несогласованы"
+            } else {
+                "выбрана перенумерация по схеме проекта"
+            };
+            report.warnings.push(format!(
+                "в Word найдены номера у {found} из {} display-формул ({reason}) — назначены по схеме «{}»",
+                block_indices.len(),
+                options.numbering
+            ));
+        }
+    } else if !block_indices.is_empty() {
+        report.warnings.push("нумерация display-формул отключена: номера не назначены".to_owned());
+    }
+    for index in &mixed_indices {
+        let raw = &candidates[*index].0;
+        let order = display_indices.iter().position(|candidate| candidate == index).map(|order| order + 1).unwrap_or(0);
+        let reason = if raw.in_table { "формула в таблице" } else { "в абзаце есть текст" };
+        report.warnings.push(format!("display-формула #{order}: {reason} — оставлена inline, номер не назначен"));
+    }
+    for (order, index) in display_indices.iter().enumerate() {
+        if candidates[*index].0.auto_number {
+            report.warnings.push(format!(
+                "display-формула #{}: автономер Word (`#`/eqArr) не хранится литерально — {}",
+                order + 1,
+                if number_texts[*index].is_some() { "назначен по схеме" } else { "номер не назначен" }
+            ));
+        }
+    }
+
+    // ── Шаг 2. Вставки и замены фрагментов ───────────────────────────────────────────────────
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
-    for ((raw, _model), plan) in candidates.iter().zip(plans) {
+    for (index, ((raw, _model), plan)) in candidates.iter().zip(plans.iter()).enumerate() {
         let id = super::next_insert_id(&rde_doc.inserts, &xml);
         let para_id = super::para_id_for(&format!("{}:formula:{id}", rde_doc.doc_id), rde_doc.inserts.len());
+        let number_text = number_texts[index].clone();
+        let number = number_indices[index];
+        let block_formula = raw.block_formula();
+        let numbered = block_formula && number_text.is_some();
+        let number_source = if preserved_all && number.is_some() {
+            NUMBER_SOURCE_WORD.to_owned()
+        } else if block_formula && number.is_none() {
+            NUMBER_SOURCE_OFF.to_owned()
+        } else {
+            String::new()
+        };
+        let suffix = if block_formula { raw.suffix.clone() } else { String::new() };
+        // Подпись тела — по фрагменту, который реально попадёт в sdt (inline-вставка display-кэша
+        // хранится без `m:oMathPara`, см. `omml_fragment`).
+        let embedded_omml = omml_fragment(&plan.omml, block_formula)?;
         let body = FormulaBody {
             formula_id: plan.formula_id.clone(),
             act_key: plan.act_key.clone(),
             latex: plan.latex.clone(),
             display: raw.display,
-            numbered: raw.number.is_some(),
+            numbered,
             omml: plan.omml.clone(),
             svg: None,
             png: None,
@@ -1074,48 +1351,53 @@ pub fn migrate_formulas(package: &Path, plans: &[FormulaMigrationPlan]) -> Resul
             kind: "formula".to_owned(),
             target: format!("rde://formula/{}@{}", plan.formula_id, plan.act_key),
             caption: String::new(),
-            number: raw.number,
-            number_text: None,
+            number,
+            number_text: number_text.clone(),
+            suffix: suffix.clone(),
+            number_source,
             hash: Some(plan.act_key.clone()),
             cached: plan.latex.clone(),
             selector: String::new(),
             value_kind: "formula".to_owned(),
-            para_id: None,
+            para_id: if block_formula { Some(para_id.clone()) } else { None },
             style: String::new(),
             format: String::new(),
             run_style: String::new(),
             render_mode: "omml".to_owned(),
-            body_hash: Some(omml_signature(&plan.omml)?),
+            body_hash: Some(omml_signature(&embedded_omml)?),
         };
-        let number_text = raw.number.map(|number| number.to_string());
-        insert.number_text = number_text.clone();
-        let content = if raw.display {
-            insert.para_id = Some(para_id.clone());
-            wrap_block_sdt(&id, &block_content(&insert, &body, number_text.as_deref(), &para_id, None, &entries)?)
+        if raw.numbered_table_block() {
+            let (start, end, _) = raw.numbered_table.clone().ok_or("миграция: нет границ нумерованной таблицы")?;
+            let content = wrap_block_sdt(&id, &block_content(&insert, &body, number_text.as_deref(), &suffix, &para_id, None, &entries)?);
+            edits.push((start, end, content));
+            report.replaced_tables += 1;
+            insert.number = number;
+        } else if block_formula {
+            let (start, end) = match (raw.paragraph_start, raw.paragraph_end) {
+                (Some(start), Some(end)) => (start, end),
+                _ => return Err("миграция: у формульного абзаца нет границ".to_owned()),
+            };
+            let content = wrap_block_sdt(&id, &block_content(&insert, &body, number_text.as_deref(), &suffix, &para_id, None, &entries)?);
+            edits.push((start, end, content));
+            report.replaced_blocks += 1;
         } else {
-            wrap_inline_sdt(&id, &inline_content(&insert, &body, &para_id, None)?)
-        };
-        if raw.display {
-            if let Some((start, end, _)) = raw.numbered_table {
-                report.replaced_tables += 1;
-                edits.push((start, end, content));
-            } else if raw.paragraph_only {
-                report.replaced_blocks += 1;
-                let start = raw.paragraph_start.ok_or("миграция: у формулы нет абзаца")?;
-                let end = raw.paragraph_end.ok_or("миграция: абзац формулы не закрыт")?;
-                edits.push((start, end, content));
-            } else {
-                report.replaced_inline += 1;
-                edits.push((raw.start, raw.end, content));
-            }
-        } else {
-            report.replaced_inline += 1;
+            // Смешанный display-абзац или inline-формула: заменяем только сам OMML-фрагмент
+            // inline-вставкой (block-`w:sdt` внутрь `w:p` не вставляем — невалидный OOXML).
+            let content = wrap_inline_sdt(&id, &inline_content(&insert, &body, &para_id, None)?);
             edits.push((raw.start, raw.end, content));
+            report.replaced_inline += 1;
         }
         rde_doc.inserts.push(insert);
         report.insert_ids.push(id);
     }
+    // Диапазоны замен не должны пересекаться: иначе замены «съедят» друг друга (например,
+    // нумерованная таблица с формулами и отдельная формула в её ячейке).
     edits.sort_by_key(|(start, _, _)| *start);
+    for pair in edits.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err("миграция: пересекающиеся диапазоны замен (вложенные формулы в таблице)".to_owned());
+        }
+    }
     let mut out = xml;
     for (start, end, replacement) in edits.iter().rev() {
         if *start > out.len() || *end > out.len() || start > end {
@@ -1130,6 +1412,27 @@ pub fn migrate_formulas(package: &Path, plans: &[FormulaMigrationPlan]) -> Resul
     super::upsert_custom_props(&mut entries, &rde_doc);
     super::write_entries_atomic(&entries, package)?;
     Ok(report)
+}
+
+/// Согласованы ли номера Word для сохранения: все есть, уникальны и (если все числовые) растут.
+fn numbers_are_consistent(indices: &[usize], candidates: &[(RawEquation, ModelEquation)]) -> bool {
+    let numbers: Vec<&str> = indices
+        .iter()
+        .filter_map(|index| candidates[*index].0.number_text.as_deref())
+        .collect();
+    if numbers.len() != indices.len() {
+        return false;
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    if !numbers.iter().all(|number| unique.insert((*number).to_owned())) {
+        return false;
+    }
+    let numeric: Option<Vec<u32>> = numbers.iter().map(|number| number.parse::<u32>().ok()).collect();
+    match numeric {
+        Some(values) => values.windows(2).all(|pair| pair[0] < pair[1]),
+        // Буквенные номера (приложения): достаточно полного набора уникальных значений.
+        None => true,
+    }
 }
 
 /// Формула в модели документа (порядок документа).
@@ -1163,18 +1466,50 @@ fn model_equations(package: &Path) -> Result<Vec<ModelEquation>, String> {
     result
 }
 
-/// Сырое OMML-вхождение в `word/document.xml`: границы, макет, регистрация в реестре.
+/// Сырое OMML-вхождение в `word/document.xml`: границы, макет, регистрация в реестре, номер и
+/// пунктуация формульного абзаца (ADR-0019).
 #[derive(Clone, Debug)]
 struct RawEquation {
     start: usize,
     end: usize,
     display: bool,
     registered: bool,
-    number: Option<u32>,
-    numbered_table: Option<(usize, usize, u32)>,
+    /// Номер из Word без скобок: `"3"`, `"2.1"`, `"А.1"`; `None` — номера нет.
+    number_text: Option<String>,
+    /// Нумерованная legacy-таблица 1×2 вокруг формулы: (границы таблицы, номер без скобок).
+    numbered_table: Option<(usize, usize, String)>,
     paragraph_start: Option<usize>,
     paragraph_end: Option<usize>,
+    /// Кроме формулы в абзаце только табы/пробелы/пунктуация/номер.
     paragraph_only: bool,
+    /// Пунктуация сразу после формулы (`,`, `.`, `;`).
+    suffix: String,
+    /// Формула внутри таблицы, но не в нумерованной 1×2: не нумеруем (ограничение).
+    in_table: bool,
+    /// Автономер Word (`#`/eqArr) без литерального значения.
+    auto_number: bool,
+}
+
+impl RawEquation {
+    /// display-формула отдельного абзаца — можно заменить block-вставкой.
+    fn block_paragraph(&self) -> bool {
+        self.display && !self.in_table && self.paragraph_only
+    }
+
+    /// display-формула в legacy-нумерованной таблице 1×2 — заменяется таблица целиком.
+    fn numbered_table_block(&self) -> bool {
+        self.display && self.numbered_table.is_some()
+    }
+
+    /// display-формула, которую нельзя вынести в block (смешанный абзац/таблица): останется inline.
+    fn mixed_display(&self) -> bool {
+        self.display && !self.block_paragraph() && !self.numbered_table_block()
+    }
+
+    /// Формула станет block-вставкой в миграции и может получить номер.
+    fn block_formula(&self) -> bool {
+        self.block_paragraph() || self.numbered_table_block()
+    }
 }
 
 #[derive(Clone)]
@@ -1183,7 +1518,21 @@ struct OpenTag {
     start: usize,
 }
 
-/// Найти все `m:oMath`/`m:oMathPara` в документе (документный порядок) с контекстом.
+/// Есть ли в тексте открывающий тег абзаца (`<w:p `, `<w:p>`, `<w:p/`; не `<w:pPr>`).
+fn contains_paragraph_tag(text: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(relative) = text[from..].find("<w:p") {
+        let at = from + relative;
+        let after = text.as_bytes().get(at + "<w:p".len()).copied();
+        if matches!(after, Some(b' ' | b'>' | b'/')) {
+            return true;
+        }
+        from = at + "<w:p".len();
+    }
+    false
+}
+
+/// Найти все `m:oMath`/`m:oMathPara` в документе (документный порядок) с контекстом абзаца.
 fn raw_equations(xml: &str) -> Vec<RawEquation> {
     let mut stack: Vec<OpenTag> = Vec::new();
     let mut out = Vec::new();
@@ -1208,22 +1557,39 @@ fn raw_equations(xml: &str) -> Vec<RawEquation> {
                     let registered = stack.iter().any(|open| {
                         open.name == "w:sdt" && xml[open.start..end].contains("w:tag w:val=\"rde:formula:")
                     });
-                    let paragraph = stack.iter().rev().find(|open| open.name == "w:p");
-                    let paragraph_start = paragraph.map(|open| open.start);
-                    let paragraph_end = paragraph.map(|_| end + 1);
-                    let numbered_table = ancestor_numbered_table(xml, &stack, end + 1);
-                    let number = numbered_table.map(|(_, _, number)| number);
-                    let paragraph_only = paragraph_start.is_some_and(|p_start| paragraph_is_only_math(xml, p_start, end + 1, open.start));
+                    let math_end = end + 1;
+                    // Границы настоящего абзаца: формула должна быть внутри него, а не в следующем.
+                    let paragraph = paragraph_bounds(xml, open.start).filter(|(paragraph_start, _)| {
+                        // Между найденным абзацем и формулой не должно быть других абзацев
+                        // (`<w:pPr>` и прочие теги с префиксом `w:p` не считаются абзацем).
+                        let inside = &xml[paragraph_start + 4..open.start];
+                        !contains_paragraph_tag(inside) && !inside.contains("</w:p>")
+                    });
+                    let paragraph_start = paragraph.map(|(start, _)| start);
+                    let paragraph_end = paragraph.map(|(_, end)| end);
+                    let (number_text, suffix, paragraph_only, auto_number) = match (paragraph_start, paragraph_end) {
+                        (Some(paragraph_start), Some(paragraph_end)) => {
+                            let parts = paragraph_parts(xml, paragraph_start, paragraph_end, open.start, math_end);
+                            (parts.number_text, parts.suffix, parts.paragraph_only, parts.auto_number)
+                        }
+                        _ => (None, String::new(), false, false),
+                    };
+                    let numbered_table = if display { ancestor_numbered_table(xml, &stack, math_end) } else { None };
+                    let number_text = numbered_table.as_ref().map(|(_, _, number)| number.clone()).or(number_text);
+                    let in_table = stack.iter().any(|open| open.name == "w:tbl") && numbered_table.is_none();
                     out.push(RawEquation {
                         start: open.start,
-                        end: end + 1,
+                        end: math_end,
                         display,
                         registered,
-                        number,
+                        number_text,
                         numbered_table,
                         paragraph_start,
                         paragraph_end,
                         paragraph_only,
+                        suffix,
+                        in_table,
+                        auto_number,
                     });
                 }
             }
@@ -1238,19 +1604,127 @@ fn raw_equations(xml: &str) -> Vec<RawEquation> {
     out
 }
 
-/// Нумерованная таблица 1×2 вокруг формулы: (границы таблицы, номер).
-fn ancestor_numbered_table(xml: &str, stack: &[OpenTag], equation_end: usize) -> Option<(usize, usize, u32)> {
+/// Контекст формулы внутри абзаца: номер, пунктуация, «чистота» абзаца, автономер.
+struct ParagraphParts {
+    number_text: Option<String>,
+    suffix: String,
+    paragraph_only: bool,
+    auto_number: bool,
+}
+
+/// Разобрать абзац вокруг формулы: допустимые соседи display-формулы — табы/пробелы, пунктуация
+/// (`, . ; : — – -` и т.п.) и номер `(N)`/`(N.M)`/`(А.N)`, в т.ч. в полях Word (`SEQ MTEqn`).
+fn paragraph_parts(xml: &str, paragraph_start: usize, paragraph_end: usize, math_start: usize, math_end: usize) -> ParagraphParts {
+    let before = &xml[paragraph_start..math_start];
+    let after = &xml[math_end..paragraph_end];
+    let (visible_before, non_text_before) = visible_text(before);
+    let (visible_after, non_text_after) = visible_text(after);
+    let literal_before = literal_text(before);
+    let literal_after = literal_text(after);
+    // Номер: кэш поля `SEQ MTEqn \c` (MathType/Word) или литеральный `(N)` в конце абзаца.
+    let number_text = mteqn_cached_number(after).or_else(|| trailing_paren_number(&literal_after));
+    let suffix = suffix_punctuation(&literal_after, number_text.as_deref());
+    let prefix_clean = visible_before.chars().all(char::is_whitespace) && literal_before.trim().is_empty();
+    let suffix_clean = is_punctuation_only(&suffix);
+    // Видимый текст после формулы помимо номера не должен содержать слов: поле Word могло
+    // оставить в результате не только номер (например, «, (3)» — ок, «, см. (3)» — смешанный).
+    let visible_after_words = visible_after
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let after_clean = is_punctuation_only(&visible_after_words)
+        || number_text.as_deref().is_some_and(|number| visible_after_words.is_empty() || visible_after_words.contains(number));
+    let (auto_number, auto_number_text) = eqarr_number(&xml[math_start..math_end]);
+    ParagraphParts {
+        number_text: number_text.or(auto_number_text),
+        suffix,
+        paragraph_only: prefix_clean && suffix_clean && after_clean && !non_text_before && !non_text_after,
+        auto_number,
+    }
+}
+
+/// Номер в конце литерального текста абзаца: `(3)`, `(2.1)`, `(А.1)`.
+fn trailing_paren_number(text: &str) -> Option<String> {
+    let trimmed = text.trim_matches(|ch: char| ch.is_whitespace());
+    let open = trimmed.rfind('(')?;
+    parse_paren_number_text(&trimmed[open..])
+}
+
+/// Пунктуация после формулы: литеральный текст абзаца после формулы без номера и пробелов.
+fn suffix_punctuation(literal_after: &str, number_text: Option<&str>) -> String {
+    let mut text = literal_after.trim_matches(char::is_whitespace).to_owned();
+    if let Some(number) = number_text
+        && let Some(open) = text.rfind('(')
+        && parse_paren_number_text(&text[open..]).as_deref() == Some(number)
+    {
+        text.truncate(open);
+    }
+    text.trim_matches(char::is_whitespace).to_owned()
+}
+
+/// Номер `(3)`/`(2.1)`/`(А.1)` из строки (без пробелов по краям).
+fn parse_paren_number_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?.trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let first = inner.chars().next()?;
+    if !(first.is_ascii_digit() || first.is_uppercase()) {
+        return None;
+    }
+    if !inner.chars().all(|ch| ch.is_ascii_digit() || ch == '.' || ch.is_uppercase()) {
+        return None;
+    }
+    if inner.starts_with('.') || inner.ends_with('.') || inner.contains("..") {
+        return None;
+    }
+    Some(inner.to_owned())
+}
+
+/// Автономер Word: литеральный `#`/`#(N)` в конце формулы (eqArr-нумерация).
+///
+/// Word при вводе `#(N)` в линейном формате превращает формулу в `m:eqArr`, а номер хранит
+/// отдельной ячейкой/текстом; литеральное значение есть не всегда. Если значение найдено — оно
+/// используется как номер, иначе номер будет назначен по схеме (с предупреждением).
+fn eqarr_number(math_xml: &str) -> (bool, Option<String>) {
+    let mut number = None;
+    let mut marker = false;
+    let mut pos = 0usize;
+    while let Some(rel) = math_xml[pos..].find("<m:t") {
+        let start = pos + rel;
+        let Some(open_end) = math_xml[start..].find('>').map(|offset| start + offset + 1) else { break };
+        let Some(close) = math_xml[open_end..].find("</m:t>") else { break };
+        let text = &math_xml[open_end..open_end + close];
+        if let Some(at) = text.find('#') {
+            marker = true;
+            let rest = text[at + 1..].trim();
+            if let Some(found) = trailing_paren_number(rest).or_else(|| parse_paren_number_text(rest)) {
+                number = Some(found);
+            }
+        }
+        pos = open_end + close + "</m:t>".len();
+    }
+    (marker, number)
+}
+
+/// Нумерованная legacy-таблица 1×2 вокруг формулы: (границы таблицы, номер без скобок).
+fn ancestor_numbered_table(xml: &str, stack: &[OpenTag], equation_end: usize) -> Option<(usize, usize, String)> {
     let table = stack.iter().rev().find(|open| open.name == "w:tbl")?;
     let start = table.start;
-    let close = "</w:tbl>";
-    let end = xml[start..].find(close)? + start + close.len();
-    let after = &xml[equation_end..end];
+    let end = balanced_end(xml, start, "w:tbl")?;
+    let table_xml = xml.get(start..end)?;
+    // Строго 1×2 (как пишет legacy `equation.rs`): иначе это обычная таблица данных.
+    if table_xml.matches("</w:tr>").count() != 1 || table_xml.matches("</w:tc>").count() != 2 {
+        return None;
+    }
+    let after = xml.get(equation_end.min(end)..end)?;
     let mut rest = after;
     while let Some(index) = next_text_run(rest) {
         let Some(open_end) = rest[index..].find('>') else { break };
         let inner_start = index + open_end + 1;
         let Some(close_rel) = rest[inner_start..].find("</w:t>") else { break };
-        if let Some(number) = parse_paren_number(rest[inner_start..inner_start + close_rel].trim()) {
+        if let Some(number) = parse_paren_number_text(rest[inner_start..inner_start + close_rel].trim()) {
             return Some((start, end, number));
         }
         rest = &rest[inner_start + close_rel..];
@@ -1258,56 +1732,50 @@ fn ancestor_numbered_table(xml: &str, stack: &[OpenTag], equation_end: usize) ->
     None
 }
 
-/// Начало следующего текстового run (`<w:t>`/`<w:t ...>`, не `<w:tc>`/`<w:tbl>`).
-fn next_text_run(text: &str) -> Option<usize> {
-    let plain = text.find("<w:t>");
-    let with_attrs = text.find("<w:t ");
-    match (plain, with_attrs) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
-/// Разобрать «(n)» → n.
-fn parse_paren_number(text: &str) -> Option<u32> {
-    let inner = text.strip_prefix('(')?.strip_suffix(')')?;
-    inner.trim().parse().ok()
-}
-
-/// Абзац содержит только формулу (и `w:pPr`)? — миграция заменит абзац целиком.
-fn paragraph_is_only_math(xml: &str, paragraph_start: usize, paragraph_end: usize, math_start: usize) -> bool {
-    let paragraph = &xml[paragraph_start..paragraph_end];
-    let rel_math = math_start.saturating_sub(paragraph_start);
-    let paragraph_tail = &xml[math_start..paragraph_end];
-    let math_len = if let Some(at) = paragraph_tail.find("</m:oMathPara>") {
-        at + "</m:oMathPara>".len()
-    } else if let Some(at) = paragraph_tail.find("</m:oMath>") {
-        at + "</m:oMath>".len()
-    } else {
-        return false;
-    };
-    let before = &paragraph[..rel_math];
-    let after = &paragraph_tail[math_len..];
-    let rest = format!("{before}{after}");
-    let stripped = strip_between(&rest, "<w:pPr>", "</w:pPr>");
-    !stripped.contains("<w:t") && !stripped.contains("<w:drawing")
-}
-
-/// Убрать из строки все фрагменты между `open` и `close` (включительно).
-fn strip_between(text: &str, open: &str, close: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(index) = rest.find(open) {
-        out.push_str(&rest[..index]);
-        match rest[index..].find(close) {
-            Some(end) => rest = &rest[index + end + close.len()..],
-            None => return out,
+/// Границы элемента `tag` от открывающего тега, с балансировкой вложений того же имени.
+fn balanced_end(xml: &str, start: usize, tag: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut pos = start;
+    while pos < xml.len() {
+        let rel = xml[pos..].find('<')?;
+        let at = pos + rel;
+        let rel_end = xml[at..].find('>')?;
+        let end = at + rel_end;
+        let body = &xml[at + 1..end];
+        let closing = body.starts_with('/');
+        let self_closing = body.ends_with('/');
+        let name = body.trim_start_matches('/').split([' ', '\t', '\n', '/']).next().unwrap_or("");
+        if name == tag {
+            if closing {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(end + 1);
+                }
+            } else if self_closing {
+                if depth == 0 {
+                    return Some(end + 1);
+                }
+            } else {
+                depth += 1;
+            }
         }
+        pos = end + 1;
     }
-    out.push_str(rest);
-    out
+    None
+}
+
+/// Начало следующего текстового run (`<w:t>`/`<w:t ...>`, не `<w:tc>`/`<w:tbl>`/`<w:tabs>`).
+fn next_text_run(text: &str) -> Option<usize> {
+    let mut from = 0usize;
+    while let Some(relative) = text[from..].find("<w:t") {
+        let at = from + relative;
+        let after = text.as_bytes().get(at + "<w:t".len()).copied();
+        if matches!(after, Some(b' ' | b'>' | b'/')) {
+            return Some(at);
+        }
+        from = at + "<w:t".len();
+    }
+    None
 }
 
 // ── поиск sdt формулы в document.xml ─────────────────────────────────────────
@@ -1441,10 +1909,51 @@ mod tests {
     }
 
     #[test]
-    fn parses_paren_numbers() {
-        assert_eq!(parse_paren_number("(12)"), Some(12));
-        assert_eq!(parse_paren_number("( 3 )"), Some(3));
-        assert!(parse_paren_number("рис. 3").is_none());
+    fn parses_paren_number_texts() {
+        assert_eq!(parse_paren_number_text("(12)").as_deref(), Some("12"));
+        assert_eq!(parse_paren_number_text("( 3 )").as_deref(), Some("3"));
+        assert_eq!(parse_paren_number_text("(2.1)").as_deref(), Some("2.1"));
+        assert_eq!(parse_paren_number_text("(А.1)").as_deref(), Some("А.1"));
+        assert_eq!(parse_paren_number_text("(Б.12)").as_deref(), Some("Б.12"));
+        assert!(parse_paren_number_text("рис. 3").is_none());
+        assert!(parse_paren_number_text("(рис. 3)").is_none());
+        assert!(parse_paren_number_text("()").is_none());
+        assert!(parse_paren_number_text("(1.)").is_none());
+    }
+
+    /// MathType-абзац как в реальном Word-документе: таб, формула, пунктуация, таб и поля номера.
+    fn display_paragraph(omml: &str, punctuation: &str, number: Option<&str>) -> String {
+        let number_xml = match number {
+            Some(number) => format!(
+                "<w:r><w:tab/></w:r>\
+                 <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+                 <w:r><w:instrText xml:space=\"preserve\"> MACROBUTTON MTPlaceRef \\* MERGEFORMAT </w:instrText></w:r>\
+                 <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+                 <w:r><w:instrText xml:space=\"preserve\"> SEQ MTEqn \\h \\* MERGEFORMAT </w:instrText></w:r>\
+                 <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+                 <w:r><w:instrText>(</w:instrText></w:r>\
+                 <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+                 <w:r><w:instrText xml:space=\"preserve\"> SEQ MTEqn \\c \\* Arabic \\* MERGEFORMAT </w:instrText></w:r>\
+                 <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+                 <w:r><w:rPr><w:noProof/></w:rPr><w:instrText>{number}</w:instrText></w:r>\
+                 <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+                 <w:r><w:instrText>)</w:instrText></w:r>\
+                 <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+            ),
+            None => String::new(),
+        };
+        format!(
+            "<w:p w14:paraId=\"1A2B3C4D\"><w:pPr><w:pStyle w:val=\"MTDisplayEquation\"/></w:pPr>\
+             <w:r><w:tab/></w:r>{omml}<w:r><w:t xml:space=\"preserve\">{punctuation}</w:t></w:r>{number_xml}</w:p>"
+        )
+    }
+
+    fn paragraph_doc(paragraphs: &str) -> String {
+        format!("<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\"><w:body>{paragraphs}</w:body></w:document>")
+    }
+
+    fn display_omml(text: &str) -> String {
+        format!("<m:oMathPara><m:oMath><m:r><m:t>{text}</m:t></m:r></m:oMath></m:oMathPara>")
     }
 
     #[test]
@@ -1453,10 +1962,88 @@ mod tests {
         let raw = raw_equations(xml);
         assert_eq!(raw.len(), 1, "nested m:oMath не считается отдельно: {raw:?}");
         assert!(raw[0].display);
-        assert_eq!(raw[0].number, Some(7));
+        assert_eq!(raw[0].number_text.as_deref(), Some("7"));
         assert!(raw[0].numbered_table.is_some(), "таблица 1×2 распознана: {raw:?}");
         // В левой ячейке нумерованной таблицы — только формула (абзац «чистый»), но миграция
         // выбирает замену таблицы целиком (numbered_table имеет приоритет над paragraph_only).
         assert!(raw[0].paragraph_only);
+        assert!(raw[0].block_formula());
+    }
+
+    #[test]
+    fn raw_equations_reads_display_field_number_and_punctuation() {
+        let xml = paragraph_doc(&display_paragraph(&display_omml("Δr>ΔR"), ".", Some("3")));
+        let raw = raw_equations(&xml);
+        assert_eq!(raw.len(), 1, "{raw:?}");
+        assert!(raw[0].display);
+        assert_eq!(raw[0].number_text.as_deref(), Some("3"), "номер из поля SEQ MTEqn: {raw:?}");
+        assert_eq!(raw[0].suffix, ".");
+        assert!(raw[0].paragraph_only, "табы/пунктуация/номер не делают абзац смешанным: {raw:?}");
+        assert!(raw[0].block_formula());
+        assert!(!raw[0].mixed_display());
+    }
+
+    #[test]
+    fn raw_equations_reads_literal_paren_numbers() {
+        for (punctuation, number, expected) in [
+            (",", Some("(5)"), Some("5")),
+            ("", Some("(2.1)"), Some("2.1")),
+            ("", Some("(А.1)"), Some("А.1")),
+            (".", None, None),
+        ] {
+            let paragraph = format!(
+                "<w:p><w:r><w:tab/></w:r>{}{}<w:r><w:tab/></w:r>{}</w:p>",
+                display_omml("x"),
+                if punctuation.is_empty() { String::new() } else { format!("<w:r><w:t>{punctuation}</w:t></w:r>") },
+                number.map(|number| format!("<w:r><w:t>{number}</w:t></w:r>")).unwrap_or_default()
+            );
+            let raw = raw_equations(&paragraph_doc(&paragraph));
+            assert_eq!(raw.len(), 1);
+            assert_eq!(raw[0].number_text.as_deref(), expected, "номер {number:?}: {raw:?}");
+            assert_eq!(raw[0].suffix, punctuation, "пунктуация {punctuation:?}");
+            assert!(raw[0].paragraph_only);
+        }
+    }
+
+    #[test]
+    fn raw_equations_keeps_display_in_mixed_paragraph_inline() {
+        let paragraph = format!("<w:p><w:r><w:t>где </w:t></w:r>{}<w:r><w:t> — постоянная.</w:t></w:r></w:p>", display_omml("x"));
+        let raw = raw_equations(&paragraph_doc(&paragraph));
+        assert_eq!(raw.len(), 1);
+        assert!(raw[0].display);
+        assert!(!raw[0].paragraph_only);
+        assert!(raw[0].mixed_display(), "содержательный текст → inline: {raw:?}");
+    }
+
+    #[test]
+    fn raw_equations_ignores_data_tables_and_flags_them() {
+        let table = "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc></w:tr>\
+                     <w:tr><w:tc><w:p><m:oMath><m:r><m:t>y</m:t></m:r></m:oMath></w:p></w:tc><w:tc><w:p><w:r><w:t>c</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+        let raw = raw_equations(&paragraph_doc(table));
+        assert_eq!(raw.len(), 1);
+        assert!(raw[0].in_table, "обычная таблица — не нумерованная: {raw:?}");
+        assert!(raw[0].numbered_table.is_none());
+        assert!(!raw[0].display);
+    }
+
+    #[test]
+    fn raw_equations_detects_eqarr_auto_number() {
+        let omml = "<m:oMathPara><m:oMath><m:eqArr><m:e><m:r><m:t>x=1</m:t></m:r></m:e><m:e><m:r><m:t>#(4)</m:t></m:r></m:e></m:eqArr></m:oMath></m:oMathPara>";
+        let paragraph = format!("<w:p>{omml}</w:p>");
+        let raw = raw_equations(&paragraph_doc(&paragraph));
+        assert_eq!(raw.len(), 1);
+        assert!(raw[0].auto_number, "маркер # распознан: {raw:?}");
+        assert_eq!(raw[0].number_text.as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn paragraph_bounds_cover_whole_formula_paragraph() {
+        let paragraph = display_paragraph(&display_omml("x"), ",", Some("1"));
+        let xml = paragraph_doc(&paragraph);
+        let math = xml.find("<m:oMathPara").unwrap();
+        let (start, end) = paragraph_bounds(&xml, math).unwrap();
+        assert!(xml[start..end].starts_with("<w:p "));
+        assert!(xml[start..end].ends_with("</w:p>"));
+        assert!(xml[start..end].contains("SEQ MTEqn"), "поля номера внутри границ абзаца: {}", &xml[start..end]);
     }
 }

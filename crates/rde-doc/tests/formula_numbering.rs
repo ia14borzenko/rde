@@ -251,23 +251,25 @@ fn update_pass_assigns_section_numbers_and_next_number_preview() {
 }
 
 #[test]
-fn schema_version_4_roundtrips_number_text() {
+fn schema_version_5_roundtrips_number_text_suffix_and_source() {
     let root = tmp("schema");
     write_project(&root);
     let package = new_package(&root);
     let rde_doc = load_rde_doc(&package).unwrap();
-    assert_eq!(rde_doc.schema_version, "4", "новые пакеты пишутся схемой v4 (ADR-0018)");
-    // Пакет v3 (без number_text) читается: поле необязательное.
-    let mut legacy = rde_doc.clone();
-    legacy.schema_version = "3".to_owned();
-    legacy.inserts.push(rde_doc::RdeInsert {
+    assert_eq!(rde_doc.schema_version, "5", "новые пакеты пишутся схемой v5 (ADR-0019)");
+    // Схема v5: пунктуация после формулы и источник номера переживают запись/чтение.
+    let mut doc = rde_doc.clone();
+    doc.schema_version = "5".to_owned();
+    doc.inserts.push(rde_doc::RdeInsert {
         id: "v99".to_owned(),
         block: String::new(),
         kind: "formula".to_owned(),
         target: format!("rde://formula/{FORMULA_A}@act-a"),
         caption: String::new(),
         number: Some(1),
-        number_text: None,
+        number_text: Some("1".to_owned()),
+        suffix: ",".to_owned(),
+        number_source: rde_doc::NUMBER_SOURCE_WORD.to_owned(),
         hash: Some("act-a".to_owned()),
         cached: String::new(),
         selector: String::new(),
@@ -279,6 +281,16 @@ fn schema_version_4_roundtrips_number_text() {
         render_mode: "omml".to_owned(),
         body_hash: None,
     });
+    let rendered = rde_doc::render_rde_doc(&doc);
+    assert!(rendered.contains("suffix=\",\""), "пунктуация в rde:doc: {rendered}");
+    assert!(rendered.contains("number_source=\"word\""), "источник номера в rde:doc: {rendered}");
+    let parsed = rde_doc::parse_rde_doc(&rendered).expect("v5 пакет читается");
+    let insert = parsed.inserts.iter().find(|insert| insert.id == "v99").expect("вставка");
+    assert_eq!(insert.suffix, ",");
+    assert_eq!(insert.number_source, "word");
+    // Пакет v3 (без number_text/suffix/number_source) читается: поля необязательные.
+    let mut legacy = rde_doc.clone();
+    legacy.schema_version = "3".to_owned();
     let rendered = rde_doc::render_rde_doc(&legacy);
     assert!(rendered.contains("schema_version=\"3\""));
     let parsed = rde_doc::parse_rde_doc(&rendered).expect("v3 пакет читается");

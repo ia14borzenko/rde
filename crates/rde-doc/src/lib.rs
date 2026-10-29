@@ -63,6 +63,9 @@ pub use suggestions::*;
 mod text_edit;
 pub use text_edit::*;
 
+/// Разбор текста OOXML с учётом полей Word (номера MathType `SEQ MTEqn`, ADR-0019).
+mod xml_fields;
+
 /// ADR-0018: схемы нумерации формул (сквозная/по разделам, приложения) в контексте документа.
 pub mod formula_numbering;
 pub use formula_numbering::{FormulaNumber, FormulaNumbering, SectionHeading, SectionScan, number_formulas, scan_sections};
@@ -72,11 +75,13 @@ pub mod math_font;
 pub use math_font::{MATH_FONT_COPYRIGHT, MATH_FONT_FAMILY, MATH_FONT_FILE, ensure_registered as ensure_math_font};
 
 pub const RDE_NS: &str = "https://rde.dev/ns/doc";
-/// Версия схемы `rde:doc`: 4 — отображаемый номер формулы `number_text` (схемы нумерации
-/// «по разделам»/приложения, ADR-0018); 3 — скрытые объекты MathType-формул из импорта
-/// (`<rde:formulas>`, R-DOC-44); 2 — формульные вставки (`kind="formula"`, `render_mode`,
-/// `body_hash`). Пакеты версий 1–4 читаются (новые поля необязательны); при записи ставится 4.
-pub const SCHEMA_VERSION: &str = "4";
+/// Версия схемы `rde:doc`: 5 — пунктуация после формулы (`suffix`) и источник номера
+/// (`number_source`, ADR-0019: сохранение номеров Word при импорте); 4 — отображаемый номер
+/// формулы `number_text` (схемы нумерации «по разделам»/приложения, ADR-0018); 3 — скрытые
+/// объекты MathType-формул из импорта (`<rde:formulas>`, R-DOC-44); 2 — формульные вставки
+/// (`kind="formula"`, `render_mode`, `body_hash`). Пакеты версий 1–5 читаются (новые поля
+/// необязательны); при записи ставится 5.
+pub const SCHEMA_VERSION: &str = "5";
 pub const RDE_DOC_PART: &str = "customXml/item1.xml";
 pub const RDE_ITEM_PROPS: &str = "customXml/itemProps1.xml";
 pub const RDE_ITEM_RELS: &str = "customXml/_rels/item1.xml.rels";
@@ -122,6 +127,17 @@ pub struct RdeInsert {
     /// `None` — взять `number` (сквозная схема/совместимость с v3).
     #[serde(default)]
     pub number_text: Option<String>,
+    /// Пунктуация, стоящая в нумерованном абзаце сразу после display-формулы (`,` `.` `;`…):
+    /// переносится в канонический таб-абзац между формулой и правым табом и сохраняется при
+    /// пересборке тела (ADR-0019; схема v5).
+    #[serde(default)]
+    pub suffix: String,
+    /// Источник отображаемого номера (ADB-0019, схема v5): пусто — номер считает схема документа
+    /// (авто); `word` — номер сохранён из исходного Word при миграции; `manual` — задан вручную;
+    /// `off` — формула сознательно не нумеруется. Непустой `word`/`manual` номер исключает вставку
+    /// из автоматической перенумерации при «Обновить документ».
+    #[serde(default)]
+    pub number_source: String,
     #[serde(default)]
     pub hash: Option<String>,
     /// Кэш значения вставки (R-DOC-11): то, что показано в документе.
@@ -346,6 +362,12 @@ pub fn render_rde_doc(doc: &RdeDoc) -> String {
         if let Some(number_text) = &insert.number_text {
             out.push_str(&format!(" number_text=\"{}\"", escape_attr(number_text)));
         }
+        if !insert.suffix.is_empty() {
+            out.push_str(&format!(" suffix=\"{}\"", escape_attr(&insert.suffix)));
+        }
+        if !insert.number_source.is_empty() {
+            out.push_str(&format!(" number_source=\"{}\"", escape_attr(&insert.number_source)));
+        }
         if let Some(hash) = &insert.hash {
             out.push_str(&format!(" hash=\"{}\"", escape_attr(hash)));
         }
@@ -478,6 +500,8 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                             caption: String::new(),
                             number: None,
                             number_text: None,
+                            suffix: String::new(),
+                            number_source: String::new(),
                             hash: None,
                             cached: String::new(),
                             selector: String::new(),
@@ -500,6 +524,8 @@ pub fn parse_rde_doc(xml: &str) -> Result<RdeDoc, String> {
                                 "caption" => insert.caption = value,
                                 "number" => insert.number = value.parse().ok(),
                                 "number_text" => insert.number_text = (!value.is_empty()).then_some(value),
+                                "suffix" => insert.suffix = value,
+                                "number_source" => insert.number_source = value,
                                 "hash" => insert.hash = Some(value),
                                 "cached" => insert.cached = value,
                                 "selector" => insert.selector = value,
@@ -1767,6 +1793,8 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 caption: caption.clone(),
                 number: caption_number(&caption).or(Some(counter)),
                 number_text: None,
+                suffix: String::new(),
+                number_source: String::new(),
                 hash: None,
                 cached: String::new(),
                 selector: String::new(),
@@ -1787,6 +1815,8 @@ fn build_inserts(blocks: &[RdeBlock]) -> Vec<RdeInsert> {
                 caption: block.text.clone(),
                 number: caption_number(&block.text),
                 number_text: None,
+                suffix: String::new(),
+                number_source: String::new(),
                 hash: None,
                 cached: block.text.clone(),
                 selector: String::new(),
@@ -1988,6 +2018,8 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
         caption: request.caption,
         number: None,
         number_text: None,
+        suffix: String::new(),
+        number_source: String::new(),
         hash: None,
         cached: request.cached,
         selector: request.selector,
@@ -2260,6 +2292,8 @@ pub fn add_table_insert(package: &Path, request: InsertRequest, rows: &[Vec<Stri
         caption: caption.clone(),
         number: None,
         number_text: None,
+        suffix: String::new(),
+        number_source: String::new(),
         hash: None,
         cached: format!("{}×{}", rows.len(), rows.iter().map(Vec::len).max().unwrap_or(0)),
         selector: request.selector.clone(),
@@ -2563,6 +2597,8 @@ pub fn add_figure_insert(
         caption: caption.clone(),
         number: None,
         number_text: None,
+        suffix: String::new(),
+        number_source: String::new(),
         hash: Some(out_hash),
         cached: caption,
         selector: String::new(),

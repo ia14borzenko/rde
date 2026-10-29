@@ -28,6 +28,7 @@ pub use manifest::{
 };
 pub use ops::{
     CreateRequest, NewObjectKind, clear_artifact_out_hash, create_document_stub, create_formula,
+    create_formula_with_display,
     create_object, create_project, delete_object, record_artifact_out_hash, record_formula_state,
     rename_object, set_project_authors, backup_project, list_project_backups, restore_project,
     set_project_trusted, write_artifact_manifest, set_document_formula_numbering,

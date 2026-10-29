@@ -34,10 +34,20 @@ fn ole_with_mtef(mtef: &[u8]) -> Vec<u8> {
     compound.into_inner().into_inner()
 }
 
-/// Синтетический `.doc.rde`: один MathType-объект (display-абзац) + `rde:doc`.
-fn synthetic_package(path: &std::path::Path) {
-    let document = r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="MTDisplayEquation"/></w:pPr><w:r><w:rPr><w:position w:val="-28"/></w:rPr><w:object w:dxaOrig="740" w:dyaOrig="720"><v:shape id="_x0000_i1025" type="#_x0000_t75" style="width:37.1pt;height:36.65pt" o:ole=""><v:imagedata r:id="rId2" o:title=""/></v:shape><o:OLEObject Type="Embed" ProgID="Equation.DSMT4" ShapeID="_x0000_i1025" DrawAspect="Content" ObjectID="_1" r:id="rId1"/></w:object></w:r><w:r><w:t>текст</w:t></w:r></w:p></w:body></w:document>"##;
+/// Run с MathType-объектом (`w:object` + OLE `Equation.DSMT4`).
+const OLE_RUN: &str = r##"<w:r><w:rPr><w:position w:val="-28"/></w:rPr><w:object w:dxaOrig="740" w:dyaOrig="720"><v:shape id="_x0000_i1025" type="#_x0000_t75" style="width:37.1pt;height:36.65pt" o:ole=""><v:imagedata r:id="rId2" o:title=""/></v:shape><o:OLEObject Type="Embed" ProgID="Equation.DSMT4" ShapeID="_x0000_i1025" DrawAspect="Content" ObjectID="_1" r:id="rId1"/></w:object></w:r>"##;
+
+/// Тело display-формулы MathType: отдельный абзац с табами вокруг объекта.
+fn display_body() -> String {
+    format!("<w:p><w:pPr><w:pStyle w:val=\"MTDisplayEquation\"/></w:pPr><w:r><w:tab/></w:r>{OLE_RUN}<w:r><w:tab/></w:r></w:p>")
+}
+
+/// Синтетический `.doc.rde` с одним MathType-объектом и `rde:doc`; `body` — содержимое `w:body`.
+fn synthetic_package_with(path: &std::path::Path, body: &str) {
+    let document = format!(
+        r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"##
+    );
     let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.wmf"/></Relationships>"#;
     let ole = ole_with_mtef(&mtef_char(0x0078)); // 'x'
@@ -58,6 +68,11 @@ fn synthetic_package(path: &std::path::Path) {
     add("word/media/image1.wmf", &preview);
     add(RDE_DOC_PART, rde_xml.as_bytes());
     writer.finish().expect("finish");
+}
+
+/// Синтетический `.doc.rde`: один MathType-объект в display-абзаце.
+fn synthetic_package(path: &std::path::Path) {
+    synthetic_package_with(path, &display_body());
 }
 
 fn hex_decode(text: &str) -> Vec<u8> {
@@ -84,7 +99,7 @@ fn math_type_object_becomes_native_formula_and_hidden_object() {
     assert_eq!(report.found, 1);
     assert_eq!(report.converted, 1, "warnings: {:?}", report.warnings);
     assert_eq!(report.failed, 0, "warnings: {:?}", report.warnings);
-    assert_eq!(report.display, 1, "display-формула");
+    assert_eq!(report.display, 1, "display-формула (отдельный абзац без текста)");
     assert_eq!(report.formulas.len(), 1);
     let formula = &report.formulas[0];
     assert_eq!(formula.latex, "x");
@@ -103,7 +118,6 @@ fn math_type_object_becomes_native_formula_and_hidden_object() {
     }
     assert!(!xml.contains("<w:object"), "OLE-объект заменён: {xml}");
     assert!(xml.contains("<m:oMathPara"), "display-формула: {xml}");
-    assert!(xml.contains("текст"), "соседний текст сохранён");
 
     // rde:doc: скрытый объект, версия схемы, body_hash от нового document.xml.
     let doc = crate::load_rde_doc(&package).expect("rde:doc");
@@ -111,6 +125,49 @@ fn math_type_object_becomes_native_formula_and_hidden_object() {
     assert_eq!(doc.formulas.len(), 1);
     assert_eq!(doc.formulas[0].latex, "x");
     assert_eq!(doc.body_hash, rde_hash::sha256(xml.as_bytes()).hex());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn inline_object_in_text_paragraph_stays_inline() {
+    let dir = std::env::temp_dir().join(format!("rde-doc-math-type-inline-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let package = dir.join("inline.doc.rde");
+    let body = format!(r#"<w:p><w:r><w:t xml:space="preserve">где </w:t></w:r>{OLE_RUN}<w:r><w:t> — постоянная.</w:t></w:r></w:p>"#);
+    synthetic_package_with(&package, &body);
+    let report = convert_math_type_objects(&package).expect("convert");
+    assert_eq!(report.found, 1);
+    assert_eq!(report.converted, 1, "warnings: {:?}", report.warnings);
+    assert_eq!(report.display, 0, "объект в абзаце с текстом — inline (ADR-0019)");
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&package).expect("open")).expect("zip");
+    let mut xml = String::new();
+    {
+        use std::io::Read;
+        archive.by_name("word/document.xml").expect("document").read_to_string(&mut xml).expect("read");
+    }
+    assert!(!xml.contains("<m:oMathPara"), "inline-формула без oMathPara: {xml}");
+    assert!(xml.contains("<m:oMath>"), "inline OMML: {xml}");
+    assert!(xml.contains("постоянная"), "текст абзаца сохранён");
+    let doc = crate::load_rde_doc(&package).expect("rde:doc");
+    assert_eq!(doc.formulas.len(), 1);
+    assert!(!doc.formulas[0].display);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn clean_paragraph_with_normal_style_is_inline() {
+    // Inline-формула, стоящая отдельным абзацем-продолжением (без display-стиля MathType), —
+    // не display-нумерация (ADR-0019: решает display-стиль + отсутствие текста вокруг).
+    let dir = std::env::temp_dir().join(format!("rde-doc-math-type-normal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let package = dir.join("normal.doc.rde");
+    let body = format!(r#"<w:p><w:pPr><w:pStyle w:val="Standard"/></w:pPr>{OLE_RUN}</w:p>"#);
+    synthetic_package_with(&package, &body);
+    let report = convert_math_type_objects(&package).expect("convert");
+    assert_eq!(report.converted, 1);
+    assert_eq!(report.display, 0, "без display-стиля — inline: {:?}", report.warnings);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

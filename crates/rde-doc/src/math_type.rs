@@ -24,6 +24,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
 
+use crate::xml_fields::{has_meaningful_text, paragraph_bounds, strip_number_tokens, visible_text};
 use crate::{DOCUMENT_XML, RDE_DOC_PART, RdeDoc, SCHEMA_VERSION, parse_rde_doc, read_package, render_rde_doc, write_package_entries};
 
 /// ProgID объекта MathType в OOXML.
@@ -179,9 +180,10 @@ fn convert_object(
     let latex = crate::mtef::latex_from_mtef(&mtef).map_err(|error| format!("MTEF: {error}"))?;
     let mtef_sha256 = rde_hash::sha256(&mtef).hex();
     let id = format!("mt-{}", &mtef_sha256[..12]);
-    // Заменить несущий абзац/run: display-формула — отдельный абзац MathType.
+    // Заменить несущий run: display-формула — отдельный абзац MathType (классификация по
+    // окружению абзаца, ADR-0019).
     let (run_start, run_end) = enclosing_run(document_xml, span_start, span_end).ok_or("не найден несущий w:r")?;
-    let display = paragraph_is_display(document_xml, run_start);
+    let display = object_is_display(document_xml, run_start, run_end);
     // Компиляция: LaTeX → OMML (штатный пайплайн RDE).
     let caches = crate::formula::compile_formula(&latex, display).map_err(|error| format!("LaTeX: {error}"))?;
     let omml = String::from_utf8_lossy(&caches.omml).to_string();
@@ -318,14 +320,36 @@ fn rfind_element_start(text: &str, prefix: &str) -> Option<usize> {
     None
 }
 
-/// Абзац, в котором лежит позиция `pos`, — display-формула? (MathType пишет display-абзацам стиль
-/// `MTDisplayEquation`/`MTDisplayEquationCenter` и т.п.)
-fn paragraph_is_display(xml: &str, pos: usize) -> bool {
-    let Some(before) = xml.get(..pos) else { return false };
-    let Some(paragraph_start) = rfind_element_start(before, "<w:p") else { return false };
-    let Some(after) = xml.get(paragraph_start..) else { return false };
-    let Some(paragraph_end) = after.find("</w:p>") else { return false };
-    let paragraph = after.get(..paragraph_end).unwrap_or_default();
+/// display-ли MathType-объект (ADR-0019). Два условия:
+/// 1. MathType пометил абзац display-стилем (`MTDisplayEquation`/`...Center`/`...Equation...`) —
+///    MathType пишет display-формулы отдельными абзацами с таким стилем, inline — обычным;
+/// 2. в абзаце вокруг объекта нет содержательного текста — только табы, пунктуация и номер `(N)`
+///    (в т.ч. в полях `SEQ MTEqn`). Иначе формула остаётся inline, даже если стиль «equation».
+///
+/// Одного «чистого абзаца» недостаточно: в реальных документах inline-формула иногда стоит
+/// отдельным абзацем-продолжением (без текста или с одной точкой) — это не display-нумерация.
+fn object_is_display(xml: &str, run_start: usize, run_end: usize) -> bool {
+    if !paragraph_style_display(xml, run_start) {
+        return false;
+    }
+    let Some((paragraph_start, paragraph_end)) = paragraph_bounds(xml, run_start) else {
+        return false;
+    };
+    let before = xml.get(paragraph_start..run_start).unwrap_or_default();
+    let after = xml.get(run_end..paragraph_end).unwrap_or_default();
+    let (visible_before, non_text_before) = visible_text(before);
+    let (visible_after, non_text_after) = visible_text(after);
+    let text_around = strip_number_tokens(&format!("{visible_before}{visible_after}"));
+    !has_meaningful_text(&text_around) && !non_text_before && !non_text_after
+}
+
+/// Стиль абзаца вокруг позиции `pos` — display-стиль MathType? (`MTDisplayEquation`,
+/// `MTDisplayEquationCenter`, `… Equation …`).
+fn paragraph_style_display(xml: &str, pos: usize) -> bool {
+    let Some((paragraph_start, paragraph_end)) = paragraph_bounds(xml, pos) else {
+        return false;
+    };
+    let paragraph = xml.get(paragraph_start..paragraph_end).unwrap_or_default();
     let style = tag_attr(paragraph, "<w:pStyle", "w:val")
         .or_else(|| tag_attr(paragraph, "<w:pStyle", "val"))
         .unwrap_or_default()
