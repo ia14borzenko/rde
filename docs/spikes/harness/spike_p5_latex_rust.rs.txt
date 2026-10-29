@@ -1,0 +1,116 @@
+//! Спайк Research Gate (§2.4-1): `latex-rust` 3.0.1 — parse/layout/egui/PNG, замеры на этом
+//! железе (release), проверка AST, рендер σ-формулы и попытка «каретки по префиксам».
+use std::time::Instant;
+
+use latex_rust::{Dim, EguiOptions, MathFont, MathStyle, SvgOptions, parse, layout, latex_to_png, latex_to_svg, PngBackground, PngOptions, render::egui::shapes};
+
+fn em(d: &Dim) -> String { d.to_dec_string() }
+
+const CASES: &[(&str, &str)] = &[
+    ("simple", r"x=Vt"),
+    ("demand", r"\sigma =\sqrt{\frac{1}{N-1}\sum_{i=1}^{N} {({x}_{i}}-\bar{x}{)}^{2}}"),
+    (
+        "complex",
+        r"ss\left({t}_{n},\tau \right)=\dot{\rho }s\left(\tau -\frac{2{r}_{n}}{c}\right)\exp\left[-i{k}_{w}{r}_{n}\right]",
+    ),
+    ("matrix", r"\left[\begin{matrix}1&2\\3&4\end{matrix}\right]"),
+    ("cases", r"f(x)=\begin{cases} x & x\ge 0\\ -x & x<0\end{cases}"),
+    ("scripts", r"x_{i}^{2}+\frac{a+b}{c-d}+\sqrt[3]{y}"),
+    ("accents", r"\hat{x}+\bar{y}+\vec{v}+\tilde{u}+\dot{a}"),
+    ("text", r"\text{если } x>0"),
+];
+
+fn main() {
+    let font = MathFont::stix_two_math().expect("STIX");
+    println!("FONT upem={} name={}", font.units_per_em(), latex_rust::STIX_TWO_MATH_NAME);
+
+    // 1) Замеры parse / layout / egui-рендер (release).
+    for (label, latex) in CASES {
+        let n = 200;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            let _ = parse(latex).expect("parse");
+        }
+        let parse_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        let tree = parse(latex).expect("parse");
+        let t1 = Instant::now();
+        for _ in 0..n {
+            let _ = layout(&tree, &font, MathStyle::Display).expect("layout");
+        }
+        let layout_us = t1.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        let boxed = layout(&tree, &font, MathStyle::Display).expect("layout");
+        let opts = EguiOptions::new();
+        let t2 = Instant::now();
+        for _ in 0..n {
+            let _ = shapes(&boxed, &font, &opts, egui::pos2(0.0, 0.0), 1.0).expect("shapes");
+        }
+        let egui_us = t2.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        let shapes_count = shapes(&boxed, &font, &opts, egui::pos2(0.0, 0.0), 1.0).map(|(s, _)| s.len()).unwrap_or(0);
+        println!(
+            "BENCH {label:8} parse={parse_us:8.2}us layout={layout_us:8.2}us egui_shapes={egui_us:8.2}us shapes={shapes_count} w={} h={} d={}",
+            em(&boxed.width), em(&boxed.height), em(&boxed.depth)
+        );
+    }
+
+    // 2) Рендер σ-формулы в PNG и SVG (визуальная проверка).
+    let sigma = CASES[1].1;
+    let tree = parse(sigma).expect("parse sigma");
+    let boxed = layout(&tree, &font, MathStyle::Display).expect("layout sigma");
+    let mut popts = PngOptions::default();
+    popts.font_size_pt = Dim::from_i64(28);
+    popts.background = PngBackground::White;
+    match latex_to_png(sigma, &font, &popts) {
+        Ok(png) => {
+            std::fs::write("/tmp/lr-sigma.png", &png).expect("write png");
+            println!("PNG /tmp/lr-sigma.png bytes={}", png.len());
+        }
+        Err(e) => println!("PNG error: {e}"),
+    }
+    let svg = latex_to_svg(sigma, &font, &SvgOptions::new()).expect("svg");
+    std::fs::write("/tmp/lr-sigma.svg", &svg).expect("write svg");
+    println!("SVG /tmp/lr-sigma.svg bytes={}", svg.len());
+
+    // 3) AST и box-модель: есть ли source spans / привязка к узлам (для каретки).
+    println!("AST gold: {}", tree.gold());
+    println!("BOX content kind: {:?}", std::mem::discriminant(&boxed.content));
+
+    // 4) Попытка «каретки по префиксам»: ширина префикса vs полная вёрстка.
+    //    Для структур внутри формулы это не работает без собственного layout: префикс
+    //    пере-вёрстывается (меняются размеры скриптов), поэтому позиция каретки не выводится.
+    let mut prefix = String::new();
+    for piece in ["x", "_{i}", "^{2}", "+", r"\frac{a}{b}"] {
+        prefix.push_str(piece);
+        let t = parse(&prefix).expect("prefix");
+        let b = layout(&t, &font, MathStyle::Text).expect("prefix layout");
+        println!("PREFIX {prefix:24} width={:.2}", em(&b.width));
+    }
+    let full = parse(r"x_{i}^{2}+\frac{a}{b}").expect("full");
+    let fb = layout(&full, &font, MathStyle::Text).expect("full layout");
+    println!("FULL   width={:.2}", em(&fb.width));
+
+    // 5) Покрытие конструкций чек-листа P0: что парсится, что нет.
+    let probes = [
+        r"\frac{1}{2}",
+        r"\sqrt[3]{x+1}",
+        r"\sum_{i=1}^{N} i",
+        r"\int_{0}^{\infty} e^{-x}\,dx",
+        r"\lim_{x \to 0} \frac{\sin x}{x}",
+        r"\left(\frac{a}{b}\right)",
+        r"\begin{matrix}a&b\\c&d\end{matrix}",
+        r"\begin{cases}x & x>0\\ -x & x\le 0\end{cases}",
+        r"\begin{aligned}a&=b\\c&=d\end{aligned}",
+        r"\hat{x}+\bar{y}+\vec{v}",
+        r"\mathbb{R}\ \mathcal{L}\ \mathfrak{g}",
+        r"\text{если } x>0",
+        r"\binom{n}{k}",
+        r"\overbrace{a+b}^{n}",
+        r"\left\|x\right\|",
+        r"\usepackage{amsmath}",
+    ];
+    for probe in probes {
+        match parse(probe) {
+            Ok(_) => println!("SUPPORTED   {probe}"),
+            Err(e) => println!("UNSUPPORTED {probe}  ({e})"),
+        }
+    }
+}

@@ -1,0 +1,302 @@
+//! SPIKE (временный, не коммитится): проверка пригодности math-движка WordCraft как основы
+//! нативного WYSIWYG-редактора формул RDE (P5, Research Gate §2.4 спайк 3).
+//!
+//! Проверяет: roundtrip LaTeX→модель→LaTeX на корпусе, латентность layout+render, геометрию
+//! каретки (MathLayout.slots), операции редактирования (math_edit) и шаблоны галереи.
+
+use std::time::Instant;
+
+use wordcraft_engine::doc::props::CharProps;
+use wordcraft_engine::doc::{Document, InlineObject, Paragraph, para_block, props::Align};
+use wordcraft_engine::doc::math::{Arg, Math, to_linear};
+use wordcraft_engine::doc::math_edit as me;
+use wordcraft_engine::doc::math_latex::{parse_latex, to_latex};
+
+fn corpus() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    // Файлы корпуса: демо-формула + импортированные MathType-формулы (если есть).
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let mut push_from = |dir: std::path::PathBuf, tag: &str| {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path().join("formula.toml");
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    for line in text.lines() {
+                        let Some(rest) = line.strip_prefix("latex = ") else { continue };
+                        let rest = rest.trim();
+                        let latex = if let Some(body) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                            // TOML basic string без редких escape — в корпусе только \\ и \".
+                            let mut out = String::with_capacity(body.len());
+                            let mut chars = body.chars();
+                            while let Some(c) = chars.next() {
+                                if c == '\\' {
+                                    if let Some(n) = chars.next() {
+                                        out.push(n);
+                                    }
+                                } else {
+                                    out.push(c);
+                                }
+                            }
+                            out
+                        } else if let Some(body) = rest.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+                            body.to_owned()
+                        } else {
+                            continue;
+                        };
+                        out.push((format!("{tag}:{}", entry.file_name().to_string_lossy()), latex));
+                    }
+                }
+            }
+        }
+    };
+    push_from(std::path::Path::new(manifest).join("../../demo-project/objects/formulas"), "demo");
+    push_from(std::path::Path::new(manifest).join("../../.cache-tmp/import-v0003/final-e2e/objects/formulas"), "import");
+    // Шаблоны Equation-галереи (все структуры) в их каноническом LaTeX.
+    for template in wordcraft_engine::math_gallery::templates() {
+        let nodes = template.nodes();
+        out.push((format!("gal:{}", template.id), to_latex(&nodes)));
+    }
+    // Конструкции чек-листа P0 (MathType-паритет).
+    for (i, s) in [
+        r"\frac{1}{2}",
+        r"\dfrac{a+b}{c-d}",
+        r"\sqrt{x}",
+        r"\sqrt[3]{x+1}",
+        r"x^{2}",
+        r"x_{i}",
+        r"x_{i}^{2}",
+        r"\sum_{i=1}^{N} i",
+        r"\int_{0}^{\infty} e^{-x} dx",
+        r"\prod_{k=1}^{n} k",
+        r"\lim_{x \to 0} \frac{\sin x}{x}",
+        r"\left(\frac{a}{b}\right)",
+        r"\left[\begin{matrix}1&2\\3&4\end{matrix}\right]",
+        r"\begin{matrix}a&b\\c&d\end{matrix}",
+        r"\begin{cases}x & x>0\\ -x & x\le 0\end{cases}",
+        r"\begin{aligned}a&=b\\c&=d\end{aligned}",
+        r"\hat{x}+\bar{y}+\vec{v}+\tilde{u}+\dot{a}+\ddot{b}",
+        r"\sin x+\cos y+\tan z+\log a+\ln b+\exp c",
+        r"\alpha\beta\gamma\Delta\Omega",
+        r"\mathbb{R}\ \mathcal{L}\ \mathfrak{g}",
+        r"\left\|x\right\|+\left|x\right|",
+        r"a \ne b,\ a \le b,\ a \ge b,\ a \approx b,\ a \equiv b",
+        r"f\colon X\to Y",
+        r"\text{если } x>0",
+        r"\begin{array}{cc}a&b\\c&d\end{array}",
+        r"\overline{AB}+\underline{CD}",
+        r"\overbrace{a+b}^{n}",
+        r"\binom{n}{k}",
+        r"\sigma =\sqrt{\frac{1}{N-1}\sum_{i=1}^{N} {({x}_{i}}-\bar{x}{)}^{2}}",
+        r"\dot{\rho }s\left(\tau -\frac{2{r}_{n}}{c}\right)",
+        r"\begin{matrix}ss\left({t}_{n},\tau \right)\approx \\ \approx \dot{\rho }\end{matrix}",
+    ]
+    .iter()
+    .enumerate()
+    {
+        out.push((format!("p0:{i:02}"), (*s).to_owned()));
+    }
+    out
+}
+
+#[test]
+fn spike_roundtrip_latex() {
+    let cases = corpus();
+    let mut bad = Vec::new();
+    let mut idempotent_bad = Vec::new();
+    let start = Instant::now();
+    for (label, latex) in &cases {
+        let ast1 = parse_latex(latex);
+        let out1 = to_latex(&ast1);
+        let ast2 = parse_latex(&out1);
+        if ast2 != ast1 {
+            bad.push((label.clone(), latex.clone(), out1.clone()));
+        }
+        let out2 = to_latex(&ast2);
+        if out2 != out1 {
+            idempotent_bad.push((label.clone(), out1.clone(), out2.clone()));
+        }
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "ROUNDTRIP: cases={} mismatched={} not_idempotent={} total={:?} per_case={:?}",
+        cases.len(),
+        bad.len(),
+        idempotent_bad.len(),
+        elapsed,
+        elapsed / u32::try_from(cases.len()).unwrap_or(1)
+    );
+    for (label, before, after) in bad.iter().take(15) {
+        println!("MISMATCH {label}\n  in : {before}\n  out: {after}");
+    }
+    for (label, first, second) in idempotent_bad.iter().take(15) {
+        println!("NOT-IDEMPOTENT {label}\n  1: {first}\n  2: {second}");
+    }
+    assert!(bad.is_empty(), "структурный roundtrip сломан: {} случаев", bad.len());
+    assert!(idempotent_bad.is_empty(), "to_latex не идемпотентен: {} случаев", idempotent_bad.len());
+}
+
+/// Собрать scratch-документ с одной формулой и получить `MathLayout` + растр: тот же путь, что
+/// `previews::math_texture`, но с точными габаритами формулы и позицией базовой линии.
+fn render_scratch(nodes: &Arg, display: bool, pt: f32, ppp: f32) -> Option<(wordcraft_engine::layout::math::MathLayout, f32, f32, Vec<u8>, u32, u32)> {
+    let props = CharProps { size: Some(pt), ..Default::default() };
+    let mut p = Paragraph::with_text("", props.clone());
+    p.props.align = Some(Align::Left);
+    p.props.space_before = Some(0.0);
+    p.props.space_after = Some(0.0);
+    p.props.line_spacing = Some(wordcraft_engine::doc::props::LineSpacing::Multiple(1.0));
+    let eq = InlineObject::Equation { linear: to_linear(nodes), display, math: Math { nodes: nodes.clone(), ..Default::default() } };
+    p.insert_object(0, eq, &props).ok()?;
+    let mut d = Document::new();
+    d.body = vec![para_block(p)];
+    d.last_section.page_w = 4000.0;
+    d.last_section.page_h = 4000.0;
+    d.last_section.margin_left = 0.0;
+    d.last_section.margin_right = 0.0;
+    d.last_section.margin_top = 0.0;
+    d.last_section.margin_bottom = 0.0;
+    let l = wordcraft_engine::layout::layout(&d, &mut wordcraft_engine::layout::LayoutCache::new(), &Default::default());
+    let page = l.pages.first()?;
+    let mut math_layout = None;
+    let mut base_y = 0.0f32;
+    let mut left = 0.0f32;
+    for placed in &page.items {
+        if let wordcraft_engine::layout::Placed::Lines { para, y, x, .. } = placed
+            && let Some((_, ml)) = para.maths.first()
+        {
+            // Первая (и единственная) строка: базовая линия относительно верха абзаца.
+            let baseline = para.lines.first().map(|line| line.baseline).unwrap_or(0.0);
+            base_y = y + baseline;
+            // x первой кластерной позиции — левый край уравнения.
+            left = x + para.lines.first().and_then(|line| line.xs.first().copied()).unwrap_or(0.0);
+            math_layout = Some(ml.clone());
+        }
+    }
+    let ml = math_layout?.as_ref().clone();
+    let w = ml.width.max(1.0);
+    let h = (ml.ascent + ml.descent).max(1.0);
+    let opts = wordcraft_engine::render::RenderOptions::default();
+    let mut opts = opts;
+    opts.display.placeholders = true;
+    let img = wordcraft_engine::render::render_area(&d, page, left, base_y - ml.ascent, w, h, ppp, &opts);
+    let px = img.to_straight();
+    Some((ml, w, h, px, img.width, img.height))
+}
+
+#[test]
+fn spike_layout_render_latency() {
+    let formulas: &[(&str, &str)] = &[
+        ("simple", r"x=Vt"),
+        ("demand", r"\sigma =\sqrt{\frac{1}{N-1}\sum_{i=1}^{N} {({x}_{i}}-\bar{x}{)}^{2}}"),
+        (
+            "complex",
+            r"ss\left({t}_{n},\tau \right)=\dot{\rho }s\left(\tau -\frac{2{r}_{n}}{c}\right)\exp\left[-i{k}_{w}{r}_{n}\right]",
+        ),
+        ("matrix", r"\left[\begin{matrix}1&2\\3&4\end{matrix}\right]"),
+    ];
+    for (label, latex) in formulas {
+        let nodes = parse_latex(latex);
+        // Прогрев (шрифты/кэши).
+        let _ = render_scratch(&nodes, true, 12.0, 1.0);
+        let n = 20;
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = render_scratch(&nodes, true, 12.0, 1.0);
+        }
+        let per = t.elapsed() / n;
+        let (ml, w, h, px, iw, ih) = render_scratch(&nodes, true, 12.0, 4.0).expect("render");
+        if *label == "demand" {
+            // Рендер σ-формулы тем же конвейером, что и документ (vello_cpu + STIX): сравнение
+            // визуального паритета с кандидатом latex-rust (спайк 5).
+            let img = image::RgbaImage::from_raw(iw, ih, px.clone()).expect("rgba");
+            img.save("/tmp/wc-sigma.png").expect("save png");
+            println!("WC-PNG /tmp/wc-sigma.png {iw}x{ih}");
+        }
+        println!(
+            "LATENCY {label:8}: {per:?}/frame (layout+render_area+to_straight), math_pt={w:.1}x{:.1} (asc {:.1} desc {:.1}), img={iw}x{ih} ({} px)",
+            h,
+            ml.ascent,
+            ml.descent,
+            px.len()
+        );
+    }
+}
+
+#[test]
+fn spike_caret_geometry() {
+    // σ-формула: позиции каретки по слотам (MathLayout.slots) — основа каретки/хит-теста.
+    let nodes = parse_latex(r"\sigma =\sqrt{\frac{1}{N-1}\sum_{i=1}^{N} {({x}_{i}}-\bar{x}{)}^{2}}");
+    let (ml, _w, _h, _px, _, _) = render_scratch(&nodes, true, 12.0, 1.0).expect("render");
+    println!("SLOTS total={} width={:.1} ascent={:.1} descent={:.1}", ml.slots.len(), ml.width, ml.ascent, ml.descent);
+    for slot in ml.slots.iter().take(12) {
+        println!("  path={:?} off={} x={:.1} y={:.1} a={:.1} d={:.1}", slot.path, slot.off, slot.x, slot.y, slot.a, slot.d);
+    }
+    // Хит-тест в точку чуть правее начала: должен вернуть ближайший слот.
+    let hit = ml.hit(ml.width * 0.5, 3.0).expect("hit");
+    println!("HIT at mid: path={:?} off={} x={:.1}", hit.path, hit.off, hit.x);
+    assert!(ml.slots.len() > 10, "слоты каретки есть");
+    assert!(ml.width > 50.0);
+}
+
+#[test]
+fn spike_edit_ops() {
+    // Навигация/вставка/структуры через math_edit: то же, что делают equation.* команды.
+    let mut root: Arg = parse_latex(r"x_i^2+\frac{a}{b}");
+    let mut pos = me::MathPos::new(Vec::new(), me::units(&root));
+    assert_eq!(pos.off, me::units(&root));
+    // Влево-влево, затем структура «дробь» в позицию каретки.
+    if let Some(p) = me::move_left(&root, &pos) {
+        pos = p;
+    }
+    if let Some(p) = me::move_left(&root, &pos) {
+        pos = p;
+    }
+    let before = to_latex(&root);
+    me::insert_text(&mut root, &pos, "+c", me::TypeStyle::default());
+    let after = to_latex(&root);
+    println!("EDIT insert: {before}  ->  {after}");
+    assert_ne!(before, after);
+    // Структуры: доступные действия и применение.
+    let acts = me::structure_actions(&root, &pos);
+    println!("STRUCTURE actions: {}", acts.len());
+    let mut applied = 0;
+    for (level, action, label) in acts.iter().take(40) {
+        let mut copy = root.clone();
+        if me::apply_structure(&mut copy, &pos, *level, action).is_some() {
+            applied += 1;
+            let out = to_latex(&copy);
+            let reparsed = parse_latex(&out);
+            let _ = label;
+            assert_eq!(to_latex(&reparsed), out, "структура {action}: to_latex не идемпотентен");
+        }
+    }
+    println!("STRUCTURE applied={applied}");
+    // Undo-модель: снапшот — клон дерева (дёшево для формул).
+    let snap = root.clone();
+    let unit = me::units(&root);
+    let mut p2 = me::MathPos::new(Vec::new(), 0);
+    me::insert_text(&mut root, &p2, "Z", me::TypeStyle::default());
+    assert_ne!(snap, root);
+    root = snap;
+    p2.off = unit.min(me::units(&root));
+    println!("EDIT undo restore ok, units={unit}");
+}
+
+#[test]
+fn spike_gallery_coverage() {
+    let mut n = 0;
+    let mut bad = Vec::new();
+    for template in wordcraft_engine::math_gallery::templates() {
+        n += 1;
+        let nodes = template.nodes();
+        let latex = to_latex(&nodes);
+        let reparsed = parse_latex(&latex);
+        if reparsed != nodes {
+            bad.push((template.id, latex));
+        }
+    }
+    println!("GALLERY templates={n} roundtrip_bad={}", bad.len());
+    for (id, latex) in bad.iter().take(10) {
+        println!("  BAD {id}: {latex}");
+    }
+    println!("SYMBOL_SETS={} BUILT_IN_EQUATIONS={}", wordcraft_engine::math_gallery::SYMBOL_SETS.len(), wordcraft_engine::math_gallery::BUILT_INS.len());
+}
