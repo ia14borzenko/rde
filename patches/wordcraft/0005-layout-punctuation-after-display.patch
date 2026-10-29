@@ -1,0 +1,139 @@
+From 33213040d9aa4132828b7b3ba32f95d4aee971bf Mon Sep 17 00:00:00 2001
+From: RDE <rde@local>
+Date: Thu, 29 Oct 2026 16:32:40 +0300
+Subject: [PATCH] =?UTF-8?q?RDE:=20layout:=20=D0=BF=D1=83=D0=BD=D0=BA=D1=82?=
+ =?UTF-8?q?=D1=83=D0=B0=D1=86=D0=B8=D1=8F=20=D0=BF=D0=BE=D1=81=D0=BB=D0=B5?=
+ =?UTF-8?q?=20display-=D1=84=D0=BE=D1=80=D0=BC=D1=83=D0=BB=D1=8B=20=D0=BE?=
+ =?UTF-8?q?=D1=81=D1=82=D0=B0=D1=91=D1=82=D1=81=D1=8F=20=D0=BD=D0=B0=20?=
+ =?UTF-8?q?=D1=81=D1=82=D1=80=D0=BE=D0=BA=D0=B5=20=D1=81=20=D0=BD=D0=BE?=
+ =?UTF-8?q?=D0=BC=D0=B5=D1=80=D0=BE=D0=BC=20(ADR-0019)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Display-формула в right-numbered абзаце может сопровождаться пунктуацией
+(запятая/точка/точка с запятой) до таба к номеру. break_lines уводил номер на
+следующую строку, потому что после display-формулы продолжал строку только таб;
+теперь допускаются кластеры-пунктуация (по тексту абзаца в ParaLayout::text),
+если за ними идёт таб.
+
+Тест: tests::punctuation_after_display_equation_shares_its_line (формула,
+запятая и (1) — в одной строке, номер у правого поля).
+---
+ crates/layout/src/para.rs  | 28 ++++++++++++++++++++++++++-
+ crates/layout/src/tests.rs | 39 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/crates/layout/src/para.rs b/crates/layout/src/para.rs
+index 58e4ccd6..fe984c12 100644
+--- a/crates/layout/src/para.rs
++++ b/crates/layout/src/para.rs
+@@ -357,6 +357,9 @@ pub struct ParaLayout {
+     /// Sum of line heights (without space before/after).
+     pub height: f32,
+     pub text_len: usize,
++    /// Текст абзаца (RDE: разбор пунктуации после display-формулы при разбиении на строки,
++    /// ADR-0019); тот же, по чьим байтовым смещениям считаются `clusters`.
++    pub text: String,
+     /// Paragraph contains fields whose text depends on the page.
+     pub has_page_fields: bool,
+     /// Note references (part id) in this paragraph, by cluster index.
+@@ -1895,6 +1898,7 @@ pub fn layout_para(p: &Paragraph, env: &ParaEnv) -> ParaLayout {
+         label,
+         height: 0.0,
+         text_len: p.text.len(),
++        text: p.text.clone(),
+         has_page_fields,
+         notes,
+         issues: env.proofing.map(|o| proof_issues(p, &runs, &o, env.typing_word, is_list_item(doc, p))).unwrap_or_default(),
+@@ -2344,7 +2348,13 @@ fn break_lines(pl: &mut ParaLayout, env: &ParaEnv, mark_style: u32, level: Optio
+                 }
+                 // RDE: номер `(n)` справа — после display-формулы строка продолжается табом
+                 // (right-numbered без таблицы); таб уводит номер к правой границе текста.
+-                if j < n && pl.clusters.get(j).is_some_and(|c| c.kind == ClKind::Tab) {
++                // RDE (ADR-0019): пунктуация после формулы (`,` `.` `;` …) остаётся на той же
++                // строке сразу за формулой, если дальше идёт таб к номеру.
++                let mut after = j;
++                while after < n && pl.clusters.get(after).is_some_and(|c| cluster_is_punctuation(pl, c)) {
++                    after += 1;
++                }
++                if after < n && pl.clusters.get(after).is_some_and(|c| c.kind == ClKind::Tab) {
+                     continue;
+                 }
+                 end = if j >= n { LineEnd::Para } else { LineEnd::Wrap };
+@@ -2948,6 +2958,22 @@ fn pl_text_at(c: &Cluster) -> bool {
+     c.dot
+ }
+ 
++/// Пунктуация/пробел в кластере (RDE ADR-0019): после display-формулы така€ пунктуация не
++/// разрывает строку — за ней ожидается таб к номеру. Текст берётся по байтовому диапазону кластера.
++fn cluster_is_punctuation(pl: &ParaLayout, c: &Cluster) -> bool {
++    if matches!(c.kind, ClKind::Space) {
++        return true;
++    }
++    if c.kind != ClKind::Text {
++        return false;
++    }
++    let Some(text) = pl.text.get(c.start..c.end) else { return false };
++    !text.is_empty()
++        && text.chars().all(|ch| {
++            ch.is_whitespace() || matches!(ch, ',' | '.' | ';' | ':' | '!' | '?' | '-' | '–' | '—' | '…' | '«' | '»' | '"' | '\'' | ')' | ']' | '*')
++        })
++}
++
+ fn resolve_tab(pl: &mut ParaLayout, pending: &mut Option<(usize, TabStop, f32)>, xs: &mut [f32], c0: usize, x: f32, xo: &mut f32) {
+     // Finish a centre/right/decimal tab: its text (possibly empty) ends at `x`.
+     let Some((tj, stop, tx)) = pending.take() else { return };
+diff --git a/crates/layout/src/tests.rs b/crates/layout/src/tests.rs
+index dad77bf1..4e90bb13 100644
+--- a/crates/layout/src/tests.rs
++++ b/crates/layout/src/tests.rs
+@@ -10689,6 +10689,45 @@ fn layout_cache_invalidates_on_changed_filepath() {
+     assert_eq!(text_b, "/path/two/a.docx", "second layout with same cache shows /path/two/a.docx");
+ }
+ 
++/// RDE ADR-0019: пунктуация после display-формулы (`,`/`.`/`;`) остаётся на строке формулы —
++/// «α = λ/d, … (1)» — и не уводит номер на отдельную строку.
++#[test]
++fn punctuation_after_display_equation_shares_its_line() {
++    use wordcraft_doc::props::{TabAlign, TabLeader, TabStop};
++    let text_width = 468.0f32;
++    let mut d = Document::from_text("");
++    let math = wordcraft_doc::math::Math { nodes: wordcraft_doc::math::parse_linear("a=b"), ..Default::default() };
++    let p = d.para_mut(StoryRef::Body, &Path::top(0)).unwrap();
++    // «таб , таб (1)»: запятая — сразу после формулы (объект вставляется после первого таба).
++    p.insert_text(0, "\t,\t(1)", &Default::default()).unwrap();
++    p.insert_object(1, InlineObject::Equation { linear: "a=b".into(), display: true, math }, &Default::default()).unwrap();
++    p.props.tabs = Some(vec![
++        TabStop { pos: text_width / 2.0, align: TabAlign::Center, leader: TabLeader::None },
++        TabStop { pos: text_width, align: TabAlign::Right, leader: TabLeader::None },
++    ]);
++    let l = lay(&d);
++    let (para, x) = l.pages[0]
++        .items
++        .iter()
++        .find_map(|it| match it {
++            Placed::Lines { para, x, .. } => Some((para, *x)),
++            _ => None,
++        })
++        .unwrap();
++    assert_eq!(para.lines.len(), 1, "формула, запятая и номер — в одной строке: {:?}", para.lines);
++    let line = &para.lines[0];
++    let formula = para.clusters.iter().position(|c| matches!(c.kind, crate::para::ClKind::Object(_))).expect("кластер формулы");
++    // Запятая — следующий после формулы текстовый кластер, до правого таба.
++    let comma = para.clusters.iter().position(|c| c.kind == crate::para::ClKind::Text).expect("кластер запятой");
++    assert_eq!(comma, formula + 1, "запятая сразу после формулы: {:?}", para.clusters);
++    let formula_right = x + line.xs[formula] + para.clusters[formula].adv;
++    let comma_x = x + line.xs[comma];
++    assert!(comma_x >= formula_right - 0.5, "запятая не наезжает на формулу: {comma_x} vs {formula_right}");
++    // Конец строки (правый край последнего кластера) — у правой границы текста.
++    let end = x + line.xs[line.c1 - line.c0];
++    assert!((end - (x + text_width)).abs() < 1.0, "номер прижат к правому полю: {end} vs {}", x + text_width);
++}
++
+ /// RDE: display-формула в абзаце с табуляциями делит строку с номером — формула на центральном
+ /// таб-стопе, номер `(1)` правым краем у правого таб-стопа (Word «Right-numbered» без таблицы;
+ /// RDE ADR-0018). Раньше display-формула всегда уводилась на отдельную строку.
+-- 
+2.53.0
+

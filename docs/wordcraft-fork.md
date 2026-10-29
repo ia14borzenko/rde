@@ -17,12 +17,13 @@
 | 2 | 2026-10-27 | `crates/doc`, `crates/docx` | `a33bb6ce3d8d4e3ee73a4712b3799b5921cf4b1c` (ветка `rde/main`) | **P2.5**: сохранение blip-extLst — `InlineObject::Image` получает `blip_ext: Option<Arc<Embedded>>`; на чтении `a:blip/a:extLst` (в т.ч. `asvg:svgBlip`) сохраняется тем же механизмом, что вложенные объекты/чарты (части: `word/media/*.svg`, их relationship и Content_Types — в `Document::passthrough`), на записи список целиком возвращается в `a:blip` с новыми `r:id`; namespace `asvg`/`a14` — канонические. Зачем: R-DOC-22 п.2 / ADR-0005 — векторная формула/рисунок в docx не должны терять SVG при пересохранении WordCraft | да, кандидат: blip-extLst в модели картинки + общий preserve-механизм (не спец-случай формулы) | форк: `cargo test -p wordcraft-docx` — вся crate, включая `tests/svg_blip.rs` (docx с `svgBlip` → open → save → `svgBlip` и SVG-часть сохранены; повторный save тоже), `cargo check --workspace --tests`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` — зелёные; семантика затронутых крейтов — `wordcraft-doc/docbin/formats/engine`: **1456 passed, 0 failed**. RDE: `rde-docx/tests/svg_blip_roundtrip.rs` (roundtrip через `wordcraft_engine::io`, SVG-часть + rels + Content_Types + LO-оракул) |
 | 3 | 2026-10-28 | `crates/metafile` | `d3a92ab729d04ebc075ae4417cde962448a76fff` (ветка `rde/main`) | **WMF/EMF-текст**: reader игнорировал текстовые записи, поэтому preview-картинки MathType-формул (чистый текст Times New Roman/Symbol/MT Extra) рендерились пустыми — в RDE импортированные формулы выглядели «пропусками». Добавлены `CreateFontIndirect`/`TextOut`/`ExtTextOut` (оба формата длины), `SetTextCharacterExtra`/`SetTextColor`/`SetBkColor`, `ETO_OPAQUE`/`ETO_CLIPPED`, `Rectangle`; имена шрифтов обрезаются по первому NUL (MathType добивает мусором); байты текста → Unicode по charset (CP1252/CP1251/CP1250) + полная таблица Adobe Symbol (включая куски скобок 0xE6–0xFE → U+239B–U+23AE), MT Extra `0x26` → U+02D9 (проверено оракулом LibreOffice). Зачем: fallback-видимость формул при импорте и корректный preview любых WMF/EMF с текстом | да, кандидат: текстовые записи WMF/EMF в metafile (не спец-случай MathType) | форк: `cargo test -p wordcraft-metafile` — **70 passed** (7 новых: текстовые записи/оба формата ExtTextOut, charset'ы, Symbol-куски, NUL-имена, ETO_OPAQUE, advances), `cargo clippy -p wordcraft-metafile --all-targets -- -D warnings`, `cargo fmt` — зелёные. Визуально: все 15 страниц с формулами реального `.docx` в preview-рендере WordCraft совпадают с LibreOffice (RDE-проба `metafile`); после конверсии MathType-preview заменяются нативными формулами (R-DOC-44) |
 | 4 | 2026-10-29 | `crates/layout` | `e90d2743f362c09c7436037b964118bc7438e406` (ветка `rde/main`) | **Right-numbered формула без таблицы (ADR-0018)**: display-формула в абзаце с таб-стопами (центр + право) и номером `(n)` в конце строки — Word-стиль; layout больше не уводит формулу на отдельную строку из-за табов перед ней и продолжает строку табом после неё. Зачем: номер `(N)` справа на той же строке, без невидимой таблицы 1×2 (R-DOC-21, B1) | да, кандидат: «numbered display equation with explicit tabs» (семантика Word для абзаца с текстом и display-формулой сохранена) | форк: `cargo test -p wordcraft-layout` (490 passed, новый `tests::a_display_equation_shares_a_line_with_its_right_number`), clippy `-D warnings`, fmt check. RDE: LO-оракул (номер bbox xMax≈552.9 pt при правом поле 552.5 pt), XML-тесты `formula_numbering`, headless-рендер страницы |
+| 5 | 2026-10-29 | `crates/layout` | `33213040` (ветка `rde/main`) | **Пунктуация после display-формулы (ADR-0019)**: right-numbered абзац может содержать пунктуацию сразу после формулы (`,`/`.`/`;`) до таба к номеру; `break_lines` уводил номер на новую строку, потому что продолжал строку только табом. Теперь после display-формулы допускаются кластеры-пунктуация (по тексту абзаца, `ParaLayout::text`), если за ними идёт таб. Зачем: пунктуация в миграции MathType-документов сохраняется на строке формулы, а не отдельной строкой | да, кандидат: «numbered display equation with trailing punctuation» | форк: `cargo test -p wordcraft-layout` (**491 passed**, новый `tests::punctuation_after_display_equation_shares_its_line`), clippy `-D warnings`, `cargo fmt --check` — зелёные. RDE: headless-скриншот предпросмотра (`gui-p19-preview-numbered.png`: `α = λ/d , … (2)` в одной строке), LO-оракул экспорта на реальном MathType-документе |
 
 ## Форк опубликован (2026-10-24)
 
 - **URL:** <https://github.com/ia14borzenko/wordcraft-rde> (публичный, parent `storytold/wordcraft`).
 - **Ветка:** `rde/main`; первый коммит форка `f85cb9c9ecaf6d4193a8b06d32eefe9671338733`, текущий
-  пин RDE — `d3a92ab729d04ebc075ae4417cde962448a76fff` (проверено публичным клоном и `git ls-remote`).
+  пин RDE — `33213040` (после патча #5, ADR-0019; проверено публичным клоном и `git ls-remote`).
 - **`.gitmodules`** в RDE указывает на форк: `https://github.com/ia14borzenko/wordcraft-rde.git`;
   `git submodule sync` выполнен, пин субмодуля — тот же коммит.
 - **Проверена воспроизводимость:** `git clone` RDE + `git submodule update --init --recursive`
@@ -121,3 +122,27 @@ WordCraft-рендер страницы (предпросмотр/PDF) став�
 `unverified` (по ECMA-376 допустимо; LO и WordCraft рендерят корректно). Абзац с обычным текстом
 перед display-формулой сохранёт прежнее поведение WordCraft (формула на своей строке) — RDE так не
 вставляет.
+
+## Пунктуация после display-формулы (2026-10-29, коммит `33213040`)
+
+**Что было.** После display-формулы `break_lines` продолжал строку только если следующий кластер —
+таб (патч #4). В MathType-документах/миграции (ADR-0019) между формулой и табом к номеру стоит
+пунктуация (`,`/`.`/`;`) — layout считал её обычным текстом и уводил номер на новую строку:
+в RDE-предпросмотре номер и знак оказывались на отдельной строке, хотя экспорт `.docx` в
+LibreOffice раскладывался правильно.
+
+**Что сделано (RDE-патч форка, ADR-0019 §3).**
+
+* `ParaLayout` получает `text: String` — текст абзаца для разбора кластеров по байтовым смещениям;
+* после display-формулы строка продолжается, если следующие кластеры — только пунктуация/пробел
+  (`,` `.` `;` `:` `!` `?` `-` `–` `—` `…` `«` `»` кавычки/скобки), а за ними идёт таб;
+* тест `tests::punctuation_after_display_equation_shares_its_line`: формула, запятая и `(1)` — в
+  одной строке, запятая сразу после формулы, номер правым краем у правого поля.
+
+**Проверка.** `cargo test -p wordcraft-layout` — **491 passed, 0 failed**; clippy `-D warnings` и
+`cargo fmt --check` чистые. RDE: предпросмотр синтетического MathType-документа — `α = λ/d, … (2)`
+одной строкой (скриншот `docs/fidelity/gui-p19-preview-numbered.png`); экспорт `.docx` —
+LO-оракул на реальном документе (номера `(N)` у правого поля, пунктуация после формул).
+
+**Ограничения.** Word на стенде нет — `unverified`; продолжаем строку только для пунктуации перед
+табом; обычный текст после display-формулы (смешанный абзац) по-прежнему начинает новую строку.

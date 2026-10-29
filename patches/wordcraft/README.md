@@ -40,3 +40,17 @@ git -C vendor/wordcraft apply ../../../patches/wordcraft/0001-rde-docview.patch
 git -C vendor/wordcraft apply ../../../patches/wordcraft/0002-wmf-text.patch
 git -C vendor/wordcraft apply ../../../patches/wordcraft/0004-layout-right-numbered.patch
 ```
+
+## 0005-layout-punctuation-after-display.patch
+`break_lines` (`crates/layout/src/para.rs`): после display-формулы строка продолжается не только
+табом, но и пунктуацией (`,`/`.`/`;`) перед табом к номеру — пунктуация после формулы остаётся на
+строке формулы в right-numbered вёрстке (ADR-0019). Добавлено поле `ParaLayout::text`.
+
+Применение на чистом WordCraft v0.10.0 (после 0001/0002/0004):
+```bash
+git -C vendor/wordcraft checkout v0.10.0
+git -C vendor/wordcraft apply ../../../patches/wordcraft/0001-rde-docview.patch
+git -C vendor/wordcraft apply ../../../patches/wordcraft/0002-wmf-text.patch
+git -C vendor/wordcraft apply ../../../patches/wordcraft/0004-layout-right-numbered.patch
+git -C vendor/wordcraft apply ../../../patches/wordcraft/0005-layout-punctuation-after-display.patch
+```
