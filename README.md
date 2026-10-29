@@ -122,16 +122,22 @@ suggested edits/ревизии), **M2**
 `tesseract-ocr` + `tesseract-ocr-rus` (источники), `uv` (Python-артефакты), опционально `monolith`.
 
 ```bash
-# 1) WordCraft v0.10.0 + форк-патч DocView
+# 1) WordCraft v0.10.0 + форк-патч DocView (один раз)
 git submodule update --init --recursive
-# 2) сборка приложения (target вынесен на внешний ext4)
-./scripts/build.sh build -p rde
 
-# 3) запуск: по умолчанию демо-проект demo-project/
-./scripts/build.sh run -p rde
+# 2) запуск приложения — одной командой: сам соберёт (если бинаря нет) и откроет GUI
+./scripts/run.sh
+#    с конкретным проектом:
+./scripts/run.sh /путь/к/проекту
+#    (запоминает последний проект: следующий ./scripts/run.sh откроет его же;
+#     --rebuild — пересобрать, --print — только показать команду)
 
-#    после сборки бинарь лежит в $CARGO_TARGET_DIR/debug/rde
-#    (на стенде 2026-10-25 — `rde/target/debug/rde`, см. примечание ниже)
+# 3) всё остальное — из окна GUI (CLI не нужен):
+#    • открыть проект — «Файл → Открыть проект…» или перетащить папку с rde.toml в окно;
+#    • импорт .docx — «Файл → Обмен с Word → Импорт .docx…» или перетащить .docx в окно
+#      (MathType-формулы при импорте становятся нативными формулами RDE, R-DOC-44;
+#       исходный .docx не изменяется, отчёт — в журнале внизу и import.json);
+#    • сохранить/экспорт — «Файл → Сохранить проект», «Файл → Экспорт .docx».
 
 #    другой проект RDE:
 ./scripts/build.sh run -p rde -- --project /путь/к/проекту
@@ -149,9 +155,10 @@ RDE_PROJECT=/путь/к/проекту ./scripts/build.sh run -p rde
 то же в `.cargo/config.toml`), проверка свободного места, очистка incremental при нехватке.
 На другой машине переопределите `CARGO_TARGET_DIR` или удалите `target-dir` из `.cargo/config.toml`.
 
-> **Стенд 2026-10-25:** `/srv/yocto` смонтирован **read-only** — сборка идёт с явным локальным
-> target: `export CARGO_TARGET_DIR=$PWD/target`; для `uv` — `export UV_CACHE_DIR=/home/admin-pc/proj/rde-dev/.cache-tmp/uv-cache`.
-> Когда диск вернётся в rw, достаточно убрать `export` — `.cargo/config.toml` снова направит target на `/srv/yocto`.
+> **Где бинарник:** `$CARGO_TARGET_DIR/debug/rde`; на этом стенде — **`/srv/yocto/rde-target/debug/rde`**
+> (`target-dir` в `.cargo/config.toml`, каталог `rde/target` **не используется** и его можно удалять).
+> `./scripts/run.sh` находит бинарник сам; полная очистка — `./scripts/clean-build.sh`, после неё
+> первый `run.sh` соберёт всё заново (долго).
 Полная очистка — `./scripts/clean-build.sh`. Для сборки/тестов из каталога `rde/` можно и просто
 `cargo …`: target-dir уже прописан.
 

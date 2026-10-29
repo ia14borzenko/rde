@@ -2929,6 +2929,33 @@ impl RdeApp {
         if let Some(editor) = &mut self.editor {
             editor.app.ui.theme = appearance_of(theme);
         }
+        // Drag&Drop без заклинаний: папка проекта → открыть проект, .docx → импорт в текущий проект
+        // (MathType-формулы при импорте становятся нативными формулами RDE).
+        let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|input| {
+            input.raw.dropped_files.iter().map(|file| file.path().to_path_buf()).collect()
+        });
+        if !dropped.is_empty() {
+            self.handle_dropped_paths(&dropped);
+        }
+        // Подсказка, пока пользователь держит файл над окном.
+        let hovered: Vec<String> = ui.ctx().input(|input| {
+            input
+                .raw
+                .hovered_files
+                .iter()
+                .map(|file| {
+                    file.path
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "файл".to_owned())
+                })
+                .collect()
+        });
+        if !hovered.is_empty() {
+            self.drop_hint_overlay(ui.ctx(), &hovered);
+        }
+
         // Горячие клавиши (Ctrl+F — поиск, Ctrl+S — сохранить проект, Ctrl+Z/Y — отмена/повтор в редакторе).
         let (find, save, undo, redo) = ui.input(|input| {
             (
@@ -4595,6 +4622,90 @@ impl RdeApp {
             }
             Err(error) => self.push_log(Level::Warn, format!("Не удалось открыть проект {}: {error}", root.display())),
         }
+    }
+
+    /// Drag&Drop без заклинаний (GUI-only сценарий): решает, что делать с перетащенными путями.
+    ///
+    /// * папка с `rde.toml` → открыть проект (текущий документ предварительно сохраняется);
+    /// * `.docx` → импорт в текущий проект (исходник не изменяется; MathType-формулы становятся
+    ///   нативными формулами RDE — R-DOC-44);
+    /// * прочее (в т.ч. `.doc`/`.odt`) → понятное предупреждение в журнале, без «тихих» потерь.
+    pub fn handle_dropped_paths(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            if path.is_dir() {
+                if path.join("rde.toml").is_file() {
+                    if self.editor.is_some() {
+                        self.save_project_document();
+                    }
+                    self.open_project(path);
+                } else {
+                    self.push_log(
+                        Level::Warn,
+                        format!(
+                            "Перетащена папка без rde.toml: {} — перетащите папку проекта RDE (в ней должен быть rde.toml)",
+                            path.display()
+                        ),
+                    );
+                }
+                continue;
+            }
+            if !path.is_file() {
+                self.push_log(Level::Warn, format!("Перетащен несуществующий путь: {}", path.display()));
+                continue;
+            }
+            let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
+            match extension.as_str() {
+                "docx" => {
+                    if self.editor.is_some() {
+                        // Не терять несохранённые правки текущего документа перед импортом.
+                        self.save_project_document();
+                    }
+                    self.push_log(Level::Info, format!("Перетащен .docx: {} — импортирую…", path.display()));
+                    if let Err(error) = self.import_docx_action(path) {
+                        self.push_log(Level::Warn, format!("Импорт .docx (drag&drop): {error}"));
+                    }
+                }
+                "doc" | "rtf" | "odt" | "html" | "htm" | "md" | "tex" | "txt" => self.push_log(
+                    Level::Warn,
+                    format!(
+                        "Импорт поддерживает только .docx (R-DOC-39): {} — сохраните документ как .docx и перетащите его",
+                        path.display()
+                    ),
+                ),
+                _ => self.push_log(
+                    Level::Warn,
+                    format!(
+                        "Неизвестный файл: {} — перетащите .docx для импорта или папку проекта с rde.toml",
+                        path.display()
+                    ),
+                ),
+            }
+        }
+    }
+
+    /// Полупрозрачная подсказка поверх окна, пока файл держат над окном (drag&drop).
+    fn drop_hint_overlay(&self, ctx: &egui::Context, hovered: &[String]) {
+        let pal = theme_colors(ctx.theme());
+        egui::Area::new(egui::Id::new("rde_drop_hint"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(pal.panel_hi)
+                    .stroke(egui::Stroke::new(2.0, pal.accent))
+                    .corner_radius(CornerRadius::same(14))
+                    .inner_margin(Margin::same(24))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Отпустите файл").heading().strong().color(pal.text));
+                        let name = hovered.first().map(String::as_str).unwrap_or("");
+                        if !name.is_empty() {
+                            ui.label(RichText::new(name).color(pal.muted));
+                        }
+                        ui.label("• папка проекта с rde.toml → открыть проект");
+                        ui.label("• .docx → импорт (MathType-формулы станут нативными)");
+                    });
+            });
     }
 
     /// Создать новый проект и открыть его.
@@ -9781,6 +9892,68 @@ mod docview_tests {
         app.tab = super::Tab::Document;
         app.ensure_editor();
         assert!(app.editor.is_some(), "редактор открывает импортированный документ: {:?}", app.editor_error);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// GUI-only сценарий (drag&drop): .docx, перетащенный в окно, импортируется в текущий проект —
+    /// тот же путь, что «Файл → Импорт .docx…» (MathType-формулы конвертируются при импорте, R-DOC-44).
+    #[test]
+    fn drag_and_drop_docx_imports_into_current_project() {
+        let root = temp_demo_copy("drop-docx");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let before = app.project.documents().count();
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rde-doc/tests/fixtures/base-report.docx")
+            .canonicalize()
+            .expect("фикстура .docx");
+        app.handle_dropped_paths(&[source]);
+        let after = app.project.documents().count();
+        assert_eq!(after, before + 1, "перетащенный .docx импортирован новым документом");
+        let imported = app
+            .project
+            .documents()
+            .find(|object| object.title.starts_with("[IMPORTED]"))
+            .expect("документ [IMPORTED]");
+        assert!(imported.dir.join("report.doc.rde").is_file(), "пакет создан: {}", imported.dir.display());
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Импортирован .docx")),
+            "журнал: импорт виден пользователю"
+        );
+        assert!(app.active_document_path().is_some(), "импортированный документ стал активным");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// GUI-only сценарий (drag&drop): папка проекта, перетащенная в окно, открывается как проект.
+    #[test]
+    fn drag_and_drop_project_folder_opens_project() {
+        let first = temp_demo_copy("drop-proj-a");
+        let second = temp_demo_copy("drop-proj-b");
+        let mut app = RdeApp::new(rde_core::load_project(&first).unwrap());
+        app.handle_dropped_paths(&[second.clone()]);
+        let opened = app.project.root.canonicalize().unwrap_or_else(|_| app.project.root.clone());
+        let expected = second.canonicalize().unwrap_or_else(|_| second.clone());
+        assert_eq!(opened, expected, "открыт перетащенный проект");
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("Проект открыт")),
+            "журнал: открытие проекта видно пользователю"
+        );
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    /// GUI-only сценарий (drag&drop): неподдерживаемый файл не «теряется молча» — предупреждение.
+    #[test]
+    fn drag_and_drop_unsupported_file_warns_about_docx_only() {
+        let root = temp_demo_copy("drop-bad");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let legacy = std::env::temp_dir().join(format!("rde-ui-drop-legacy-{}.doc", std::process::id()));
+        std::fs::write(&legacy, b"old binary doc").unwrap();
+        app.handle_dropped_paths(&[legacy.clone()]);
+        assert!(
+            app.project.log.iter().any(|line| line.text.contains("только .docx")),
+            "журнал: подсказка «сохраните как .docx»"
+        );
+        let _ = std::fs::remove_file(&legacy);
         let _ = std::fs::remove_dir_all(&root);
     }
 
