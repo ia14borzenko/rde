@@ -1919,3 +1919,110 @@ cd /home/admin-pc/proj/rde-dev/rde
 - Схемы: нет многоуровневых разделов (`2.1.3`) и приложений без номера в заголовке; формулы в
   колонтитулах/сносках не нумеруются; ссылка на повторную вставку одной формулы — на первое вхождение.
 - `equation.rs` (legacy-API фазы 1) остаётся табличным — не путать с вставками GUI.
+
+## Обновление 2026-10-29 (импорт MathType с нумерацией формул; ADR-0019, тег `import-numbered-formulas`)
+
+### Что сделано
+
+- **Классификация display/inline при импорте MathType** (`math_type::object_is_display`): display —
+  object в абзаце с display-стилем MathType (`MTDisplayEquation*`) **и** без содержательного текста
+  вокруг (табы/пунктуация/поля номера допустимы; проверка по видимому тексту с полями); формула в
+  абзаце с текстом или отдельным абзацем-продолжением без display-стиля — inline. На документе
+  приёмки: display **31**, inline **33** (раньше heuristic стилей давал 31, но inline-объекты в
+  «чистых» абзацах-продолжениях неверно считались display — исправлено).
+- **Номера из Word распознаются** (новый `rde-doc/src/xml_fields.rs` + `raw_equations`): поля
+  MathType `MACROBUTTON MTPlaceRef` + `SEQ MTEqn \c` в формах `w:fldChar` и `w:fldSimple` (кэш
+  значения в `w:instrText` — реальная MathType-нумерация), литеральные `(N)`/`(N.M)`/`(А.N)`,
+  legacy-таблица 1×2, пунктуация сразу после формулы (`,`/`.`/`;`), смешанные абзацы (текст/обычная
+  таблица), автономер `#`/eqArr. **Исправлен вывод предыдущего аудита**: в документе приёмки номера
+  `(1)…(31)` есть — они были невидимы для наивного разбора (лежат в результатах полей, не в `w:t`).
+- **Миграция** (`migrate_formulas_with` + `FormulaMigrationOptions`): display в чистом абзаце
+  заменяется **целиком** на block-`w:sdt` с канонической right-numbered вёрсткой (табы center+right,
+  `m:oMathPara`, пунктуация после формулы, номер `(N)` справа; block-sdt внутрь `w:p` не вставляется),
+  legacy-таблица — целиком, смешанный абзац — inline без номера + предупреждение; пунктуация
+  сохраняется в `RdeInsert.suffix` и переживает «Обновить документ». Политика: **сохранять номера
+  Word**, если они есть у всех display-формул и согласованы, иначе — назначать по схеме проекта
+  (`document.toml: formula_numbering`), с предупреждением. `create_formula_with_display` — display
+  project-level формулы из фактического вхождения. После миграции сразу пересобираются тела и
+  перекрёстные ссылки (`refresh_formula_crossrefs`) — отдельное «Обновить документ» не нужно.
+- **`rde:doc` v5**: `RdeInsert.suffix`/`number_source` (`word`/`manual`/`off`/авто); номера из Word
+  не перенумеровываются при обновлении, явная смена схемы снимает фиксацию; чтение v1–v5.
+- **UI**: диалог «Принять формулы как объекты» со счётчиками (display/inline/найдено номеров),
+  выбором схемы, галочками «Сохранять существующие номера из Word» (вкл., если найдены) и
+  «Нумеровать display-формулы»; журнал с числами и предупреждениями; источник номера в инспекторе
+  «где вставлено».
+- **Форк WordCraft #5** (`33213040`, ветка `rde/main`, запушен): layout продолжает строку
+  display-формулы пунктуацией перед табом к номеру — в RDE-предпросмотре `α = λ/d, … (2)` в одной
+  строке; патч `patches/wordcraft/0005-layout-punctuation-after-display.patch`, журнал
+  [`wordcraft-fork.md`](wordcraft-fork.md) (#5). Тесты форка — `cargo test -p wordcraft-layout`
+  **491 passed**, clippy/fmt чистые.
+- **Headless-путь** для проверки своего документа:
+  `cargo run -p rde-doc --example migrate-numbered -- <проект> [--section] [--renumber] [--export out.docx]`
+  (тот же путь, что у кнопки GUI); `--export-only`/`--renumber-only` — экспорт/смена схемы без миграции.
+
+### Проверка
+
+- `cargo test --workspace` — **582 passed, 0 failed** (было 560; +22: `rde-doc` `xml_fields` 7,
+  `formula_insert` +6, `math_type` +2, `import_numbered_formulas` 5; `rde-ui` kittest +2).
+- Реальный документ приёмки (локально, в git не добавлен): 64 MathType-формулы — **64/64** вставок
+  (62 уникальных project-level объекта — две формулы повторяются), **31 display** с номерами
+  `(1)…(31)`, **сохранены из Word** (`number_source="word"`), **33 inline** не тронуты, пунктуация
+  сохранена у **24** формул; «Обновить документ» сразу после миграции — 0 конфликтов/0 обновлений
+  (идемпотентно); LO-рендер экспорта `.docx`: **27 страниц** (было 27), номер `(1)` bbox
+  `xMax=555.41 pt` при правом поле текста **555.3 pt**; было `11\* MERGEFORMAT ()`, стало `(1)`;
+  смена схемы «по разделам» → `(1.1)`, `(1.2)`, `(3.1)…` + 2 предупреждения (заголовки без номера),
+  обратно → `(1)…(31)`.
+- Синтетический документ (в git): до/после + GUI-скриншоты —
+  [`fidelity/import-numbered-formulas.md`](fidelity/import-numbered-formulas.md),
+  [`p19-import-before-numbering.png`](fidelity/p19-import-before-numbering.png),
+  [`p19-import-after-numbering.png`](fidelity/p19-import-after-numbering.png),
+  [`gui-p19-migration-dialog.png`](fidelity/gui-p19-migration-dialog.png),
+  [`gui-p19-preview-numbered.png`](fidelity/gui-p19-preview-numbered.png).
+- Clippy: новые/изменённые участки `rde-doc`/`rde-ui` без предупреждений (остальные clippy-1.99
+  предупреждения — существовавшие ранее, не трогались).
+
+### Ограничения и следующий шаг
+
+- Смешанные абзацы (display + текст) и формулы в обычных таблицах не нумеруются (остаются inline,
+  предупреждение); автономера Word без литерального кэша (`#`/eqArr) назначаются по схеме.
+- Плейн-текстовые ссылки `(N)` в тексте не автодетектируются (в следующем шаге — опционально);
+  формулы в колонтитулах/сносках по-прежнему не нумеруются.
+- Word на стенде нет: `m:oMathPara`+табы+пунктуация и `m:mathPr/mathFont` — `unverified` (LO и
+  layout WordCraft — проверено). Display-стиль MathType с переименованным именем → inline
+  (безопасная деградация, зафиксировано в ADR-0019).
+- 64 вставки на 62 project-level объекта — переиспользование формулы проекта (повторяющиеся
+  формулы), поведение задокументировано.
+
+### Как запустить (актуально на этой итерации)
+
+```bash
+cd /home/admin-pc/proj/rde-dev/rde
+
+# 1) приложение (бинарь уже собран; target — внешний ext4 /srv/yocto/rde-target)
+/srv/yocto/rde-target/debug/rde                      # демо-проект по умолчанию
+./scripts/run.sh                                     # то же через обёртку
+./scripts/run.sh -- --project .cache-tmp/import-v0003/e2e/project  # конкретный проект
+RDE_PROJECT=.cache-tmp/import-v0003/e2e/project ./scripts/run.sh   # или через переменную
+
+# 2) тесты (обёртка защищает от переполнения /home; target-dir уже в .cargo/config.toml)
+./scripts/build.sh test --workspace                  # 582 passed / 0 failed
+
+# 3) headless-скриншоты (egui_kittest, wgpu offscreen, без окна)
+RDE_PROJECT=.cache-tmp/adr19-fidelity/before RDE_SCREENSHOT_STEPS=60 \
+  /srv/yocto/rde-target/debug/examples/screenshot /tmp/migrate-dialog.png \
+  document "" 0 formula-migration-dialog light
+RDE_PROJECT=.cache-tmp/adr19-fidelity/after RDE_SCREENSHOT_STEPS=60 \
+  /srv/yocto/rde-target/debug/examples/screenshot /tmp/numbered-preview.png \
+  document "" 0 "" light "" preview 0
+
+# 4) миграция импортированного MathType-документа без GUI (тот же путь, что кнопка)
+cargo run -p rde-doc --example migrate-numbered -- .cache-tmp/import-v0003/e2e/project \
+  --export /tmp/numbered.docx
+cargo run -p rde-doc --example migrate-numbered -- .cache-tmp/import-v0003/e2e/project \
+  --renumber-only --section           # сменить схему на «по разделам» (и обратно — без --section)
+
+# 5) пересборка (debug/release) и полная очистка
+./scripts/build.sh build -p rde                      # debug
+./scripts/build.sh build -p rde --release            # release
+./scripts/clean-build.sh                             # полная очистка /srv/yocto/rde-target
+```
