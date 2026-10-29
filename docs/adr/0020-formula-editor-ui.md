@@ -1,0 +1,211 @@
+# ADR-0020 — Редактор формул в GUI (P4): создание/правка source-of-truth, панель equation_tab, вставка с нумерацией
+
+- **Статус:** принято (2026-10-29, итерация `formula-editor`)
+- **Контекст:** ADR-0005 **P4** (§5 «Редактор: нативный WordCraft в панели RDE», §11 «План P4»),
+  R-DOC-21 «фаза 2» / R-DOC-19 / R-DOC-13, ADR-0018 (right-numbered, схемы нумерации, ссылки),
+  ADR-0019 (импорт MathType и `number_source`), спайк A
+  ([`docs/spikes/formulas-latex.md`](../spikes/formulas-latex.md) §2), ADR-0001 §4 (правило форка
+  WordCraft), ADR-0002 (границы крейтов), R-TREE-01/02.
+- **Связанные документы:** [docs/tz-03.md](../tz-03.md) §5.7.5/§16,
+  [docs/gui-coverage.md](../gui-coverage.md),
+  [docs/fidelity/p20-formula-editor.md](../fidelity/p20-formula-editor.md),
+  [ADR-0005](0005-formulas-and-values-as-project-objects.md),
+  [ADR-0018](0018-formula-math-font-and-right-numbered.md),
+  [ADR-0019](0019-import-numbered-formulas.md), [docs/state.md](../state.md).
+- **База:** HEAD `61255fe` (тег `import-numbered-formulas`), рабочее дерево чистое; на входе
+  `cargo test --workspace` — **582 passed / 0 failed**; на выходе — **590 passed / 0 failed** (см. §7).
+- **Vendor:** `vendor/wordcraft` **не менялся** (пин `33213040` прежний). Спайк A подтвердил: P4
+  достижим через публичные `equation_tab`/`WordApp`; ADR-0001 §4 не задействован.
+
+## Контекст
+
+Предыдущие итерации закрыли **конвейер формул**: project-level объекты (ADR-0005 P2), Word-вёрстку
+right-numbered + схемы нумерации + перекрёстные ссылки (ADR-0018), импорт MathType с сохранением
+номеров Word (ADR-0019), вставки/статусы/«где вставлено»/миграцию (P3). Но **в GUI нельзя было
+создать или отредактировать ни одной формулы**:
+
+- `create_formula`/`create_formula_with_display` вызывались только из миграции импортированного
+  документа; `NewObjectKind` не имел варианта Formula;
+- диалог «Вставить формулу» требовал **уже существующий** объект: при пустом реестре писал «в проекте
+  нет formulas-объектов»;
+- инспектор формулы показывал latex/display/нумерацию/статус/«где вставлено», но кнопки правки не
+  было; в `docs/gui-coverage.md` строка 202 значилась «❌ только файл/агент»;
+- не было API правки `formula.toml` (только точечная запись `[state]` — `record_formula_state`);
+- `FormulaBody.numbered` при вставке/обновлении вычислялся как `numbered = display`, **игнорируя
+  политику объекта** `numbering.mode = auto|none` (это стало видно при появлении выбора в GUI).
+
+Для продукта «написать ВКР в RDE» это был главный оставшийся пробел (R-DOC-21 фаза 2 / ADR-0005 P4).
+
+## Решение 1 — API создания/правки формулы (`rde-core`)
+
+Слой `rde-core` (владелец манифестов) получил три публичные операции
+([`crates/rde-core/src/ops.rs`](../../crates/rde-core/src/ops.rs)):
+
+| Операция | Назначение |
+|---|---|
+| `create_formula_with_options(root, title, latex, display, numbering_mode)` | создание project-level формулы с явными `display` и политикой `auto\|none`; `create_formula_with_display` делегирует с `auto` (совместимость миграции) |
+| `read_formula_manifest(root, id)` | типизированное чтение `formula.toml` (редактору нужны `inputs`/`fragments`/`state` для сохранения) |
+| `write_formula_manifest(root, &FormulaManifest)` | перезапись манифеста из типизированной модели; `schema` проверяется, JSON Schema валидируется **до** замены |
+| `update_formula_source(root, id, &FormulaSourceUpdate { title, latex, display, numbering_mode, numbering_label })` | правка «шапки» источника: читает манифест, меняет title/latex/display/numbering и пишет, **сохраняя** `inputs`/`fragments`/`[state]` |
+
+Инварианты:
+
+- **Атомарность:** запись идёт в `formula.toml.tmp` рядом, JSON Schema валидируется по tmp-файлу,
+  затем `rename` — невалидный манифест на диске не остаётся (tmp удаляется; прежний файл цел).
+  Прецедент — `record_artifact_out_hash`/`record_formula_state` (точечная правка без потери текста).
+- **Source-of-truth:** `inputs`/`fragments`/`[state]` не теряются при правке источника; `[state]` —
+  зеркало ledger (источник истины актуальности — `rde-dag`), его перезаписывает слой кэшей после
+  успешной компиляции (`record_prepared_formula_state`), а не UI.
+- **Сериализация без мусора:** `FormulaManifest.inputs/fragments` с `skip_serializing_if = "Vec::is_empty"`,
+  пустой `[state]` не сериализуется — первая запись из GUI не добавляет в `formula.toml` пустые
+  таблицы (диффы остаются читаемыми).
+- Поля валидируются по смыслу до записи: пустые title/latex, `numbering_mode ∉ {auto,none}` — ошибки
+  с понятным текстом (валидация LaTeX — компиляцией на уровне UI/rde-dag, не core: core не зависит
+  от движка документа, ADR-0002).
+
+Юнит-тесты (`rde-core` `ops::formula_write_tests`): создание с политикой `none`; правка не теряет
+`inputs`/`fragments`/`[state]`; невалидные поля не перезаписывают файл; запись с чужой схемой
+отклоняется без замены и без tmp-хвостов.
+
+## Решение 2 — панель редактора формулы (`rde-ui`)
+
+Состояние — `FormulaEditorState` (`formula_id: Option<String>`; `None` = режим создания):
+`title`, `latex`, `display`, `numbering_mode`, `numbering_label`, `render_mode` (omml|svg для
+вставки), `error`/`info`, `native_open`, scratch-редактор `native`. Окно «Формула» / «Новая формула»
+(содержимое в `ScrollArea`, на 1000-px окне не уезжает за экран):
+
+1. **Статус** существующей формулы: актуальна/устарела/не вычислена/ошибка + причина, число вставок
+   и устаревших (по `formula_insert_statuses`, R-DOC-13/19), короткий id; предупреждение «есть
+   неприменённые правки»; кнопка «Открыть документ на вставке».
+2. **Поля:** заголовок; **LaTeX-источник** (многострочный `code_editor`, источник истины);
+   display/inline; политика нумерации `auto|none` с пояснением «номер (N) справа — канон ADR-0018».
+3. **Предпросмотр:** `wordcraft_ui_egui::previews::math_texture` (тот же рендер, что у вкладки
+   Equation WordCraft; шрифт формул — STIX, ADR-0018) на отдельном scratch-`WordApp` панели;
+   пустой LaTeX — подсказка «введите LaTeX». Текстура кэшируется по `latex+display` (MathAtlas).
+4. **Подсказка дедупа:** если при создании такой `latex.trim()` уже есть — «такая формула (по LaTeX)
+   уже есть: «…» — «Создать» использует существующую» (поведение миграции ADR-0019).
+5. **Действия:** «Создать»/«Применить» (primary), «Вставить в документ» (disabled, пока есть
+   неприменённые правки — вставка берёт кэши применённой формулы), «Обновить документ», «Закрыть»;
+   строка вставки: режим `OMML|SVG`, позиция якоря (`insert_anchor_block`) и **превью номера** по
+   схеме документа (`next_formula_number_text`; `inline`/`none` — «без номера»).
+
+Поток **создания** (`create_formula_action`): валидация LaTeX **компиляцией** (`rde_doc::compile_formula`
+— ошибка движка показывается в панели, объект не создаётся) → дедуп по `latex.trim()` → запись
+`formula.toml` (`create_formula_with_options`) → `prepare_formula_update` (компиляция OMML/SVG/PNG) →
+`commit_formula_update` (ledger `formula-update`) → `record_prepared_formula_state` → перезагрузка
+проекта, выбор объекта в дереве; при ошибке кэшей каталог объекта удаляется (нет «полу-созданной»
+формулы).
+
+Поток **правки** (`apply_formula_edit`): валидация LaTeX компиляцией → `update_formula_source`
+(inputs/fragments/[state] сохраняются) → пересчёт кэшей → ledger/`[state]`; `act_key` меняется,
+поэтому формульные вставки становятся `Stale` (живые статусы сравнивают `act_key` вставки с текущим).
+
+## Решение 3 — нативная вкладка Equation WordCraft (спайк A)
+
+`wordcraft_ui_egui::equation_tab::{show}` публична; `WordApp` можно создать поверх пустого
+`Document::default()`. Панель использует **отдельный scratch-редактор** (не документ пользователя):
+
+- открытие «Профессиональный редактор (WordCraft)»: новый `Session::new(Document::default())` +
+  `WordApp::new(…, Services::default())`, `insert.equation {latex, display}` (при невалидном LaTeX —
+  пустое уравнение), `equation.inputFormat {format: latex}`, фокус canvas;
+- отдельное окно «Профессиональный редактор формулы»: `equation_tab::show(&mut app, ui)` +
+  `doc_view_ui` (canvas) — пользователь вводит структуры/символы/текст нативно;
+- «← Забрать LaTeX из редактора»: `equation.get` → `latex`/`display` в поля панели (источник истины
+  остаётся `formula.toml`: правка попадает в документ только после «Применить»);
+- `theme::install_fonts(ctx)` вызывается до первого кадра вкладки (иначе паника
+  `FontFamily::Name("semibold") is not bound to any fonts`), первый кадр рисуется без `show`
+  (`set_fonts` применяется со следующего кадра) — ровно как спайк A;
+- **документ проекта не изменяется** (проверено тестом: байты `.doc.rde` до/после открытия
+  нативного редактора идентичны).
+
+Почему отдельное окно, а не встроенная область в окне формулы: canvas WordCraft использует
+фиксированный egui-id (`Id::new("wordcraft_canvas")`); два canvas в одном кадре (живой документ
+RDE и canvas панели) конфликтуют по слоям (`debug_assert` egui о смене `layer_id`), а вложенный
+`ScrollArea` клипует canvas не полностью. Поэтому: (а) нативная вкладка — отдельное окно; (б) пока
+она открыта, живой canvas документа в DocView заменяется **растровым предпросмотром страниц** (тот же
+`DocPreview`, что в режиме «Предпросмотр страниц»), после закрытия возвращается живой canvas.
+Ограничение честное и локальное: текст документа в это время только для чтения.
+
+Нативная правка «в самом документе поверх equation_tab» (каретка к формуле вставки по
+`RdeInsert.para_id`, `equation.edit`, `equation.get` → запись в объект) **не делалась**: API WordCraft
+не умеет ставить каретку к формуле объекта, а выставлять `session.sel` напрямую — хак (спайк A §5.2
+п.1); выбран безопасный поток «панель источника + вставка/обновление». Это следующий шаг (см. §6).
+
+## Решение 4 — точки входа (R-TREE-01/02, §19-9)
+
+| Вход | Что делает |
+|---|---|
+| Лента «Документ → Формулы» | «Создать формулу…» (primary), «Редактировать формулу…», «Вставить формулу…» (P3), «Принять формулы как объекты» (ADR-0019) |
+| Дерево: группа «Формулы» (служебные, скрыта по умолчанию) | в группе — кнопка «+ Создать формулу…» (показывается и для пустой группы, если служебные включены); контекстное меню формулы — «Редактировать формулу…», «Вставить в документ» |
+| Инспектор формулы | кнопки «Редактировать» и «Вставить»; статус/act_key/«где вставлено» — как раньше |
+| Демо/скриншоты | `demo_open_formula_editor`, `demo_open_formula_editor_create`, `demo_open_formula_editor_native`, `demo_insert_formula_with_number`; действия screenshot-примера `formula-create-dialog`, `formula-editor`, `formula-editor-native`, `formula-insert` |
+
+Создание формулы не добавлено в `NewObjectKind`/`UiObjectKind` намеренно: «Новый объект» создаёт
+манифест по одному `title`, а формуле нужен LaTeX-диалог с валидацией; формула создаётся из
+специализированного диалога (лента/дерево), чтобы не появлялось заведомо пустых/битых объектов.
+
+## Решение 5 — вставка с номером политики объекта
+
+При вставке/обновлении `FormulaBody.numbered` теперь = `display && formula.numbering.mode != "none"`
+(раньше — `numbered = display`, политика игнорировалась). Это затронуло `formula_insert_from_dialog`
+и `formula_body_from_state` (+ хелпер `formula_numbering_enabled`), а также путь миграции (там
+`numbered` уже вычислялся из фактического вхождения). Следствия:
+
+- display + `auto` → block-вставка right-numbered (табы center/right, номер `(N)` справа; **без
+  таблицы**, ADR-0018), номер — документно-локальный по схеме `document.toml`;
+- display + `none` → центрированный абзац **без номера** (R-DOC-15);
+- inline → inline-вставка без номера (как раньше);
+- `number_source = word|manual|off` (ADR-0019) у существующих вставок не регрессирует: обновление
+  уважает фиксацию, явная смена схемы её снимает (`renumber_formula_numbers`).
+
+## Рассмотренные альтернативы
+
+| Вариант | Почему отклонён |
+|---|---|
+| Правка формулы на реальном документе через нативный canvas (вставка чернового уравнения в текст) | меняет документ пользователя ради черновика, конфликтует с `body_hash`/R-DOC-13 и вставками; LOD — недопустимо |
+| Встроить canvas нативной вкладки в то же окно формулы | egui-id/layer-конфликт и клип canvas (см. §3); отдельное окно — без хаков и без vendor-патчей |
+| Только LaTeX-поле без нативного редактора (fallback) | нативная вкладка рисуется публичным API без правок vendor (спайк A), fallback не понадобился |
+| Патч `vendor/wordcraft` для command «каретка к формуле объекта» | P4 достижим без патча; правка форка — только по ADR-0001 §4 при необходимости |
+| Добавить `Formula` в `NewObjectKind` | диалог «Новый объект» не умеет LaTeX-валидацию; получились бы пустые/битые объекты |
+
+## Последствия и ограничения
+
+- **Сделано:** создание и правка source-of-truth формулы в GUI (title/latex/display/политика
+  нумерации) с валидацией компиляцией и пересчётом кэшей/ledger/`[state]`; предпросмотр тем же
+  рендером, что вкладка Equation; нативная вкладка Equation WordCraft на scratch-документе;
+  вставка с номером по схеме из панели/дерева/инспектора; `numbered` уважает политику объекта;
+  кнопки/команды/дерево/инспектор; kittest + fidelity-скриншоты.
+- **Не сделано (следующий шаг):** правка формулы «в тексте документа» (каретка к вставке +
+  `equation.edit`); редактирование `inputs`/`fragments` в GUI (сохраняются, но задаются файлом/
+  агентом); ручная нумерация `numbering.label` (R-DOC-15) в UI; удаление используемой формулы с
+  проверкой «используется в N документах» (сейчас generic `delete_object` + корзина, вставки без
+  цели показываются статусом «цель отсутствует»); многострочные разрывы формул (R-DOC-21 п.4) и
+  плейн-текстовые ссылки `(N)` (отложены из ADR-0019).
+- **Word `unverified`:** Word на стенде отсутствует; вёрстка `m:oMathPara`+табы в одном абзаце —
+  по ECMA-376 и LO-оракулу (номер `(2)` у правого поля: `xMax=552.9 pt` при правом поле 555.3 pt),
+  не по факту Word.
+- **Scratch-редактор** не связан кареткой с документом (см. §3) — это осознанный компромисс, а не
+  недоделка: источник истины — `formula.toml`, документ обновляется явной командой.
+- `FORMULA_RENDERER_VERSION` **не менялся** (рендер не изменился); `rde:doc` v5 и поля
+  `number_source`/`suffix` не менялись; legacy `crates/rde-doc/src/equation.rs` не трогали.
+
+## Проверка (сводка)
+
+- **Тесты workspace:** 582 → **590 passed / 0 failed** (+8: `rde-ui` kittest/интеграционные
+  `formula_editor_*`: создание+валидация+предпросмотр/панель, правка→Stale→«Обновить документ»,
+  вставка с номером/политика `none`, нативная вкладка на scratch-документе без правки документа);
+  и `rde-core` `formula_write_tests` (+4; lib-тесты `rde-core` 39 → 43) входят в общий счёт.
+- **Проверки acceptance:** валидный LaTeX → объект+кэши OMML/SVG/PNG в CAS+`[state]`+статус Fresh;
+  невалидный LaTeX/пустые поля → ошибка, файлов нет; дедуп по LaTeX; правка LaTeX → вставки Stale →
+  «Обновить документ» → тела/номера/пунктуация/`number_source` сохранены, `<w:tbl>` не добавлен,
+  `<w:tabs>`/OMML на месте; display+auto → номер `(N)` по схеме, display+none/inline → без номера;
+  нативная вкладка рендерится и `equation.get` возвращает LaTeX, `.doc.rde` не изменён.
+- **Headless-скриншоты (`docs/fidelity/`):** [`gui-p20-formula-create.png`](../fidelity/gui-p20-formula-create.png)
+  (диалог создания), [`gui-p20-formula-editor.png`](../fidelity/gui-p20-formula-editor.png) (панель:
+  LaTeX + предпросмотр + статус + вставка), [`gui-p20-formula-native.png`](../fidelity/gui-p20-formula-native.png)
+  (нативная вкладка Equation + canvas), [`gui-p20-formula-inspector.png`](../fidelity/gui-p20-formula-inspector.png)
+  (инспектор с кнопками), [`gui-p20-formula-insert-numbered.png`](../fidelity/gui-p20-formula-insert-numbered.png)
+  (вставка с номером `(2)` в документе). Отчёт — [`docs/fidelity/p20-formula-editor.md`](../fidelity/p20-formula-editor.md).
+- **Clippy:** новые/изменённые участки `rde-core`/`rde-ui` без предупреждений (остальные
+  clippy-1.99 предупреждения — существовавшие ранее, не трогались).
+- **Форк WordCraft:** не менялся; пин прежний.

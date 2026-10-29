@@ -5,16 +5,35 @@
 проект — каталог с TOML-манифестами, документ — `.doc.rde` (OOXML + `rde:doc`), артефакты —
 скрипты (Python в демо) с хешами/транзакциями, источники — PDF/OCR/ревью.
 
-![RDE, P10: одна строка вкладок, узкий инспектор, DocView](docs/fidelity/gui-p10-document-dark.png)
+![RDE, P4: панель редактора формулы — LaTeX-источник, предпросмотр, вставка с номером](docs/fidelity/gui-p20-formula-editor.png)
 
-*P10 «UI-долги» (2026-10-26): строка вкладок центра — одна линия (вкладки + сегментированный
-переключатель режимов справа, масштаб — на ленте), инспектор 340 px и не съедает центр, тёмная тема,
-DocView. Ещё: [светлая тема](docs/fidelity/gui-p10-document-light.png),
-[артефакты и DAG](docs/fidelity/gui-p10-artifacts-dark.png).*
+*P4 «Редактор формул в GUI» (2026-10-29, [ADR-0020](docs/adr/0020-formula-editor-ui.md)): панель
+«Формула» — LaTeX-источник (source-of-truth `formula.toml`), предпросмотр тем же рендером, что вкладка
+Equation WordCraft, display/inline и политика нумерации, «Применить» (кэши OMML/SVG/PNG + ledger),
+«Вставить в документ» с номером по схеме. Ещё:
+[создание формулы](docs/fidelity/gui-p20-formula-create.png),
+[нативная вкладка Equation](docs/fidelity/gui-p20-formula-native.png),
+[инспектор](docs/fidelity/gui-p20-formula-inspector.png),
+[вставка с номером `(2)`](docs/fidelity/gui-p20-formula-insert-numbered.png).*
 
 ## Состояние
 
-Текущая итерация — **импорт MathType-документов с нумерацией формул** (2026-10-29,
+Текущая итерация — **редактор формул в GUI (P4)** (2026-10-29,
+[ADR-0020](docs/adr/0020-formula-editor-ui.md)): формулу теперь можно **создать и отредактировать
+из интерфейса** — диалог/панель «Формула» с **LaTeX-источником** (source-of-truth `formula.toml`),
+**предпросмотром** тем же рендером, что вкладка Equation WordCraft (шрифт формул STIX), переключателем
+display/inline и **политикой нумерации** `auto|none`; «Применить» валидирует LaTeX компиляцией,
+пересчитывает кэши OMML/SVG/PNG, ledger `act_key` и `[state]` в манифесте (входы/фрагменты/состояние
+не теряются), после чего вставки становятся **Stale** и «Обновить документ» пересобирает тела,
+сохраняя номер/пунктуацию/`number_source` (ADR-0018/0019, R-DOC-13); **«Вставить в документ»** —
+OMML или SVG-вектор, display+auto → right-numbered `(N)` справа по схеме документа (без таблицы),
+display+none/inline — без номера; нативная вкладка **Equation WordCraft** встроена как
+«профессиональный редактор» на отдельном мини-документе — документ пользователя не меняется
+(спайк A, без правок `vendor/wordcraft`); точки входа — лента «Документ → Формулы», дерево (группа
+«Формулы», «+ Создать формулу…»), инспектор. Доказательства — **590 тестов**, headless-скриншоты
+[`docs/fidelity/p20-formula-editor.md`](docs/fidelity/p20-formula-editor.md), LO-оракул номера
+`(2)` у правого поля (`xMax=552.9 pt` при поле 555.3 pt).
+Предыдущая итерация — **импорт MathType-документов с нумерацией формул** (2026-10-29,
 [ADR-0019](docs/adr/0019-import-numbered-formulas.md)): display-формулы MathType при миграции
 становятся **block-вставками с номером справа** (каноническая Word-вёрстка right-numbered: формула
 по центру, `(N)` у правого поля, **без таблицы**), inline-формулы остаются inline и не нумеруются;
@@ -23,10 +42,10 @@ DocView. Ещё: [светлая тема](docs/fidelity/gui-p10-document-light.
 пунктуация после формул (`,`/`.`/`;`) переносится в абзац сразу после формулы и переживает
 «Обновить документ» (`rde:doc` v5: `suffix`/`number_source`); миграция — диалогом со счётчиками,
 схемой и галочкой «Сохранять номера из Word», сразу с номерами в тексте и обновлением ссылок.
-Доказательства — **582 теста**, на реальном документе 64/64 формул (31 display с номерами, 33
+Доказательства — **582 теста** (на тот момент), на реальном документе 64/64 формул (31 display с номерами, 33
 inline, 27→27 страниц), LO-оракул номера у правого поля; до/после —
 [`docs/fidelity/import-numbered-formulas.md`](docs/fidelity/import-numbered-formulas.md).
-Предыдущая итерация — **формулы: math-шрифт «как Times New Roman» + Word-нумерация справа и ссылки
+До этого — **формулы: math-шрифт «как Times New Roman» + Word-нумерация справа и ссылки
 на формулы** (2026-10-29, [ADR-0018](docs/adr/0018-formula-math-font-and-right-numbered.md)):
 формулы рендерятся бандл-шрифтом **STIX Two Math** (SIL OFL, Times-совместимая антиква с `MATH`,
 полная кириллица) в редакторе, предпросмотре и SVG/PNG-кэшах (`FORMULA_RENDERER_VERSION = 0.10.0+rde3`);
@@ -116,7 +135,7 @@ suggested edits/ревизии), **M2**
 Прототип **v0.1** закрыт по [`docs/exit-v0.1.md`](docs/exit-v0.1.md) (P5, теги `p5-gates` /
 `v0.1-prototype`) и отполирован в P6–P8.
 
-- **582 теста** (`#[test]`/`#[tokio::test]`) в 16 пакетах, 18 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
+- **590 тестов** (`#[test]`/`#[tokio::test]`) в 16 пакетах, 18 примеров. История вех и коммитов — [`CHANGELOG.md`](CHANGELOG.md).
 - Демо-проект [`demo-project/`](demo-project): 12 объектов (вкл. project-level формулу σ, P3),
   документ с 11 живыми вставками; формула σ — режимы **OMML** (номер `(1)` справа в таб-абзаце без
   таблицы, [`docs/fidelity/p18-formula-stix.png`](docs/fidelity/p18-formula-stix.png) — рендер RDE,
@@ -147,7 +166,7 @@ suggested edits/ревизии), **M2**
 | Документ: вставки | `w:sdt`-вставки значения/рисунка/таблицы/константы/даты/цитаты из артефактов; обновление из выходов, бэкапы, diff, откат; все виды вставок в демо |
 | Документ: импорт `.docx` (R-DOC-39, минимальный) | **«Файл → Импорт .docx…»** или `rde import-docx <file> --project <dir>`: создаётся новый объект-документ **`[IMPORTED] имя`** (WordCraft → `.doc.rde` + `rde:doc`), **он сразу становится активным** (редактор/сохранение/вставки работают с ним), исходник **не изменяется**, происхождение — `import.json` (sha256/части/время), в журнал/CLI — предупреждения о диаграммах/SmartArt/OLE/макросах/track changes/полях Word; **выбор документа в дереве переключает редактор**, при старте открывается самый свежий документ (несколько документов в проекте); остальные форматы (`.doc/.odt/.rtf/…`), merge и полный фиделити-отчёт — v0.2 |
 | Документ: правки агента (M2.5/M2.6) | suggested edits через MCP: changeset (`before/after` блока, автор, базовый `body_hash`), `suggestion_accept`/`suggestion_reject`, каждая правка — чекпоинт `.doc.rde` + версия в store (`revision_list`); прямая правка `doc_replace_range` с R-DOC-13-защитой (`expected_text`/`expected_body_hash` → `RDE_CONFLICT`); **M2.6:** `doc_insert`/`doc_delete` (вставка/удаление абзацев под approval+чекпоинтом, позиционные `bN` сдвигаются); правка только простого абзаца; символьные диапазоны и track changes Word — дальше ([ADR-0008](docs/adr/0008-document-suggested-edits-and-revisions.md), [ADR-0010](docs/adr/0010-m26-insert-delete-paragraphs.md)) |
-| Формулы (P2/P3 + ADR-0018/0019) | project-level объекты `objects/formulas/<id>` (`rde/formula@1`: LaTeX-источник, входы/фрагменты, `numbering`, `act_key`); вставки `kind="formula"` в режимах **OMML** (редактируемая формула) и **SVG-вектор** (`asvg:svgBlip` + PNG-fallback); **Word-вёрстка right-numbered без таблицы** (формула по центру, номер `(N)` справа в том же абзаце с таб-стопами); math-шрифт формул — бандл **STIX Two Math** (OFL, Times-стиль); номера ведёт документ: схемы **сквозная** `(1)`, `(2)`… и **по разделам** ГОСТ `(2.1)`, приложения `(А.1)` (`document.toml: formula_numbering`; `RdeInsert.number_text`, `rde:doc` v4), раздел — из заголовка через `styles.xml` с fallback-предупреждениями; **перекрёстные ссылки на формулы** `rde://formula/<id>` с автообновлением текста и `(?)`+журнал при удалённой цели; в экспорте `.docx` — best-effort `m:mathPr/m:mathFont` + `w:rFonts` math-ранов (Word `unverified`); статусы «устарела/цель отсутствует/не вычислена/ручная правка», «где вставлено» по всем документам, обновление документа вместе с пересчётом кэшей одной транзакцией, явная миграция OMML вне реестра; **импорт MathType с нумерацией (ADR-0019)**: display/inline-классификация при импорте, распознавание номеров Word (`SEQ MTEqn`, литеральные `(N)`, legacy-таблица 1×2), миграция display → block-вставки с номером справа и пунктуацией после формулы (`RdeInsert.suffix`/`number_source`, `rde:doc` v5), сохранение номеров из Word или назначение по схеме, диалог «Принять формулы как объекты»; нет нативного редактора (P4) и векторного экспорта/обмена LaTeX (P5) |
+| Формулы (P2/P3 + ADR-0018/0019) | project-level объекты `objects/formulas/<id>` (`rde/formula@1`: LaTeX-источник, входы/фрагменты, `numbering`, `act_key`); вставки `kind="formula"` в режимах **OMML** (редактируемая формула) и **SVG-вектор** (`asvg:svgBlip` + PNG-fallback); **Word-вёрстка right-numbered без таблицы** (формула по центру, номер `(N)` справа в том же абзаце с таб-стопами); math-шрифт формул — бандл **STIX Two Math** (OFL, Times-стиль); номера ведёт документ: схемы **сквозная** `(1)`, `(2)`… и **по разделам** ГОСТ `(2.1)`, приложения `(А.1)` (`document.toml: formula_numbering`; `RdeInsert.number_text`, `rde:doc` v4), раздел — из заголовка через `styles.xml` с fallback-предупреждениями; **перекрёстные ссылки на формулы** `rde://formula/<id>` с автообновлением текста и `(?)`+журнал при удалённой цели; в экспорте `.docx` — best-effort `m:mathPr/m:mathFont` + `w:rFonts` math-ранов (Word `unverified`); статусы «устарела/цель отсутствует/не вычислена/ручная правка», «где вставлено» по всем документам, обновление документа вместе с пересчётом кэшей одной транзакцией, явная миграция OMML вне реестра; **импорт MathType с нумерацией (ADR-0019)**: display/inline-классификация при импорте, распознавание номеров Word (`SEQ MTEqn`, литеральные `(N)`, legacy-таблица 1×2), миграция display → block-вставки с номером справа и пунктуацией после формулы (`RdeInsert.suffix`/`number_source`, `rde:doc` v5), сохранение номеров из Word или назначение по схеме, диалог «Принять формулы как объекты»; **редактор в GUI (P4, ADR-0020)**: создание/правка source-of-truth с предпросмотром и валидацией компиляцией, нативная `equation_tab` на scratch-документе, вставка с номером по схеме из панели/дерева/инспектора; нет правки «в тексте документа», `inputs`/`fragments`/`numbering.label` в GUI и векторного экспорта/обмена LaTeX (P5) |
 | Шаблоны и библиография | ГОСТ 7.32-2017 (поля/шрифты/интервалы/заголовки/подписи), библиография ГОСТ 7.0.100 из источников |
 | Источники, PDF/OCR, ревью | импорт BibTeX/RIS/CSL-JSON, PDF-текст/рендер, OCR страницы, комментарии Word и импорт внешнего ревью; веб-архив — при наличии `monolith` |
 | VCS, настройки, гейты | git init/status/commit/revert/log, `.gitignore`/`.gitattributes`, настройки приложения и авторы (вкл. «Разрешить внешним агентам», M4.1), i18n-каркас ru/en, экспорт диагностики, OPC-гейт, корпус docx, `xtask`/CI, перф 10k |
@@ -461,7 +480,13 @@ rde/
   SDK 3.5.0, панель чата, permissions, HTTP-loopback RDE-MCP, транскрипт в проекте),
   [0015](docs/adr/0015-m44-context-refs-and-diff-ui.md) (M4.4: контекст-ссылки §8.7.2 — URI-схема,
   чипы, `resource_link`, PDF-регион; diff-UI suggested edits — word-diff, accept с
-  чекпоинтом/версией/аудитом).
+  чекпоинтом/версией/аудитом),
+  [0016](docs/adr/0016-mathtype-import-mtef-to-omml.md) (MathType MTEF → нативные OMML-формулы при
+  импорте `.docx`), [0017](docs/adr/0017-file-picker-backend.md) (GUI-02: «Проводник…» и недавние
+  проекты), [0018](docs/adr/0018-formula-math-font-and-right-numbered.md) (math-шрифт STIX Two Math,
+  right-numbered вёрстка, схемы нумерации и ссылки), [0019](docs/adr/0019-import-numbered-formulas.md)
+  (импорт MathType с номерами Word: display/inline, `rde:doc` v5), [0020](docs/adr/0020-formula-editor-ui.md)
+  (P4: редактор формул в GUI — создание/правка source-of-truth, панель `equation_tab`, вставка с номером).
 - [`CHANGELOG.md`](CHANGELOG.md) — история вех M1–P10 и v0.3-M4.4: что добавлено/изменено/исправлено.
 - [`docs/exit-v0.1.md`](docs/exit-v0.1.md) — exit-критерий v0.1 и что осталось за фазой.
 - [`docs/milestones.md`](docs/milestones.md) — критерии и доказательства вех.
@@ -494,9 +519,17 @@ rde/
   разделы `2.1.3` и приложения без номера в заголовке; формулы в колонтитулах/сносках не нумеруются,
   смешанные абзацы (display + текст) не нумеруются, плейн-текстовые ссылки `(N)` не
   автодетектируются (ADR-0019).
-  Нет нативного редактора `equation_tab` в RDE (P4), векторного экспорт-режима docx/PDF с гейтами и
-  обмена LaTeX (P5); Word-совместимость svgBlip — по спецификации (Word на стенде нет), проверено
-  LO-оракулом; подробности — [ТЗ §5.7.5](docs/tz-03.md), [`docs/state.md`](docs/state.md),
+  **P4 — редактор в GUI готов** ([ADR-0020](docs/adr/0020-formula-editor-ui.md)): создание/правка
+  источника (title/LaTeX/display/политика нумерации) с предпросмотром и валидацией компиляцией,
+  нативная вкладка Equation WordCraft на scratch-документе (документ пользователя не меняется),
+  вставка с номером по схеме из панели/дерева/инспектора. **Ограничения P4:** правка формулы «в
+  тексте документа» (каретка к вставке + `equation.edit`) — следующий шаг (API WordCraft не умеет
+  ставить каретку к формуле объекта); `inputs`/`fragments` и ручная метка нумерации
+  (`numbering.label`, R-DOC-15) в GUI не редактируются (сохраняются); удаление используемой формулы —
+  generic `delete_object` без проверки «N документов». Word-совместимость `m:oMathPara`+табы и
+  `svgBlip` — по спецификации (Word на стенде нет), проверено LO-оракулом; подробности —
+  [ТЗ §5.7.5](docs/tz-03.md), [`docs/state.md`](docs/state.md),
+  [`docs/fidelity/p20-formula-editor.md`](docs/fidelity/p20-formula-editor.md),
   [`docs/fidelity/formula-font-numbering.md`](docs/fidelity/formula-font-numbering.md).
 - **MCP-сервер** — **M3/M2.6/M4.1/M4.2/M4.2b/M4.3** (v0.3, [ADR-0006](docs/adr/0006-mcp-independent-layer.md),
   [ADR-0007](docs/adr/0007-mutations-approvals-checkpoints.md),

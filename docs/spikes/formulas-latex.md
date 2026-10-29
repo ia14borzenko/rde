@@ -326,7 +326,7 @@ WordCraft mini-doc (OMML σ=F/A)
 | **P2** formula | `objects/formulas/<id>/` (project-level) — старый загрузчик каталог игнорирует; `act_key`-прототип; цикл-детект; OMML-извлечение (A16); SVG-пайплайн (B) | `FormulaManifest`+загрузка/валидация/циклы, компиляция OMML-кэша из LaTeX, SVG-кэш, статусы/причины, переиспользование в документах |
 | **P2.5** writer fix | gap B6 измерен: WordCraft теряет `svgBlip`/svg-медиа при open→save | фикс `crates/docx` в форке (blip-extLst, svg-медиа, rels, Content_Types на чтении и записи), регрессионный тест форка, docs/wordcraft-fork.md, коммит `rde/main`, пин субмодуля |
 | **P3** вставка | `RdeInsert`/`rde:doc` готовы к новому kind; пост-обработка пакета — рабочий механизм (sdt/paraId, как у рисунков) | kind `formula`, `render_mode omml|svg`, rewrite по paraId/tag, конфликт ручной правки (R-DOC-13), миграция демо |
-| **P4** редактор | `equation_tab::{insert_button,show}` публичны и рисуются в egui-панели; команды Equation доступны через `WordApp::run`; LaTeX-круг без потерь | панель в DocView, установка шрифтов WordCraft, связка `formula.toml` ↔ `equation.get/set`, нумерация из объекта |
+| **P4** редактор — **реализовано (2026-10-29, [ADR-0020](../adr/0020-formula-editor-ui.md))** | `equation_tab::{insert_button,show}` публичны и рисуются в egui-панели; команды Equation доступны через `WordApp::run`; LaTeX-круг без потерь | панель «Формула» (LaTeX+предпросмотр `previews::math_texture`, display/inline, политика нумерации), нативная `equation_tab` на **scratch-`WordApp`** в отдельном окне (документ проекта не меняется), `equation.get` → поля панели; `formula.toml` — source-of-truth, кэши/`[state]` через ledger; вставка с номером по схеме (`numbered` из политики объекта) — см. §8 |
 | **P5** вектор/экспорт | векторный PDF WordCraft; SVG-вставка `asvg:svgBlip`+PNG проверена в LO; гейты `pdfimages`/`pdffonts` воспроизводимы | export-mode «формулы как SVG», переприменение SVG после сохранения движком (gap B6), `pdfimages`-гейт «нет растровых формул», Word-проверка (Word на стенде нет), `.tex`-обмен |
 
 ---
@@ -375,3 +375,23 @@ rm crates/rde-ui/examples/spike_p0_equation.rs crates/rde-doc/examples/spike_p0_
 Ограничения воспроизведения: Word на стенде отсутствует (проверка Word-совместимости
 `asvg:svgBlip` — по спецификации MS-ODRAWXML, не фактическая); точные размеры/хеши в этой
 таблице — снимок 2026-10-26 и могут отличаться при других версиях poppler/LO/WordCraft.
+
+---
+
+## 8. Реализация P4 (2026-10-29, ADR-0020)
+
+Спайк A подтвердился на практике; правок `vendor/wordcraft` не понадобилось (пин прежний).
+
+| Что проверено спайком | Как реализовано |
+|---|---|
+| A2/A3: `insert.equation {latex, display}` + `equation.inputFormat latex` на `Session::new(Document::default())` | «Профессиональный редактор формулы»: отдельный scratch-`WordApp` панели; текущий LaTeX вставляется в мини-документ, пользователь вводит структуры/символы/текст нативно |
+| A6: `equation.get` → `latex`/`display` | кнопка «← Забрать LaTeX из редактора» переносит правку в поля панели; в `formula.toml` она попадает только по «Применить» |
+| шрифты `medium`/`semibold` обязательны до первого кадра вкладки | `wordcraft_ui_egui::theme::install_fonts(ctx)` перед первым кадром + первый кадр без `equation_tab::show` (как в харнессе спайка) |
+| предпросмотр — `previews::math_texture` | предпросмотр панели рендерится тем же путём (MathAtlas-кэш по latex+display), пустой LaTeX — подсказка |
+| canvas WordCraft | рисуется в отдельном окне; пока он открыт, живой canvas документа заменяется растровым предпросмотром страниц — два canvas в одном кадре конфликтуют по фиксированному egui-id `wordcraft_canvas`/слоям (обнаружено при встраивании, задокументировано в ADR-0020 §3) |
+| ограничение «каретка к формуле объекта» | не хачили: правка «в тексте документа поверх equation_tab» — следующий шаг; поток P4 — источник в панели + вставка/обновление |
+
+Доказательства: [`docs/fidelity/p20-formula-editor.md`](../fidelity/p20-formula-editor.md),
+скриншоты `docs/fidelity/gui-p20-formula-*.png`, тесты `rde-ui` `formula_editor_*` (4) и
+`rde-core` `formula_write_tests` (4); LO-оракул номера `(2)` — `xMax=552.9 pt` при правом поле
+555.3 pt.

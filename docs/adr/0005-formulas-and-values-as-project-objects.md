@@ -3,7 +3,7 @@
 | Поле | Значение |
 |---|---|
 | Дата | 2026-10-26 |
-| Статус | **принято владельцем** (2026-10-26): формулы — **project-level** объекты, SVG-вставки — фикс WordCraft-writer в форке (P2.5) вместо переприменения в RDE; **реализация: P1, P2 — готово (2026-10-26), P2.5 — готово (2026-10-27), P3 — готово (2026-10-27), P4–P5 — в работе** |
+| Статус | **принято владельцем** (2026-10-26): формулы — **project-level** объекты, SVG-вставки — фикс WordCraft-writer в форке (P2.5) вместо переприменения в RDE; **реализация: P1, P2 — готово (2026-10-26), P2.5 — готово (2026-10-27), P3 — готово (2026-10-27), P4 — готово (2026-10-29, [ADR-0020](0020-formula-editor-ui.md)), P5 — в работе** |
 | Контекст | решения владельца по формулам (нативный редактор WordCraft, SVG-вектор, формулы/величины — объекты с зависимостями, project-level хранение формул, фикс writer'а в форке) + спайки P0 |
 | Нормативная база | [`docs/tz-03.md`](../tz-03.md): §4.2, §7.2/7.3, §8.3, §8.5, §9.4, §9.7; R-DOC-11…13, R-DOC-19…24, R-ART-09, R-TREE-01/02; NFR-LIC-02 |
 | Связанные ADR | [ADR-0001](0001-repo-layout-and-build.md) — WordCraft-форк; [ADR-0002](0002-component-boundaries.md) — границы крейтов; [ADR-0003](0003-deviations-from-tz02.md) — отклонения (poppler §15-2) |
@@ -292,7 +292,7 @@ computed_at = 0                  # unix
 (OMML→`m:oMathPara`/`m:oMath`, SVG из WordCraft PDF через `pdftocairo` с кропом bbox, PNG через
 resvg), `store_formula_caches`; измерено на σ=F/A: компиляция **≈0,1–0,2 с** (тест
 `project_formula_compiles_caches_and_becomes_fresh`), SVG без `<image>`, OMML с `m:f`. В дереве RDE
-группа «Формулы» пока скрыта (P4 даст переключатель «показать служебные»).
+группа «Формулы» скрыта по умолчанию (переключатель «Служебные объекты» и редактор формулы — P3/P4).
 
 ---
 
@@ -458,6 +458,32 @@ act_key     = rde_hash::act_key("formula", "rde/formula@1", in_hash, Some(src_ha
 5. **Привязка объекта к формуле в модели** — нет поля/якоря; обход — sdt-тег/`paraId` на уровне
    пакета (RDE и так пост-обрабатывает пакет).
 
+### 5.3. Реализация P4 (2026-10-29, [ADR-0020](0020-formula-editor-ui.md))
+
+- **API `rde-core`:** `create_formula_with_options` (display + политика `auto|none`),
+  `read_formula_manifest`, `write_formula_manifest` (валидация схемы до замены, атомарная запись),
+  `update_formula_source` — правка title/latex/display/нумерации с сохранением
+  `inputs`/`fragments`/`[state]`.
+- **Панель «Формула»/«Новая формула» (`rde-ui`):** LaTeX-источник, display/inline, политика
+  нумерации, **предпросмотр** через `previews::math_texture` (тот же рендер, что вкладка Equation;
+  шрифт STIX — ADR-0018), «Создать/Применить» (компиляция → `prepare/commit_formula_update` →
+  `record_prepared_formula_state`), «Вставить в документ» (OMML|SVG, номер по схеме документа),
+  «Обновить документ», статус/«где вставлено», «Открыть документ на вставке».
+- **Нативный редактор:** `equation_tab::show` + canvas на **scratch-`WordApp`** (отдельное окно
+  «Профессиональный редактор формулы»; документ пользователя не меняется), `equation.get` →
+  поля панели. Шрифты `theme::install_fonts`, первый кадр без `show` (спайк A). Пока нативный
+  редактор открыт, живой canvas документа заменяется растровым предпросмотром — два canvas
+  WordCraft в одном кадре конфликтуют по egui-id/слоям (см. ADR-0020 §3).
+- **Вставка:** `FormulaBody.numbered` теперь учитывает политику объекта
+  (`display && numbering.mode != "none"`), а не только `display`; display+auto — right-numbered
+  табами без таблицы, display+none/inline — без номера (R-DOC-15).
+- **Точки входа:** лента «Документ → Формулы» (Создать/Редактировать/Вставить/Принять как объекты),
+  дерево (группа «Формулы»: «+ Создать формулу…», контекстное меню формулы), инспектор
+  («Редактировать», «Вставить»).
+- **Не сделано (следующий шаг):** правка «в тексте документа» (каретка к вставке + `equation.edit`),
+  редактирование `inputs`/`fragments` в GUI, ручная нумерация `numbering.label` (R-DOC-15), удаление
+  используемой формулы с проверкой «N документов». Word-часть вёрстки — `unverified` (Word на стенде нет).
+
 ---
 
 ## 6. Вектор: SVG-кэш и экспорт (P5; частично P2)
@@ -580,7 +606,7 @@ act_key     = rde_hash::act_key("formula", "rde/formula@1", in_hash, Some(src_ha
 | **P2** formula — **ГОТОВО (2026-10-26)** | `FormulaManifest` в `objects/formulas/` + загрузка/валидация/циклы, `formula_edges`/топопорядок, compile OMML/SVG/PNG в CAS, `[state]`/ledger, статусы/причины, переиспользование в документах | core, hash, dag, doc | тесты модели/циклов, стабильность act_key, компиляция σ=F/A (как A16/B), откат кэшей |
 | **P2.5** writer fix — **ГОТОВО (2026-10-27)** | WordCraft `crates/docx` (форк `rde/main` `a33bb6ce`): `InlineObject::Image.blip_ext`; чтение `a:blip/a:extLst` через `keep_embedded` (svg-медиа + rels + Content_Types в `Document::passthrough`), запись через `embedded_xml`; namespace `asvg`/`a14`; регрессионный тест `crates/docx/tests/svg_blip.rs`; запись в [`docs/wordcraft-fork.md`](../wordcraft-fork.md); пин субмодуля `f85cb9c9` → `a33bb6ce` отдельным RDE-коммитом | vendor/wordcraft, rde-docx (гейт) | форк: `cargo test -p wordcraft-docx` + `wordcraft-doc/docbin/formats/engine` 1456 passed, clippy/fmt/check зелёные; RDE: `rde-docx/tests/svg_blip_roundtrip.rs` (engine roundtrip + LO-оракул), 204 passed; fidelity-гейты не сломаны; пин поднят |
 | **P3** вставка — **ГОТОВО (2026-10-27)** | `RdeInsert kind="formula"`+`render_mode`, `rde:doc` 1→2, block/inline sdt-оболочка (`rde:formula:<id>`): OMML из кэша или `w:drawing` с `asvg:svgBlip`+PNG; обновление вставок (`update_formula_inserts`: пересборка содержимого, документно-локальная нумерация), статусы (Fresh/Stale/MissingTarget/NotComputed/BodyModified), «где вставлено» (`formula_backlinks`), update-транзакция формул+документов (одна tx, корни `formula/*`+`document/<id>`, откат), миграция OMML вне реестра (`unregistered_formulas`/`migrate_formulas`, явная идемпотентная); UI: диалог вставки, инспектор формулы, служебная группа «Формулы» в дереве, «Принять формулы как объекты»; демо σ мигрирована (OMML+SVG) | doc, dag, docx, ui | `rde-doc/tests/formula_insert.rs` (omml/svg + engine roundtrip + LO-оракул; обновление при изменении формулы и входа из артефакта одной tx; статусы; ручная правка; откат; миграция+идемпотентность), `rde-docx/tests/formula_gate.rs` (гейт `svg_blip`), kittest UI; демо fidelity PASS (`omml 1→1`, `svg_blip 1→1`, LO valid); **215 passed** (+11); скриншоты `docs/fidelity/gui-p3-formula-{dialog,inspector}.png` |
-| **P4** редактор | панель `equation_tab` в DocView, LaTeX-поле+предпросмотр, правка существующей, нумерация из объекта, команды RDE | ui | kittest-панель (как спайк A), вставка/правка формулы из UI, headless-скриншоты |
+| **P4** редактор — **ГОТОВО (2026-10-29, [ADR-0020](0020-formula-editor-ui.md))** | API создания/правки (`create_formula_with_options`/`update_formula_source`/`write_formula_manifest`), панель «Формула» (LaTeX+предпросмотр через `previews::math_texture`, display/inline, политика нумерации, «Применить»), нативная `equation_tab` на scratch-`WordApp` (отдельное окно), вставка с номером по схеме, `numbered` уважает политику объекта; лента/дерево/инспектор; без правок vendor | core, ui | `rde-core` `formula_write_tests` (4), `rde-ui` kittest/интеграционные `formula_editor_*` (4: создание+валидация+панель, правка→Stale→«Обновить документ», вставка с номером/`none`, нативная вкладка без правки документа); workspace **590 passed**; LO-оракул `(2)` `xMax=552.9 pt` при правом поле 555.3; скриншоты `docs/fidelity/gui-p20-formula-{create,editor,native,inspector,insert-numbered}.png`, отчёт `docs/fidelity/p20-formula-editor.md` |
 | **P5** вектор/обмен | export-mode «формулы как SVG», PDF-гейт «нет растровых формул», обмен LaTeX (.tex/буфер), повторное использование SVG-кэшей для экспорта; опц. vendor-кандидаты (SVG-экспорт формулы, номер полем) | docx, doc, ui, vendor | LO/PDF-гейты (как B5), docx с svgBlip (после P2.5), `.tex` roundtrip |
 
 Зависимости: P1 → P2 → P2.5 (writer fix может идти параллельно P2, но до P3-гейтов SVG) → P3 → P4;
@@ -667,5 +693,7 @@ P5 после P2/P3 (частично параллельно P4). Порядок
   зелёные. Скриншоты: `docs/fidelity/gui-p3-formula-dialog.png`,
   `docs/fidelity/gui-p3-formula-inspector.png` (просмотрены). Ограничения: Word на стенде нет
   (svgBlip-совместимость Word 2016+ — по MS-ODRAWXML, LO-оракул проходит; неизвестные namespace
-  внутри extLst не сохраняются); нет нативного редактора (P4) и векторного экспорт-режима/обмена
-  LaTeX (P5); смена display/render_mode после вставки — только переоформлением.
+  внутри extLst не сохраняются); нативного редактора не было до P4 — **сделан в P4**
+  ([ADR-0020](0020-formula-editor-ui.md): правка source-of-truth, вкладка Equation на scratch-док.,
+  вставка с номером; в тексте документа — следующий шаг); векторный экспорт-режим/обмен LaTeX (P5);
+  смена display/render_mode после вставки — только переоформлением.

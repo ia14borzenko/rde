@@ -2026,3 +2026,118 @@ cargo run -p rde-doc --example migrate-numbered -- .cache-tmp/import-v0003/e2e/p
 ./scripts/build.sh build -p rde --release            # release
 ./scripts/clean-build.sh                             # полная очистка /srv/yocto/rde-target
 ```
+
+## Обновление 2026-10-29 (редактор формул в GUI — P4; ADR-0020, тег `formula-editor`)
+
+### Что сделано
+
+- **API создания/правки формулы** (`rde-core`, `ops.rs`): `create_formula_with_options` (display +
+  политика нумерации `auto|none`), `read_formula_manifest`, `write_formula_manifest` (JSON Schema
+  валидируется **до** замены, запись атомарная tmp+rename) и `update_formula_source` — правка
+  title/latex/display/нумерации с сохранением `inputs`/`fragments`/`[state]`. Пустой `[state]` и
+  пустые списки входов/фрагментов не сериализуются (диффы `formula.toml` читаемые). Создание
+  формулы намеренно не добавлено в `NewObjectKind`: нужен LaTeX-диалог с валидацией, поэтому
+  формула создаётся специализированным диалогом (лента/дерево).
+- **Панель «Формула»/«Новая формула»** (`rde-ui`): статус (актуальна/устарела/не вычислена/ошибка +
+  причина, число вставок и устаревших), заголовок, **LaTeX-источник** (source-of-truth), display/inline,
+  политика нумерации, **предпросмотр** через `wordcraft_ui_egui::previews::math_texture` (тот же
+  рендер, что вкладка Equation; шрифт формул STIX), подсказка дедупа по LaTeX, «Создать/Применить»
+  (валидация компиляцией → `prepare_formula_update` → `commit_formula_update` →
+  `record_prepared_formula_state`, при ошибке — откат без полу-созданного объекта), «Вставить в
+  документ» (OMML|SVG, позиция якоря, **превью номера** по схеме, disabled при неприменённых правках),
+  «Обновить документ», «Открыть документ на вставке».
+- **Нативная вкладка Equation WordCraft** — «Профессиональный редактор формулы»: отдельный
+  scratch-`WordApp` (`Session::new(Document::default())`, `insert.equation {latex,display}`,
+  `equation.inputFormat latex`), отдельное окно `equation_tab::show` + canvas; «← Забрать LaTeX из
+  редактора» → `equation.get` → поля панели. Документ пользователя **не меняется** (проверено
+  тестом по байтам `.doc.rde`); шрифты `theme::install_fonts` до первого кадра + первый кадр без
+  `show` (спайк A); пока редактор открыт, живой canvas документа заменяется растровым предпросмотром
+  страниц (два canvas WordCraft в кадре конфликтуют по фиксированному egui-id/слоям). Правок
+  `vendor/wordcraft` не потребовалось (пин `33213040` прежний).
+- **Вставка/правка с нумерацией:** `FormulaBody.numbered` теперь = `display && numbering.mode != "none"`
+  (раньше — только `display`, политика объекта игнорировалась): display+auto — right-numbered табами
+  без таблицы, display+none/inline — без номера (R-DOC-15); после правки источника вставки становятся
+  Stale, «Обновить документ» пересобирает тела с сохранением номера/пунктуации/`number_source`
+  (ADR-0018/0019), конфликт ручной правки тела (`body_hash`) не перезаписывается (R-DOC-13).
+- **Точки входа:** лента «Документ → Формулы» (`Cmd::NewFormula`, `Cmd::EditFormula`), дерево —
+  группа «Формулы»: «+ Создать формулу…» (показывается и для пустой группы при включённых служебных)
+  + контекстное меню формулы («Редактировать формулу…», «Вставить в документ»), инспектор формулы —
+  кнопки «Редактировать»/«Вставить», демо-методы и screenshot-действия (`formula-create-dialog`,
+  `formula-editor`, `formula-editor-native`, `formula-insert`).
+
+### Проверка
+
+- `cargo test --workspace` — **590 passed / 0 failed** (было 582; +8: +4 `rde-ui` `formula_editor_*`, +4 `rde-core` `formula_write_tests`;
+  `rde-core` `formula_write_tests` +4 входят в общий счёт).
+  - `formula_editor_creates_formula_with_caches_and_validates_latex`: невалидный LaTeX (`{{{{`) и
+    пустые поля → ошибка, объектов нет; валидная → объект+кэши OMML/SVG/PNG в CAS+`[state]`+Fresh;
+    дедуп по LaTeX не создаёт дубль; политика `none`/inline сохраняется; панель рендерится.
+  - `formula_editor_edit_stales_inserts_and_document_update_rebuilds`: правка LaTeX/заголовка →
+    вставки Stale → «Обновить документ» → номер/`number_text`/`suffix`/`number_source` сохранены,
+    `hash` (act_key) вставки обновлён, `<w:tbl>` не добавлен, `<w:tabs>`/`m:oMath` на месте.
+  - `formula_editor_inserts_numbered_formula_and_respects_numbering_policy`: вставка из панели —
+    +1 formula-вставка с `target=rde://formula/<id>@…`, номер по схеме, right-numbered табами без
+    таблицы; смена схемы «по разделам» перенумеровывает; политика `none` — без номера.
+  - `formula_editor_native_equation_tab_renders_and_does_not_touch_project_document`: нативная
+    вкладка Equation рендерится в headless-харнессе, `equation.get` возвращает LaTeX, байты
+    `.doc.rde` до/после идентичны.
+- LO-оракул вставки с номером (экспорт в `.docx` → LO PDF → `pdftotext -bbox`): номер `(2)` —
+  `xMax = 552.9 pt` при правом поле текста 555.3 pt (как существующая `(1)`); `<w:tbl>` не добавлен.
+- Скриншоты (headless, `egui_kittest`): `docs/fidelity/gui-p20-formula-{create,editor,native,inspector,
+  insert-numbered}.png`; отчёт — [`fidelity/p20-formula-editor.md`](fidelity/p20-formula-editor.md).
+- Clippy: новые/изменённые участки `rde-core`/`rde-ui` без предупреждений (остальные clippy-1.99
+  предупреждения — существовавшие ранее, не трогались). Форк WordCraft не менялся.
+
+### Ограничения и следующий шаг
+
+- **Правка формулы «в тексте документа»** (каретка к формуле вставки по `RdeInsert.para_id`,
+  `equation.edit`, `equation.get` → запись в объект) не сделана: API WordCraft не умеет ставить
+  каретку к формуле объекта, а выставлять `session.sel` напрямую — хак (спайк A §5.2). Поток P4 —
+  источник в панели + вставка/обновление. Следующий шаг.
+- Нативный редактор — на scratch-документе, не связан кареткой с документом (осознанный компромисс:
+  source-of-truth — `formula.toml`, документ обновляется явной командой).
+- `inputs`/`fragments` в GUI не редактируются (сохраняются при правке источника, задаются файлом/
+  агентом); ручная метка нумерации `numbering.label` (R-DOC-15) не выведена.
+- Удаление используемой формулы — generic `delete_object` (корзина) без проверки «используется в N
+  документах»; вставки без цели показываются статусом «цель отсутствует».
+- Word на стенде нет: `m:oMathPara`+табы и экспортный `m:mathFont` — `unverified` (LO-оракул и
+  ECMA-376 проверены).
+- Следующий шаг по формулам: P5 (векторный экспорт-режим docx/PDF с гейтами «нет растровых формул»,
+  обмен LaTeX `.tex`/буфер) + правка «в тексте документа», `inputs`/`fragments` в панели,
+  плейн-текстовые ссылки `(N)` (отложены из ADR-0019).
+
+### Как запустить (актуально на этой итерации)
+
+```bash
+cd /home/admin-pc/proj/rde-dev/rde
+
+# 1) приложение (бинарь уже собран; target — внешний ext4 /srv/yocto/rde-target)
+/srv/yocto/rde-target/debug/rde                      # демо-проект по умолчанию
+./scripts/run.sh                                     # то же через обёртку
+./scripts/run.sh -- --project demo-project           # конкретный проект
+RDE_PROJECT=demo-project ./scripts/run.sh            # или через переменную
+
+# 2) тесты (обёртка защищает от переполнения /home; target-dir уже в .cargo/config.toml)
+./scripts/build.sh test --workspace                  # 590 passed / 0 failed
+
+# 3) headless-скриншоты (egui_kittest, wgpu offscreen, без окна) — панель редактора формулы
+RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=45 \
+  /srv/yocto/rde-target/debug/examples/screenshot /tmp/formula-editor.png \
+  document "" 0 formula-editor dark
+RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=45 \
+  /srv/yocto/rde-target/debug/examples/screenshot /tmp/formula-create.png \
+  document "" 0 formula-create-dialog light
+RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=80 \
+  /srv/yocto/rde-target/debug/examples/screenshot /tmp/formula-native.png \
+  document "" 0 formula-editor-native dark tall
+
+# 4) ручные проверки в GUI: «Документ → Формулы → Создать формулу…» → LaTeX → «Создать» →
+#    «Вставить в документ» (номер справа по схеме); «Редактировать формулу…» → изменить LaTeX →
+#    «Применить» → «Обновить документ» (тело/номер пересобраны); инспектор документа → схема
+#    «по разделам» (номера (2.1)…) и обратно; «Профессиональный редактор» — нативная вкладка Equation.
+
+# 5) пересборка (debug/release) и полная очистка
+./scripts/build.sh build -p rde                      # debug
+./scripts/build.sh build -p rde --release            # release
+./scripts/clean-build.sh                             # полная очистка /srv/yocto/rde-target
+```

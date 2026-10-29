@@ -12,6 +12,54 @@
 
 ### Добавлено
 
+- **Редактор формул в GUI (P4, 2026-10-29, [ADR-0020](docs/adr/0020-formula-editor-ui.md), тег
+  `formula-editor`)**:
+  - **Создание формулы из GUI** («Документ → Формулы → Создать формулу…», дерево (группа
+    «Формулы» → «+ Создать формулу…»)): диалог с заголовком, **LaTeX-источником**, display/inline,
+    политикой нумерации `auto|none` и **предпросмотром** (рендер вкладки Equation WordCraft,
+    `previews::math_texture`, шрифт формул STIX). LaTeX валидируется **компиляцией** до создания
+    объекта (ошибка — в диалоге, файлов нет); дедуп по `latex.trim()` использует существующую
+    формулу (как миграция ADR-0019); после создания — `formula.toml` + кэши OMML/SVG/PNG в CAS +
+    ledger `act_key` + `[state]`, объект выбран в дереве, статус Fresh. При ошибке кэшей каталог
+    объекта удаляется (нет «полу-созданной» формулы).
+  - **Правка source-of-truth** (панель «Формула», инспектор → «Редактировать», контекстное меню
+    дерева): `title`/`latex`/`display`/политика нумерации пишутся в `formula.toml` без потери
+    `inputs`/`fragments`/`[state]`, кэши и `[state]` пересчитываются, `act_key` меняется → вставки
+    становятся **Stale** и «Обновить документ» пересобирает тела, сохраняя номер/пунктуацию/
+    `number_source` (ADR-0018/0019); ручная правка тела (`body_hash`) не перезаписывается (R-DOC-13).
+  - **API `rde-core`** ([`ops.rs`](crates/rde-core/src/ops.rs)): `create_formula_with_options`
+    (display + политика нумерации), `read_formula_manifest`, `write_formula_manifest` (валидация
+    JSON Schema **до** замены, атомарная запись tmp+rename), `update_formula_source` (читает
+    манифест, сохраняет входы/фрагменты/состояние); пустой `[state]`/пустые списки не сериализуются.
+  - **Нативная вкладка Equation WordCraft** встроена как «Профессиональный редактор формулы»:
+    `equation_tab::show` + canvas на **scratch-`WordApp`** (пустой `Document::default()`,
+    `insert.equation {latex,display}`, `equation.inputFormat latex`), отдельное окно; «← Забрать
+    LaTeX из редактора» переносит `equation.get` в поля панели; документ пользователя не меняется
+    (тест: байты `.doc.rde` до/после идентичны); шрифты WordCraft (`theme::install_fonts`) + первый
+    кадр без `show` (спайк A); пока редактор открыт, живой canvas документа заменяется растровым
+    предпросмотром страниц. Правок `vendor/wordcraft` **не потребовалось**.
+  - **Вставка с номером из панели/дерева/инспектора:** OMML или SVG-вектор, позиция — якорь вставки,
+    номер — по схеме документа (превью номера в панели); `FormulaBody.numbered` теперь учитывает
+    политику объекта (`display && numbering.mode != "none"`): display+auto — right-numbered табами
+    без таблицы, display+none/inline — без номера (R-DOC-15). Исправлено игнорирование политики
+    нумерации при вставке/обновлении.
+  - **Точки входа:** лента «Документ → Формулы» (+2 команды `Cmd::NewFormula`/`Cmd::EditFormula`),
+    дерево (+2 `TreeAction`: правка/вставка формулы), инспектор формулы («Редактировать»/«Вставить»),
+    статус/«где вставлено» в панели и «Открыть документ на вставке».
+  - Проверено: workspace **590 passed / 0 failed** (`rde-core` `formula_write_tests` 4; `rde-ui`
+    `formula_editor_*` 4: создание+валидация+предпросмотр, правка→Stale→«Обновить документ»,
+    вставка с номером/политика `none`, нативная вкладка без правки документа); LO-оракул вставки с
+    номером `(2)` — `xMax=552.9 pt` при правом поле 555.3 pt; headless-скриншоты
+    [`gui-p20-formula-create.png`](docs/fidelity/gui-p20-formula-create.png),
+    [`gui-p20-formula-editor.png`](docs/fidelity/gui-p20-formula-editor.png),
+    [`gui-p20-formula-native.png`](docs/fidelity/gui-p20-formula-native.png),
+    [`gui-p20-formula-inspector.png`](docs/fidelity/gui-p20-formula-inspector.png),
+    [`gui-p20-formula-insert-numbered.png`](docs/fidelity/gui-p20-formula-insert-numbered.png);
+    отчёт — [`docs/fidelity/p20-formula-editor.md`](docs/fidelity/p20-formula-editor.md).
+  - Ограничения: правка формулы «в тексте документа» (каретка к вставке + `equation.edit`) —
+    следующий шаг; `inputs`/`fragments`/`numbering.label` в GUI не редактируются (сохраняются);
+    удаление используемой формулы — generic `delete_object` без проверки «N документов»; Word на
+    стенде нет — вёрстка `unverified` (LO-оракул).
 - **Импорт MathType-документов с нумерацией формул: display/inline, номера из Word, миграция в
   нумерованные вставки (2026-10-29, [ADR-0019](docs/adr/0019-import-numbered-formulas.md), тег
   `import-numbered-formulas`)**:
