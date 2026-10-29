@@ -12,6 +12,76 @@
 
 ### Добавлено
 
+- **P5 `math-editor` Phase 2 — нативный WYSIWYG-редактор формул MathType-класса (2026-10-29,
+  [ADR-0021](docs/adr/0021-latex-math-editor.md), отчёт
+  [`docs/fidelity/p22-formula-editor.md`](docs/fidelity/p22-formula-editor.md))**:
+  - **Новый crate [`crates/rde-math-editor`](crates/rde-math-editor)** (без новых внешних
+    зависимостей, `vendor/wordcraft` не менялся): `source` — LaTeX↔модель с **собственным
+    roundtrip-safe сериализатором** (корпус 316 случаев: демо σ, 62 MathType-формулы, 222 шаблона
+    галереи, P0-конструкции; `parse(to_latex(parse(x))) == parse(x)` + идемпотентность после
+    `normalize`); `layout` — вёрстка/растр **тем же конвейером, что документ** (scratch-`Document` →
+    `layout` → `MathLayout` → `render_area`, STIX, placeholders пустых слотов), кэш текстур,
+    геометрия каретки/выделения/`arg_extent`; `edit` — модель `MNode`+`MathPos`+selection+undo/redo,
+    ввод (build-up `a/b`→дробь, `x^2`, autocorrect `\alpha`→α), шаблоны, навигация стрелками/Tab/
+    Esc/Home/End, Backspace/Delete (в т.ч. выделение), действия над структурами и пределами,
+    `prepare_source` (нормализация+roundtrip перед записью); `palette` — 11 категорий структур
+    (222 шаблона `math_gallery`, русские подписи, превью рендером), 8 наборов символов (222+),
+    автодополнение LaTeX-команд; `widget` — egui-виджет: **один canvas**, без второго `WordApp`.
+  - **Интеграция в вкладку «Формула»:** WYSIWYG-редактор над LaTeX-полем (двусторонняя
+    синхронизация, LaTeX — источник истины); «Применить»/«Создать» проводит `prepare_source` →
+    существующие `apply_formula_edit`/`create_formula_action` → `formula.toml` + кэши OMML/SVG/PNG +
+    ledger; клик по формуле в тексте / «Вставить в документ» / «Обновить документ» / статусы /
+    нумерация — без изменений. Растровый предпросмотр и scratch-`WordApp` панели удалены: редактор
+    и есть WYSIWYG-предпросмотр. Тесты: `formula_wysiwyg_editor_edits_model_and_creates_formula`,
+    `formula_wysiwyg_model_syncs_latex_field`.
+  - **Скриншоты:** [`gui-p22-formula-editor.png`](docs/fidelity/gui-p22-formula-editor.png) (+light),
+    [`gui-p22-formula-fraction.png`](docs/fidelity/gui-p22-formula-fraction.png),
+    [`gui-p22-formula-matrix.png`](docs/fidelity/gui-p22-formula-matrix.png),
+    [`gui-p22-formula-palette.png`](docs/fidelity/gui-p22-formula-palette.png).
+  - **Замеры:** [`docs/fidelity/p22-perf.md`](docs/fidelity/p22-perf.md) — рендер формулы
+    142–253 µs release; debug/release кадры; бэклог PERF-1 — [`docs/perf-backlog.md`](docs/perf-backlog.md).
+  - **Ограничения MVP (честно):** паритет MathType — P0 (дроби/корни/скрипты/пределы/скобки/матрицы/
+    cases/выравнивания/акценты/операторы/палитры/клавиатура/undo/clipboard LaTeX); P1 (матричный
+    тулбар «+строка/+столбец» в UI, подсветка через границы структур, MathML/OMML-копипаст, полная
+    таблица шорткатов, цвета/фон) — бэклог; пустые хвостовые строки матриц и «нестандартные» виды
+    дробей нормализуются при записи (LaTeX-first, ADR-0021).
+
+- **P5 `math-editor` — Research Gate и Phase 1: выбор движка LaTeX-редактора, safety-фикс порчи
+  формул, сохранение позиции документа, quick-win перф (2026-10-29, [ADR-0021](docs/adr/0021-latex-math-editor.md),
+  спайк [`docs/spikes/latex-editor.md`](docs/spikes/latex-editor.md))**:
+  - **Research Gate:** проверены кандидаты (`latex-rust` 3.0.1 — MIT/Apache, только рендер, нет
+    геометрии каретки; `mathtex-editor` 0.4.1 — лучший готовый UX, но лицензия движка
+    `mathtex-portable-engine-generated` (производная TeX/eTeX/XeTeX, non-standard) несовместима с
+    NFR-LIC-01/02 + `format.pkg`/TeX Live bootstrap + нет импорта LaTeX; webview — запрет
+    владельца). Выбран **WordCraft math engine + собственный MathType-подобный UI**: та же модель
+    OMML/операции/вёрстка/растр и STIX, что у документа (visual parity by construction), **без
+    новых зависимостей и правок `vendor/`**. Измерения: layout+растр формулы 0,14–0,25 мс release;
+    46 слотов каретки на σ-формулу; 222 шаблона/8 наборов символов/14 формул в галерее; roundtrip
+    LaTeX→модель→LaTeX 307/316 случаев (9 — вендорный `to_latex` не roundtrip-safe → в Phase 2
+    свой сериализатор).
+  - **Safety-фикс (инцидент A):** `equation.get` нативного проф. редактора больше **не может**
+    записать в `formula.toml` не-LaTeX: новый модуль `rde_doc::formula_latex::check_formula_latex`
+    отклоняет плейсхолдеры линейного формата (`▒`, `█`, `⬚`) и Unicode-заменители команд (`√`, `∑`,
+    `∫`), требует семантической эквивалентности источнику (иначе — ошибка в панели, источник не
+    меняется). Кнопка «Проф. редактор…»/автосинк **выведены из UI** (за флагом `FORMULA_NATIVE_UI`
+    для тестов) — до замены редактором MathType-класса (Phase 2). Регресс-тесты:
+    `corrupted_native_latex_is_rejected_by_panel_sync`, unit-тесты `formula_latex`.
+  - **Сохранение позиции документа (инцидент B):** «Обновить документ», вставка объекта, «Обновить
+    всё», rollback, миграция, оформление больше не пересоздают `WordApp`/`DocPreview` с нуля —
+    единый `reload_document_view_preserving()` перезагружает документ **на месте**
+    (`Session::set_document`), сохраняя каретку/выделение/`page_hint` и камеру скролла; предпросмотр
+    страниц получает одноразовый restore offset. Регресс-тесты:
+    `document_update_preserves_caret_on_long_document` (250-страничный документ, каретка в конце),
+    `preview_keeps_scroll_offset_after_document_update`.
+  - **Quick-win перф (§5.2 ТЗ):** кэш `formula_inspector_data` по эпохе данных (было до 52 мс
+    **на кадр** в debug на демо и сотни мс на проекте с 62 формулами), кэш превью номера формулы
+    (`next_formula_number_text` распаковывал `.doc.rde` каждый кадр), кэш счётчика вставок ленты по
+    (путь, mtime, размер). Замеры: кадр «Документ» 7,39 → 4,27 мс (−42 %), кадр панели «Формула»
+    11,10 → 4,86 мс (−56 %) — debug/kittest. Бэклог следующей итерации оптимизации —
+    [`docs/perf-backlog.md`](docs/perf-backlog.md).
+  - **Тесты (итог после Phase 2):** workspace **592 → 618 passed / 0 failed** (+26); `rde-ui`
+    143 → 149, новый crate `rde-math-editor` — 15, `rde-doc` +5 (+1 ignored perf-smoke).
+    Спайк-артефакты — `docs/spikes/harness/`, `docs/spikes/assets/p5-*`.
 - **Редактор формул — вкладка ленты «Формула», клик по формуле в тексте, фикс скролла предпросмотра
   (2026-10-29, продолжение P4, [ADR-0020](docs/adr/0020-formula-editor-ui.md) §5.2, тег
   `formula-tab`)**:
@@ -690,6 +760,14 @@
 
 ### Изменено
 
+- **P5: нативный «проф. редактор» формул выведен из UI** (2026-10-29, [ADR-0021](docs/adr/0021-latex-math-editor.md)):
+  кнопка «Проф. редактор…»/«← Из редактора» и автосинк `equation.get` при «Применить/Скрыть»
+  скрыты (код за флагом `FORMULA_NATIVE_UI` до Phase 4-удаления) — UX-клон Microsoft Equations
+  отвергнут владельцем, а `equation.get` мог возвращать не-LaTeX. **Phase 2:** на их место пришёл
+  собственный WYSIWYG-редактор (см. §«Добавлено»), растровый предпросмотр и второй `WordApp` панели
+  удалены; LaTeX-поле осталось источником истины и синхронизировано с моделью.
+- **P5: панель формулы и ленты больше не читают `.doc.rde` каждый кадр** — кэши по эпохе/метаданным
+  (см. §«Добавлено» и [`docs/perf-backlog.md`](docs/perf-backlog.md)).
 - **Строка вкладок центра — одна линия без переноса** (§19-7): вкладки слева, на вкладке «Документ»
   справа в той же строке — компактный сегментированный переключатель режимов **RDE | WordCraft |
   Предпросмотр** (иконки с тултипами, подписи — если хватает ширины); при нехватке ширины вкладки
@@ -709,6 +787,16 @@
 
 ### Исправлено
 
+- **P5 (инцидент A): порча формулы σ при навигации в нативном проф. редакторе.** После конвертаций
+  (`Equation › Convert → Linear`) `equation.get` отдавал линейный формат (`√`, `▒`, `\backslash …`),
+  и «Применить» записывал его в `formula.toml`. Теперь полученный LaTeX валидируется
+  (`rde_doc::check_formula_latex`: запрет плейсхолдеров/Unicode-команд + семантическая
+  эквивалентность источнику), при отказе источник не меняется; сам автосинк и UI проф. редактора
+  выведены. Демо-фикстуры восстановлены (`git checkout -- demo-project/`, порча не коммитится).
+- **P5 (инцидент B): «Обновить документ»/вставка сбрасывали документ на первую страницу.** Все
+  «внутренние» пересборки пакета используют in-place reload редактора: каретка/страница/скролл
+  сохраняются (проверено на 250-страничном документе и в предпросмотре), undo-история при пересборке
+  сбрасывается (документ пересобирается — зафиксировано в ADR-0021).
 - **«Проводник…»: поздний выбор из закрытого диалога не подменяет путь (2026-10-29, найдено при
   независимой проверке `gui-pickers`)** — если закрыть диалог (Esc/«Отмена») или пересоздать его,
   пока системное окно выбора ещё открыто, его результат больше не раскладывается в поле нового

@@ -9,6 +9,13 @@
 | Vendor | `vendor/wordcraft` не менялся |
 | Скриншоты | `gui-p21-formula-tab.png`, `gui-p21-formula-tab-empty.png`, `gui-p21-formula-tab-create.png`, `gui-p21-formula-tab-native.png`, `gui-p21-preview-scroll.png` |
 
+
+> **Исторический документ.** Отчёт итерации P4, итерация `formula-tab`; нативный «проф. редактор» (equation_tab-окно),
+> предпросмотр scratch-`WordApp` и скриншоты `gui-p2x-*native*` **выведены** в P5 «math-editor»
+> (2026-10-29, [ADR-0021](../adr/0021-latex-math-editor.md)): редактор заменён собственным
+> WYSIWYG-редактором MathType-класса, LaTeX-источник валидируется. Актуальные скриншоты и
+> отчёт — [`p22-formula-editor.md`](p22-formula-editor.md), [`gui-p22-*`](gui-p22-formula-editor.png).
+
 ## 1. Что изменилось по итогам приёмки P4
 
 1. **Редактор формулы — вкладка ленты «Формула»** (в верхней панели RDE рядом с «Файл/Правка/

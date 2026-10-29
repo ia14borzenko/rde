@@ -15,6 +15,13 @@
 > (оконную) версию панели; актуальные — в отчёте
 > [`p21-formula-tab.md`](p21-formula-tab.md) (`docs/fidelity/gui-p21-*.png`).
 
+
+> **Исторический документ.** Отчёт итерации P4; нативный «проф. редактор» (equation_tab-окно),
+> предпросмотр scratch-`WordApp` и скриншоты `gui-p2x-*native*` **выведены** в P5 «math-editor»
+> (2026-10-29, [ADR-0021](../adr/0021-latex-math-editor.md)): редактор заменён собственным
+> WYSIWYG-редактором MathType-класса, LaTeX-источник валидируется. Актуальные скриншоты и
+> отчёт — [`p22-formula-editor.md`](p22-formula-editor.md), [`gui-p22-*`](gui-p22-formula-editor.png).
+
 ## 1. Что проверялось
 
 Acceptance (ADR-0020/промпт итерации):

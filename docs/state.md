@@ -2237,3 +2237,69 @@ RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=40 RDE_SCREENSHOT_WHEEL=-320 \
 ./scripts/build.sh build -p rde --release            # release
 ./scripts/clean-build.sh                             # очистка /srv/yocto/rde-target
 ```
+
+---
+
+## Обновление 2026-10-29 (P5 «math-editor»: нативный WYSIWYG-редактор формул MathType-класса, safety, позиция документа, quick-win перф)
+
+Итерация **`math-editor`** (P5). Вход: HEAD `3e21164` (тег `formula-tab`), workspace **592 passed**;
+выход: **618 passed / 0 failed**, release-бинарь `/srv/yocto/rde-target/release/rde`, документы —
+[ADR-0021](adr/0021-latex-math-editor.md), спайк [`spikes/latex-editor.md`](spikes/latex-editor.md),
+отчёт [`fidelity/p22-formula-editor.md`](fidelity/p22-formula-editor.md), замеры
+[`fidelity/p22-perf.md`](fidelity/p22-perf.md), бэклог [`perf-backlog.md`](perf-backlog.md).
+
+### Что сделано
+
+1. **Research Gate:** проверены `latex-rust` (только рендер, нет геометрии каретки, другой лейаут),
+   `mathtex-editor` (лицензия движка — производная TeX, non-standard; `format.pkg`/TeX Live; нет
+   импорта LaTeX), WordCraft math engine, webview (запрет владельца), GPL-инструменты (не в бандл).
+   Выбран **WordCraft math model/operations/layout/raster + собственный UI** — новые зависимости не
+   нужны, visual parity by construction. Замеры рендера формулы: **142–253 µs release**.
+2. **Safety (инцидент A):** `equation.get` нативного редактора мог отдать линейный мусор (`√`, `▒`,
+   `\backslash`) — и он писался в `formula.toml`. Теперь LaTeX из внешнего редактора валидируется
+   (`rde-doc::formula_latex`: запрет плейсхолдеров/Unicode-команд + семантическая эквивалентность),
+   проф. редактор и автосинк выведены из UI.
+3. **Позиция документа (инцидент B):** «Обновить документ»/вставка/«Обновить всё»/rollback/миграция/
+   оформление больше не пересоздают `WordApp` с нуля: in-place reload + restore каретки/страницы,
+   предпросмотр сохраняет offset; проверено на **250-страничном** документе.
+4. **WYSIWYG-редактор (Phase 2, новый crate `rde-math-editor`):** LaTeX-кодек с собственным
+   roundtrip-safe сериализатором (корпус 316), вёрстка/растр тем же конвейером, что документ,
+   каретка/выделение по `MathLayout.slots`, ввод/палитры (222 шаблона, 8 наборов символов)/
+   LaTeX-команды/undo; интеграция в вкладку «Формула»: LaTeX — источник истины и синхронизированная
+   витрина, «Применить» пишет источник и пересчитывает кэши прежним конвейером. Старый
+   equation_tab-редактор и второй `WordApp` панели удалены из UI.
+5. **Quick-win перф:** кэши `formula_inspector_data` (эпоха), `next_formula_number_text`, счётчика
+   вставок ленты; in-place reload убрал стоимость пересоздания редактора. Кадр «Документ»
+   7,39→4,27 мс debug (0,96 release), кадр панели «Формула» 11,10→4,86 мс debug (0,79 release).
+   Бэклог и методика — `perf-backlog.md`/`p22-perf.md`; **следующая итерация — PERF-1** (владелец
+   просил напомнить после формул).
+
+### Тесты/доказательства
+
+- `./scripts/build.sh test --workspace` — **618 passed / 0 failed**: `rde-ui` 149 (+6), новый
+  `rde-math-editor` 15 (11 unit + 4 roundtrip), `rde-doc` +5 (`formula_latex`); +1 ignored perf-smoke.
+- Скриншоты: [`gui-p22-formula-editor.png`](fidelity/gui-p22-formula-editor.png) (+light),
+  `gui-p22-formula-fraction.png`, `gui-p22-formula-matrix.png`, `gui-p22-formula-palette.png`.
+- Release-бинарь собран; debug/release числа — `fidelity/p22-perf.md`.
+
+### Ограничения
+
+- Паритет MathType — **MVP-P0**; P1 (матричный тулбар в UI, подсветка через границы структур,
+  MathML/OMML-копипаст, полная таблица шорткатов, цвета/фон) — бэклог.
+- LaTeX-представимость: пустые хвостовые строки матриц и нестандартные виды дробей нормализуются
+  при записи (LaTeX-first; `\binom` сохраняется). Word на стенде нет — вёрстка `unverified`
+  (LO-оракул), как и раньше.
+- Legacy-код проф. редактора остаётся за флагом `FORMULA_NATIVE_UI=false` (не показывается) —
+  удаление в Phase 4.
+
+### Как запустить
+
+```bash
+cd /home/admin-pc/proj/rde-dev/rde && source ~/.cargo/env
+/srv/yocto/rde-target/release/rde            # release-бинарь (собран в этой итерации)
+./scripts/build.sh build -p rde --release    # пересборка release (~4–5 мин, тёплый кэш)
+./scripts/build.sh test --workspace          # 618 passed / 0 failed
+# скриншоты WYSIWYG-редактора
+RDE_PROJECT=demo-project RDE_SCREENSHOT_STEPS=120 \
+  /srv/yocto/rde-target/release/examples/screenshot /tmp/p22.png document "" 0 formula-editor-v2 dark
+```

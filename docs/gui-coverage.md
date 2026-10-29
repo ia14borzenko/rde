@@ -419,3 +419,23 @@ RDE_PROJECT=demo-project /srv/yocto/rde-target/debug/examples/screenshot \
 - `./scripts/run.sh --print` открывает последний проект; тесты не засоряют `~/.config/rde/`
   (там только `last-project`);
 - найден и исправлен 1 дефект (таблица §10), после фикса пересчитаны сводные числа §1.
+
+---
+
+## 13. Обновление P5 (`math-editor`, 2026-10-29): WYSIWYG-редактор формул, safety, позиция
+
+| Возможность | Статус | Точка входа в GUI | Тест/доказательство |
+|---|---|---|---|
+| Редактор формулы MathType-класса (структурный 2D-ввод, каретка, палитры, undo) | ✅🧪 | вкладка ленты «Формула» → блок «РЕДАКТОР ФОРМУЛЫ» | `formula_wysiwyg_editor_edits_model_and_creates_formula`, `formula_wysiwyg_model_syncs_latex_field`; `gui-p22-formula-*.png` |
+| LaTeX-источник как источник истины (двусторонняя синхронизация с моделью) | ✅🧪 | поле «LaTeX-источник» под редактором | `formula_wysiwyg_model_syncs_latex_field` |
+| Структуры палитрой (222 шаблона, 11 категорий) и символы (8 наборов) | ✅🧪 | палитра «Структуры»/«Символы» в редакторе | `rde-math-editor` unit (`palette::*`), `gui-p22-formula-matrix.png` |
+| LaTeX-команда с автодополнением (`\frac`, `\alpha`, `\sum…`) | ✅🧪 | строка «LaTeX-команда» + Enter/подсказки | `palette::tests::commands_autocomplete` |
+| Валидация LaTeX из внешнего редактора (запрет линейного мусора) | ✅🧪 | панель «Формула» (ошибка при отказе) | `corrupted_native_latex_is_rejected_by_panel_sync`, `rde-doc::formula_latex` unit |
+| «Проф. редактор…» (нативный equation_tab) | ❌ выведен | — (клон MS Equations отвергнут; заменён WYSIWYG-редактором) | `formula_panel_hides_removed_native_professional_editor` |
+| Сохранение каретки/страницы при «Обновить документ»/вставке/«Обновить всё»/rollback | ✅🧪 | «Обновить документ», вставки | `document_update_preserves_caret_on_long_document` (250 стр.), ADR-0021 §Решение 3 |
+| Прокрутка предпросмотра не сбрасывается при обновлении | ✅🧪 | «Предпросмотр страниц» + «Обновить документ» | `preview_keeps_scroll_offset_after_document_update`, `preview_scrolls_with_mouse_wheel` |
+| Замеры перфа (до/после) | ✅ | — | `perf_smoke_measure_frame_costs` (ignored), `docs/fidelity/p22-perf.md` |
+
+**Следующая очередь (P1):** матричный тулбар «+строка/+столбец» в UI (примитивы `math_edit` уже
+есть), подсветка выделения через границы структур, MathML/OMML-копипаст, полная таблица
+MathType-шорткатов, цвета/фон. Бэклог перфа — [`perf-backlog.md`](perf-backlog.md).
