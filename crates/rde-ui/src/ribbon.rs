@@ -154,6 +154,9 @@ pub(crate) enum RibbonTab {
     File,
     Edit,
     Home,
+    /// P4 (ADR-0020): полноценный редактор формулы в ленте — открывается по клику на формулу
+    /// в тексте/дереве/инспекторе; заменяет группы ленты панелью редактора.
+    Formula,
     Insert,
     Document,
     Project,
@@ -163,10 +166,11 @@ pub(crate) enum RibbonTab {
 }
 
 impl RibbonTab {
-    pub(crate) const ALL: [RibbonTab; 9] = [
+    pub(crate) const ALL: [RibbonTab; 10] = [
         RibbonTab::File,
         RibbonTab::Edit,
         RibbonTab::Home,
+        RibbonTab::Formula,
         RibbonTab::Insert,
         RibbonTab::Document,
         RibbonTab::Project,
@@ -180,6 +184,7 @@ impl RibbonTab {
             RibbonTab::File => "Файл",
             RibbonTab::Edit => "Правка",
             RibbonTab::Home => "Главная",
+            RibbonTab::Formula => "Формула",
             RibbonTab::Insert => "Вставка",
             RibbonTab::Document => "Документ",
             RibbonTab::Project => "Проект",
@@ -207,6 +212,10 @@ pub(crate) enum Slot {
     Zoom,
     /// Текст без команды (состояние агента: v0.3, не подключён).
     Note(&'static str),
+    /// Полноценный редактор формулы на вкладке «Формула» (P4/ADR-0020): LaTeX-источник,
+    /// предпросмотр, display/inline, политика нумерации, «Применить»/«Вставить».
+    /// Отрисовка — `RdeApp::formula_ribbon_editor` (вкладка заменяет группы ленты).
+    FormulaEditor,
 }
 
 impl Slot {
@@ -215,7 +224,7 @@ impl Slot {
     pub(crate) fn cmd(self) -> Option<Cmd> {
         match self {
             Slot::Button { cmd, .. } | Slot::Toggle { cmd, .. } | Slot::Icon { cmd, .. } => Some(cmd),
-            Slot::InsertPosition | Slot::Zoom | Slot::Note(_) => None,
+            Slot::InsertPosition | Slot::Zoom | Slot::Note(_) | Slot::FormulaEditor => None,
         }
     }
 }
@@ -370,6 +379,10 @@ pub(crate) fn ribbon_groups(tab: RibbonTab) -> &'static [Group] {
                 ],
             },
         ],
+        // P4 (ADR-0020): вкладка «Формула» — панель редактора рисуется вместо групп
+        // (`ribbon_ui` → `formula_ribbon_editor`); слот-маркер держит инвариант «у вкладки есть
+        // группа и слот» и не несёт команды.
+        RibbonTab::Formula => &[Group { title: "Редактор формулы", slots: &[Slot::FormulaEditor] }],
         RibbonTab::Insert => &[
             Group { title: "Вставки", slots: INSERT_SLOTS },
             Group { title: "Позиция", slots: &[Slot::InsertPosition] },
@@ -605,10 +618,10 @@ mod tests {
         }
     }
 
-    /// Вкладок девять, у каждой есть хотя бы одна группа с хотя бы одним слотом.
+    /// Вкладок десять (P4 добавила «Формула»), у каждой есть хотя бы одна группа со слотом.
     #[test]
     fn every_ribbon_tab_has_groups_and_slots() {
-        assert_eq!(RibbonTab::ALL.len(), 9);
+        assert_eq!(RibbonTab::ALL.len(), 10);
         for tab in RibbonTab::ALL {
             let groups = ribbon_groups(tab);
             assert!(!groups.is_empty(), "вкладка {} без групп", tab.title());

@@ -4,6 +4,8 @@
 //! `cargo run -p rde-ui --example screenshot -- /path/out.png [tab] [объект]`
 //! tab: document|structure|artifacts|source|code; объект: id или часть названия.
 //! Проект: `RDE_PROJECT=<dir>` (иначе демо-проект) — удобно снимать реальные проекты.
+//! `RDE_SCREENSHOT_WHEEL=<delta>` — прокрутить область документа колесом после прогрева кадров
+//! (проверка скролла предпросмотра страниц; delta<0 — вниз).
 
 use std::path::Path;
 
@@ -31,7 +33,8 @@ fn main() {
         state.demo_set_logs_tab(logs_tab);
     }
     // 5-й аргумент — действие для снимка: update | insert-value | insert-figure | insert-formula |
-// formula-create-dialog | formula-editor | formula-editor-native | formula-insert …
+// formula-tab-empty | formula-create-dialog | formula-editor | formula-editor-native |
+// formula-insert …
     match std::env::args().nth(5).as_deref() {
         Some("update") => state.request_update(None, true),
         Some("insert-value") => state.demo_open_insert_dialog("value"),
@@ -50,6 +53,7 @@ fn main() {
             state.demo_select_tab("document");
         }
         // P4 (ADR-0020): создание/правка формулы в GUI.
+        Some("formula-tab-empty") => state.demo_show_formula_tab(),
         Some("formula-create-dialog") => {
             state.demo_open_formula_editor_create(
                 "Средняя квадратичная ошибка",
@@ -170,6 +174,24 @@ fn main() {
     let steps = std::env::var("RDE_SCREENSHOT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
     for _ in 0..steps {
         harness.step();
+    }
+    // RDE_SCREENSHOT_WHEEL=<delta>: прокрутить область документа колесом (проверка скролла
+    // предпросмотра страниц: демо-offset не форсируется, работает и колесо, и ползунок).
+    if let Some(delta) = std::env::var("RDE_SCREENSHOT_WHEEL").ok().and_then(|value| value.parse::<f32>().ok()) {
+        harness.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(760.0, 520.0)));
+        harness.step();
+        for _ in 0..6 {
+            harness.input_mut().events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, delta),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        for _ in 0..4 {
+            harness.step();
+        }
     }
 
     match harness.render() {
