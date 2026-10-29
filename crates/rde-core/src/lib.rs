@@ -27,11 +27,12 @@ pub use manifest::{
     RepositoryManifest, RuntimeManifest, SourceManifest, parse_formula_input_source, parse_formula_ref,
 };
 pub use ops::{
-    CreateRequest, NewObjectKind, clear_artifact_out_hash, create_document_stub, create_formula,
-    create_formula_with_display,
-    create_object, create_project, delete_object, record_artifact_out_hash, record_formula_state,
-    rename_object, set_project_authors, backup_project, list_project_backups, restore_project,
-    set_project_trusted, write_artifact_manifest, set_document_formula_numbering,
+    CreateRequest, FormulaSourceUpdate, NewObjectKind, clear_artifact_out_hash, create_document_stub,
+    create_formula, create_formula_with_display, create_formula_with_options, create_object,
+    create_project, delete_object, read_formula_manifest, record_artifact_out_hash,
+    record_formula_state, rename_object, set_project_authors, backup_project, list_project_backups,
+    restore_project, set_project_trusted, update_formula_source, write_artifact_manifest,
+    write_formula_manifest, set_document_formula_numbering,
 };
 pub use project::{
     Freshness, Group, Issue, Level, LogLine, Object, ObjectData, ObjectKind, Project, load_project,

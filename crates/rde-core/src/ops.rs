@@ -640,6 +640,18 @@ pub fn create_formula(root: &Path, title: &str, latex: &str) -> Result<PathBuf, 
 /// block-абзацем, inline — вставляется в текст и не нумеруется. Импорт/миграция MathType-формул
 /// передаёт фактический режим вхождения (иначе inline-формулы проекта всегда были бы `display`).
 pub fn create_formula_with_display(root: &Path, title: &str, latex: &str, display: bool) -> Result<PathBuf, String> {
+    create_formula_with_options(root, title, latex, display, "auto")
+}
+
+/// Создать формулу проекта с явными `display` и политикой нумерации (P4, диалог создания в GUI):
+/// `numbering_mode` — `auto` (нумеровать при вставке/обновлении) или `none` (без номера).
+pub fn create_formula_with_options(
+    root: &Path,
+    title: &str,
+    latex: &str,
+    display: bool,
+    numbering_mode: &str,
+) -> Result<PathBuf, String> {
     let title = title.trim();
     if title.is_empty() {
         return Err("название формулы не может быть пустым".to_owned());
@@ -648,11 +660,16 @@ pub fn create_formula_with_display(root: &Path, title: &str, latex: &str, displa
     if latex.is_empty() {
         return Err("LaTeX-источник формулы не может быть пустым".to_owned());
     }
+    let numbering_mode = numbering_mode.trim();
+    let numbering_mode = if numbering_mode.is_empty() { "auto" } else { numbering_mode };
+    if !matches!(numbering_mode, "auto" | "none") {
+        return Err(format!("политика нумерации формулы должна быть auto|none, а не `{numbering_mode}`"));
+    }
     let id = new_id();
     let dir = root.join("objects/formulas").join(&id);
     fs::create_dir_all(&dir).map_err(|e| format!("создать каталог формулы: {e}"))?;
     let manifest = format!(
-        "schema = \"{}\"\nid = \"{id}\"\ntitle = {}\nlatex = {}\ndisplay = {display}\n\n[numbering]\nmode = \"auto\"\nlabel = \"\"\n",
+        "schema = \"{}\"\nid = \"{id}\"\ntitle = {}\nlatex = {}\ndisplay = {display}\n\n[numbering]\nmode = \"{numbering_mode}\"\nlabel = \"\"\n",
         crate::manifest::SCHEMA_FORMULA,
         toml_string(title),
         toml_string(latex)
@@ -667,6 +684,90 @@ pub fn create_formula_with_display(root: &Path, title: &str, latex: &str, displa
         return Err(error);
     }
     Ok(dir)
+}
+
+/// Правка источника формулы (P4, ADR-0005 §5): `title`/`latex`/`display`/политика нумерации.
+/// `inputs`/`fragments`/`[state]` сохраняются как есть — источник истины актуальности остаётся в
+/// ledger (`rde-dag`), `[state]` перезаписывается после пересчёта кэшей вызывающим слоем.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormulaSourceUpdate {
+    pub title: String,
+    pub latex: String,
+    /// `true` — display (отдельная строка), `false` — inline.
+    pub display: bool,
+    /// `auto` — нумеровать при вставке/обновлении документа; `none` — без номера.
+    pub numbering_mode: String,
+    /// Метка/группа нумерации (R-DOC-15; пусто — нет).
+    pub numbering_label: String,
+}
+
+/// Прочитать `formula.toml` объекта в типизированную модель (P4: редактор формулы в UI).
+pub fn read_formula_manifest(root: &Path, id: &str) -> Result<crate::manifest::FormulaManifest, String> {
+    let path = root.join("objects/formulas").join(id).join("formula.toml");
+    let text = fs::read_to_string(&path).map_err(|e| format!("прочитать {}: {e}", path.display()))?;
+    toml::from_str(&text).map_err(|e| format!("разобрать {}: {e}", path.display()))
+}
+
+/// Перезаписать `formula.toml` из типизированной модели (P4): правка источника/политики без потери
+/// `inputs`/`fragments`/`[state]`. Схема валидируется **до** замены, запись атомарная (tmp+rename) —
+/// невалидный манифест на диске не остаётся.
+pub fn write_formula_manifest(root: &Path, manifest: &crate::manifest::FormulaManifest) -> Result<(), String> {
+    if manifest.schema != crate::manifest::SCHEMA_FORMULA {
+        return Err(format!(
+            "манифест формулы: schema должна быть `{}`, а не `{}`",
+            crate::manifest::SCHEMA_FORMULA,
+            manifest.schema
+        ));
+    }
+    let dir = root.join("objects/formulas").join(&manifest.id);
+    if !dir.is_dir() {
+        return Err(format!("каталог формулы {} не найден", dir.display()));
+    }
+    let text = toml::to_string_pretty(manifest).map_err(|e| format!("formula.toml: {e}"))?;
+    write_formula_manifest_atomic(&dir, &text)
+}
+
+/// Правка источника существующей формулы (P4): читает манифест, меняет шапку (title/latex/display/
+/// нумерация), сохраняя входы/фрагменты/состояние; валидирует поля и схему до записи.
+pub fn update_formula_source(root: &Path, id: &str, update: &FormulaSourceUpdate) -> Result<(), String> {
+    let title = update.title.trim();
+    if title.is_empty() {
+        return Err("название формулы не может быть пустым".to_owned());
+    }
+    let latex = update.latex.trim();
+    if latex.is_empty() {
+        return Err("LaTeX-источник формулы не может быть пустым".to_owned());
+    }
+    let mode = update.numbering_mode.trim();
+    if !matches!(mode, "auto" | "none") {
+        return Err(format!("политика нумерации формулы должна быть auto|none, а не `{mode}`"));
+    }
+    let mut manifest = read_formula_manifest(root, id)?;
+    manifest.title = title.to_owned();
+    manifest.latex = latex.to_owned();
+    manifest.display = update.display;
+    manifest.numbering.mode = mode.to_owned();
+    manifest.numbering.label = update.numbering_label.trim().to_owned();
+    write_formula_manifest(root, &manifest)
+}
+
+/// Атомарная запись `formula.toml`: валидация JSON Schema по tmp-файлу **до** rename, чтобы при
+/// ошибке прежний манифест остался нетронутым (tmp удаляется).
+fn write_formula_manifest_atomic(dir: &Path, text: &str) -> Result<(), String> {
+    let path = dir.join("formula.toml");
+    let tmp = dir.join("formula.toml.tmp");
+    fs::write(&tmp, text).map_err(|e| format!("записать {}: {e}", tmp.display()))?;
+    let validated = (|| -> Result<(), String> {
+        let written = fs::read_to_string(&tmp).map_err(|e| format!("прочитать {}: {e}", tmp.display()))?;
+        let value: toml::Value = toml::from_str(&written).map_err(|e| format!("TOML {}: {e}", tmp.display()))?;
+        let errors = manifest::validate(ManifestKind::Formula, &value);
+        if errors.is_empty() { Ok(()) } else { Err(format!("formula.toml не проходит JSON Schema: {}", errors.join("; "))) }
+    })();
+    if let Err(error) = validated {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    fs::rename(&tmp, &path).map_err(|e| format!("заменить {}: {e}", path.display()))
 }
 
 fn write_artifact(dir: &Path, id: &str, _title: &str, kind: &str, manifest: &str) -> Result<(), String> {
@@ -985,6 +1086,176 @@ mod manifest_write_tests {
         assert_eq!(again.groups.len(), 2);
         assert_eq!(again.groups[1].mode, "ref");
         assert!(reloaded.issues.is_empty(), "{:?}", reloaded.issues);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod formula_write_tests {
+    use super::*;
+    use crate::manifest::{FormulaFragment, FormulaInput, FormulaState};
+    use crate::{load_project, ObjectData};
+
+    fn project_with_formula(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("rde-core-formula-write-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("rde.toml"),
+            "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"Формулы\"\n",
+        )
+        .unwrap();
+        let dir = create_formula_with_options(&root, "Закон Ома", "\\sigma=\\frac{F}{A}", true, "auto").unwrap();
+        (root, dir)
+    }
+
+    #[test]
+    fn create_formula_with_options_writes_numbering_policy() {
+        let root = std::env::temp_dir().join(format!("rde-core-formula-create-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("rde.toml"), "schema = \"rde/project@1\"\nid = \"01M5VJ1JG0V3RS3DTR98H6BCFN\"\nname = \"T\"\n").unwrap();
+        let dir = create_formula_with_options(&root, "Инлайн", "x^2", false, "none").unwrap();
+        let text = fs::read_to_string(dir.join("formula.toml")).unwrap();
+        assert!(text.contains("mode = \"none\""), "{text}");
+        assert!(text.contains("display = false"), "{text}");
+        let manifest = read_formula_manifest(&root, dir.file_name().unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(manifest.numbering.mode, "none");
+        // Неизвестная политика — ошибка до создания каталога.
+        assert!(create_formula_with_options(&root, "Плохая", "x", true, "sometimes").is_err());
+        // Пустые поля — ошибки (совместимость с create_formula).
+        assert!(create_formula_with_options(&root, "  ", "x", true, "auto").is_err());
+        assert!(create_formula_with_options(&root, "T", "  ", true, "auto").is_err());
+        let project = load_project(&root).unwrap();
+        assert!(project.issues.is_empty(), "{:?}", project.issues);
+        assert_eq!(project.formulas().count(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_formula_source_keeps_inputs_fragments_and_state() {
+        let (root, dir) = project_with_formula("keep");
+        let id = dir.file_name().unwrap().to_str().unwrap().to_owned();
+        // Входы/фрагменты/состояние — как их пишет миграция/пересчёт кэшей (P2/P3).
+        let mut manifest = read_formula_manifest(&root, &id).unwrap();
+        manifest.inputs = vec![FormulaInput {
+            alias: "F".into(),
+            mode: "hashed".into(),
+            source: "rde://constants/01M5VJ1JG0ZZZZZZZZZZZZZZZZ/F".into(),
+            as_kind: "symbol".into(),
+            format: String::new(),
+            unit: String::new(),
+        }];
+        manifest.fragments = vec![FormulaFragment {
+            alias: "base".into(),
+            source: "rde://formula/01M5VJ1JG0ZZZZZZZZZZZZZZZY".into(),
+        }];
+        manifest.state = FormulaState {
+            act_key: "ab".repeat(32),
+            resolved_latex_hash: "cd".repeat(32),
+            omml_hash: "ef".repeat(32),
+            svg_hash: "12".repeat(32),
+            png_hash: "34".repeat(32),
+            computed_at: 1_790_000_000,
+        };
+        write_formula_manifest(&root, &manifest).unwrap();
+        // Правка шапки: latex/display/нумерация/заголовок.
+        update_formula_source(
+            &root,
+            &id,
+            &FormulaSourceUpdate {
+                title: "Закон Ома (правка)".into(),
+                latex: "\\sigma = F/A".into(),
+                display: false,
+                numbering_mode: "none".into(),
+                numbering_label: "2.1".into(),
+            },
+        )
+        .unwrap();
+        let updated = read_formula_manifest(&root, &id).unwrap();
+        assert_eq!(updated.title, "Закон Ома (правка)");
+        assert_eq!(updated.latex, "\\sigma = F/A");
+        assert!(!updated.display);
+        assert_eq!(updated.numbering.mode, "none");
+        assert_eq!(updated.numbering.label, "2.1");
+        assert_eq!(updated.inputs, manifest.inputs, "входы не потеряны");
+        assert_eq!(updated.fragments, manifest.fragments, "фрагменты не потеряны");
+        assert_eq!(updated.state, manifest.state, "[state] не потерян до пересчёта кэшей");
+        // Загрузчик проекта видит правку (объект и данные); висят только ссылки-заглушки
+        // на несуществующие объекты (вход/фрагмент — проверка ссылок, не правки).
+        let project = load_project(&root).unwrap();
+        assert!(
+            project.issues.iter().all(|issue| issue.message.contains("не найден")),
+            "issues: {:?}",
+            project.issues
+        );
+        let object = project.formula_object(&id).unwrap();
+        let ObjectData::Formula(loaded) = &object.data else { panic!("не формула") };
+        assert_eq!(loaded.latex, "\\sigma = F/A");
+        assert_eq!(object.title, "Закон Ома (правка)");
+        assert_eq!(project.formulas().count(), 1, "правка не создаёт новый объект");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_formula_source_rejects_invalid_and_does_not_overwrite() {
+        let (root, dir) = project_with_formula("reject");
+        let id = dir.file_name().unwrap().to_str().unwrap().to_owned();
+        let path = dir.join("formula.toml");
+        let before = fs::read_to_string(&path).unwrap();
+        for update in [
+            FormulaSourceUpdate {
+                title: "  ".into(),
+                latex: "x".into(),
+                display: true,
+                numbering_mode: "auto".into(),
+                numbering_label: String::new(),
+            },
+            FormulaSourceUpdate {
+                title: "T".into(),
+                latex: " \t".into(),
+                display: true,
+                numbering_mode: "auto".into(),
+                numbering_label: String::new(),
+            },
+            FormulaSourceUpdate {
+                title: "T".into(),
+                latex: "x".into(),
+                display: true,
+                numbering_mode: "sometimes".into(),
+                numbering_label: String::new(),
+            },
+        ] {
+            assert!(update_formula_source(&root, &id, &update).is_err(), "{update:?}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), before, "файл не перезаписан при ошибке: {update:?}");
+        }
+        // Неизвестный id — ошибка, без паники/записи.
+        assert!(update_formula_source(&root, "01M5VJ1JG0ZZZZZZZZZZZZZZZZ", &FormulaSourceUpdate {
+            title: "T".into(),
+            latex: "x".into(),
+            display: true,
+            numbering_mode: "auto".into(),
+            numbering_label: String::new(),
+        }).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_formula_manifest_validates_schema_before_replace() {
+        let (root, dir) = project_with_formula("schema");
+        let id = dir.file_name().unwrap().to_str().unwrap().to_owned();
+        let path = dir.join("formula.toml");
+        let before = fs::read_to_string(&path).unwrap();
+        let mut manifest = read_formula_manifest(&root, &id).unwrap();
+        manifest.schema = "rde/artifact@1".into();
+        assert!(write_formula_manifest(&root, &manifest).is_err(), "чужая схема отклонена");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "прежний манифест цел");
+        assert!(!dir.join("formula.toml.tmp").exists(), "tmp-файл убран после ошибки");
+        // Неизвестный id (нет каталога) — ошибка без создания файлов.
+        let mut other = manifest.clone();
+        other.id = "01M5VJ1JG0ZZZZZZZZZZZZZZZZ".into();
+        other.schema = crate::manifest::SCHEMA_FORMULA.into();
+        assert!(write_formula_manifest(&root, &other).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 }

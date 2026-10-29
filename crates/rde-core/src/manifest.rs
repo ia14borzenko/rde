@@ -321,6 +321,17 @@ fn default_true() -> bool {
     true
 }
 
+/// Пустое зеркало `[state]` не сериализуется (первая запись формулы из GUI не добавляет
+/// в `formula.toml` пустую таблицу — `[state]` появляется после пересчёта кэшей).
+fn formula_state_is_empty(state: &FormulaState) -> bool {
+    state.act_key.is_empty()
+        && state.resolved_latex_hash.is_empty()
+        && state.omml_hash.is_empty()
+        && state.svg_hash.is_empty()
+        && state.png_hash.is_empty()
+        && state.computed_at == 0
+}
+
 fn default_input_as() -> String {
     "value".to_owned()
 }
@@ -401,11 +412,11 @@ pub struct FormulaManifest {
     pub display: bool,
     #[serde(default)]
     pub numbering: FormulaNumbering,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<FormulaInput>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fragments: Vec<FormulaFragment>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "formula_state_is_empty")]
     pub state: FormulaState,
 }
 
