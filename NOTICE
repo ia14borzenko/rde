@@ -36,6 +36,14 @@ Third-party components referenced or used as dependencies (attribution):
   Phosphor Icons; full license text in `crates/rde-ui/fonts/PHOSPHOR-LICENSE.txt`.
 - Liberation fonts — SIL Open Font License 1.1. Planned OFL metric-compatible family per NFR-LIC-04;
   not bundled in this prototype version (pending decision, see ADR-0003 §5).
+- **STIX Two Math** (`crates/rde-doc/assets/fonts/STIXTwoMath-Regular.otf`, 838 KB) — SIL Open Font
+  License 1.1, Copyright 2001-2021 The STIX Fonts Project Authors; full license text in
+  `crates/rde-doc/assets/fonts/STIXTwoMath-OFL.txt`. Bundled as the math font for OMML formulas in RDE
+  (editor/preview/SVG/PNG caches) and referenced in exported `.docx` (`m:mathPr/m:mathFont`,
+  `w:rFonts` of math runs, best-effort; see ADR-0018). Times-compatible design with a `MATH` table;
+  embedded at build time, no runtime downloads.
+- Times New Roman — proprietary (Monotype, delivered with Microsoft software); NOT distributed with
+  this project. RDE only references it as the document's text font when the user's system has it.
 - ГОСТ standards texts are NOT distributed with this project; formatting rules are implemented
   as data/own wording with standard designations only.
 

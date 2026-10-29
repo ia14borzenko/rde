@@ -1822,3 +1822,100 @@ cd /home/admin-pc/proj/rde-dev/rde
 #               /tmp/open-project.png document "" 0 open-project-dialog dark
 # Пересборка: ./scripts/build.sh build -p rde  (или ./scripts/run.sh --rebuild)
 ```
+
+## Обновление 2026-10-29 (формулы: math-шрифт «как TNR» + Word-нумерация справа/ссылки; ADR-0018, тег `formulas-times-numbering`)
+
+### Что сделано
+
+- **Math-шрифт формул.** Бандл **STIX Two Math** (`crates/rde-doc/assets/fonts/`, 838 КБ, SIL OFL 1.1,
+  текст лицензии рядом) + `rde-doc/src/math_font.rs`: `ensure_math_font()` регистрирует шрифт в
+  `wordcraft_fonts::FontDb::global()` (идемпотентно) при старте GUI, перед компиляцией формул и при
+  открытии движка. Движок резолвит `resolve_math("Cambria Math") → STIX Two Math` (2-й в
+  `MATH_SUBSTITUTES`) — Times-совместимая антиква вместо DejaVu Math TeX Gyre, **без форк-патча**.
+  Выбор обоснован: у TeX Gyre Termes Math 0 букв кириллицы (а в импортированных MathType-формулах
+  она бывает), STIX — OFL 1.1 с полной кириллицей/греческим/операторами. `FORMULA_RENDERER_VERSION`
+  `0.10.0+rde2 → +rde3`: кэши OMML/SVG/PNG формул (демо, пользовательские) пересобираются по
+  `renderer`-хэшу; демо-формулы перекомпилированы. Аварийный откат — `RDE_MATH_FONT=dejavu`.
+- **Right-numbered вёрстка без таблицы (B1).** Нумерованная display-формула — **один `w:p`**:
+  `w:tabs` (center = половина ширины текста из `w:sectPr`, right = правый край), `<w:tab/>` +
+  `m:oMathPara` (display OMML) + `<w:tab/>` + номер `(N)` обычным TNR-текстом; видимой таблицы нет.
+  Место табов — `docx`-безопасно по ECMA-376 (`m:oMath` ∈ `EG_RunLevelElts`). Потребовался
+  **форк-патч WordCraft** (`crates/layout`): layout уводил display-формулу на отдельную строку при
+  табах перед ней и после — номер уезжал; теперь табы не разрывают строку, а после формулы строка
+  продолжается табом. Коммит форка `e90d2743` (ветка `rde/main`, запушен), патч
+  `patches/wordcraft/0004-layout-right-numbered.patch`, пин субмодуля поднят, журнал —
+  [`wordcraft-fork.md`](wordcraft-fork.md) (#4). Таблица 1×2 — только историческая форма: мигрирует
+  при «Обновить документ» (ручная правка тела не перезаписывается); legacy-API `equation.rs` не
+  тронут.
+- **Нумерация в контексте проекта (B2).** `document.toml`: `formula_numbering = continuous|section`
+  (по умолчанию сквозная; старые документы без поля — сквозные; `rde-core` API
+  `set_document_formula_numbering`). `RdeInsert.number_text` — отображаемый номер без скобок;
+  схема `rde:doc` **v3 → v4** (чтение v1–v4). `rde-doc/src/formula_numbering.rs`: схемы «сквозная»
+  и «по разделам» ГОСТ `(2.1)`, приложения `(А.1)`; раздел — заголовок 1-го уровня, резолв через
+  `word/styles.xml` (`w:outlineLvl`, имя «heading N»/«Заголовок N», `w:basedOn`; прямое
+  `w:pPr/w:outlineLvl` приоритетнее); номер — из текста заголовка, приложения — из буквы; fallback-и
+  (заголовок без номера, формулы до раздела, нет заголовков) — детерминированные номера +
+  **предупреждения в журнал**. Пересчёт — один идемпотентный проход `renumber_formula_numbers`
+  (только текст номеров, без пересборки тел — `body_hash` не конфликтует); полная пересборка —
+  `update_formula_inserts_with(package, bodies, scheme)`. После вставки формулы номера и ссылки
+  пересчитываются автоматически. `update_formula_inserts` обновляет и `target` (`@act_key`) —
+  иначе «где вставлено» показывало ложное «устарела».
+- **Сквозные ссылки на формулы (B3).** `kind="crossref"`, `target="rde://formula/<id>"`, текст
+  `(N)`; диалог «Вставка → Перекрёстная ссылка» — формулы проекта первыми (с номерами в активном
+  документе), затем рисунки/таблицы; обновление — после формул, как у подписей; удалённая цель →
+  `(?)` + предупреждение в журнале. Ссылка указывает на первое вхождение формулы в документ.
+- **Экспорт `.docx` (A3, best-effort).** `export_docx` = `extract_docx` + патч экспортируемой копии:
+  `word/settings.xml` `m:mathPr/m:mathFont = "STIX Two Math"` (+локальный namespace `m`),
+  `word/document.xml` `w:rFonts` math-ранов → STIX (было жёстко «Cambria Math» на 18 ранах),
+  `RDE_EXPORT_MATH_FONT` — переопределение, пусто/`cambria` — не патчить. OMML остаётся OMML:
+  OMML-гейт `rde-docx` PASS, LO-оракул — PDF валиден. **Word на стенде нет → Word-часть
+  `unverified`** (по ECMA-376/справке Microsoft; без шрифта Word откатится на Cambria Math).
+- **UI.** Комбобокс «нумерация формул» в инспекторе документа (смена схемы сразу перенумеровывает
+  формулы и ссылки пакета + журнал), номер в «где вставлено» инспектора формулы, предварительный
+  номер в диалоге вставки формулы, ссылки на формулы в диалоге перекрёстных ссылок.
+- **Демо-проект.** Формулы σ переведены на таб-вёрстку с `number_text`, кэши под `+rde3`,
+  обновлён пакет документа и версия в store.
+
+### Артефакты
+
+- [`docs/adr/0018-formula-math-font-and-right-numbered.md`](adr/0018-formula-math-font-and-right-numbered.md) —
+  решение и ограничения; [`docs/fidelity/formula-font-numbering.md`](fidelity/formula-font-numbering.md) —
+  числа (LO-оракул, MathType 64/64, профиль компиляции, до/после);
+  [`docs/wordcraft-fork.md`](wordcraft-fork.md) #4 + `patches/wordcraft/0004-layout-right-numbered.patch`.
+- Fidelity: [`demo-report.json`](fidelity/demo-report.json) (14 частей, 46→46 абзацев, OMML 1→1,
+  `svg_blip` 1→1, LO 26.2.6.3 → PDF 188 886 Б, гейт PASS), [`demo-formula.png`](fidelity/demo-formula.png)
+  (LO, новая вёрстка) vs [`demo-formula-before.png`](fidelity/demo-formula-before.png),
+  [`p18-formula-stix.png`](fidelity/p18-formula-stix.png) (рендер RDE: STIX + номер справа),
+  [`p18-preview-page2.png`](fidelity/p18-preview-page2.png), GUI:
+  [`gui-p18-numbering-scheme.png`](fidelity/gui-p18-numbering-scheme.png),
+  [`gui-p18-formula-dialog.png`](fidelity/gui-p18-formula-dialog.png),
+  [`gui-p18-formula-inspector.png`](fidelity/gui-p18-formula-inspector.png),
+  [`gui-p18-preview-numbered.png`](fidelity/gui-p18-preview-numbered.png).
+- Схемы: `docs/schema/document.schema.json` (поле `formula_numbering`), `NOTICE` (STIX OFL,
+  Times New Roman — проприетарный, не поставляется), `README.md`, `CHANGELOG.md`.
+
+### Проверка
+
+- `cargo test --workspace` — **560 passed, 0 failed** (`rde-ui` 133 → 135). Новое: `rde-doc`
+  `formula_numbering` (5: таб-вёрстка без таблицы, схемы/переключение/идемпотентность, ссылки и
+  placeholder, превью номера, v4-roundtrip), `export_math_font` (3: mathFont/rFonts/OMML, override,
+  **LO-оракул номера у правого поля**), `math_font` (3: регистрация/идемпотентность/покрытие глифов),
+  `rde-ui` kittest +2 (ссылка на формулу из диалога и автообновление; смена схемы в инспекторе);
+  обновлён `formula_insert` (target `@act_key`).
+- Форк WordCraft: `cargo test -p wordcraft-layout` — 490 passed, 0 failed; clippy `-D warnings`,
+  `fmt --check`; новый тест «display-формула делит строку с табом и номером»; пуш `rde/main` в форк.
+- LO-оракул: номера `(1)`/`(2)` bbox `xMax=552.9 pt` при правом поле `552.5 pt`; OMML-гейт PASS.
+- MathType-регрессия (ручная, реальный `.docx`): **64/64** формул сконвертированы (`failed=0`),
+  93 уникальных глифа LaTeX — все покрыты STIX (нет потерь из-за смены шрифта).
+- Производительность `compile_formula` (debug, 20 повторов): 392 мс/формула со STIX против 388 мс
+  с DejaVu — регресса нет (+1 %, в пределах шума); профиль — `cargo run -p rde-doc --example bench-formula`.
+
+### Ограничения и следующий шаг
+
+- **Word не проверен** (на стенде отсутствует): `m:oMathPara` в одном абзаце с табами и
+  `m:mathPr/m:mathFont` в экспорте — `unverified`; LO-оракул и ECMA-376 — «по спецификации».
+  Если Word разложит display-формулу иначе, запасной вариант — таблица 1×2 (сохранена как
+  историческая форма и в legacy-API).
+- Схемы: нет многоуровневых разделов (`2.1.3`) и приложений без номера в заголовке; формулы в
+  колонтитулах/сносках не нумеруются; ссылка на повторную вставку одной формулы — на первое вхождение.
+- `equation.rs` (legacy-API фазы 1) остаётся табличным — не путать с вставками GUI.
