@@ -66,7 +66,7 @@ fn package_with_formula(root: &Path) -> PathBuf {
                 png: caches.png,
             },
             render_mode: "omml".to_owned(),
-            anchor_block: None,
+            anchor: rde_doc::InsertAnchor::end(),
             numbering: FormulaNumbering::Continuous,
         },
     )

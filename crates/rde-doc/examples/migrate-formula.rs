@@ -101,7 +101,7 @@ fn main() -> Result<(), String> {
         append_paragraph(&package, "Тот же результат в векторном режиме (SVG + PNG-fallback, совместимость с Word 2016+):")?;
         let report = add_formula_insert(
             &package,
-            FormulaInsertRequest { body, render_mode: "svg".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, },
+            FormulaInsertRequest { body, render_mode: "svg".to_owned(), anchor: rde_doc::InsertAnchor::end(), numbering: rde_doc::FormulaNumbering::Continuous, },
         )?;
         commit_document(&root, &package, &doc_id, &mut store, "formula svg insert")?;
         println!("svg-вставка формулы: {} (target {})", report.insert.id, report.insert.target);

@@ -427,10 +427,45 @@ struct CenterLineDensity {
     mode_labels: bool,
 }
 
+/// Хвост строки в символах (для подписи позиции вставки); границы UTF-8 не рвутся.
+fn text_tail_chars(text: &str, count: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    chars[chars.len().saturating_sub(count)..].iter().collect()
+}
+
+/// Начало строки в символах (для подписи позиции вставки); длинный хвост помечается «…».
+fn text_head_chars(text: &str, count: usize) -> String {
+    let mut out: String = text.chars().take(count).collect();
+    if text.chars().count() > count {
+        out.push('…');
+    }
+    out
+}
+
 /// Встроенный редактор WordCraft: полноценный `WordApp` (ribbon + canvas + ввод).
 struct EmbeddedEditor {
     app: wordcraft_ui_egui::WordApp,
     pages: usize,
+}
+
+/// P9 (`inline-formula-insert`): кэш списка `w14:paraId` абзацев активного пакета. Якорь вставки
+/// не перечитывает 400 КБ `word/document.xml` каждый кадр — только при изменении пакета.
+struct InsertAnchorCache {
+    package: PathBuf,
+    mtime_ms: u64,
+    len: u64,
+    ids: Vec<Option<String>>,
+}
+
+/// P9: разрешённая позиция вставки для панели «Формула» (paraId/абзац/позиция/контекст).
+#[derive(Clone, Debug, Default)]
+struct InsertAnchorInfo {
+    para_id: Option<String>,
+    ordinal: usize,
+    offset: usize,
+    text_len: usize,
+    context_before: String,
+    context_after: String,
 }
 
 /// Тип объекта в диалоге создания (документ создаётся силами UI: нужен WordCraft-движок).
@@ -930,6 +965,8 @@ pub struct RdeApp {
     backup_dialog: Option<Vec<PathBuf>>,
     /// Блок-якорь вставки: каретка в DocView или выбранный блок в «Структуре» (P8-B1).
     insert_anchor_block: Option<usize>,
+    /// P9: кэш `w14:paraId` абзацев пакета (якорь вставки; перечитывается при изменении файла).
+    insert_anchor_cache: Option<InsertAnchorCache>,
     /// Показывать служебные объекты в дереве (R-TREE-01/02): группа «Формулы» скрыта по
     /// умолчанию, переключатель — вкладка «Вид» (P3).
     show_service_objects: bool,
@@ -1115,6 +1152,7 @@ impl RdeApp {
             auto_updating: false,
             backup_dialog: None,
             insert_anchor_block: None,
+            insert_anchor_cache: None,
             show_service_objects: false,
             formula_labels: BTreeMap::new(),
             external_agents: agent_server::ExternalAgentServer::new(),
@@ -2065,13 +2103,27 @@ impl RdeApp {
                     }
                 }
                 self.reload_document_view_preserving();
+                // P9: журнал сообщает, куда именно попала вставка (абзац + позиция), а не просто id.
+                let placement = match &report.placement {
+                    Some(placement) if placement.exact => format!(
+                        " в абзац {} после «{}»",
+                        placement.para_id.clone().unwrap_or_else(|| format!("№{}", placement.ordinal.unwrap_or(0) + 1)),
+                        placement.context_before
+                    ),
+                    Some(_) => ", в конец абзаца-якоря".to_owned(),
+                    None => String::new(),
+                };
+                let mode = if report.insert.render_mode.is_empty() { String::new() } else { format!(", {}", report.insert.render_mode) };
+                let inline = if report.insert.kind == "formula" && report.insert.number.is_none() { " inline" } else { "" };
+                for warning in &report.warnings {
+                    self.push_log(Level::Warn, format!("Вставка {}: {warning}", report.insert.id));
+                }
                 self.push_log(
                     Level::Ok,
                     format!(
-                        "Вставка {} ({}{}) добавлена в документ (hash {})",
+                        "Вставка {} ({}{mode}{inline}){placement} добавлена в документ (hash {})",
                         report.insert.id,
                         report.insert.kind,
-                        if report.insert.render_mode.is_empty() { String::new() } else { format!(", {}", report.insert.render_mode) },
                         hash.chars().take(10).collect::<String>()
                     ),
                 );
@@ -2130,6 +2182,120 @@ impl RdeApp {
             .unwrap_or_default()
     }
 
+    /// P9: если встроенный редактор держит несохранённые правки — сохранить их в проект до записи
+    /// пакета (вставка/обновление), иначе перезагрузка вида молча откатит их.
+    fn save_dirty_editor_before_package_write(&mut self) {
+        let dirty = self.editor.as_ref().is_some_and(|editor| editor.app.session.dirty);
+        if !dirty {
+            return;
+        }
+        self.save_project_document();
+        if let Some(editor) = self.editor.as_mut() {
+            editor.app.session.dirty = false;
+        }
+    }
+
+    /// P9: кэш списка `w14:paraId` абзацев активного пакета (обновляется при изменении файла).
+    fn paragraph_ids_cached(&mut self, package: &Path) -> Result<&[Option<String>], String> {
+        let meta = fs::metadata(package).map_err(|error| format!("пакет документа {}: {error}", package.display()))?;
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let fresh = self
+            .insert_anchor_cache
+            .as_ref()
+            .is_some_and(|cache| cache.package == package && cache.mtime_ms == mtime_ms && cache.len == meta.len());
+        if !fresh {
+            let xml = rde_doc::document_xml(package)?;
+            let ids = rde_doc::body_paragraph_ids(&xml)?;
+            self.insert_anchor_cache = Some(InsertAnchorCache { package: package.to_path_buf(), mtime_ms, len: meta.len(), ids });
+        }
+        Ok(&self.insert_anchor_cache.as_ref().expect("кэш только что заполнен").ids)
+    }
+
+    /// P9: текущий якорь вставки из каретки DocView — `w14:paraId` абзаца + позиция в тексте.
+    ///
+    /// Если каретка недоступна (документ не открыт в режиме «RDE», каретка вне текста) — ошибка с
+    /// подсказкой: вставка никогда не «угадывает» абзац по счётчику и не дописывает в конец молча.
+    fn current_insert_anchor(&mut self, package: &Path) -> Result<rde_doc::InsertAnchor, String> {
+        let extracted = {
+            let Some(editor) = self.editor.as_ref() else {
+                return Err("каретка недоступна: документ не открыт — выберите режим «RDE» и поставьте каретку в текст".to_owned());
+            };
+            let focus = editor.app.session.sel.focus.clone();
+            if focus.story != wordcraft_engine::doc::StoryRef::Body {
+                return Err("каретка не в основном тексте документа — поставьте её в текст (режим «RDE»)".to_owned());
+            }
+            let doc = &editor.app.session.doc;
+            let Some(paragraph) = doc.para(focus.story, &focus.path) else {
+                return Err("каретка не в абзаце документа — поставьте каретку в текст (режим «RDE»)".to_owned());
+            };
+            let text = paragraph.text.clone();
+            let paths = doc.para_paths(focus.story);
+            let Some(ordinal) = paths.iter().position(|candidate| candidate == &focus.path) else {
+                return Err("абзац каретки не найден в модели документа — перезагрузите вид документа".to_owned());
+            };
+            (focus.off, text, ordinal, paths.len())
+        };
+        let (offset, text, ordinal, model_len) = extracted;
+        let ids = self.paragraph_ids_cached(package)?;
+        if ids.len() != model_len {
+            return Err(format!(
+                "каретка не сопоставлена с разметкой: абзацев в document.xml {}, в модели документа {} — \
+                 сохраните документ («Сохранить проект») и повторите",
+                ids.len(),
+                model_len
+            ));
+        }
+        let para_id = ids.get(ordinal).cloned().flatten();
+        Ok(rde_doc::InsertAnchor { para_id, ordinal: Some(ordinal), offset: Some(offset), text: Some(text), legacy_block: None })
+    }
+
+    /// P9: разрешённый якорь для подписи в панели «Формула» (paraId/абзац/позиция/контекст).
+    fn insert_anchor_info(&mut self, package: &Path) -> Result<InsertAnchorInfo, String> {
+        let anchor = self.current_insert_anchor(package)?;
+        let text = anchor.text.clone().unwrap_or_default();
+        let offset = anchor.offset.unwrap_or(0).min(text.len());
+        Ok(InsertAnchorInfo {
+            para_id: anchor.para_id.clone(),
+            ordinal: anchor.ordinal.unwrap_or(0),
+            offset,
+            text_len: text.len(),
+            context_before: text_tail_chars(&text[..offset], 28),
+            context_after: text_head_chars(&text[offset..], 20),
+        })
+    }
+
+    /// Подпись позиции вставки для панели «Формула»: куда именно встанет формула.
+    fn formula_anchor_label(&mut self) -> String {
+        let Some(package) = self.active_document_path() else {
+            return "якорь: в проекте нет документа".to_owned();
+        };
+        if !rde_doc::is_rde_package(&package) {
+            return "якорь: документ ещё не в .doc.rde («Сохранить проект»)".to_owned();
+        }
+        match self.insert_anchor_info(&package) {
+            Ok(info) => {
+                let place = info
+                    .para_id
+                    .clone()
+                    .map(|para_id| format!("абзац {para_id}"))
+                    .unwrap_or_else(|| format!("абзац №{} (без paraId)", info.ordinal + 1));
+                format!(
+                    "якорь: {place}, позиция {} из {} — «{}▸{}»",
+                    info.offset,
+                    info.text_len,
+                    info.context_before,
+                    info.context_after
+                )
+            }
+            Err(error) => format!("якорь не определён: {error}"),
+        }
+    }
+
     /// Вставка формулы (P3): кэш-бандл из formula-объекта (при устаревании — пересчёт), затем
     /// sdt-вставка с render_mode = omml|svg. Возвращает (отчёт, act_key).
     fn formula_insert_from_dialog(
@@ -2137,6 +2303,9 @@ impl RdeApp {
         dialog: &InsertDialogState,
         package: &Path,
     ) -> Result<(rde_doc::InsertReport, String), String> {
+        // P9: вставка пишет пакет (source-of-truth) — несохранённые правки редактора фиксируем
+        // заранее, чтобы перезагрузка вида после вставки их не откатила молча.
+        self.save_dirty_editor_before_package_write();
         let renderer = rde_dag::FormulaRenderer {
             id: rde_doc::FORMULA_RENDERER_ID,
             version: rde_doc::FORMULA_RENDERER_VERSION,
@@ -2182,15 +2351,30 @@ impl RdeApp {
             svg: state.svg_hash.as_ref().map(|_| load(&state.svg_hash)).transpose()?,
             png: state.png_hash.as_ref().map(|_| load(&state.png_hash)).transpose()?,
         };
+        // P9: якорь вставки — каретка DocView (paraId + позиция). Для inline каретка обязательна;
+        // для display без каретки — прежнее поведение (в конец документа) с явным предупреждением.
+        let anchor = match self.current_insert_anchor(package) {
+            Ok(anchor) => anchor,
+            Err(error) if !display => {
+                return Err(format!("{error}. Inline-формула вставляется в позицию каретки — документ не изменён"));
+            }
+            Err(error) => {
+                self.push_log(Level::Warn, format!("Вставка display-формулы: {error} — формула добавлена в конец документа"));
+                rde_doc::InsertAnchor::end()
+            }
+        };
         let report = rde_doc::add_formula_insert(
             package,
             rde_doc::FormulaInsertRequest {
                 body,
                 render_mode: dialog.render_mode.clone(),
-                anchor_block: self.insert_anchor_block,
+                anchor,
                 numbering: self.document_formula_numbering(),
             },
         )?;
+        for warning in &report.warnings {
+            self.push_log(Level::Warn, format!("Вставка формулы: {warning}"));
+        }
         Ok((report, state.act_key.clone()))
     }
 
@@ -2614,8 +2798,17 @@ impl RdeApp {
                     .or_else(|| report.insert.number.map(|number| number.to_string()))
                     .map(|number| format!(" ({number})"))
                     .unwrap_or_else(|| " (без номера)".to_owned());
+                let place = match &report.placement {
+                    Some(placement) if placement.exact => format!(
+                        ", абзац {} после «{}»",
+                        placement.para_id.clone().unwrap_or_else(|| "без paraId".to_owned()),
+                        placement.context_before
+                    ),
+                    Some(_) => ", в конец абзаца-якоря".to_owned(),
+                    None => String::new(),
+                };
                 dialog.error.clear();
-                dialog.info = format!("Формула вставлена в документ: {}{number}", report.insert.id);
+                dialog.info = format!("Формула вставлена в документ: {}{number}{place}", report.insert.id);
             }
             Err(error) => dialog.error = format!("Вставка: {error}"),
         }
@@ -2741,10 +2934,8 @@ impl RdeApp {
         let duplicate = (dialog.formula_id.is_none() && !dialog.latex.trim().is_empty())
             .then(|| self.project.formulas().find(|formula| formula.latex.trim() == dialog.latex.trim()).map(|formula| formula.id.clone()))
             .flatten();
-        let anchor_label = match self.insert_anchor_block {
-            Some(block) => format!("после блока {}", block + 1),
-            None => "в конец документа".to_owned(),
-        };
+        // P9: панель показывает фактический якорь каретки (paraId/позиция), а не «индекс блока».
+        let anchor_label = self.formula_anchor_label();
         let number_preview: Option<String> = self.next_formula_number_preview();
         let mut close = false;
         let mut new_formula = false;
@@ -2888,7 +3079,9 @@ impl RdeApp {
                             ui.selectable_value(&mut dialog.render_mode, "omml".to_owned(), "Word-объект (OMML, редактируемый)");
                             ui.selectable_value(&mut dialog.render_mode, "svg".to_owned(), "SVG-вектор (+PNG fallback)");
                         });
-                    ui.label(RichText::new(format!("позиция: {anchor_label}")).small().color(pal.muted));
+                    let anchor_resolved = anchor_label.starts_with("якорь: абзац");
+                    let anchor_color = if anchor_resolved { pal.accent } else { pal.amber };
+                    ui.label(RichText::new(format!("позиция: {anchor_label}")).small().color(anchor_color));
                     let number_text = if dialog.display && dialog.numbering_mode == "auto" {
                         number_preview
                             .as_ref()
@@ -4370,6 +4563,74 @@ impl RdeApp {
             self.formula_quick_insert(&id, "svg");
             self.insert_anchor_block = None;
         }
+    }
+
+    /// P9: поставить каретку DocView в абзац демо-документа (для скриншотов/демо якоря вставки).
+    fn demo_place_caret(&mut self, needle: &str, word: &str) {
+        self.tab = Tab::Document;
+        self.doc_mode = DocMode::DocView;
+        self.ensure_editor();
+        let story = wordcraft_engine::doc::StoryRef::Body;
+        let placed = {
+            let Some(editor) = self.editor.as_mut() else { return };
+            let mut found = None;
+            for path in editor.app.session.doc.para_paths(story) {
+                let Some(paragraph) = editor.app.session.doc.para(story, &path) else { continue };
+                if paragraph.text.contains(needle) {
+                    let offset = paragraph.text.find(word).unwrap_or(0);
+                    found = Some((path, offset));
+                    break;
+                }
+            }
+            found
+        };
+        if let Some((path, offset)) = placed
+            && let Some(editor) = self.editor.as_mut()
+        {
+            editor.app.session.sel = wordcraft_engine::Selection::caret(wordcraft_engine::doc::Pos::new(story, path, offset));
+        }
+    }
+
+    /// P9 (скриншоты/демо): панель «Формула» с фактическим якорем каретки — paraId абзаца,
+    /// позиция в тексте и контекст («куда встанет формула»).
+    pub fn demo_insert_formula_inline_anchor(&mut self) {
+        self.demo_place_caret("Проект RDE", "RDE");
+        self.show_formula_editor_context();
+        let existing = self.project.formulas().find(|formula| !formula.display).map(|formula| formula.id.clone());
+        let formula_id = match existing {
+            Some(id) => id,
+            // В демо-проекте inline-формул может не быть — создаём (действие скриншота работает на
+            // копии проекта, см. правила безопасности).
+            None => match self.create_formula_action("Inline-демо (якорь)", "\\xi_{q}", false, "none") {
+                Ok((id, _)) => id,
+                Err(error) => {
+                    self.push_log(Level::Warn, format!("Демо якоря вставки: {error}"));
+                    return;
+                }
+            },
+        };
+        self.open_formula_editor(&formula_id);
+        self.ribbon_tab = RibbonTab::Formula;
+    }
+
+    /// P9 (скриншоты/демо): успешная inline-вставка из панели в позицию каретки (OMML);
+    /// журнал сообщает абзац и контекст, документ показывает формулу в строке текста.
+    pub fn demo_insert_formula_inline(&mut self) {
+        self.demo_place_caret("Проект RDE", "RDE");
+        let existing = self.project.formulas().find(|formula| !formula.display).map(|formula| formula.id.clone());
+        let formula_id = match existing {
+            Some(id) => id,
+            None => match self.create_formula_action("Inline-демо", "\\xi_{q}", false, "none") {
+                Ok((id, _)) => id,
+                Err(error) => {
+                    self.push_log(Level::Warn, format!("Демо inline-вставки: {error}"));
+                    return;
+                }
+            },
+        };
+        self.formula_quick_insert(&formula_id, "omml");
+        self.tab = Tab::Document;
+        self.doc_mode = DocMode::DocView;
     }
 
     // ── GUI-02: демо/скриншоты диалогов путей и «Проводника…» (ADR-0017) ────
@@ -13811,11 +14072,172 @@ mod docview_tests {
         assert_eq!(doc.inserts.iter().filter(|insert| insert.kind == "formula").count(), before + 1);
         assert!(inserted.number.is_none(), "политика none — без номера: {inserted:?}");
         // Inline-формула — в тексте без номера (R-DOC-11/ADR-0019) и без правой нумерации.
-        let (inline_id, _) = app.create_formula_action("Inline-формула", "x_i", false, "auto").expect("inline-формула");
+        // P9: inline-вставка адресуется кареткой DocView — открываем редактор и ставим каретку.
+        app.ensure_editor();
+        let target = app
+            .editor
+            .as_ref()
+            .expect("редактор демо-документа")
+            .app
+            .session
+            .doc
+            .para_paths(wordcraft_engine::doc::StoryRef::Body)
+            .into_iter()
+            .find(|path| {
+                app.editor
+                    .as_ref()
+                    .unwrap()
+                    .app
+                    .session
+                    .doc
+                    .para(wordcraft_engine::doc::StoryRef::Body, path)
+                    .is_some_and(|paragraph| paragraph.text.contains("Проект RDE"))
+            })
+            .expect("абзац демо-документа");
+        let text_len = app
+            .editor
+            .as_ref()
+            .unwrap()
+            .app
+            .session
+            .doc
+            .para(wordcraft_engine::doc::StoryRef::Body, &target)
+            .unwrap()
+            .text
+            .len();
+        app.editor.as_mut().unwrap().app.session.sel = wordcraft_engine::Selection::caret(
+            wordcraft_engine::doc::Pos::new(wordcraft_engine::doc::StoryRef::Body, target.clone(), text_len),
+        );
+        let (inline_id, _) =
+            app.create_formula_action("Inline-формула", "\\beta_{j}", false, "auto").expect("inline-формула");
         app.formula_quick_insert(&inline_id, "omml");
         let doc = rde_doc::load_rde_doc(&package).unwrap();
         let inserted = doc.inserts.iter().rfind(|insert| insert.kind == "formula").expect("inline-вставка");
         assert!(inserted.number.is_none(), "inline — без номера: {inserted:?}");
+        // Формула — в тексте целевого абзаца (а не в конце документа и не в чужом абзаце).
+        let xml = package_document_xml(&package);
+        let tag = format!("rde:formula:{}", inserted.id);
+        let at = xml.find(&tag).expect("sdt inline-вставки");
+        let para_start = xml[..at].rfind("<w:p ").expect("абзац вставки");
+        let para_end = xml[para_start..].find("</w:p>").unwrap() + para_start;
+        assert!(at > para_start && at < para_end, "sdt внутри абзаца: {}", &xml[para_start..(at + 200).min(xml.len())]);
+        let expected_ids = rde_doc::body_paragraph_ids(&rde_doc::document_xml(&package).unwrap()).unwrap();
+        let ordinal = app
+            .editor
+            .as_ref()
+            .unwrap()
+            .app
+            .session
+            .doc
+            .para_paths(wordcraft_engine::doc::StoryRef::Body)
+            .iter()
+            .position(|path| path == &target)
+            .unwrap();
+        assert_eq!(
+            inserted.para_id.as_deref(),
+            expected_ids[ordinal].as_deref(),
+            "анкор inline-вставки — хост-абзац каретки"
+        );
+        assert!(
+            xml[para_start..para_end].contains(&format!("w14:paraId=\"{}\"", expected_ids[ordinal].clone().unwrap())),
+            "sdt в абзаце каретки"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P9 (`inline-formula-insert`): якорь вставки берётся из каретки DocView — paraId абзаца и
+    /// позиция в тексте; без каретки inline-вставка отклоняется с понятной ошибкой в панели и
+    /// журнале (документ не меняется), успешная вставка журналируется с абзацем и контекстом.
+    #[test]
+    fn formula_inline_insert_uses_caret_anchor_and_reports_errors() {
+        if !poppler_available() {
+            eprintln!("poppler недоступен — тест пропущен");
+            return;
+        }
+        let root = temp_demo_copy("formula-anchor");
+        let mut app = RdeApp::new(rde_core::load_project(&root).unwrap());
+        let package = app.project.document_path().expect("документ демо");
+        let (inline_id, _) =
+            app.create_formula_action("Inline-якорь", "\\xi_{q}", false, "none").expect("inline-формула");
+        // 1) Каретки нет (редактор не открыт): inline-вставка — ошибка в панели, документ цел.
+        app.open_formula_editor(&inline_id);
+        let before = std::fs::read(&package).unwrap();
+        let before_inserts = rde_doc::load_rde_doc(&package).unwrap().inserts.len();
+        let mut dialog = app.formula_editor.take().expect("панель формулы");
+        app.formula_editor_insert(&mut dialog);
+        app.formula_editor = Some(dialog);
+        let dialog = app.formula_editor.as_ref().unwrap();
+        assert!(dialog.error.contains("каретка"), "ошибка в панели: {}", dialog.error);
+        assert_eq!(std::fs::read(&package).unwrap(), before, "неуспешная вставка не меняет пакет");
+        assert_eq!(rde_doc::load_rde_doc(&package).unwrap().inserts.len(), before_inserts);
+        assert!(!root.join(".rde/doc-backups").exists(), "бэкапы не создавались");
+        // 2) Каретка в тексте: якорь разрешается в paraId + позицию; журнал сообщает место.
+        app.ensure_editor();
+        assert!(app.editor.is_some(), "редактор демо-документа: {:?}", app.editor_error);
+        let paths = app.editor.as_ref().unwrap().app.session.doc.para_paths(wordcraft_engine::doc::StoryRef::Body);
+        let target = paths
+            .iter()
+            .find(|path| {
+                app.editor
+                    .as_ref()
+                    .unwrap()
+                    .app
+                    .session
+                    .doc
+                    .para(wordcraft_engine::doc::StoryRef::Body, path)
+                    .is_some_and(|paragraph| paragraph.text.contains("Проект RDE"))
+            })
+            .cloned()
+            .expect("абзац «Проект RDE»");
+        let text = app
+            .editor
+            .as_ref()
+            .unwrap()
+            .app
+            .session
+            .doc
+            .para(wordcraft_engine::doc::StoryRef::Body, &target)
+            .unwrap()
+            .text
+            .clone();
+        let offset = text.find("RDE").expect("слово RDE в абзаце");
+        app.editor.as_mut().unwrap().app.session.sel = wordcraft_engine::Selection::caret(
+            wordcraft_engine::doc::Pos::new(wordcraft_engine::doc::StoryRef::Body, target.clone(), offset),
+        );
+        let expected_ids = rde_doc::body_paragraph_ids(&rde_doc::document_xml(&package).unwrap()).unwrap();
+        let ordinal = paths.iter().position(|path| path == &target).unwrap();
+        let expected_para_id = expected_ids[ordinal].clone().expect("paraId абзаца-якоря");
+        let info = app.insert_anchor_info(&package).expect("якорь каретки");
+        assert_eq!(info.para_id.as_deref(), Some(expected_para_id.as_str()));
+        assert_eq!(info.offset, offset);
+        assert!(info.context_before.ends_with("Проект "), "контекст до: {}", info.context_before);
+        assert!(info.context_after.starts_with("RDE"), "контекст после: {}", info.context_after);
+        let label = app.formula_anchor_label();
+        assert!(label.contains(&format!("абзац {expected_para_id}")), "панель показывает якорь: {label}");
+        assert!(label.contains(&format!("позиция {offset}")), "панель показывает позицию: {label}");
+        // Вставка: sdt в тексте абзаца-якоря, журнал — с paraId и контекстом.
+        app.formula_quick_insert(&inline_id, "omml");
+        let doc = rde_doc::load_rde_doc(&package).unwrap();
+        let inserted = doc.inserts.iter().rfind(|insert| insert.kind == "formula").expect("inline-вставка");
+        assert_eq!(inserted.para_id.as_deref(), Some(expected_para_id.as_str()), "анкор вставки — абзац каретки");
+        let xml = rde_doc::document_xml(&package).unwrap();
+        let at = xml.find(&format!("rde:formula:{}", inserted.id)).expect("sdt в документе");
+        let para_start = xml[..at].rfind("<w:p ").expect("абзац sdt");
+        let para_end = xml[para_start..].find("</w:p>").unwrap() + para_start;
+        assert!(
+            xml[para_start..para_end].contains(&format!("w14:paraId=\"{expected_para_id}\"")),
+            "sdt в абзаце каретки"
+        );
+        assert!(
+            xml[para_start..at].contains(">Проект </w:t>"),
+            "формула после «Проект », а не в конце абзаца: {}",
+            &xml[para_start..at]
+        );
+        let log: Vec<String> = app.project.log.iter().map(|line| line.text.clone()).collect();
+        let last = log.last().cloned().unwrap_or_default();
+        assert!(last.contains(&format!("абзац {expected_para_id}")), "журнал сообщает абзац: {last}");
+        assert!(last.contains("после «"), "журнал сообщает контекст: {last}");
+        assert!(last.contains("inline"), "журнал сообщает inline-режим: {last}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

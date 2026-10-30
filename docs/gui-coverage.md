@@ -215,6 +215,8 @@
 | Клик по формуле в тексте документа → редактор на вкладке «Формула» | `equation.get` → `formula_for_latex` (LaTeX/resolved_latex) → `open_formula_editor`; выход из инлайн-правки `equation.exit` | клик по OMML-формуле в DocView (каретка WordCraft на объекте-уравнении) | ✅🧪 |
 | Скролл предпросмотра страниц (колесо и ползунок) | `doc_preview_pages` (`ScrollArea::both`; демо-offset только для скриншотов) | режим «Предпросмотр страниц» | ✅🧪 |
 | Вставка формулы с номером из панели/дерева/инспектора | `formula_insert_from_dialog`, `add_formula_insert`, политика `numbering.mode` | панель «Формула» («Вставить в документ», OMML/SVG, превью номера), меню дерева, инспектор | ✅🧪 |
+| **Inline-вставка формулы ровно в позицию каретки** (середина абзаца, «перед запятой», с разрывом прогонов) | `rde_doc::InsertAnchor` (`w14:paraId` + offset + текст абзаца), `insert_inline_at` (разрыв `w:r`/`w:t`, `w:rPr`/`xml:space`), `resolve_para_id_for_path` | панель «Формула» → «Вставить в документ» (inline-формула); каретка в тексте DocView (режим «RDE») | ✅🧪 `inline_insert_lands_between_runs_in_target_paragraph`, `anchor_resolves_table_cell_and_para_without_para_id`, `formula_inline_insert_uses_caret_anchor_and_reports_errors`; `gui-p24-inline-anchor.png`, `gui-p24-inline-document.png` |
+| Якорь вставки виден до вставки; ошибка вместо «тихой» вставки в конец документа | `current_insert_anchor`/`insert_anchor_info` (каретка → paraId/позиция/контекст), `dialog.error` + журнал | панель «Формула» (строка «позиция: якорь: абзац …») | ✅🧪 `formula_inline_insert_uses_caret_anchor_and_reports_errors`, `failed_inline_insert_leaves_package_untouched_without_backups` |
 | Версии документа (`document_revisions`, `restore_document_revision`) | `lib.rs:2723/2766` | — | ❌ в GUI нет списка версий; откат последнего обновления есть (`RollbackDocument`); revisions — следующий шаг |
 | Откат документа/«Формулы» | `restore_document_from_store`, `rde_dag::rollback` | «Главная → Откат документа», журнал «Откатить» | ✅🧪 |
 
@@ -464,3 +466,23 @@ PERF-2 в [`perf-backlog.md`](perf-backlog.md). Следующая итерац�
 **Историческая пометка:** разделы §12–§13 (P5) описывают удалённый WYSIWYG-редактор `rde-math-editor`
 и его тесты — заменены P6 (ADR-0022); safety `check_formula_latex`, in-place reload и перф-quick-win
 P5 остаются действующими (используются панелью P6).
+
+---
+
+## 15. Обновление `inline-formula-insert` (2026-10-30): inline-вставка формулы в позицию каретки
+
+| Возможность | Статус | Точка входа в GUI | Тест/доказательство |
+|---|---|---|---|
+| **Inline-формула в середину абзаца** (между прогонами, перед пунктуацией) | ✅🧪 | панель «Формула» → «Вставить в документ»; каретка DocView в тексте (режим «RDE») | `inline_insert_lands_between_runs_in_target_paragraph` (sdt ровно между `w:r`, текст/форматирование не изменены, повторная вставка — новый id), `gui-p24-inline-document.png` |
+| Якорь `w14:paraId` (а не «индекс блока»), включая абзацы таблиц и абзацы без `paraId` | ✅🧪 | автоматически при вставке (каретка DocView) | `anchor_resolves_table_cell_and_para_without_para_id`, `resolve_para_id_for_path` (число абзацев модели = разметки, иначе ошибка), `body_paragraph_spans` unit |
+| Якорь и место вставки видны в панели; журнал сообщает абзац/позицию/контекст | ✅🧪 | панель «Формула» (строка «позиция: якорь: абзац …»), журнал | `formula_inline_insert_uses_caret_anchor_and_reports_errors`, `gui-p24-inline-anchor.png` |
+| Неуспешная вставка: понятная ошибка, пакет не изменён, бэкапов нет | ✅🧪 | панель «Формула» (ошибка), журнал | `failed_inline_insert_leaves_package_untouched_without_backups`, `renumber_failure_rolls_back_insert_transaction` |
+| Display-формула — после блока с абзацем-якорем (не в конец документа) | ✅🧪 | панель «Формула» → «Вставить в документ» (display-формула) | `display_insert_uses_paragraph_anchor_and_keeps_numbering`, `legacy_block_anchor_keeps_old_semantics` |
+| Inline+SVG amber-предупреждение (P6) | ✅ | панель «Формула» (подсказка при `display=false` + SVG) | `formula_panel_warns_about_inline_svg_baseline` |
+
+**Ограничения `inline-formula-insert`:** вставка внутрь полей Word, отслеживаемых правок
+(`w:ins`/`w:del`) и вложенных content-control не поддерживается — понятная ошибка с подсказкой
+(вместо невалидного OOXML); соответствие «модель ↔ разметка» требует равного числа абзацев (при
+расхождении — ошибка «сохраните документ и повторите»); display-формула в абзац таблицы вставляется
+после таблицы с предупреждением; Word на стенде нет (позиция проверена headless-разбором XML,
+рендером WordCraft и LO-оракулом — `unverified` для Word).

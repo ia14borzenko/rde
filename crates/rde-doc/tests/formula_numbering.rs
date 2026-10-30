@@ -90,7 +90,7 @@ fn insert_formula(package: &Path, formula_id: &str, latex: &str, act_key: &str, 
     let body = compiled_body(formula_id, latex, act_key);
     add_formula_insert(
         package,
-        FormulaInsertRequest { body, render_mode: "omml".to_owned(), anchor_block: anchor, numbering },
+        FormulaInsertRequest { body, render_mode: "omml".to_owned(), anchor: anchor.map(rde_doc::InsertAnchor::legacy_block).unwrap_or_default(), numbering },
     )
     .expect("вставка формулы");
 }

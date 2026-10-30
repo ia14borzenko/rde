@@ -5,9 +5,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rde_doc::{
-    add_formula_insert, compile_formula, extract_docx, formula_insert_statuses, load_rde_doc, migrate_formulas,
-    insert_equation, open_document, save_engine_document, unregistered_formulas, update_document_transactional, update_formula_inserts, FormulaAvailability,
-    FormulaBody, FormulaInsertRequest, FormulaInsertState, FormulaMigrationPlan,
+    add_formula_insert, add_formula_insert_with_renumber_error, body_paragraph_ids, compile_formula, extract_docx,
+    formula_insert_statuses, load_rde_doc, migrate_formulas, insert_equation, open_document, resolve_para_id_for_path,
+    save_engine_document, unregistered_formulas, update_document_transactional, update_formula_inserts, FormulaAvailability,
+    FormulaBody, FormulaInsertRequest, FormulaInsertState, FormulaMigrationPlan, FormulaNumbering, InsertAnchor,
 };
 
 const FORMULA_ID: &str = "01M5VJ1JG039MMV97SZGY6V9EQ";
@@ -108,7 +109,7 @@ fn omml_insert_updates_and_roundtrips_through_engine() {
     let body_v1 = compiled_body("\\sigma=\\frac{F}{A}", true, "act-v1", true);
     let report = add_formula_insert(
         &package,
-        FormulaInsertRequest { body: body_v1.clone(), render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, },
+        FormulaInsertRequest { body: body_v1.clone(), render_mode: "omml".to_owned(), anchor: rde_doc::InsertAnchor::end(), numbering: rde_doc::FormulaNumbering::Continuous, },
     )
     .expect("вставка формулы");
     assert_eq!(report.insert.kind, "formula");
@@ -172,7 +173,7 @@ fn svg_insert_keeps_media_rels_and_content_types() {
     let body_v1 = compiled_body("\\sigma=\\frac{F}{A}", true, "act-svg", true);
     let report = add_formula_insert(
         &package,
-        FormulaInsertRequest { body: body_v1.clone(), render_mode: "svg".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, },
+        FormulaInsertRequest { body: body_v1.clone(), render_mode: "svg".to_owned(), anchor: rde_doc::InsertAnchor::end(), numbering: rde_doc::FormulaNumbering::Continuous, },
     )
     .expect("вставка svg-формулы");
     let document = body(&package);
@@ -244,7 +245,7 @@ fn svg_numbered_insert_raises_number_to_math_baseline() {
     let package = new_package(&root);
     add_formula_insert(
         &package,
-        FormulaInsertRequest { body: body_v1.clone(), render_mode: "svg".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous },
+        FormulaInsertRequest { body: body_v1.clone(), render_mode: "svg".to_owned(), anchor: rde_doc::InsertAnchor::end(), numbering: rde_doc::FormulaNumbering::Continuous },
     )
     .expect("svg-вставка");
     let document = body(&package);
@@ -262,7 +263,7 @@ fn svg_numbered_insert_raises_number_to_math_baseline() {
     let plain = FormulaBody { numbered: false, ..body_v1.clone() };
     add_formula_insert(
         &package_plain,
-        FormulaInsertRequest { body: plain, render_mode: "svg".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous },
+        FormulaInsertRequest { body: plain, render_mode: "svg".to_owned(), anchor: rde_doc::InsertAnchor::end(), numbering: rde_doc::FormulaNumbering::Continuous },
     )
     .expect("svg-вставка без номера");
     let document_plain = body(&package_plain);
@@ -272,7 +273,7 @@ fn svg_numbered_insert_raises_number_to_math_baseline() {
     let package_omml = new_package(&root);
     add_formula_insert(
         &package_omml,
-        FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous },
+        FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor: rde_doc::InsertAnchor::end(), numbering: rde_doc::FormulaNumbering::Continuous },
     )
     .expect("omml-вставка");
     let document_omml = body(&package_omml);
@@ -291,7 +292,7 @@ fn missing_target_and_manual_edit_are_noted_not_overwritten() {
     let body_v1 = compiled_body("\\sigma=\\frac{F}{A}", true, "act-v1", true);
     let report = add_formula_insert(
         &package,
-        FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, },
+        FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor: rde_doc::InsertAnchor::end(), numbering: rde_doc::FormulaNumbering::Continuous, },
     )
     .unwrap();
 
@@ -404,7 +405,7 @@ fn rollback_transaction_restores_previous_formula_insert() {
     let package = new_package(&root);
     let mut store = rde_store::Store::open(&root).unwrap();
     let body_v1 = compiled_body("\\sigma=\\frac{F}{A}", true, "act-v1", true);
-    add_formula_insert(&package, FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, }).unwrap();
+    add_formula_insert(&package, FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor: rde_doc::InsertAnchor::end(), numbering: rde_doc::FormulaNumbering::Continuous, }).unwrap();
     let before = body(&package);
     rde_doc::commit_document(&root, &package, DOC_ID, &mut store, "v1").unwrap();
 
@@ -505,7 +506,7 @@ fn input_change_marks_instale_then_updates_in_one_transaction() {
     let package = new_package(&root);
     let package = {
         let body_v1 = body_from_state(&store, FORMULA_ID, &prepared.state, "\\sigma=42", true);
-        add_formula_insert(&package, FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor_block: None, numbering: rde_doc::FormulaNumbering::Continuous, }).expect("вставка");
+        add_formula_insert(&package, FormulaInsertRequest { body: body_v1, render_mode: "omml".to_owned(), anchor: rde_doc::InsertAnchor::end(), numbering: rde_doc::FormulaNumbering::Continuous, }).expect("вставка");
         package
     };
     let availability = BTreeMap::from([(FORMULA_ID.to_owned(), FormulaAvailability::Current(act_key_v1.clone()))]);
@@ -547,5 +548,343 @@ fn input_change_marks_instale_then_updates_in_one_transaction() {
     // Ledger формулы читается из смешанной транзакции (`document-formula-update`).
     let ledger = rde_dag::formula_ledger(&store).unwrap();
     assert_eq!(ledger[FORMULA_ID].act_key, prepared_v2.state.act_key, "ledger видит новый act_key");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── P9 (итерация inline-formula-insert): однозначный якорь и позиционная inline-вставка ────────
+
+/// `word/document.xml` с контролируемым телом (namespace `w14` — анкоры абзацев).
+fn document_xml_with_body(body_xml: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <w:document xmlns:wpc=\"http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas\" \
+         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
+         xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\" \
+         xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+         xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\"><w:body>{body_xml}<w:sectPr/></w:body></w:document>"
+    )
+}
+
+/// Пакет `.doc.rde` с заданным телом `word/document.xml` (WordCraft читает его как обычный docx;
+/// `write_package` проставляет `w14:paraId` и реестр блоков).
+fn package_with_body(root: &Path, body_xml: &str) -> PathBuf {
+    let skeleton = root.join("controlled.docx");
+    let document = wordcraft_engine::doc::Document::new();
+    wordcraft_engine::io::save_path(&skeleton, &document).unwrap();
+    write_part(&skeleton, "word/document.xml", document_xml_with_body(body_xml).as_bytes());
+    let mut rde_doc = rde_doc::build_rde_doc(&skeleton, DOC_ID, "").unwrap();
+    let package = root.join("report.doc.rde");
+    rde_doc::write_package(&skeleton, &mut rde_doc, &package).unwrap();
+    package
+}
+
+fn para_ids(package: &Path) -> Vec<Option<String>> {
+    body_paragraph_ids(&body(package)).unwrap()
+}
+
+/// Абзацы и их `paraId` для документа с двумя абзацами (целевой — с разными прогонами).
+fn two_paragraph_body() -> String {
+    "<w:p><w:pPr><w:ind w:firstLine=\"0\"/></w:pPr>\
+     <w:r><w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">До формулы </w:t></w:r>\
+     <w:r><w:t>после запятой, и хвост.</w:t></w:r></w:p>\
+     <w:p><w:r><w:t>Другой абзац</w:t></w:r></w:p>"
+        .to_owned()
+}
+
+const TARGET_TEXT: &str = "До формулы после запятой, и хвост.";
+
+/// Вставка inline-формулы в середину абзаца: sdt ровно между прогонами, чужой текст и
+/// форматирование не изменены; повторная вставка — отдельный id в том же абзаце.
+#[test]
+fn inline_insert_lands_between_runs_in_target_paragraph() {
+    if !poppler_available() {
+        return;
+    }
+    let root = tmp("inline-mid");
+    write_project(&root);
+    let package = package_with_body(&root, &two_paragraph_body());
+    let ids = para_ids(&package);
+    assert_eq!(ids.len(), 2);
+    let target = ids[0].clone().expect("paraId первого абзаца");
+    let offset = TARGET_TEXT.find("после").unwrap();
+    let body_v = compiled_body("\\left\\vert R_{оп}-R_{ц}\\right\\vert", false, "act-inline", false);
+    let request = |offset: usize| FormulaInsertRequest {
+        body: body_v.clone(),
+        render_mode: "omml".to_owned(),
+        anchor: InsertAnchor::paragraph(target.clone(), Some(offset), Some(TARGET_TEXT.to_owned())),
+        numbering: FormulaNumbering::Continuous,
+    };
+    let report = add_formula_insert(&package, request(offset)).expect("inline-вставка");
+    assert_eq!(report.warnings, Vec::<String>::new());
+    let placement = report.placement.clone().expect("позиция вставки");
+    assert!(placement.exact, "позиция каретки соблюдена: {placement:?}");
+    assert_eq!(placement.para_id.as_deref(), Some(target.as_str()));
+    assert_eq!(placement.offset, Some(offset));
+    assert_eq!(report.insert.kind, "formula");
+    assert_eq!(report.insert.render_mode, "omml");
+    assert!(report.insert.number.is_none(), "inline без номера");
+    assert_eq!(report.insert.para_id.as_deref(), Some(target.as_str()), "анкор inline-вставки — хост-абзац");
+    let xml = body(&package);
+    let tag = format!("rde:formula:{}", report.insert.id);
+    let at = xml.find(&tag).expect("sdt в документе");
+    let para_start = xml[..at].rfind("<w:p ").expect("абзац sdt");
+    let para_end = xml[para_start..].find("</w:p>").unwrap() + para_start;
+    assert!(at > para_start && at < para_end, "sdt внутри абзаца");
+    assert!(
+        xml[para_start..para_end].contains(&format!("w14:paraId=\"{target}\"")),
+        "sdt в целевом абзаце, а не в чужом: {}",
+        &xml[para_start..para_end]
+    );
+    assert_eq!(xml[..para_start].matches("rde:formula:").count(), 0, "в предыдущих абзацах вставок нет");
+    assert_eq!(
+        xml[para_end..].matches("rde:formula:").count(),
+        0,
+        "в следующих абзацах вставок нет (никакого append в конец документа)"
+    );
+    let left = &xml[para_start..at];
+    let right = &xml[at..para_end];
+    assert!(left.contains("До формулы "), "текст до вставки сохранён: {left}");
+    assert!(!left.contains("после запятой"), "формула до текста после запятой: {left}");
+    assert!(right.contains("после запятой"), "текст после вставки сохранён: {right}");
+    assert_eq!(xml.matches("<w:b/>").count(), 1, "форматирование прогона не задвоено");
+    assert_eq!(xml.matches("До формулы ").count(), 1, "текст не продублирован");
+    // Реестр и статус.
+    let rde_doc = load_rde_doc(&package).unwrap();
+    let insert = rde_doc.inserts.iter().find(|insert| insert.id == report.insert.id).unwrap();
+    assert_eq!(insert.para_id.as_deref(), Some(target.as_str()));
+    let availability = BTreeMap::from([(FORMULA_ID.to_owned(), FormulaAvailability::Current("act-inline".to_owned()))]);
+    assert_eq!(formula_insert_statuses(&package, &availability).unwrap()[0].state, FormulaInsertState::Fresh);
+    // Документ переживает roundtrip через WordCraft (sdt и OMML на месте).
+    let roundtripped = engine_roundtrip(&package, &root);
+    assert!(roundtripped.inserts.iter().any(|insert| insert.id == report.insert.id));
+    let xml = body(&package);
+    assert!(xml.contains(&tag), "sdt после roundtrip: {xml}");
+    assert!(xml.contains("<m:oMath"), "OMML после roundtrip");
+    // Повторная вставка в то же место: новый id, тот же абзац, без чужих абзацев.
+    let second = add_formula_insert(&package, request(offset)).expect("повторная inline-вставка");
+    assert_ne!(second.insert.id, report.insert.id, "повторная вставка — отдельный id");
+    let xml = body(&package);
+    assert_eq!(xml.matches(&format!("rde:formula:{}", report.insert.id)).count(), 1);
+    assert_eq!(xml.matches(&format!("rde:formula:{}", second.insert.id)).count(), 1);
+    let target_pos = xml.find(&format!("w14:paraId=\"{target}\"")).unwrap();
+    let target_end = xml[target_pos..].find("</w:p>").unwrap() + target_pos;
+    assert_eq!(xml[..target_pos].matches("rde:formula:").count(), 0, "вставки только в целевом абзаце");
+    assert_eq!(xml[target_end..].matches("rde:formula:").count(), 0, "вставки только в целевом абзаце");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Якорь по `paraId` в абзаце таблицы; абзац без `w14:paraId` — по порядковому номеру;
+/// соответствие путь WordCraft ↔ paraId однозначно проверяется по числу абзацев.
+#[test]
+fn anchor_resolves_table_cell_and_para_without_para_id() {
+    if !poppler_available() {
+        return;
+    }
+    let root = tmp("anchor-table");
+    write_project(&root);
+    let package = package_with_body(
+        &root,
+        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>В ячейке</w:t></w:r></w:p></w:tc>\
+         <w:tc><w:p><w:r><w:t>Вторая ячейка</w:t></w:r></w:p></w:tc></w:tr></w:tbl>\
+         <w:p><w:r><w:t>После таблицы</w:t></w:r></w:p>",
+    );
+    let ids = para_ids(&package);
+    assert_eq!(ids.len(), 3, "два абзаца таблицы + абзац после: {ids:?}");
+    let cell = ids[0].clone().expect("paraId первого абзаца таблицы");
+    // 1) Таблица: путь WordCraft → paraId (число абзацев разметки и модели совпадает).
+    let (doc, _is_rde) = open_document(&package).unwrap();
+    let paths = doc.para_paths(wordcraft_engine::doc::StoryRef::Body);
+    assert_eq!(paths.len(), ids.len(), "модель и разметка совпадают по числу абзацев");
+    for (path, expected) in paths.iter().zip(ids.iter()) {
+        let (para_id, ordinal) = resolve_para_id_for_path(&package, &doc, path).expect("резолв пути");
+        assert_eq!(&Some(para_id), expected, "paraId пути {path} (ordinal {ordinal})");
+    }
+    // 2) Inline-вставка в абзац таблицы попадает в его ячейку.
+    let body_v = compiled_body("x_{i}", false, "act-cell", false);
+    let text = "В ячейке";
+    let report = add_formula_insert(
+        &package,
+        FormulaInsertRequest {
+            body: body_v,
+            render_mode: "omml".to_owned(),
+            anchor: InsertAnchor::paragraph(cell.clone(), Some(text.len()), Some(text.to_owned())),
+            numbering: FormulaNumbering::Continuous,
+        },
+    )
+    .expect("вставка в абзац таблицы");
+    assert!(report.placement.as_ref().is_some_and(|placement| placement.exact));
+    let xml = body(&package);
+    let tag = format!("rde:formula:{}", report.insert.id);
+    let at = xml.find(&tag).unwrap();
+    assert!(at < xml.find("</w:tbl>").unwrap(), "sdt внутри таблицы: {xml}");
+    assert_eq!(xml[..at].matches("<w:tc>").count(), 1, "sdt в первой ячейке");
+    // 3) Абзац без `w14:paraId` (импортированный/внешний документ): якорь по порядковому номеру.
+    let mut stripped = body(&package);
+    let third_para = stripped.rfind("<w:p ").unwrap();
+    let open_end = stripped[third_para..].find('>').unwrap() + third_para;
+    let open_tag = stripped[third_para..open_end].to_owned();
+    assert!(open_tag.contains("w14:paraId="), "{open_tag}");
+    stripped.replace_range(third_para..open_end, "<w:p>");
+    write_part(&package, "word/document.xml", stripped.as_bytes());
+    let ids = para_ids(&package);
+    assert_eq!(ids.len(), 3);
+    assert!(ids[2].is_none(), "у абзаца удалён paraId: {ids:?}");
+    let body_v = compiled_body("y_{i}", false, "act-ordinal", false);
+    let text = "После таблицы";
+    let report = add_formula_insert(
+        &package,
+        FormulaInsertRequest {
+            body: body_v,
+            render_mode: "omml".to_owned(),
+            anchor: InsertAnchor::ordinal(2, Some(text.len()), Some(text.to_owned())),
+            numbering: FormulaNumbering::Continuous,
+        },
+    )
+    .expect("вставка по порядковому якорю");
+    assert!(report.placement.as_ref().is_some_and(|placement| placement.exact));
+    let xml = body(&package);
+    let at = xml.find(&format!("rde:formula:{}", report.insert.id)).unwrap();
+    let para_start = xml[..at].rfind("<w:p").unwrap();
+    assert!(xml[para_start..at].contains("После таблицы"), "sdt в абзаце без paraId: {}", &xml[para_start..at]);
+    // 4) Рассинхронизация разметки и модели → ошибка (никакого угадывания по номеру).
+    let (doc, _) = open_document(&package).unwrap();
+    let paths = doc.para_paths(wordcraft_engine::doc::StoryRef::Body);
+    let mut extra = body(&package);
+    extra = extra.replace("</w:body>", "<w:p><w:r><w:t>Лишний абзац</w:t></w:r></w:p></w:body>");
+    write_part(&package, "word/document.xml", extra.as_bytes());
+    let error = resolve_para_id_for_path(&package, &doc, &paths[0]).expect_err("рассинхронизация отклонена");
+    assert!(error.contains("абзацев"), "понятная ошибка: {error}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Неуспешная вставка не меняет пакет побайтово и не создаёт бэкапов (`.bak`/`doc-backups`).
+#[test]
+fn failed_inline_insert_leaves_package_untouched_without_backups() {
+    if !poppler_available() {
+        return;
+    }
+    let root = tmp("inline-rollback");
+    write_project(&root);
+    let package = package_with_body(&root, &two_paragraph_body());
+    let before = std::fs::read(&package).unwrap();
+    let before_sha = rde_hash::sha256(&before).hex();
+    let body_v = compiled_body("z", false, "act-fail", false);
+    let try_insert = |anchor: InsertAnchor| {
+        add_formula_insert(
+            &package,
+            FormulaInsertRequest {
+                body: body_v.clone(),
+                render_mode: "omml".to_owned(),
+                anchor,
+                numbering: FormulaNumbering::Continuous,
+            },
+        )
+    };
+    let error = try_insert(InsertAnchor::paragraph("DEADBEEF", Some(1), Some(TARGET_TEXT.to_owned())))
+        .expect_err("несуществующий paraId");
+    assert!(error.contains("не найден"), "{error}");
+    let error = try_insert(InsertAnchor::end()).expect_err("inline без якоря — ошибка, а не append в конец");
+    assert!(error.contains("якоря"), "{error}");
+    let target = para_ids(&package)[0].clone().unwrap();
+    let error = try_insert(InsertAnchor::paragraph(target.clone(), Some(10_000), Some(TARGET_TEXT.to_owned())))
+        .expect_err("позиция за концом абзаца");
+    assert!(!error.is_empty());
+    let error = try_insert(InsertAnchor::paragraph(target, Some(3), Some("чужой текст".to_owned())))
+        .expect_err("текст не совпал");
+    assert!(error.contains("не совпала"), "{error}");
+    assert_eq!(rde_hash::sha256(std::fs::read(&package).unwrap()).hex(), before_sha, "пакет побайтово не изменён");
+    assert_eq!(std::fs::read(&package).unwrap(), before);
+    assert!(!root.join(".rde/doc-backups").exists(), "бэкапы не создавались");
+    assert!(!package.with_extension("doc.rde.bak").exists(), ".bak не создавался");
+    assert_eq!(load_rde_doc(&package).unwrap().inserts.iter().filter(|insert| insert.kind == "formula").count(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ошибка перенумерации после вставки откатывает транзакцию: пакет не записан, вставки нет.
+#[test]
+fn renumber_failure_rolls_back_insert_transaction() {
+    if !poppler_available() {
+        return;
+    }
+    let root = tmp("renumber-rollback");
+    write_project(&root);
+    let package = package_with_body(&root, "<w:p><w:r><w:t>Текст документа</w:t></w:r></w:p>");
+    let before = std::fs::read(&package).unwrap();
+    let body_v = compiled_body("\\sigma=\\frac{F}{A}", true, "act-rollback", true);
+    let error = add_formula_insert_with_renumber_error(
+        &package,
+        FormulaInsertRequest {
+            body: body_v,
+            render_mode: "omml".to_owned(),
+            anchor: InsertAnchor::end(),
+            numbering: FormulaNumbering::Continuous,
+        },
+    )
+    .expect_err("инъекция ошибки перенумерации");
+    assert!(error.contains("инъекция"), "{error}");
+    assert_eq!(std::fs::read(&package).unwrap(), before, "пакет откатан (не записан)");
+    assert!(!root.join(".rde/doc-backups").exists(), "бэкапы не создавались");
+    assert!(!package.with_extension("doc.rde.bak").exists(), ".bak не создавался");
+    assert!(load_rde_doc(&package).unwrap().inserts.is_empty(), "вставка не зарегистрирована");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Display-вставка с якорем по `paraId`: block-sdt после абзаца-якоря (а не в конце документа),
+/// номер назначен схемой; legacy-якорь сохраняет прежнюю семантику «после блока N».
+#[test]
+fn display_insert_uses_paragraph_anchor_and_keeps_numbering() {
+    if !poppler_available() {
+        return;
+    }
+    let root = tmp("display-anchor");
+    write_project(&root);
+    let package = package_with_body(
+        &root,
+        "<w:p><w:r><w:t>Первый</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>Второй — якорь</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>Третий</w:t></w:r></w:p>",
+    );
+    let ids = para_ids(&package);
+    let anchor_id = ids[1].clone().unwrap();
+    let body_v = compiled_body("\\alpha=\\frac{\\lambda}{d}", true, "act-display", true);
+    let report = add_formula_insert(
+        &package,
+        FormulaInsertRequest {
+            body: body_v.clone(),
+            render_mode: "omml".to_owned(),
+            anchor: InsertAnchor::paragraph(anchor_id.clone(), None, None),
+            numbering: FormulaNumbering::Continuous,
+        },
+    )
+    .expect("display-вставка");
+    assert!(report.insert.number.is_some(), "номер назначен");
+    assert_eq!(
+        report.insert.number_text.clone().or_else(|| report.insert.number.map(|number| number.to_string())).as_deref(),
+        Some("1"),
+        "отображаемый номер — 1"
+    );
+    let xml = body(&package);
+    let tag = format!("rde:formula:{}", report.insert.id);
+    let at = xml.find(&tag).unwrap();
+    let anchor_pos = xml.find(&format!("w14:paraId=\"{anchor_id}\"")).unwrap();
+    let anchor_end = xml[anchor_pos..].find("</w:p>").unwrap() + anchor_pos;
+    assert!(at > anchor_end, "формула после абзаца-якоря");
+    assert!(at < xml.find("Третий").unwrap(), "формула не в конце документа");
+    assert!(xml[at..].contains("<w:tabs>"), "right-numbered без таблицы");
+    // Legacy-совместимость: «после блока 0» — между первым и вторым абзацами.
+    let legacy = add_formula_insert(
+        &package,
+        FormulaInsertRequest {
+            body: body_v,
+            render_mode: "omml".to_owned(),
+            anchor: InsertAnchor::legacy_block(0),
+            numbering: FormulaNumbering::Continuous,
+        },
+    )
+    .expect("legacy display-вставка");
+    let xml = body(&package);
+    let legacy_at = xml.find(&format!("rde:formula:{}", legacy.insert.id)).unwrap();
+    assert!(legacy_at > xml.find("Первый").unwrap());
+    assert!(legacy_at < xml.find("Второй — якорь").unwrap(), "legacy-якорь после первого блока");
     let _ = std::fs::remove_dir_all(&root);
 }

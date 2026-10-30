@@ -2421,3 +2421,128 @@ git checkout -- demo-project && git clean -fdq demo-project   # восстано
 ./scripts/build.sh build -p rde --release         # release
 ./scripts/clean-build.sh                          # полная очистка target
 ```
+
+---
+
+## Обновление 2026-10-30 (`inline-formula-insert`): inline-вставка формул в позицию каретки — однозначный якорь `w14:paraId`
+
+Итерация **`inline-formula-insert`** (P8-B3). Вход: HEAD `55388cc` (тег `formula-editor-window`),
+workspace **632 passed / 0 failed**; выход: **649 passed / 0 failed / 2 ignored**, release-бинарь
+`/srv/yocto/rde-target/release/rde`; документы — [ADR-0023](adr/0023-inline-formula-insert.md), отчёт
+[`fidelity/p24-inline-formula-insert.md`](fidelity/p24-inline-formula-insert.md), скриншоты
+`docs/fidelity/gui-p24-*.png`.
+
+### Что сделано
+
+1. **Однозначный якорь вставки [`rde_doc::InsertAnchor`](../crates/rde-doc/src/insert_anchor.rs)**
+   (`w14:paraId` — приоритет; `ordinal` — fallback для импортированных абзацев без `paraId`;
+   `offset`+`text` — позиция каретки и контроль; `legacy_block` — совместимость display-вставок
+   P3/P6). `FormulaInsertRequest.anchor_block` заменён на `anchor`; у GUI и `rde-doc` теперь одна
+   система координат. Соответствие «путь WordCraft → `paraId`» — по **порядку абзацев**: обход
+   `word/document.xml` повторяет читалку WordCraft (таблицы, block-level `w:sdt`,
+   `w:customXml`/`w:ins`/`w:moveTo`, одна ветка `mc:AlternateContent`, без `w:txbxContent`/удалённых
+   блоков, синтетические абзацы block-level `m:oMath`); при расхождении числа абзацев — `Err`
+   (никакого угадывания по номеру).
+2. **Позиционная inline-вставка** (`insert_inline_at`): текст абзаца реконструируется из разметки с
+   обратной картой символ→диапазон, сверяется по префиксу с текстом модели, затем `w:sdt` вставляется
+   **ровно в каретку**: разрыв `w:t`/`w:r` с дублированием `w:rPr` и `xml:space="preserve"`, вставка
+   между прогонами, разрыв `w:hyperlink` на две ссылки (как в writer WordCraft). Внутрь полей
+   Word/трек-правок/вложенных content-control — понятная ошибка; позиция недоступна — конец **того
+   же** абзаца с предупреждением (не в конец документа).
+3. **Display-вставка** адресуется абзацем: block-sdt после top-level блока, содержащего абзац-якорь
+   (в таблице — после таблицы с предупреждением); старый «после блока N» сохранён для совместимости.
+4. **Транзакционность**: перенумерация формул и перекрёстных ссылок — **в памяти до записи**, пакет
+   пишется одним `write_entries_atomic`. Ошибка любой стадии (якорь/позиция/перенумерация) не меняет
+   пакет/store и не создаёт `.bak`/`.rde/doc-backups`; повторный клик после ошибки не плодит вставок.
+   `InsertReport` расширен `placement` (paraId/offset/контекст) и `warnings`; тестовая инъекция
+   `add_formula_insert_with_renumber_error` (hidden) проверяет откат.
+5. **GUI:** якорь берётся из каретки DocView (`Session.sel.focus`, story `Body`) с кэшем списка
+   `paraId` пакета по `(mtime, размер)`; панель «Формула» показывает фактический якорь
+   (`якорь: абзац 200C20D9, позиция 163 из 418 — «…опорной дальности▸ , и именно…»`), журнал — место
+   вставки (`Вставка v74 (formula, omml inline) в абзац 200C20D9 после «…опорной дальности»…`);
+   inline без каретки — ошибка в панели (`dialog.error`) и журнале, документ не меняется;
+   несохранённые правки редактора фиксируются в проект до записи пакета; inline+SVG amber-подсказка
+   P6 сохранена.
+6. **Документы:** ADR-0023; fidelity p24; CHANGELOG/state/tz-03 (§5.7.5)/gui-coverage (§4 + §15);
+   скриншоты `gui-p24-inline-anchor{,-light}.png`, `gui-p24-inline-document.png` (headless, на копии
+   demo-project). Схема `rde:doc` не менялась (5): новых полей нет; `RdeInsert.para_id` для
+   inline-вставки теперь = `paraId` **хост-абзаца** (диагностика/«где вставлено»).
+
+### Тесты/доказательства
+
+- `./scripts/build.sh test --workspace` — **649 passed / 0 failed / 2 ignored** (+17 к baseline):
+  `rde-doc` +11 unit (`insert_anchor`: порядок абзацев/таблицы/`w:del`/`w:txbxContent`, разрез
+  `w:t`/между прогонами/в ссылке, ошибки якоря и позиции, display-якорь, legacy) +5 интеграционных
+  (`formula_insert`: inline между прогонами + roundtrip + повтор; таблица/абзац без `paraId` +
+  рассинхронизация модели; неуспешная вставка — sha256 без изменений и 0 бэкапов; откат при ошибке
+  перенумерации; display-якорь + legacy); `rde-ui` +1
+  (`formula_inline_insert_uses_caret_anchor_and_reports_errors`) и обновлённый policy-тест вставки
+  из панели (inline-формула адресуется кареткой). Регрессии P3/P6 зелёные.
+- **Headless на копии рабочего проекта v0004** (`rde/rde-project` → `/tmp/inline-fix-proj`, release):
+  формула «удаление» вставлена **между** `w:r` «…опорной дальности» и « , и именно…» целевого абзаца
+  `200C20D9` (ordinal 246, путь WordCraft 220, offset 163); текст всех прочих абзацев побайтово не
+  изменён (315→315 абзацев); `body_hash`/реестр консистентны; roundtrip WordCraft сохраняет вставку;
+  повторная вставка — отдельный id (v75); неверный якорь/отсутствие якоря — `Err`, пакет не изменён,
+  бэкапов нет; display-формула с якорем — после абзаца, номер «32» по схеме. Вставка — **57,8 мс**
+  (release, документ 411 737 B; доминирует перезапись 2,1 МБ zip), отклонённая — 9,8 мс.
+- Скриншоты: `docs/fidelity/gui-p24-inline-anchor.png` (+light), `gui-p24-inline-document.png` —
+  панель с якорем и документ с inline-формулой в тексте, журнал с абзацем/контекстом.
+
+### Ограничения (честно)
+
+1. **Word не проверен** (нет на стенде): позиция inline проверена headless-разбором XML, рендером
+   WordCraft и LO-оракулом; Word — `unverified`.
+2. Вставка внутрь полей Word, отслеживаемых правок (`w:ins`/`w:del`) и вложенных content-control не
+   поддерживается — ошибка с подсказкой (сознательно вместо невалидного OOXML).
+3. Рассинхронизация модели и разметки (несохранённые правки WordCraft/нестандартная разметка) →
+   ошибка «сохраните документ и повторите», а не риск чужим абзацем.
+4. Display-формула в абзац таблицы вставляется после таблицы (предупреждение); inline внутри ячейки
+   работает.
+5. **Рабочий проект пользователя `rde-project` не изменялся** (все прогоны — на копиях). Ошибочные
+   вставки v68/v69/v71/v73 в живом проекте остаются; их чистка и корректная вставка «удаления» —
+   отдельным шагом по согласованию с пользователем и при закрытом RDE (см. финальный ответ
+   итерации).
+
+### Следующий шаг
+
+Ручная приёмка на живом RDE (после перезапуска GUI на новом release-бинаре), затем — чистка ошибочных
+вставок в `rde-project` по согласованию; далее **PERF-1** (оптимизация RDE по
+[`perf-backlog.md`](perf-backlog.md); запись 2,1 МБ пакета при вставке — кандидат в PERF-3).
+
+### Как запустить (актуально на этой итерации)
+
+```bash
+cd /home/admin-pc/proj/rde-dev/rde
+source ~/.cargo/env
+
+# 1) приложение — новый release-бинарь (перезапустить GUI, старый процесс держит .rde/lock)
+/srv/yocto/rde-target/release/rde
+./scripts/run.sh                                  # последний проект
+RDE_PROJECT=demo-project ./scripts/run.sh         # демо-проект
+
+# в GUI: режим «RDE», каретка в текст документа (например, после слова «дальности»),
+#        вкладка «Формула» → выбрать формулу → «Вставить в документ» (inline/OMML)
+#        → формула появляется в тексте ровно в каретке, панель/журнал показывают абзац и позицию
+
+# 2) тесты
+./scripts/build.sh test --workspace               # 649 passed / 0 failed
+./scripts/build.sh test -p rde-doc -p rde-ui      # быстрый прогон затронутых крейтов
+
+# 3) headless-скриншоты (на КОПИИ demo-project; живую фикстуру не трогать)
+cp -a demo-project /tmp/rde-demo-copy && rm -f /tmp/rde-demo-copy/.rde/lock
+RDE_PROJECT=/tmp/rde-demo-copy RDE_SCREENSHOT_STEPS=140 \
+  /srv/yocto/rde-target/release/examples/screenshot /tmp/p24-anchor.png document "" 0 formula-inline-anchor dark
+RDE_PROJECT=/tmp/rde-demo-copy RDE_SCREENSHOT_STEPS=140 \
+  /srv/yocto/rde-target/release/examples/screenshot /tmp/p24-inline.png document "" 0 formula-inline dark
+rm -rf /tmp/rde-demo-copy
+
+# 4) ручные проверки: (а) inline-формула в середине абзаца — на месте, режим OMML;
+#    (б) повторный клик — вторая вставка в то же место, без вставок в чужие абзацы;
+#    (в) без каретки/в режиме WordCraft — понятная ошибка, документ не меняется, бэкапов нет;
+#    (г) переключение проекта: ./scripts/run.sh --project <dir> / RDE_PROJECT=<dir> ./scripts/run.sh.
+
+# 5) пересборка
+./scripts/build.sh build -p rde                   # debug
+./scripts/build.sh build -p rde --release         # release (~4–5 мин, тёплый кэш)
+./scripts/build.sh clean                          # полная очистка target
+```

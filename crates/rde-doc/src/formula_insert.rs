@@ -77,8 +77,10 @@ pub struct FormulaInsertRequest {
     pub body: FormulaBody,
     /// `omml` — редактируемая формула, `svg` — векторная картинка + PNG-fallback.
     pub render_mode: String,
-    /// Блок-якорь (0-based индекс блока тела); `None` — в конец документа.
-    pub anchor_block: Option<usize>,
+    /// Куда вставлять (P9): `w14:paraId` абзаца + позиция каретки для inline; для display —
+    /// после блока, содержащего абзац. [`InsertAnchor::end`] — в конец документа (прежнее
+    /// поведение P3); `legacy_block` — совместимость со старым индексом блока тела.
+    pub anchor: crate::InsertAnchor,
     /// Схема нумерации документа (ADR-0018): сквозная (по умолчанию) или по разделам. Номер
     /// назначается документно-локально и пересчитывается после вставки (см.
     /// [`renumber_formula_numbers`]).
@@ -236,6 +238,26 @@ pub struct FormulaMigrationPlan {
 /// Вставить формулу в `.doc.rde`: block-sdt (display) или inline-sdt (inline) + запись в
 /// `rde:doc`. Кэши приходят из CAS формулы; движок для вставки не запускается.
 pub fn add_formula_insert(package: &Path, request: FormulaInsertRequest) -> Result<InsertReport, String> {
+    add_formula_insert_with(package, request, |entries, numbering| {
+        renumber_entries(entries, numbering).map(|report| report.warnings)
+    })
+}
+
+/// Тестовая точка (итерация inline-formula-insert): вставка с намеренной ошибкой перенумерации —
+/// проверяет транзакционность (пакет/store не меняются, `.bak` не создаётся). Не для продакшена.
+#[doc(hidden)]
+pub fn add_formula_insert_with_renumber_error(package: &Path, request: FormulaInsertRequest) -> Result<InsertReport, String> {
+    add_formula_insert_with(package, request, |_, _| Err("инъекция ошибки перенумерации (тест)".to_owned()))
+}
+
+/// Транзакционная вставка: всё, включая перенумерацию, считается в памяти; пакет записывается
+/// одним `write_entries_atomic` в самом конце. Ошибка на любой стадии (якорь/позиция/ренумерация)
+/// не меняет пакет — вызывающий слой не создаёт бэкапов и не плодит дубликатов.
+fn add_formula_insert_with(
+    package: &Path,
+    request: FormulaInsertRequest,
+    renumber: impl FnOnce(&mut BTreeMap<String, Vec<u8>>, FormulaNumbering) -> Result<Vec<String>, String>,
+) -> Result<InsertReport, String> {
     let body = request.body;
     if body.formula_id.is_empty() || body.act_key.is_empty() {
         return Err("формула без formula_id/act_key".to_owned());
@@ -249,9 +271,9 @@ pub fn add_formula_insert(package: &Path, request: FormulaInsertRequest) -> Resu
     }
     let mut entries = super::read_package(package)?.entries;
     let mut rde_doc = super::load_rde_doc_from_entries(&entries)?;
-    let document_xml = entries.get(DOCUMENT_XML).map(|bytes| String::from_utf8_lossy(bytes).to_string()).unwrap_or_default();
+    let mut document_xml = entries.get(DOCUMENT_XML).map(|bytes| String::from_utf8_lossy(bytes).to_string()).unwrap_or_default();
     let id = super::next_insert_id(&rde_doc.inserts, &document_xml);
-    let para_id = super::para_id_for(&format!("{}:formula:{id}", rde_doc.doc_id), rde_doc.inserts.len());
+    let generated_para_id = super::para_id_for(&format!("{}:formula:{id}", rde_doc.doc_id), rde_doc.inserts.len());
     let numbering = request.numbering;
     let number = if body.display && body.numbered { next_formula_number(&rde_doc) } else { None };
     let mut insert = RdeInsert {
@@ -268,7 +290,7 @@ pub fn add_formula_insert(package: &Path, request: FormulaInsertRequest) -> Resu
         cached: body.latex.clone(),
         selector: String::new(),
         value_kind: "formula".to_owned(),
-        para_id: Some(para_id.clone()),
+        para_id: Some(generated_para_id.clone()),
         style: String::new(),
         format: String::new(),
         run_style: String::new(),
@@ -279,33 +301,54 @@ pub fn add_formula_insert(package: &Path, request: FormulaInsertRequest) -> Resu
     insert.body_hash = Some(signature);
     let number_text_provisional = number.map(|number| number.to_string());
     let content = if body.display {
-        let media = if render_mode == "svg" { Some(ensure_formula_media(&mut entries, &insert.id, &body)?) } else { None };
-        wrap_block_sdt(&insert.id, &block_content(&insert, &body, number_text_provisional.as_deref(), &insert.suffix, &para_id, media, &entries)?)
+        let media = if render_mode == "svg" { Some(ensure_formula_media(&mut entries, &id, &body)?) } else { None };
+        wrap_block_sdt(&id, &block_content(&insert, &body, number_text_provisional.as_deref(), &insert.suffix, &generated_para_id, media, &entries)?)
     } else {
-        let media = if render_mode == "svg" { Some(ensure_formula_media(&mut entries, &insert.id, &body)?) } else { None };
-        wrap_inline_sdt(&insert.id, &inline_content(&insert, &body, &para_id, media)?)
+        let media = if render_mode == "svg" { Some(ensure_formula_media(&mut entries, &id, &body)?) } else { None };
+        wrap_inline_sdt(&id, &inline_content(&insert, &body, &generated_para_id, media)?)
     };
-    let document_xml = if body.display {
-        super::insert_fragment(&document_xml, &content, request.anchor_block)
-    } else {
-        match request.anchor_block.and_then(|index| append_inline_to_block(&document_xml, &content, index)) {
-            Some(xml) => xml,
-            None => super::append_paragraph(&document_xml, &inline_paragraph(&content, &para_id)),
+    let mut warnings: Vec<String> = Vec::new();
+    let placement = if body.display {
+        let (updated, warning) = crate::insert_block_after(&document_xml, &request.anchor, &content)?;
+        if let Some(warning) = warning {
+            warnings.push(warning);
         }
+        document_xml = updated;
+        None
+    } else {
+        // Inline: без якоря — явная ошибка (прежний «тихий» append в конец документа убран).
+        let (updated, placement) = crate::insert_inline_at(&document_xml, &request.anchor, &content)?;
+        if !placement.exact {
+            warnings.push("позиция каретки недоступна — inline-формула вставлена в конец абзаца-якоря".to_owned());
+        }
+        document_xml = updated;
+        Some(placement)
     };
+    if !body.display {
+        // Анкор inline-вставки — хост-абзац (для диагностики/«где вставлено»); своего абзаца у
+        // inline content-control нет.
+        insert.para_id = placement.as_ref().and_then(|placement| placement.para_id.clone()).or(Some(generated_para_id));
+        if let Some(para_id) = &insert.para_id
+            && let Some(block) = rde_doc.blocks.iter().find(|block| block.para_id.as_deref() == Some(para_id.as_str()))
+        {
+            insert.block = block.id.clone();
+        }
+    }
     rde_doc.inserts.push(insert.clone());
     rde_doc.updated_unix = super::now_unix();
     rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
     entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
     entries.insert(RDE_DOC_PART.to_owned(), super::render_rde_doc(&rde_doc).into_bytes());
     super::upsert_custom_props(&mut entries, &rde_doc);
-    let info = super::info_from_entries(&entries);
+    // Схемная нумерация (ADR-0018) — ДО записи пакета: ошибка не оставляет полу-вставленный пакет.
+    let renumber_warnings = renumber(&mut entries, numbering)?;
+    warnings.extend(renumber_warnings);
     super::write_entries_atomic(&entries, package)?;
-    // Схемная нумерация (ADR-0018): после вставки пересчитываем номера всех формул документа и
-    // ссылки на них (схема «по разделам» переставляет номера у формул после места вставки).
-    let renumbered = renumber_formula_numbers(package, numbering)?;
-    let _ = &renumbered.warnings;
-    Ok(InsertReport { insert, package: info })
+    // Итоговая вставка — после перенумерации (номера/текст могли обновиться в rde:doc).
+    let final_doc = super::load_rde_doc_from_entries(&entries)?;
+    let insert = final_doc.inserts.iter().find(|candidate| candidate.id == id).cloned().unwrap_or(insert);
+    let info = super::info_from_entries(&entries);
+    Ok(InsertReport { insert, package: info, placement, warnings })
 }
 
 fn normalize_render_mode(mode: &str) -> &'static str {
@@ -439,58 +482,6 @@ fn suffix_run(suffix: &str) -> String {
         return String::new();
     }
     format!("<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r>", crate::escape_attr(suffix))
-}
-
-/// Абзац для inline-формулы, когда у вставки нет абзаца-якоря.
-fn inline_paragraph(content: &str, para_id: &str) -> String {
-    format!(
-        "<w:p w14:paraId=\"{para_id}\"><w:pPr><w:spacing w:before=\"0\" w:after=\"0\"/><w:ind w:left=\"0\" w:right=\"0\" w:firstLine=\"0\"/></w:pPr>{content}</w:p>"
-    )
-}
-
-/// Дописать inline-sdt в конец абзаца-якоря (индекс блока тела).
-fn append_inline_to_block(xml: &str, content: &str, block_index: usize) -> Option<String> {
-    let p_start = nth_body_paragraph_start(xml, block_index)?;
-    let p_end = xml[p_start..].find("</w:p>")? + p_start;
-    let mut out = String::with_capacity(xml.len() + content.len());
-    out.push_str(&xml[..p_end]);
-    out.push_str(content);
-    out.push_str(&xml[p_end..]);
-    Some(out)
-}
-
-/// Начало N-го абзаца верхнего уровня тела.
-fn nth_body_paragraph_start(xml: &str, index: usize) -> Option<usize> {
-    let body_open = xml.find("<w:body>")?;
-    let mut depth = 1usize;
-    let mut block = 0usize;
-    let mut pos = body_open + "<w:body>".len();
-    while pos < xml.len() {
-        let rel = xml[pos..].find('<')?;
-        let start = pos + rel;
-        let rel_end = xml[start..].find('>')?;
-        let end = start + rel_end;
-        let tag = &xml[start + 1..end];
-        if tag.starts_with('/') {
-            depth = depth.saturating_sub(1);
-            pos = end + 1;
-            continue;
-        }
-        let self_closing = tag.ends_with('/');
-        let declaration = tag.starts_with('?') || tag.starts_with('!');
-        let name = tag.trim_start_matches('/').split([' ', '\t', '\n', '/']).next().unwrap_or("");
-        if depth == 1 && !self_closing && !declaration && name == "w:p" {
-            if block == index {
-                return Some(start);
-            }
-            block += 1;
-        }
-        if !self_closing && !declaration {
-            depth += 1;
-        }
-        pos = end + 1;
-    }
-    None
 }
 
 /// Абзац «Right-numbered» формулы: таб-стопы центр/право по ширине текста, формула по центру,
@@ -955,7 +946,24 @@ pub struct FormulaRenumberReport {
 /// `number_text` не входят в `body_hash`, поэтому ручные правки тела не конфликтуют (R-DOC-13).
 pub fn renumber_formula_numbers(package: &Path, numbering: FormulaNumbering) -> Result<FormulaRenumberReport, String> {
     let mut entries = super::read_package(package)?.entries;
-    let mut rde_doc = super::load_rde_doc_from_entries(&entries)?;
+    let report = renumber_entries(&mut entries, numbering)?;
+    if report.changed() {
+        super::write_entries_atomic(&entries, package)?;
+    }
+    Ok(report)
+}
+
+impl FormulaRenumberReport {
+    /// Были ли реальные изменения (тогда нужно записать пакет).
+    pub fn changed(&self) -> bool {
+        !self.formulas.is_empty() || !self.crossrefs.is_empty()
+    }
+}
+
+/// Пересчитать номера/ссылки в уже прочитанных частях пакета (без записи на диск): общая часть
+/// [`renumber_formula_numbers`] и транзакционной вставки формулы.
+fn renumber_entries(entries: &mut BTreeMap<String, Vec<u8>>, numbering: FormulaNumbering) -> Result<FormulaRenumberReport, String> {
+    let mut rde_doc = super::load_rde_doc_from_entries(entries)?;
     let Some(document) = entries.get(DOCUMENT_XML) else { return Ok(FormulaRenumberReport::default()) };
     let mut document_xml = String::from_utf8_lossy(document).to_string();
     let styles_xml = entries.get("word/styles.xml").map(|bytes| String::from_utf8_lossy(bytes).to_string());
@@ -1003,8 +1011,7 @@ pub fn renumber_formula_numbers(package: &Path, numbering: FormulaNumbering) -> 
     rde_doc.body_hash = rde_hash::sha256(document_xml.as_bytes()).hex();
     entries.insert(DOCUMENT_XML.to_owned(), document_xml.into_bytes());
     entries.insert(RDE_DOC_PART.to_owned(), super::render_rde_doc(&rde_doc).into_bytes());
-    super::upsert_custom_props(&mut entries, &rde_doc);
-    super::write_entries_atomic(&entries, package)?;
+    super::upsert_custom_props(entries, &rde_doc);
     Ok(report)
 }
 

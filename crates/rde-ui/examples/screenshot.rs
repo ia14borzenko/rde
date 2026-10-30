@@ -87,6 +87,16 @@ fn main() {
             state.demo_document_full_width();
             state.demo_insert_formula_svg_with_number();
         }
+        // P9 (inline-formula-insert): панель «Формула» с якорем каретки (paraId/позиция) и
+        // документ после успешной inline-вставки в позицию каретки.
+        Some("formula-inline-anchor") => {
+            state.demo_show_service_objects();
+            state.demo_insert_formula_inline_anchor();
+        }
+        Some("formula-inline") => {
+            state.demo_show_service_objects();
+            state.demo_insert_formula_inline();
+        }
         Some("formula-editor-native") => {
             state.demo_show_service_objects();
             state.demo_open_formula_editor_native();

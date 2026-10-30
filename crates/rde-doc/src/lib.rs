@@ -67,6 +67,13 @@ pub use suggestions::*;
 mod text_edit;
 pub use text_edit::*;
 
+/// P9: однозначный якорь вставки (paraId + позиция каретки) и позиционная inline-вставка.
+mod insert_anchor;
+pub use insert_anchor::{
+    InsertAnchor, InlinePlacement, InsertAnchorError, ParagraphSpan, body_paragraph_ids, body_paragraph_spans,
+    document_xml, insert_block_after, insert_inline_at, resolve_para_id_for_path,
+};
+
 /// Разбор текста OOXML с учётом полей Word (номера MathType `SEQ MTEqn`, ADR-0019).
 mod xml_fields;
 
@@ -2000,6 +2007,10 @@ pub struct InsertRequest {
 pub struct InsertReport {
     pub insert: RdeInsert,
     pub package: PackageInfo,
+    /// Куда именно попала вставка (P9): paraId/позиция/контекст; `None` — в конец документа.
+    pub placement: Option<InlinePlacement>,
+    /// Предупреждения (например, inline-вставка не в позицию каретки, а в конец абзаца).
+    pub warnings: Vec<String>,
 }
 
 /// Добавить вставку в `.doc.rde`: content-control `w:sdt` с тегом `rde:<id>` в конце тела
@@ -2048,7 +2059,7 @@ pub fn add_insert(package: &Path, request: InsertRequest) -> Result<InsertReport
     upsert_custom_props(&mut entries, &rde_doc);
     let info = info_from_entries(&entries);
     write_entries_atomic(&entries, package)?;
-    Ok(InsertReport { insert, package: info })
+    Ok(InsertReport { insert, package: info, placement: None, warnings: Vec::new() })
 }
 
 /// Отчёт обновления вставок.
@@ -2326,7 +2337,7 @@ pub fn add_table_insert(package: &Path, request: InsertRequest, rows: &[Vec<Stri
     entries.insert(RDE_DOC_PART.to_owned(), render_rde_doc(&rde_doc).into_bytes());
     upsert_custom_props(&mut entries, &rde_doc);
     write_entries_atomic(&entries, package)?;
-    Ok(InsertReport { insert, package: info_from_entries(&entries) })
+    Ok(InsertReport { insert, package: info_from_entries(&entries), placement: None, warnings: Vec::new() })
 }
 
 /// Обновить таблицы вставок из свежих данных артефакта (R-DOC-18).
@@ -2639,7 +2650,7 @@ pub fn add_figure_insert(
     upsert_custom_props(&mut entries, &rde_doc);
     let info = info_from_entries(&entries);
     write_entries_atomic(&entries, package)?;
-    Ok(InsertReport { insert, package: info })
+    Ok(InsertReport { insert, package: info, placement: None, warnings: Vec::new() })
 }
 
 /// Обновить рисунки вставок: `images`: insert_id → (расширение, байты). Возвращает
