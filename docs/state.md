@@ -2427,8 +2427,9 @@ git checkout -- demo-project && git clean -fdq demo-project   # восстано
 ## Обновление 2026-10-30 (`inline-formula-insert`): inline-вставка формул в позицию каретки — однозначный якорь `w14:paraId`
 
 Итерация **`inline-formula-insert`** (P8-B3). Вход: HEAD `55388cc` (тег `formula-editor-window`),
-workspace **632 passed / 0 failed**; выход: **649 passed / 0 failed / 2 ignored**, release-бинарь
-`/srv/yocto/rde-target/release/rde`; документы — [ADR-0023](adr/0023-inline-formula-insert.md), отчёт
+workspace **632 passed / 0 failed**; выход: коммит `6f1c15e`, тег **`inline-formula-insert`**
+(push в `origin/main`), **649 passed / 0 failed / 2 ignored**, release-бинарь
+`/srv/yocto/rde-target/release/rde` (130 760 632 B); документы — [ADR-0023](adr/0023-inline-formula-insert.md), отчёт
 [`fidelity/p24-inline-formula-insert.md`](fidelity/p24-inline-formula-insert.md), скриншоты
 `docs/fidelity/gui-p24-*.png`.
 
